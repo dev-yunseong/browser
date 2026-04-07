@@ -1,4 +1,4 @@
-use tiny_skia::{Pixmap, Paint, Rect, Transform, Stroke, PathBuilder, FillRule};
+use tiny_skia::{Pixmap, Paint, Rect, Transform, Stroke, PathBuilder};
 use ab_glyph::{Font, FontRef, PxScale, point};
 use crate::layout::LayoutBox;
 use crate::css::Value;
@@ -10,26 +10,28 @@ const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/DejaVuSans.ttf");
 pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap) {
     // 1. Render Background
     if let Some(Value::Color(c)) = layout.style_node.specified_values.get("background") {
-        let mut paint = Paint::default();
-        paint.set_color_rgba8(c.r, c.g, c.b, c.a);
+        if c.a > 0 {
+            let mut paint = Paint::default();
+            paint.set_color_rgba8(c.r, c.g, c.b, c.a);
 
-        if layout.dimensions.width > 0.0 && layout.dimensions.height > 0.0 {
-            if let Some(rect) = Rect::from_xywh(
-                layout.dimensions.x,
-                layout.dimensions.y,
-                layout.dimensions.width,
-                layout.dimensions.height,
-            ) {
-                pixmap.fill_rect(rect, &paint, Transform::identity(), None);
+            if layout.dimensions.width > 0.0 && layout.dimensions.height > 0.0 {
+                if let Some(rect) = Rect::from_xywh(
+                    layout.dimensions.x,
+                    layout.dimensions.y,
+                    layout.dimensions.width,
+                    layout.dimensions.height,
+                ) {
+                    pixmap.fill_rect(rect, &paint, Transform::identity(), None);
+                }
             }
         }
     }
 
-    // 2. Render Border (Simplified: draw a stroke around the box)
+    // 2. Render Border
     if let Some(Value::Keyword(border)) = layout.style_node.specified_values.get("border") {
         if !border.is_empty() {
             let mut paint = Paint::default();
-            paint.set_color_rgba8(0, 0, 0, 255); // Default black border
+            paint.set_color_rgba8(200, 200, 200, 255); // Light gray border
             
             if let Some(rect) = Rect::from_xywh(
                 layout.dimensions.x,
@@ -53,12 +55,17 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap) {
         }
     }
 
-    // 3. Render Text
+    // 3. Render Text (Only for Text nodes)
     if let NodeData::Text { ref contents } = layout.style_node.node.data {
         let text = contents.borrow().to_string();
         let trimmed = text.trim();
         if !trimmed.is_empty() {
-            render_text(trimmed, layout.dimensions.x, layout.dimensions.y + 15.0, pixmap);
+            // Default text color: black for visibility
+            let color = match layout.style_node.specified_values.get("color") {
+                Some(Value::Color(c)) => c.clone(),
+                _ => crate::css::Color { r: 0, g: 0, b: 0, a: 255 },
+            };
+            render_text(trimmed, layout.dimensions.x, layout.dimensions.y, pixmap, color);
         }
     }
 
@@ -68,7 +75,7 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap) {
     }
 }
 
-fn render_text(text: &str, x: f32, y: f32, pixmap: &mut Pixmap) {
+fn render_text(text: &str, x: f32, y: f32, pixmap: &mut Pixmap, color: crate::css::Color) {
     let font = match FontRef::try_from_slice(FONT_DATA) {
         Ok(f) => f,
         Err(_) => return,
@@ -76,34 +83,35 @@ fn render_text(text: &str, x: f32, y: f32, pixmap: &mut Pixmap) {
     let scale = PxScale::from(16.0);
     
     let mut current_x = x;
+    let baseline_y = y + 14.0;
+    let pix_width = pixmap.width();
+    let pix_height = pixmap.height();
+
     for c in text.chars() {
         let glyph_id = font.glyph_id(c);
-        let glyph = glyph_id.with_scale_and_position(scale, point(current_x, y));
+        let glyph = glyph_id.with_scale_and_position(scale, point(current_x, baseline_y));
         
         if let Some(outline) = font.outline_glyph(glyph) {
             let bounds = outline.px_bounds();
-            let mut mask = tiny_skia::Mask::new(bounds.width() as u32, bounds.height() as u32).unwrap();
-            
-            // ab_glyph draw(o: FnMut(u32, u32, f32)) - pixel by pixel coverage
-            outline.draw(|x, y, c| {
-                let i = (y * mask.width() as u32 + x) as usize;
-                if i < mask.data().len() {
-                    mask.data_mut()[i] = (c * 255.0) as u8;
+            outline.draw(|gx, gy, coverage| {
+                if coverage > 0.0 {
+                    let px = (bounds.min.x as u32 + gx) as i32;
+                    let py = (bounds.min.y as u32 + gy) as i32;
+                    
+                    if px >= 0 && px < pix_width as i32 && py >= 0 && py < pix_height as i32 {
+                        let idx = ((py as u32 * pix_width + px as u32) * 4) as usize;
+                        let data = pixmap.data_mut();
+                        
+                        let alpha = (coverage * color.a as f32) as u8;
+                        if alpha > 0 {
+                            data[idx] = color.r;
+                            data[idx + 1] = color.g;
+                            data[idx + 2] = color.b;
+                            data[idx + 3] = alpha;
+                        }
+                    }
                 }
             });
-            
-            let mut paint = Paint::default();
-            paint.set_color_rgba8(0, 0, 0, 255); // Black text
-            
-            if let Some(rect) = Rect::from_xywh(bounds.min.x, bounds.min.y, bounds.width(), bounds.height()) {
-                pixmap.fill_path(
-                    &tiny_skia::PathBuilder::from_rect(rect),
-                    &paint,
-                    FillRule::Winding,
-                    Transform::identity(),
-                    Some(&mask),
-                );
-            }
         }
         current_x += font.h_advance_unscaled(glyph_id) * (scale.x / font.units_per_em().unwrap_or(1000.0) as f32);
     }
