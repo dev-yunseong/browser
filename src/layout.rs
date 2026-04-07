@@ -20,11 +20,21 @@ pub struct LayoutBox<'a> {
 pub enum DisplayType {
     Block,
     Inline,
+    InlineBlock,
 }
 
 fn get_display_type(style_node: &StyledNode) -> DisplayType {
     if let markup5ever_rcdom::NodeData::Text { .. } = style_node.node.data {
         return DisplayType::Inline;
+    }
+
+    if let Some(Value::Keyword(ref d)) = style_node.specified_values.get("display") {
+        match d.as_str() {
+            "block" => return DisplayType::Block,
+            "inline" => return DisplayType::Inline,
+            "inline-block" => return DisplayType::InlineBlock,
+            _ => {}
+        }
     }
 
     if let markup5ever_rcdom::NodeData::Element { ref name, .. } = style_node.node.data {
@@ -48,6 +58,7 @@ pub fn build_layout_tree<'a>(
     mut current_y: f32,
     container_width: f32
 ) -> (Option<LayoutBox<'a>>, f32, f32) {
+    // 1. display: none 처리
     if let Some(Value::Keyword(d)) = style_node.specified_values.get("display") {
         if d == "none" {
             return (None, current_x, current_y);
@@ -56,6 +67,7 @@ pub fn build_layout_tree<'a>(
 
     let display = get_display_type(style_node);
 
+    // 2. 여백 및 간격 추출
     let padding = match style_node.specified_values.get("padding") {
         Some(Value::Length(v, Unit::Px)) => *v,
         _ => 0.0,
@@ -65,7 +77,7 @@ pub fn build_layout_tree<'a>(
         _ => 0.0,
     };
 
-    // 3. 텍스트 노드 특수 처리
+    // 3. 텍스트 노드 특수 처리 (Inline flow)
     if let markup5ever_rcdom::NodeData::Text { ref contents } = style_node.node.data {
         let text = contents.borrow().to_string();
         let trimmed = text.trim();
@@ -81,7 +93,10 @@ pub fn build_layout_tree<'a>(
         let avg_char_width = 8.0 * (font_size / 16.0);
         let line_height = font_size * 1.25;
         
+        // 가용 너비 체크
         let available_width = container_width - (current_x - container_start_x) - (margin * 2.0);
+        
+        // 만약 단어 하나도 안 들어갈 정도로 좁으면 줄바꿈
         if available_width < avg_char_width && current_x > container_start_x {
             current_y += line_height;
             current_x = container_start_x;
@@ -143,9 +158,18 @@ pub fn build_layout_tree<'a>(
         _ => if let DisplayType::Block = display { container_width - (margin * 2.0) } else { 0.0 },
     };
 
+    // Block 요소는 항상 새 줄에서 시작
     if let DisplayType::Block = display {
         if current_x > container_start_x {
-            current_y += 25.0; 
+            current_y += 25.0; // Line break
+            current_x = container_start_x;
+        }
+    }
+
+    // Inline-block은 가용 너비 부족 시 줄바꿈
+    if let DisplayType::InlineBlock = display {
+        if layout_width > 0.0 && current_x + layout_width + (margin * 2.0) > container_start_x + container_width {
+            current_y += 25.0; // Line break
             current_x = container_start_x;
         }
     }
@@ -165,6 +189,7 @@ pub fn build_layout_tree<'a>(
         link_url: None,
     };
 
+    // 링크 추출
     if let markup5ever_rcdom::NodeData::Element { ref attrs, ref name, .. } = style_node.node.data {
         if name.local.to_string() == "a" {
             for attr in attrs.borrow().iter() {
@@ -200,7 +225,6 @@ pub fn build_layout_tree<'a>(
         );
 
         if let Some(child_box) = child_layout {
-            // FIX: max_y_in_box should just be the bottom of the child box
             max_y_in_box = max_y_in_box.max(child_box.dimensions.y + child_box.dimensions.height);
             max_x_in_box = max_x_in_box.max(next_x);
             layout.children.push(child_box);
@@ -209,6 +233,7 @@ pub fn build_layout_tree<'a>(
         }
     }
 
+    // 최종 크기 및 다음 좌표 결정
     if layout.dimensions.width == 0.0 {
         layout.dimensions.width = (max_x_in_box - box_x + padding).min(container_width - (margin * 2.0));
     }
