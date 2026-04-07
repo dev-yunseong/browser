@@ -29,7 +29,7 @@ struct PageData {
 impl BrowserApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         Self {
-            url: "https://example.com".to_string(),
+            url: "https://yunseong.dev".to_string(),
             history: vec![],
             history_index: 0,
             content_promise: None,
@@ -91,7 +91,7 @@ fn fetch_and_process(url_str: &str) -> Result<PageData, Box<dyn Error + Send + S
     
     let width = 800;
     let height = 600;
-    let (layout_tree, _) = layout::build_layout_tree(&style_tree, 0.0, 0.0, width as f32);
+    let (layout_tree, _, _) = layout::build_layout_tree(&style_tree, 0.0, 0.0, 0.0, width as f32);
 
     let mut pixmap = tiny_skia::Pixmap::new(width, height).unwrap();
     pixmap.fill(tiny_skia::Color::WHITE);

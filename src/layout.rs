@@ -16,18 +16,45 @@ pub struct LayoutBox<'a> {
     pub link_url: Option<String>,
 }
 
+pub enum DisplayType {
+    Block,
+    Inline,
+}
+
+fn get_display_type(style_node: &StyledNode) -> DisplayType {
+    if let markup5ever_rcdom::NodeData::Text { .. } = style_node.node.data {
+        return DisplayType::Inline;
+    }
+
+    if let markup5ever_rcdom::NodeData::Element { ref name, .. } = style_node.node.data {
+        let tag = name.local.to_string();
+        match tag.as_str() {
+            "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | 
+            "ul" | "li" | "header" | "footer" | "nav" | "section" | "article" | "body" | "html" => {
+                DisplayType::Block
+            }
+            _ => DisplayType::Inline,
+        }
+    } else {
+        DisplayType::Block
+    }
+}
+
 pub fn build_layout_tree<'a>(
     style_node: &'a StyledNode,
-    current_x: f32,
+    start_x: f32,
+    mut current_x: f32,
     mut current_y: f32,
     parent_width: f32
-) -> (Option<LayoutBox<'a>>, f32) {
+) -> (Option<LayoutBox<'a>>, f32, f32) {
     // 1. display: none 처리
     if let Some(Value::Keyword(d)) = style_node.specified_values.get("display") {
         if d == "none" {
-            return (None, current_y);
+            return (None, current_x, current_y);
         }
     }
+
+    let display = get_display_type(style_node);
 
     // 2. 여백 및 간격 추출
     let padding = match style_node.specified_values.get("padding") {
@@ -39,29 +66,90 @@ pub fn build_layout_tree<'a>(
         _ => 0.0,
     };
 
-    // 3. 링크 추출
-    let mut link_url = None;
-    if let markup5ever_rcdom::NodeData::Element { ref attrs, ref name, .. } = style_node.node.data {
-        if name.local.to_string() == "a" {
-            for attr in attrs.borrow().iter() {
-                if attr.name.local.to_string() == "href" {
-                    link_url = Some(attr.value.to_string());
-                }
+    // 3. 텍스트 노드 특수 처리 (줄바꿈 및 가로 너비 계산)
+    if let markup5ever_rcdom::NodeData::Text { ref contents } = style_node.node.data {
+        let text = contents.borrow().to_string();
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return (None, current_x, current_y);
+        }
+
+        let font_size = match style_node.specified_values.get("font-size") {
+            Some(Value::Length(v, Unit::Px)) => *v,
+            _ => 16.0,
+        };
+
+        let avg_char_width = 8.0 * (font_size / 16.0);
+        let max_chars_per_line = ((parent_width - (padding * 2.0)) / avg_char_width).max(1.0) as usize;
+        
+        let words: Vec<&str> = trimmed.split_whitespace().collect();
+        let mut lines_count = 0;
+        let mut current_line_len = 0;
+        let mut estimated_width: f32 = 0.0;
+
+        for word in words {
+            if current_line_len + word.len() + 1 > max_chars_per_line && current_line_len > 0 {
+                lines_count += 1;
+                estimated_width = estimated_width.max(current_line_len as f32 * avg_char_width);
+                current_line_len = word.len();
+            } else {
+                if current_line_len > 0 { current_line_len += 1; }
+                current_line_len += word.len();
             }
         }
+        if current_line_len > 0 { 
+            lines_count += 1;
+            estimated_width = estimated_width.max(current_line_len as f32 * avg_char_width);
+        }
+
+        let line_height = font_size * 1.25;
+        let total_height = (lines_count as f32 * line_height) + (padding * 2.0);
+        
+        let layout = LayoutBox {
+            dimensions: Rect {
+                x: current_x + margin,
+                y: current_y + margin,
+                width: estimated_width.min(parent_width - (margin * 2.0)),
+                height: total_height,
+            },
+            style_node,
+            children: Vec::new(),
+            link_url: None,
+        };
+
+        // If it's a multi-line text, it behaves like a block for the next element
+        let next_y = if lines_count > 1 {
+            current_y + total_height + (margin * 2.0)
+        } else {
+            current_y
+        };
+        let next_x = if lines_count > 1 {
+            start_x
+        } else {
+            current_x + layout.dimensions.width + (margin * 2.0)
+        };
+
+        return (Some(layout), next_x, next_y);
     }
 
-    // 4. 절대 좌표 및 크기 계산
-    let mut layout_width = parent_width - (margin * 2.0);
-    if let Some(Value::Length(w, Unit::Px)) = style_node.specified_values.get("width") {
-        layout_width = *w;
-    } else if let Some(Value::Length(w, Unit::Vw)) = style_node.specified_values.get("width") {
-        layout_width = (parent_width * (*w / 100.0)).min(parent_width - (margin * 2.0));
+    // 4. 일반 박스 처리 (Block vs Inline)
+    let mut layout_width = match style_node.specified_values.get("width") {
+        Some(Value::Length(w, Unit::Px)) => *w,
+        Some(Value::Length(w, Unit::Vw)) => parent_width * (*w / 100.0),
+        _ => if let DisplayType::Block = display { parent_width - (margin * 2.0) } else { 0.0 },
+    };
+
+    // Block 요소는 항상 새 줄에서 시작
+    if let DisplayType::Block = display {
+        if current_x > start_x {
+            current_y += 20.0;
+            current_x = start_x;
+        }
     }
 
     let box_x = current_x + margin;
     let box_y = current_y + margin;
-    
+
     let mut layout = LayoutBox {
         dimensions: Rect {
             x: box_x,
@@ -71,52 +159,28 @@ pub fn build_layout_tree<'a>(
         },
         style_node,
         children: Vec::new(),
-        link_url,
+        link_url: None,
     };
 
-    // 5. 텍스트 노드 특수 처리 (줄바꿈 로직)
-    if let markup5ever_rcdom::NodeData::Text { ref contents } = style_node.node.data {
-        let text = contents.borrow().to_string();
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            return (None, current_y);
-        }
-
-        let font_size = match style_node.specified_values.get("font-size") {
-            Some(Value::Length(v, Unit::Px)) => *v,
-            _ => 16.0,
-        };
-
-        // 아주 단순한 줄바꿈 시뮬레이션
-        let avg_char_width = 8.0 * (font_size / 16.0); 
-        let max_chars_per_line = ((layout_width - (padding * 2.0)) / avg_char_width).max(1.0) as usize;
-        
-        let words: Vec<&str> = trimmed.split_whitespace().collect();
-        let mut lines_count = 0;
-        let mut current_line_len = 0;
-
-        for word in words {
-            if current_line_len + word.len() + 1 > max_chars_per_line && current_line_len > 0 {
-                lines_count += 1;
-                current_line_len = word.len();
-            } else {
-                if current_line_len > 0 { current_line_len += 1; }
-                current_line_len += word.len();
+    // 5. 링크 추출
+    if let markup5ever_rcdom::NodeData::Element { ref attrs, ref name, .. } = style_node.node.data {
+        if name.local.to_string() == "a" {
+            for attr in attrs.borrow().iter() {
+                if attr.name.local.to_string() == "href" {
+                    layout.link_url = Some(attr.value.to_string());
+                }
             }
         }
-        if current_line_len > 0 { lines_count += 1; }
-
-        let line_height = font_size * 1.25;
-        let total_height = (lines_count as f32 * line_height) + (padding * 2.0);
-        layout.dimensions.height = total_height;
-        let next_y = box_y + total_height + margin;
-        return (Some(layout), next_y);
     }
 
-    let child_start_x = box_x + padding;
+    // 6. 자식 노드 배치
+    let child_container_width = if layout_width > 0.0 { layout_width } else { parent_width } - (padding * 2.0);
+    let mut child_start_x = box_x + padding;
+    let mut child_current_x = child_start_x;
     let mut child_current_y = box_y + padding;
+    let mut max_y_in_layer = child_current_y;
+    let mut max_width_in_layer: f32 = 0.0;
 
-    // 6. 자식 노드 레이아웃 (재귀)
     for child in &style_node.children {
         if let markup5ever_rcdom::NodeData::Element { ref name, .. } = child.node.data {
             let t = name.local.to_string();
@@ -125,24 +189,41 @@ pub fn build_layout_tree<'a>(
             }
         }
 
-        let (child_layout, next_y) = build_layout_tree(
+        let (child_layout, next_x, next_y) = build_layout_tree(
             child,
             child_start_x,
+            child_current_x,
             child_current_y,
-            layout_width - (padding * 2.0)
+            child_container_width
         );
 
         if let Some(child_box) = child_layout {
+            max_y_in_layer = max_y_in_layer.max(next_y + child_box.dimensions.height);
+            max_width_in_layer = max_width_in_layer.max(child_box.dimensions.x + child_box.dimensions.width - box_x);
             layout.children.push(child_box);
+            child_current_x = next_x;
             child_current_y = next_y;
         }
     }
 
-    // 7. 최종 높이 결정
-    let final_y = child_current_y + padding + margin;
-    layout.dimensions.height = final_y - box_y - margin;
+    // 최종 크기 결정
+    if layout.dimensions.width == 0.0 {
+        layout.dimensions.width = (max_width_in_layer + padding).min(parent_width - (margin * 2.0));
+    }
+    layout.dimensions.height = (max_y_in_layer - box_y + padding).max(20.0);
 
-    (Some(layout), final_y)
+    let final_x;
+    let final_y;
+
+    if let DisplayType::Block = display {
+        final_x = start_x;
+        final_y = box_y + layout.dimensions.height + margin;
+    } else {
+        final_x = current_x + layout.dimensions.width + (margin * 2.0);
+        final_y = current_y;
+    }
+
+    (Some(layout), final_x, final_y)
 }
 
 impl<'a> LayoutBox<'a> {
