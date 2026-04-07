@@ -88,7 +88,6 @@ fn fetch_and_process(url_str: &str) -> Result<PageData, Box<dyn Error + Send + S
     let dom_tree = dom::parse_html(&body);
     let mut css_source = style::extract_css_from_dom(&dom_tree.document);
 
-    // Fetch external CSS
     let external_links = style::extract_external_css_links(&dom_tree.document);
     for link in external_links {
         let abs_url = base_url.join(&link).map(|u| u.to_string()).unwrap_or(link.clone());
@@ -102,7 +101,6 @@ fn fetch_and_process(url_str: &str) -> Result<PageData, Box<dyn Error + Send + S
     let stylesheet = css::parse_css(&css_source);
     let style_tree = style::build_style_tree(&dom_tree.document, &stylesheet, None);
     
-    // Execute JavaScript
     let mut js_runtime = js::JsRuntime::new();
     let scripts = js::extract_scripts_from_dom(&dom_tree.document);
     for script in scripts {
@@ -119,11 +117,9 @@ fn fetch_and_process(url_str: &str) -> Result<PageData, Box<dyn Error + Send + S
     let mut links = Vec::new();
     let mut form_controls = Vec::new();
 
-    if let Some(layout) = layout_tree {
-        render::render_layout_tree(&layout, &mut pixmap);
+    if let Some(ref layout) = layout_tree {
+        render::render_layout_tree(layout, &mut pixmap);
         links = layout.get_links();
-        
-        // Extract form control positions
         for (rect, node) in layout.get_form_controls() {
             let mut initial_val = String::new();
             if let markup5ever_rcdom::NodeData::Element { ref attrs, .. } = node.node.data {
@@ -136,6 +132,8 @@ fn fetch_and_process(url_str: &str) -> Result<PageData, Box<dyn Error + Send + S
             form_controls.push((rect, initial_val));
         }
     }
+
+    println!("Loaded {} links and {} inputs", links.len(), form_controls.len());
 
     let absolute_links = links.into_iter().map(|(rect, link)| {
         let abs_link = base_url.join(&link).map(|u| u.to_string()).unwrap_or(link);
@@ -207,16 +205,17 @@ impl eframe::App for BrowserApp {
                         let val = self.form_values.entry(i).or_default();
                         let screen_pos = rect.min + egui::vec2(l_rect.x, l_rect.y);
                         let screen_rect = egui::Rect::from_min_size(screen_pos, egui::vec2(l_rect.width, l_rect.height));
-                        
-                        ui.put(screen_rect, egui::TextEdit::singleline(val).hint_text("Type here..."));
+                        ui.put(screen_rect, egui::TextEdit::singleline(val).hint_text("Input..."));
                     }
 
                     if response.clicked() {
                         if let Some(pointer_pos) = response.interact_pointer_pos() {
                             let rel_pos = pointer_pos - rect.min;
+                            println!("[Click Attempt] x: {:.1}, y: {:.1}", rel_pos.x, rel_pos.y);
                             for (l_rect, link) in &self.current_links {
                                 if rel_pos.x >= l_rect.x && rel_pos.x <= l_rect.x + l_rect.width &&
                                    rel_pos.y >= l_rect.y && rel_pos.y <= l_rect.y + l_rect.height {
+                                    println!("[Navigation] To: {}", link);
                                     url_to_load = Some(link.clone());
                                     break;
                                 }
@@ -237,8 +236,6 @@ impl eframe::App for BrowserApp {
                 });
 
                 if let Some(url) = url_to_load { self.load_url(url); }
-            } else {
-                ui.label("Enter a URL and press Go to load a page.");
             }
         });
     }

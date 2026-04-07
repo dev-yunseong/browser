@@ -91,7 +91,7 @@ pub fn build_layout_tree<'a>(
         _ => 0.0,
     };
 
-    // 3. 텍스트 노드 특수 처리
+    // 1. Text Node Handling
     if let markup5ever_rcdom::NodeData::Text { ref contents } = style_node.node.data {
         let text = contents.borrow().to_string();
         let trimmed = text.trim();
@@ -163,14 +163,14 @@ pub fn build_layout_tree<'a>(
         return (Some(layout), next_x, next_y);
     }
 
-    // 4. 일반 박스 처리
-    let mut layout_width_spec = match style_node.specified_values.get("width") {
+    // 2. Element Handling
+    let layout_width_spec = match style_node.specified_values.get("width") {
         Some(Value::Length(w, Unit::Px)) => *w,
         Some(Value::Length(w, Unit::Vw)) => container_width * (*w / 100.0),
         _ => if let DisplayType::Block | DisplayType::ListItem | DisplayType::Table | DisplayType::TableRow = display { 
             container_width - (margin * 2.0) 
         } else if let DisplayType::Input = display {
-            200.0 // Default input width
+            200.0
         } else { 
             0.0 
         },
@@ -194,7 +194,7 @@ pub fn build_layout_tree<'a>(
         dimensions: Rect {
             x: current_x + margin + x_offset,
             y: current_y + margin,
-            width: layout_width_spec - x_offset,
+            width: layout_width_spec,
             height: 0.0,
         },
         style_node,
@@ -213,10 +213,10 @@ pub fn build_layout_tree<'a>(
         }
     }
 
-    // 5. 자식 노드 배치
+    // 3. Child Placement
     let mut child_current_x = layout.dimensions.x + padding;
     let mut child_current_y = layout.dimensions.y + padding;
-    let mut child_start_x = child_current_x;
+    let child_start_x = child_current_x;
     
     let children_count = style_node.children.len() as f32;
     let cell_width = if let DisplayType::TableRow = display {
@@ -293,6 +293,7 @@ impl<'a> LayoutBox<'a> {
     pub fn get_links(&self) -> Vec<(Rect, String)> {
         let mut links = Vec::new();
         if let Some(ref url) = self.link_url {
+            // Use parent box dimensions for links to ensure they cover children
             links.push((self.dimensions, url.clone()));
         }
         for child in &self.children {
