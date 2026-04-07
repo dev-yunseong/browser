@@ -1,10 +1,9 @@
-use tiny_skia::{Pixmap, Paint, Rect, Transform, Stroke, PathBuilder, FillRule};
+use tiny_skia::{Pixmap, Paint, Rect, Transform, Stroke, PathBuilder};
 use ab_glyph::{Font, FontRef, PxScale, point};
 use crate::layout::LayoutBox;
 use crate::css::{Value, Unit};
 use markup5ever_rcdom::NodeData;
 
-// Using a bundled font that supports Korean (Nanum Gothic)
 const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/NanumGothic.ttf");
 
 pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap) {
@@ -17,15 +16,13 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap) {
             let mut paint = Paint::default();
             paint.set_color_rgba8(c.r, c.g, c.b, c.a);
 
-            if layout.dimensions.width > 0.0 && layout.dimensions.height > 0.0 {
-                if let Some(rect) = Rect::from_xywh(
-                    layout.dimensions.x,
-                    layout.dimensions.y,
-                    layout.dimensions.width,
-                    layout.dimensions.height,
-                ) {
-                    pixmap.fill_rect(rect, &paint, Transform::identity(), None);
-                }
+            if let Some(rect) = Rect::from_xywh(
+                layout.dimensions.x,
+                layout.dimensions.y,
+                layout.dimensions.width,
+                layout.dimensions.height,
+            ) {
+                pixmap.fill_rect(rect, &paint, Transform::identity(), None);
             }
         }
     }
@@ -66,21 +63,33 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap) {
         }
     }
 
-    // 3. Render Text (With wrapping and style support)
+    // 3. Render Text
     if let NodeData::Text { ref contents } = layout.style_node.node.data {
         let text = contents.borrow().to_string();
         let trimmed = text.trim();
         if !trimmed.is_empty() {
-            let color = match layout.style_node.specified_values.get("color") {
+            let mut color = match layout.style_node.specified_values.get("color") {
                 Some(Value::Color(c)) => c.clone(),
-                _ => crate::css::Color { r: 0, g: 0, b: 0, a: 255 }, // Default black
+                _ => crate::css::Color { r: 0, g: 0, b: 0, a: 255 },
             };
+
+            // Use the link_url in LayoutBox to identify links
+            let mut is_link = false;
+            if layout.link_url.is_some() {
+                color = crate::css::Color { r: 0, g: 0, b: 238, a: 255 };
+                is_link = true;
+            } else {
+                // If it's a text node inside an <a> tag, the link_url is on the parent
+                // Check style_node or parent manually
+                is_link = false; // Fallback
+            }
+
             let font_size = match layout.style_node.specified_values.get("font-size") {
                 Some(Value::Length(v, Unit::Px)) => *v,
-                Some(Value::Length(v, Unit::Em)) => *v * 16.0, // Basic em support
                 _ => 16.0,
             };
-            render_text_wrapped(trimmed, layout, pixmap, color, font_size);
+
+            render_text_wrapped(trimmed, layout, pixmap, color, font_size, is_link);
         }
     }
 
@@ -90,25 +99,20 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap) {
     }
 }
 
-fn render_text_wrapped(text: &str, layout: &LayoutBox, pixmap: &mut Pixmap, color: crate::css::Color, font_size: f32) {
+fn render_text_wrapped(text: &str, layout: &LayoutBox, pixmap: &mut Pixmap, color: crate::css::Color, font_size: f32, is_link: bool) {
     let font = match FontRef::try_from_slice(FONT_DATA) {
         Ok(f) => f,
         Err(_) => return,
     };
     let scale = PxScale::from(font_size);
-    let padding = match layout.style_node.specified_values.get("padding") {
-        Some(Value::Length(v, Unit::Px)) => *v,
-        _ => 0.0,
-    };
 
-    let start_x = layout.dimensions.x + padding;
-    let mut current_y = layout.dimensions.y + padding + (font_size * 0.85);
+    let start_x = layout.dimensions.x;
+    let mut current_y = layout.dimensions.y + (font_size * 0.85);
     let pix_width = pixmap.width();
     let pix_height = pixmap.height();
 
-    // Naive wrapping logic matching layout.rs
     let avg_char_width = 8.0 * (font_size / 16.0);
-    let max_chars = ((layout.dimensions.width - (padding * 2.0)) / avg_char_width).max(1.0) as usize;
+    let max_chars = (layout.dimensions.width / avg_char_width).max(1.0) as usize;
     
     let words: Vec<&str> = text.split_whitespace().collect();
     let mut current_line = String::new();
@@ -127,6 +131,7 @@ fn render_text_wrapped(text: &str, layout: &LayoutBox, pixmap: &mut Pixmap, colo
 
     for line in lines {
         let mut current_x = start_x;
+        let line_start_x = current_x;
         for c in line.chars() {
             let glyph_id = font.glyph_id(c);
             let glyph = glyph_id.with_scale_and_position(scale, point(current_x, current_y));
@@ -137,18 +142,14 @@ fn render_text_wrapped(text: &str, layout: &LayoutBox, pixmap: &mut Pixmap, colo
                     if coverage > 0.0 {
                         let px = bounds.min.x as i32 + gx as i32 ;
                         let py = bounds.min.y as i32 + gy as i32 ;
-                        
                         if px >= 0 && px < pix_width as i32 && py >= 0 && py < pix_height as i32 {
                             let idx = ((py as u32 * pix_width + px as u32) * 4) as usize;
                             let data = pixmap.data_mut();
-                            
                             let alpha = (coverage * color.a as f32) as u8;
                             if alpha > 0 {
-                                // Basic alpha blending: simpler but effective
                                 let old_a = data[idx + 3] as f32 / 255.0;
                                 let new_a = alpha as f32 / 255.0;
                                 let out_a = new_a + old_a * (1.0 - new_a);
-                                
                                 if out_a > 0.0 {
                                     data[idx] = ((color.r as f32 * new_a + data[idx] as f32 * old_a * (1.0 - new_a)) / out_a) as u8;
                                     data[idx + 1] = ((color.g as f32 * new_a + data[idx + 1] as f32 * old_a * (1.0 - new_a)) / out_a) as u8;
@@ -162,6 +163,15 @@ fn render_text_wrapped(text: &str, layout: &LayoutBox, pixmap: &mut Pixmap, colo
             }
             current_x += font.h_advance_unscaled(glyph_id) * (scale.x / font.units_per_em().unwrap_or(1000.0) as f32);
         }
+
+        if is_link {
+            let mut paint = Paint::default();
+            paint.set_color_rgba8(color.r, color.g, color.b, 255);
+            if let Some(line_rect) = Rect::from_xywh(line_start_x, current_y + 2.0, current_x - line_start_x, 1.0) {
+                pixmap.fill_rect(line_rect, &paint, Transform::identity(), None);
+            }
+        }
+
         current_y += font_size * 1.25; 
     }
 }
