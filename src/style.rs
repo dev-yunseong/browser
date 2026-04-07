@@ -17,6 +17,9 @@ pub fn build_style_tree(root: &Handle, stylesheet: &Stylesheet) -> StyledNode {
     if let NodeData::Element { ref name, .. } = root.data {
         let tag_name = name.local.to_string();
 
+        // [VISUALIZATION] Apply default border to see boxes
+        specified_values.insert("border".to_string(), Value::Keyword("1px solid #ccc".to_string()));
+
         for rule in &stylesheet.rules {
             for selector in &rule.selectors {
                 if let Some(ref s_tag) = selector.tag {

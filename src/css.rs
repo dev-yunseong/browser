@@ -4,7 +4,15 @@ use std::collections::HashMap;
 pub enum Value {
     Keyword(String),
     Length(f32, Unit),
-    Color(String),
+    Color(Color),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Color {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -44,12 +52,9 @@ pub struct Stylesheet {
 }
 
 pub fn parse_css(source: &str) -> Stylesheet {
-    // A VERY simplified CSS parser for demonstration purposes.
-    // In a real browser, we would use the `cssparser` crate.
     let mut rules = Vec::new();
-    let source = source.replace('\n', "");
+    let source = source.replace('\n', " ");
     
-    // Naive split by '}'
     let blocks: Vec<&str> = source.split('}').collect();
     for block in blocks {
         if block.trim().is_empty() { continue; }
@@ -63,8 +68,6 @@ pub fn parse_css(source: &str) -> Stylesheet {
             let s = s.trim();
             if !s.is_empty() {
                 let mut selector = Selector::new();
-                // Extremely naive selector parsing (only handles tags like 'body', 'h1', 'div', etc)
-                // In reality, this needs to handle classes, ids, pseudo-classes...
                 selector.tag = Some(s.to_string());
                 selectors.push(selector);
             }
@@ -78,17 +81,7 @@ pub fn parse_css(source: &str) -> Stylesheet {
             let key = kv.next().unwrap_or("").trim().to_string();
             let val_str = kv.next().unwrap_or("").trim().to_string();
             if !key.is_empty() && !val_str.is_empty() {
-                // Naive value parsing
-                let val = if val_str.ends_with("px") {
-                    Value::Length(val_str.trim_end_matches("px").parse().unwrap_or(0.0), Unit::Px)
-                } else if val_str.ends_with("vw") {
-                    Value::Length(val_str.trim_end_matches("vw").parse().unwrap_or(0.0), Unit::Vw)
-                } else if val_str.starts_with('#') || val_str == "red" || val_str == "blue" {
-                    Value::Color(val_str.clone())
-                } else {
-                    Value::Keyword(val_str.clone())
-                };
-                declarations.insert(key, val);
+                declarations.insert(key, parse_value(&val_str));
             }
         }
         
@@ -96,4 +89,62 @@ pub fn parse_css(source: &str) -> Stylesheet {
     }
     
     Stylesheet { rules }
+}
+
+fn parse_value(val: &str) -> Value {
+    let val = val.trim();
+    if val.ends_with("px") {
+        Value::Length(val.trim_end_matches("px").parse().unwrap_or(0.0), Unit::Px)
+    } else if val.ends_with("vw") {
+        Value::Length(val.trim_end_matches("vw").parse().unwrap_or(0.0), Unit::Vw)
+    } else if let Some(color) = parse_color(val) {
+        Value::Color(color)
+    } else {
+        Value::Keyword(val.to_string())
+    }
+}
+
+fn parse_color(s: &str) -> Option<Color> {
+    let s = s.to_lowercase();
+    if s.starts_with('#') {
+        let hex = &s[1..];
+        if hex.len() == 3 {
+            let r = u8::from_str_radix(&hex[0..1].repeat(2), 16).ok()?;
+            let g = u8::from_str_radix(&hex[1..2].repeat(2), 16).ok()?;
+            let b = u8::from_str_radix(&hex[2..3].repeat(2), 16).ok()?;
+            return Some(Color { r, g, b, a: 255 });
+        } else if hex.len() == 6 {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            return Some(Color { r, g, b, a: 255 });
+        }
+    } else if s.starts_with("rgb") {
+        let parts: Vec<&str> = s.split(|c| c == '(' || c == ')' || c == ',')
+            .filter(|p| !p.trim().is_empty() && !p.contains("rgb"))
+            .collect();
+        if parts.len() >= 3 {
+            let r = parts[0].trim().parse().ok()?;
+            let g = parts[1].trim().parse().ok()?;
+            let b = parts[2].trim().parse().ok()?;
+            let a = if parts.len() == 4 {
+                (parts[3].trim().parse::<f32>().ok()? * 255.0) as u8
+            } else {
+                255
+            };
+            return Some(Color { r, g, b, a });
+        }
+    } else {
+        match s.as_str() {
+            "white" => return Some(Color { r: 255, g: 255, b: 255, a: 255 }),
+            "black" => return Some(Color { r: 0, g: 0, b: 0, a: 255 }),
+            "red" => return Some(Color { r: 255, g: 0, b: 0, a: 255 }),
+            "blue" => return Some(Color { r: 0, g: 0, b: 255, a: 255 }),
+            "green" => return Some(Color { r: 0, g: 128, b: 0, a: 255 }),
+            "gray" | "grey" => return Some(Color { r: 128, g: 128, b: 128, a: 255 }),
+            "silver" => return Some(Color { r: 192, g: 192, b: 192, a: 255 }),
+            _ => {}
+        }
+    }
+    None
 }

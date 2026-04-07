@@ -214,7 +214,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "Rust Simple Browser",
+        "Aura Browser",
         options,
         Box::new(|cc| Ok(Box::new(BrowserApp::new(cc)))),
     )
