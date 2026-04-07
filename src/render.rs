@@ -27,18 +27,18 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap) {
         }
     }
 
-    // 2. Render Border
+    // 2. Render Border (Always show borders for visualization unless specified otherwise)
     let border_width = match layout.style_node.specified_values.get("border-width") {
         Some(Value::Length(v, Unit::Px)) => *v,
-        _ => 0.0,
+        _ => 0.5, // Default thin border for visibility
+    };
+    
+    let border_color = match layout.style_node.specified_values.get("border-color") {
+        Some(Value::Color(c)) => c.clone(),
+        _ => crate::css::Color { r: 220, g: 220, b: 220, a: 255 }, // Default light gray
     };
     
     if border_width > 0.0 {
-        let border_color = match layout.style_node.specified_values.get("border-color") {
-            Some(Value::Color(c)) => c.clone(),
-            _ => crate::css::Color { r: 0, g: 0, b: 0, a: 255 },
-        };
-        
         let mut paint = Paint::default();
         paint.set_color_rgba8(border_color.r, border_color.g, border_color.b, border_color.a);
         
@@ -94,7 +94,7 @@ fn render_text(text: &str, x: f32, y: f32, pixmap: &mut Pixmap, color: crate::cs
     let scale = PxScale::from(font_size);
     
     let mut current_x = x;
-    let baseline_y = y + (font_size * 0.85); // Adjust baseline based on font size
+    let baseline_y = y + (font_size * 0.85); 
     let pix_width = pixmap.width();
     let pix_height = pixmap.height();
 
@@ -106,8 +106,8 @@ fn render_text(text: &str, x: f32, y: f32, pixmap: &mut Pixmap, color: crate::cs
             let bounds = outline.px_bounds();
             outline.draw(|gx, gy, coverage| {
                 if coverage > 0.0 {
-                    let px = (bounds.min.x as u32 + gx) as i32;
-                    let py = (bounds.min.y as u32 + gy) as i32;
+                    let px = (bounds.min.x as i32 + gx as i32);
+                    let py = (bounds.min.y as i32 + gy as i32);
                     
                     if px >= 0 && px < pix_width as i32 && py >= 0 && py < pix_height as i32 {
                         let idx = ((py as u32 * pix_width + px as u32) * 4) as usize;

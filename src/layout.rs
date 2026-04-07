@@ -14,19 +14,22 @@ pub struct LayoutBox<'a> {
     pub style_node: &'a StyledNode,
     pub children: Vec<LayoutBox<'a>>,
     pub link_url: Option<String>,
-    pub padding: f32,
-    pub margin: f32,
 }
 
-pub fn build_layout_tree<'a>(style_node: &'a StyledNode, mut current_y: f32, parent_width: f32) -> (Option<LayoutBox<'a>>, f32) {
-    // 1. Handle display: none
+pub fn build_layout_tree<'a>(
+    style_node: &'a StyledNode,
+    current_x: f32,
+    mut current_y: f32,
+    parent_width: f32
+) -> (Option<LayoutBox<'a>>, f32) {
+    // 1. display: none 처리
     if let Some(Value::Keyword(d)) = style_node.specified_values.get("display") {
         if d == "none" {
             return (None, current_y);
         }
     }
 
-    // 2. Extract spacing
+    // 2. 여백 및 간격 추출
     let padding = match style_node.specified_values.get("padding") {
         Some(Value::Length(v, Unit::Px)) => *v,
         _ => 0.0,
@@ -36,6 +39,7 @@ pub fn build_layout_tree<'a>(style_node: &'a StyledNode, mut current_y: f32, par
         _ => 0.0,
     };
 
+    // 3. 링크 추출
     let mut link_url = None;
     if let markup5ever_rcdom::NodeData::Element { ref attrs, ref name, .. } = style_node.node.data {
         if name.local.to_string() == "a" {
@@ -47,51 +51,60 @@ pub fn build_layout_tree<'a>(style_node: &'a StyledNode, mut current_y: f32, par
         }
     }
 
+    // 4. 절대 좌표 및 크기 계산
+    let mut layout_width = parent_width - (margin * 2.0);
+    if let Some(Value::Length(w, Unit::Px)) = style_node.specified_values.get("width") {
+        layout_width = *w;
+    } else if let Some(Value::Length(w, Unit::Vw)) = style_node.specified_values.get("width") {
+        layout_width = (parent_width * (*w / 100.0)).min(parent_width - (margin * 2.0));
+    }
+
+    let box_x = current_x + margin;
+    let box_y = current_y + margin;
+    
     let mut layout = LayoutBox {
         dimensions: Rect {
-            x: margin,
-            y: current_y + margin,
-            width: parent_width - (margin * 2.0),
-            height: 0.0,
+            x: box_x,
+            y: box_y,
+            width: layout_width,
+            height: 0.0, // 자식 노드 순회 후 결정
         },
         style_node,
         children: Vec::new(),
         link_url,
-        padding,
-        margin,
     };
 
-    // Override width if set in CSS
-    if let Some(Value::Length(w, Unit::Px)) = style_node.specified_values.get("width") {
-        layout.dimensions.width = *w;
-    } else if let Some(Value::Length(w, Unit::Vw)) = style_node.specified_values.get("width") {
-        layout.dimensions.width = parent_width * (*w / 100.0);
-    }
+    let child_start_x = box_x + padding;
+    let mut child_current_y = box_y + padding;
 
-    let start_y = current_y + margin;
-    current_y += margin + padding;
-
+    // 5. 자식 노드 레이아웃 (재귀)
     for child in &style_node.children {
-        // Skip some elements like head, title, style, meta from layout
+        // 레이아웃에서 제외할 태그들
         if let markup5ever_rcdom::NodeData::Element { ref name, .. } = child.node.data {
             let t = name.local.to_string();
-            if t == "head" || t == "style" || t == "meta" || t == "title" {
+            if t == "head" || t == "style" || t == "meta" || t == "title" || t == "script" {
                 continue;
             }
         }
 
-        let (child_layout, new_y) = build_layout_tree(child, current_y, layout.dimensions.width - (padding * 2.0));
-        if let Some(mut child_box) = child_layout {
-            child_box.dimensions.x += padding; // Offset by parent padding
+        let (child_layout, next_y) = build_layout_tree(
+            child,
+            child_start_x,
+            child_current_y,
+            layout_width - (padding * 2.0)
+        );
+
+        if let Some(child_box) = child_layout {
             layout.children.push(child_box);
-            current_y = new_y;
+            child_current_y = next_y;
         }
     }
 
-    current_y += padding + margin;
-    layout.dimensions.height = current_y - start_y - margin;
+    // 6. 최종 높이 결정
+    let final_y = child_current_y + padding + margin;
+    layout.dimensions.height = final_y - box_y - margin;
 
-    (Some(layout), current_y)
+    (Some(layout), final_y)
 }
 
 impl<'a> LayoutBox<'a> {
@@ -104,7 +117,6 @@ impl<'a> LayoutBox<'a> {
                     return Some(node);
                 }
             }
-            
             return Some(self.style_node);
         }
         None
@@ -119,29 +131,5 @@ impl<'a> LayoutBox<'a> {
             links.extend(child.get_links());
         }
         links
-    }
-}
-
-pub fn print_layout_tree(layout: &LayoutBox, indent: usize) {
-    let indent_str = " ".repeat(indent * 2);
-
-    let tag = if let markup5ever_rcdom::NodeData::Element { ref name, .. } = layout.style_node.node.data {
-        name.local.to_string()
-    } else if let markup5ever_rcdom::NodeData::Text { ref contents } = layout.style_node.node.data {
-        let text = contents.borrow().to_string();
-        format!("Text({:?})", text.trim())
-    } else {
-        "Node".to_string()
-    };
-
-    if !tag.contains("Text(\"\")") {
-        println!("{}{} [x: {}, y: {}, w: {}, h: {}]", 
-            indent_str, tag, 
-            layout.dimensions.x, layout.dimensions.y, 
-            layout.dimensions.width, layout.dimensions.height);
-    }
-
-    for child in &layout.children {
-        print_layout_tree(child, indent + 1);
     }
 }
