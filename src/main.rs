@@ -86,7 +86,20 @@ fn fetch_and_process(url_str: &str) -> Result<PageData, Box<dyn Error + Send + S
     let base_url = Url::parse(url_str)?;
 
     let dom_tree = dom::parse_html(&body);
-    let css_source = style::extract_css_from_dom(&dom_tree.document);
+    let mut css_source = style::extract_css_from_dom(&dom_tree.document);
+
+    // Fetch external CSS
+    let external_links = style::extract_external_css_links(&dom_tree.document);
+    for link in external_links {
+        let abs_url = base_url.join(&link).map(|u| u.to_string()).unwrap_or(link.clone());
+        println!("Fetching external CSS: {}", abs_url);
+        if let Ok(resp) = reqwest::blocking::get(&abs_url) {
+            if let Ok(external_css) = resp.text() {
+                css_source.push_str(&external_css);
+            }
+        }
+    }
+
     let stylesheet = css::parse_css(&css_source);
     let style_tree = style::build_style_tree(&dom_tree.document, &stylesheet, None);
     

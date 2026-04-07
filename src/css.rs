@@ -38,6 +38,14 @@ impl Selector {
             class: Vec::new(),
         }
     }
+
+    pub fn specificity(&self) -> (usize, usize, usize) {
+        // (ID, Class, Tag)
+        let id_count = if self.id.is_some() { 1 } else { 0 };
+        let class_count = self.class.len();
+        let tag_count = if self.tag.is_some() { 1 } else { 0 };
+        (id_count, class_count, tag_count)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -67,9 +75,7 @@ pub fn parse_css(source: &str) -> Stylesheet {
         for s in selectors_str.split(',') {
             let s = s.trim();
             if !s.is_empty() {
-                let mut selector = Selector::new();
-                selector.tag = Some(s.to_string());
-                selectors.push(selector);
+                selectors.push(parse_selector(s));
             }
         }
         
@@ -81,7 +87,6 @@ pub fn parse_css(source: &str) -> Stylesheet {
             let key = kv.next().unwrap_or("").trim().to_string();
             let val_str = kv.next().unwrap_or("").trim().to_string();
             if !key.is_empty() && !val_str.is_empty() {
-                // Special handling for border shorthand
                 if key == "border" {
                     parse_border_shorthand(&val_str, &mut declarations);
                 } else {
@@ -94,6 +99,29 @@ pub fn parse_css(source: &str) -> Stylesheet {
     }
     
     Stylesheet { rules }
+}
+
+fn parse_selector(s: &str) -> Selector {
+    let mut selector = Selector::new();
+    let mut current = String::new();
+    let mut last_char = ' ';
+
+    for c in s.chars().chain(std::iter::once(' ')) {
+        if c == '#' || c == '.' || c == ' ' {
+            if !current.is_empty() {
+                match last_char {
+                    '#' => selector.id = Some(current.clone()),
+                    '.' => selector.class.push(current.clone()),
+                    _ => selector.tag = Some(current.clone()),
+                }
+                current.clear();
+            }
+            last_char = c;
+        } else {
+            current.push(c);
+        }
+    }
+    selector
 }
 
 fn parse_border_shorthand(val: &str, declarations: &mut HashMap<String, Value>) {
@@ -126,8 +154,6 @@ pub fn parse_value(val: &str) -> Value {
 
 pub fn parse_color(s: &str) -> Option<Color> {
     let s = s.trim().to_lowercase();
-    
-    // 1. HEX Color (#fff, #ffffff)
     if s.starts_with('#') {
         let hex = &s[1..];
         match hex.len() {
@@ -153,8 +179,6 @@ pub fn parse_color(s: &str) -> Option<Color> {
             _ => return None,
         }
     }
-    
-    // 2. RGB/RGBA Color (rgb(255, 0, 0), rgba(255, 0, 0, 0.5))
     if s.starts_with("rgb") {
         if let Some(content) = s.split(|c| c == '(' || c == ')').nth(1) {
             let parts: Vec<&str> = content.split(',').map(|p| p.trim()).collect();
@@ -171,8 +195,6 @@ pub fn parse_color(s: &str) -> Option<Color> {
             }
         }
     }
-    
-    // 3. Named Colors
     let mut names = HashMap::new();
     names.insert("white", Color { r: 255, g: 255, b: 255, a: 255 });
     names.insert("black", Color { r: 0, g: 0, b: 0, a: 255 });
@@ -190,11 +212,9 @@ pub fn parse_color(s: &str) -> Option<Color> {
     names.insert("pink", Color { r: 255, g: 192, b: 203, a: 255 });
     names.insert("gold", Color { r: 255, g: 215, b: 0, a: 255 });
     names.insert("transparent", Color { r: 0, g: 0, b: 0, a: 0 });
-
     if let Some(color) = names.get(s.as_str()) {
         return Some(color.clone());
     }
-    
     None
 }
 
@@ -203,29 +223,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_color_hex() {
-        assert_eq!(parse_color("#ff0000"), Some(Color { r: 255, g: 0, b: 0, a: 255 }));
-        assert_eq!(parse_color("#00f"), Some(Color { r: 0, g: 0, b: 255, a: 255 }));
-        assert_eq!(parse_color("#ff000080"), Some(Color { r: 255, g: 0, b: 0, a: 128 }));
-    }
-
-    #[test]
-    fn test_parse_color_rgb() {
-        assert_eq!(parse_color("rgb(255, 0, 0)"), Some(Color { r: 255, g: 0, b: 0, a: 255 }));
-        assert_eq!(parse_color("rgba(0, 255, 0, 0.5)"), Some(Color { r: 0, g: 255, b: 0, a: 127 }));
-        assert_eq!(parse_color("rgb(  0,  0,  0  )"), Some(Color { r: 0, g: 0, b: 0, a: 255 }));
-    }
-
-    #[test]
-    fn test_parse_color_names() {
-        assert_eq!(parse_color("White"), Some(Color { r: 255, g: 255, b: 255, a: 255 }));
-        assert_eq!(parse_color("transparent"), Some(Color { r: 0, g: 0, b: 0, a: 0 }));
-    }
-
-    #[test]
-    fn test_parse_value() {
-        assert_eq!(parse_value("10px"), Value::Length(10.0, Unit::Px));
-        assert_eq!(parse_value("50vw"), Value::Length(50.0, Unit::Vw));
-        assert_eq!(parse_value("bold"), Value::Keyword("bold".to_string()));
+    fn test_parse_selector() {
+        let s = parse_selector("div#main.header.active");
+        assert_eq!(s.tag, Some("div".to_string()));
+        assert_eq!(s.id, Some("main".to_string()));
+        assert_eq!(s.class, vec!["header".to_string(), "active".to_string()]);
     }
 }

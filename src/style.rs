@@ -1,4 +1,4 @@
-use crate::css::{Stylesheet, Value};
+use crate::css::{Stylesheet, Value, Selector};
 use markup5ever_rcdom::{Handle, NodeData};
 use std::collections::HashMap;
 
@@ -15,7 +15,6 @@ pub fn build_style_tree(root: &Handle, stylesheet: &Stylesheet, parent_style: Op
 
     // 1. Apply inherited values from parent
     if let Some(parent) = parent_style {
-        // Properties that are inherited by default in CSS
         let inheritable = ["color", "font-size", "font-family"];
         for prop in inheritable {
             if let Some(val) = parent.get(prop) {
@@ -24,19 +23,36 @@ pub fn build_style_tree(root: &Handle, stylesheet: &Stylesheet, parent_style: Op
         }
     }
 
-    // 2. Match tag-specific rules
-    if let NodeData::Element { ref name, .. } = root.data {
+    // 2. Match rules with specificity
+    if let NodeData::Element { ref name, ref attrs, .. } = root.data {
         let tag_name = name.local.to_string();
+        let mut id = None;
+        let mut classes = Vec::new();
 
+        for attr in attrs.borrow().iter() {
+            if attr.name.local.to_string() == "id" {
+                id = Some(attr.value.to_string());
+            } else if attr.name.local.to_string() == "class" {
+                classes = attr.value.to_string().split_whitespace().map(|s| s.to_string()).collect();
+            }
+        }
+
+        // Get all matching rules and sort by specificity
+        let mut matches = Vec::new();
         for rule in &stylesheet.rules {
             for selector in &rule.selectors {
-                if let Some(ref s_tag) = selector.tag {
-                    if *s_tag == tag_name {
-                        for (k, v) in &rule.declarations {
-                            specified_values.insert(k.clone(), v.clone());
-                        }
-                    }
+                if matches_selector(selector, &tag_name, id.as_deref(), &classes) {
+                    matches.push((selector.specificity(), rule));
+                    break;
                 }
+            }
+        }
+        
+        matches.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (_, rule) in matches {
+            for (k, v) in &rule.declarations {
+                specified_values.insert(k.clone(), v.clone());
             }
         }
     }
@@ -54,10 +70,22 @@ pub fn build_style_tree(root: &Handle, stylesheet: &Stylesheet, parent_style: Op
     }
 }
 
+fn matches_selector(selector: &Selector, tag: &str, id: Option<&str>, classes: &[String]) -> bool {
+    if let Some(ref s_tag) = selector.tag {
+        if s_tag != tag { return false; }
+    }
+    if let Some(ref s_id) = selector.id {
+        if Some(s_id.as_str()) != id { return false; }
+    }
+    for s_class in &selector.class {
+        if !classes.contains(s_class) { return false; }
+    }
+    true
+}
+
 // Helper to extract text from <style> nodes
 pub fn extract_css_from_dom(handle: &Handle) -> String {
     let mut css = String::new();
-
     if let NodeData::Element { ref name, .. } = handle.data {
         if name.local.to_string() == "style" {
             for child in handle.children.borrow().iter() {
@@ -67,33 +95,32 @@ pub fn extract_css_from_dom(handle: &Handle) -> String {
             }
         }
     }
-
     for child in handle.children.borrow().iter() {
         css.push_str(&extract_css_from_dom(child));
     }
-
     css
 }
 
-pub fn print_style_tree(node: &StyledNode, indent: usize) {
-    let indent_str = " ".repeat(indent * 2);
-
-    match node.node.data {
-        NodeData::Element { ref name, .. } => {
-            println!("{}<{} ...> {:?}", indent_str, name.local, node.specified_values);
-        }
-        NodeData::Text { ref contents } => {
-            let text = contents.borrow().to_string();
-            let trimmed = text.trim();
-            if !trimmed.is_empty() {
-                println!("{}Text: {:?}", indent_str, trimmed);
+pub fn extract_external_css_links(handle: &Handle) -> Vec<String> {
+    let mut links = Vec::new();
+    if let NodeData::Element { ref name, ref attrs, .. } = handle.data {
+        if name.local.to_string() == "link" {
+            let mut is_stylesheet = false;
+            let mut href = None;
+            for attr in attrs.borrow().iter() {
+                if attr.name.local.to_string() == "rel" && attr.value.to_string() == "stylesheet" {
+                    is_stylesheet = true;
+                } else if attr.name.local.to_string() == "href" {
+                    href = Some(attr.value.to_string());
+                }
+            }
+            if is_stylesheet {
+                if let Some(h) = href { links.push(h); }
             }
         }
-        NodeData::Document => println!("{}Document", indent_str),
-        _ => {}
     }
-
-    for child in &node.children {
-        print_style_tree(child, indent + 1);
+    for child in handle.children.borrow().iter() {
+        links.extend(extract_external_css_links(child));
     }
+    links
 }
