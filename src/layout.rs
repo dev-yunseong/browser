@@ -39,19 +39,7 @@ pub fn build_layout_tree<'a>(
         _ => 0.0,
     };
 
-    // 3. 노드 타입에 따른 기본 높이 설정
-    let mut min_height = 0.0;
-    if let markup5ever_rcdom::NodeData::Text { ref contents } = style_node.node.data {
-        let text = contents.borrow().to_string();
-        if !text.trim().is_empty() {
-            // 텍스트 노드는 최소한 폰트 크기만큼 높이를 차지해야 함
-            min_height = 20.0; 
-        } else {
-            return (None, current_y); // 빈 텍스트 노드는 제외
-        }
-    }
-
-    // 4. 링크 추출
+    // 3. 링크 추출
     let mut link_url = None;
     if let markup5ever_rcdom::NodeData::Element { ref attrs, ref name, .. } = style_node.node.data {
         if name.local.to_string() == "a" {
@@ -63,7 +51,7 @@ pub fn build_layout_tree<'a>(
         }
     }
 
-    // 5. 절대 좌표 및 크기 계산
+    // 4. 절대 좌표 및 크기 계산
     let mut layout_width = parent_width - (margin * 2.0);
     if let Some(Value::Length(w, Unit::Px)) = style_node.specified_values.get("width") {
         layout_width = *w;
@@ -85,6 +73,45 @@ pub fn build_layout_tree<'a>(
         children: Vec::new(),
         link_url,
     };
+
+    // 5. 텍스트 노드 특수 처리 (줄바꿈 로직)
+    if let markup5ever_rcdom::NodeData::Text { ref contents } = style_node.node.data {
+        let text = contents.borrow().to_string();
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return (None, current_y);
+        }
+
+        let font_size = match style_node.specified_values.get("font-size") {
+            Some(Value::Length(v, Unit::Px)) => *v,
+            _ => 16.0,
+        };
+
+        // 아주 단순한 줄바꿈 시뮬레이션
+        let avg_char_width = 8.0 * (font_size / 16.0); 
+        let max_chars_per_line = ((layout_width - (padding * 2.0)) / avg_char_width).max(1.0) as usize;
+        
+        let words: Vec<&str> = trimmed.split_whitespace().collect();
+        let mut lines_count = 0;
+        let mut current_line_len = 0;
+
+        for word in words {
+            if current_line_len + word.len() + 1 > max_chars_per_line && current_line_len > 0 {
+                lines_count += 1;
+                current_line_len = word.len();
+            } else {
+                if current_line_len > 0 { current_line_len += 1; }
+                current_line_len += word.len();
+            }
+        }
+        if current_line_len > 0 { lines_count += 1; }
+
+        let line_height = font_size * 1.25;
+        let total_height = (lines_count as f32 * line_height) + (padding * 2.0);
+        layout.dimensions.height = total_height;
+        let next_y = box_y + total_height + margin;
+        return (Some(layout), next_y);
+    }
 
     let child_start_x = box_x + padding;
     let mut child_current_y = box_y + padding;
@@ -111,9 +138,8 @@ pub fn build_layout_tree<'a>(
         }
     }
 
-    // 7. 최종 높이 결정 (텍스트 노드인 경우 최소 높이 보장)
-    let content_height = (child_current_y - (box_y + padding)).max(min_height);
-    let final_y = (box_y + padding) + content_height + padding + margin;
+    // 7. 최종 높이 결정
+    let final_y = child_current_y + padding + margin;
     layout.dimensions.height = final_y - box_y - margin;
 
     (Some(layout), final_y)

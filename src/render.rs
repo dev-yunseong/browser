@@ -27,18 +27,18 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap) {
         }
     }
 
-    // 2. Render Border (Always show borders for visualization unless specified otherwise)
+    // 2. Render Border (Only if specified in CSS)
     let border_width = match layout.style_node.specified_values.get("border-width") {
         Some(Value::Length(v, Unit::Px)) => *v,
-        _ => 0.5, // Default thin border for visibility
-    };
-    
-    let border_color = match layout.style_node.specified_values.get("border-color") {
-        Some(Value::Color(c)) => c.clone(),
-        _ => crate::css::Color { r: 220, g: 220, b: 220, a: 255 }, // Default light gray
+        _ => 0.0, // Default to 0 (no debug borders)
     };
     
     if border_width > 0.0 {
+        let border_color = match layout.style_node.specified_values.get("border-color") {
+            Some(Value::Color(c)) => c.clone(),
+            _ => crate::css::Color { r: 0, g: 0, b: 0, a: 255 },
+        };
+        
         let mut paint = Paint::default();
         paint.set_color_rgba8(border_color.r, border_color.g, border_color.b, border_color.a);
         
@@ -63,7 +63,7 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap) {
         }
     }
 
-    // 3. Render Text (Only for Text nodes)
+    // 3. Render Text (With wrapping support)
     if let NodeData::Text { ref contents } = layout.style_node.node.data {
         let text = contents.borrow().to_string();
         let trimmed = text.trim();
@@ -76,7 +76,7 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap) {
                 Some(Value::Length(v, Unit::Px)) => *v,
                 _ => 16.0,
             };
-            render_text(trimmed, layout.dimensions.x, layout.dimensions.y, pixmap, color, font_size);
+            render_text_wrapped(trimmed, layout, pixmap, color, font_size);
         }
     }
 
@@ -86,45 +86,71 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap) {
     }
 }
 
-fn render_text(text: &str, x: f32, y: f32, pixmap: &mut Pixmap, color: crate::css::Color, font_size: f32) {
+fn render_text_wrapped(text: &str, layout: &LayoutBox, pixmap: &mut Pixmap, color: crate::css::Color, font_size: f32) {
     let font = match FontRef::try_from_slice(FONT_DATA) {
         Ok(f) => f,
         Err(_) => return,
     };
     let scale = PxScale::from(font_size);
-    
-    let mut current_x = x;
-    let baseline_y = y + (font_size * 0.85); 
+    let padding = match layout.style_node.specified_values.get("padding") {
+        Some(Value::Length(v, Unit::Px)) => *v,
+        _ => 0.0,
+    };
+
+    let start_x = layout.dimensions.x + padding;
+    let mut current_y = layout.dimensions.y + padding + (font_size * 0.85);
     let pix_width = pixmap.width();
     let pix_height = pixmap.height();
 
-    for c in text.chars() {
-        let glyph_id = font.glyph_id(c);
-        let glyph = glyph_id.with_scale_and_position(scale, point(current_x, baseline_y));
-        
-        if let Some(outline) = font.outline_glyph(glyph) {
-            let bounds = outline.px_bounds();
-            outline.draw(|gx, gy, coverage| {
-                if coverage > 0.0 {
-                    let px = (bounds.min.x as i32 + gx as i32);
-                    let py = (bounds.min.y as i32 + gy as i32);
-                    
-                    if px >= 0 && px < pix_width as i32 && py >= 0 && py < pix_height as i32 {
-                        let idx = ((py as u32 * pix_width + px as u32) * 4) as usize;
-                        let data = pixmap.data_mut();
+    // Naive wrapping logic matching layout.rs
+    let avg_char_width = 8.0 * (font_size / 16.0);
+    let max_chars = ((layout.dimensions.width - (padding * 2.0)) / avg_char_width).max(1.0) as usize;
+    
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut current_line = String::new();
+    let mut lines = Vec::new();
+
+    for word in words {
+        if current_line.len() + word.len() + 1 > max_chars && !current_line.is_empty() {
+            lines.push(current_line.clone());
+            current_line = word.to_string();
+        } else {
+            if !current_line.is_empty() { current_line.push(' '); }
+            current_line.push_str(word);
+        }
+    }
+    if !current_line.is_empty() { lines.push(current_line); }
+
+    for line in lines {
+        let mut current_x = start_x;
+        for c in line.chars() {
+            let glyph_id = font.glyph_id(c);
+            let glyph = glyph_id.with_scale_and_position(scale, point(current_x, current_y));
+            
+            if let Some(outline) = font.outline_glyph(glyph) {
+                let bounds = outline.px_bounds();
+                outline.draw(|gx, gy, coverage| {
+                    if coverage > 0.0 {
+                        let px = (bounds.min.x as i32 + gx as i32);
+                        let py = (bounds.min.y as i32 + gy as i32);
                         
-                        let alpha = (coverage * color.a as f32) as u8;
-                        if alpha > 0 {
-                            data[idx] = color.r;
-                            data[idx + 1] = color.g;
-                            data[idx + 2] = color.b;
-                            data[idx + 3] = alpha;
+                        if px >= 0 && px < pix_width as i32 && py >= 0 && py < pix_height as i32 {
+                            let idx = ((py as u32 * pix_width + px as u32) * 4) as usize;
+                            let data = pixmap.data_mut();
+                            let alpha = (coverage * color.a as f32) as u8;
+                            if alpha > 0 {
+                                data[idx] = color.r;
+                                data[idx + 1] = color.g;
+                                data[idx + 2] = color.b;
+                                data[idx + 3] = alpha;
+                            }
                         }
                     }
-                }
-            });
+                });
+            }
+            current_x += font.h_advance_unscaled(glyph_id) * (scale.x / font.units_per_em().unwrap_or(1000.0) as f32);
         }
-        current_x += font.h_advance_unscaled(glyph_id) * (scale.x / font.units_per_em().unwrap_or(1000.0) as f32);
+        current_y += 20.0 * (font_size / 16.0); // Next line
     }
 }
 
