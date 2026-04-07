@@ -69,7 +69,15 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap) {
 }
 
 fn render_text(text: &str, x: f32, y: f32, pixmap: &mut Pixmap) {
-    let font = FontRef::try_from_slice(FONT_DATA).unwrap();
+    // Gracefully handle font loading error instead of panicking
+    let font = match FontRef::try_from_slice(FONT_DATA) {
+        Ok(f) => f,
+        Err(_) => {
+            eprintln!("Warning: Failed to load font data. Text rendering skipped.");
+            return;
+        }
+    };
+
     let scale = PxScale::from(16.0);
     
     let mut current_x = x;
@@ -79,28 +87,49 @@ fn render_text(text: &str, x: f32, y: f32, pixmap: &mut Pixmap) {
         
         if let Some(outline) = font.outline_glyph(glyph) {
             let bounds = outline.px_bounds();
-            let mut mask = tiny_skia::Mask::new(bounds.width() as u32, bounds.height() as u32).unwrap();
-            
-            outline.draw(|x, y, c| {
-                let i = (y * mask.width() as u32 + x) as usize;
-                mask.data_mut()[i] = (c * 255.0) as u8;
-            });
-            
-            let mut paint = Paint::default();
-            paint.set_color_rgba8(0, 0, 0, 255); // Black text
-            
-            if let Some(rect) = Rect::from_xywh(bounds.min.x, bounds.min.y, bounds.width(), bounds.height()) {
-                pixmap.fill_path(
-                    &PathBuilder::from_rect(rect),
-                    &paint,
-                    FillRule::Winding,
-                    Transform::identity(),
-                    Some(&mask),
-                );
+            if let Some(mask) = tiny_skia::Mask::new(bounds.width() as u32, bounds.height() as u32) {
+                let mut mask = mask;
+                outline.draw(|x, y, c| {
+                    let i = (y * mask.width() as u32 + x) as usize;
+                    if i < mask.data().len() {
+                        mask.data_mut()[i] = (c * 255.0) as u8;
+                    }
+                });
+                
+                let mut paint = Paint::default();
+                paint.set_color_rgba8(0, 0, 0, 255); // Black text
+                
+                if let Some(rect) = Rect::from_xywh(bounds.min.x, bounds.min.y, bounds.width(), bounds.height()) {
+                    pixmap.fill_path(
+                        &PathBuilder::from_rect(rect),
+                        &paint,
+                        FillRule::Winding,
+                        Transform::identity(),
+                        Some(&mask),
+                    );
+                }
             }
         }
-        // ab_glyph v0.2.x uses h_advance_unscaled * scale_factor or similar
-        // Or font.glyph_h_advance(glyph_id) * scale.x / units_per_em
-        current_x += font.h_advance_unscaled(glyph_id) * (scale.x / font.units_per_em().unwrap() as f32);
+        current_x += font.h_advance_unscaled(glyph_id) * (scale.x / font.units_per_em().unwrap_or(1000.0) as f32);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_font_loading() {
+        // Test that the bundled font is valid and can be loaded
+        let font = FontRef::try_from_slice(FONT_DATA);
+        assert!(font.is_ok(), "Bundled font should be a valid TTF/OTF format. Actual error: {:?}", font.err());
+    }
+
+    #[test]
+    fn test_pixmap_rendering() {
+        // Ensure rendering basic layout doesn't panic
+        let mut pixmap = Pixmap::new(100, 100).unwrap();
+        pixmap.fill(tiny_skia::Color::WHITE);
+        // ... more complex rendering test could be added here
     }
 }

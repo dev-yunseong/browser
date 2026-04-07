@@ -10,6 +10,11 @@
 - **Goal:** Build a web browser from scratch using Rust.
 - **Key components to consider:** Networking, HTML Parsing, DOM, CSS Parsing, Layout Engine, Rendering, and JS Engine integration.
 
+## Engineering Standards & Mandates
+- **Language:** Internal (English), User-facing (Korean).
+- **Testing:** ALWAYS write automated test cases for every new feature or bug fix. Never settle for unverified changes.
+- **Robustness:** Avoid `.unwrap()` in production code; handle errors gracefully.
+
 ## Progress
 - **Phase 1-6:** Basic CLI prototype with static PNG rendering complete.
 - **Phase 7 (GUI Upgrade):** Done. Integrated `eframe` (egui + winit) to create a functional desktop browser.
