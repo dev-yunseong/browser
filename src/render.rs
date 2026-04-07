@@ -1,6 +1,6 @@
 use tiny_skia::{Pixmap, Paint, Rect, Transform, Stroke, PathBuilder};
 use ab_glyph::{Font, FontRef, PxScale, point};
-use crate::layout::LayoutBox;
+use crate::layout::{LayoutBox, DisplayType};
 use crate::css::{Value, Unit};
 use markup5ever_rcdom::NodeData;
 
@@ -30,13 +30,13 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap) {
     // 2. Render Border
     let border_width = match layout.style_node.specified_values.get("border-width") {
         Some(Value::Length(v, Unit::Px)) => *v,
-        _ => 0.0, 
+        _ => if let DisplayType::TableCell | DisplayType::Input = layout.display { 1.0 } else { 0.0 }, 
     };
     
     if border_width > 0.0 {
         let border_color = match layout.style_node.specified_values.get("border-color") {
             Some(Value::Color(c)) => c.clone(),
-            _ => crate::css::Color { r: 0, g: 0, b: 0, a: 255 },
+            _ => crate::css::Color { r: 180, g: 180, b: 180, a: 255 },
         };
         
         let mut paint = Paint::default();
@@ -63,7 +63,16 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap) {
         }
     }
 
-    // 3. Render Text
+    // 3. Render Special Elements (Bullets for ListItem)
+    if let DisplayType::ListItem = layout.display {
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(0, 0, 0, 255);
+        if let Some(bullet_rect) = Rect::from_xywh(layout.dimensions.x - 12.0, layout.dimensions.y + 8.0, 4.0, 4.0) {
+            pixmap.fill_rect(bullet_rect, &paint, Transform::identity(), None);
+        }
+    }
+
+    // 4. Render Text
     if let NodeData::Text { ref contents } = layout.style_node.node.data {
         let text = contents.borrow().to_string();
         let trimmed = text.trim();
@@ -73,15 +82,10 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap) {
                 _ => crate::css::Color { r: 0, g: 0, b: 0, a: 255 },
             };
 
-            // Use the link_url in LayoutBox to identify links
             let mut is_link = false;
             if layout.link_url.is_some() {
                 color = crate::css::Color { r: 0, g: 0, b: 238, a: 255 };
                 is_link = true;
-            } else {
-                // If it's a text node inside an <a> tag, the link_url is on the parent
-                // Check style_node or parent manually
-                is_link = false; // Fallback
             }
 
             let font_size = match layout.style_node.specified_values.get("font-size") {

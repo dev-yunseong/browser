@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 pub type PropertyMap = HashMap<String, Value>;
 
+#[derive(Debug)]
 pub struct StyledNode {
     pub node: Handle,
     pub specified_values: PropertyMap,

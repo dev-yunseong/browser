@@ -2,6 +2,7 @@ use eframe::egui;
 use poll_promise::Promise;
 use std::error::Error;
 use url::Url;
+use std::collections::HashMap;
 
 mod dom;
 mod css;
@@ -18,6 +19,8 @@ struct BrowserApp {
     texture: Option<egui::TextureHandle>,
     error: Option<String>,
     current_links: Vec<(layout::Rect, String)>,
+    current_form_controls: Vec<(layout::Rect, String)>, // (Rect, InitialValue)
+    form_values: HashMap<usize, String>, // Map index to current text
 }
 
 struct PageData {
@@ -25,6 +28,7 @@ struct PageData {
     width: u32,
     height: u32,
     links: Vec<(layout::Rect, String)>,
+    form_controls: Vec<(layout::Rect, String)>,
 }
 
 impl BrowserApp {
@@ -37,22 +41,18 @@ impl BrowserApp {
             texture: None,
             error: None,
             current_links: vec![],
+            current_form_controls: vec![],
+            form_values: HashMap::new(),
         }
     }
 
     fn load_url(&mut self, url: String) {
-        // Add to history if new
         if self.history.is_empty() || self.history[self.history_index] != url {
             self.history.truncate(self.history_index + 1);
             self.history.push(url.clone());
             self.history_index = self.history.len() - 1;
         }
-        
-        self.url = url.clone();
-        self.error = None;
-        self.content_promise = Some(Promise::spawn_thread("fetcher", move || {
-            fetch_and_process(&url).map_err(|e| e.to_string())
-        }));
+        self.load_url_direct(url);
     }
 
     fn navigate_back(&mut self) {
@@ -92,7 +92,6 @@ fn fetch_and_process(url_str: &str) -> Result<PageData, Box<dyn Error + Send + S
     let external_links = style::extract_external_css_links(&dom_tree.document);
     for link in external_links {
         let abs_url = base_url.join(&link).map(|u| u.to_string()).unwrap_or(link.clone());
-        println!("Fetching external CSS: {}", abs_url);
         if let Ok(resp) = reqwest::blocking::get(&abs_url) {
             if let Ok(external_css) = resp.text() {
                 css_source.push_str(&external_css);
@@ -104,7 +103,6 @@ fn fetch_and_process(url_str: &str) -> Result<PageData, Box<dyn Error + Send + S
     let style_tree = style::build_style_tree(&dom_tree.document, &stylesheet, None);
     
     // Execute JavaScript
-    println!("Executing Scripts...");
     let mut js_runtime = js::JsRuntime::new();
     let scripts = js::extract_scripts_from_dom(&dom_tree.document);
     for script in scripts {
@@ -114,18 +112,29 @@ fn fetch_and_process(url_str: &str) -> Result<PageData, Box<dyn Error + Send + S
     let width = 800;
     let (layout_tree, _, final_y) = layout::build_layout_tree(&style_tree, 0.0, 0.0, 0.0, width as f32);
 
-    // FIX: Cap the height to 16384 to prevent texture size panic in egui/GPU
     let height = (final_y.ceil() as u32).clamp(600, 16384);
-    
     let mut pixmap = tiny_skia::Pixmap::new(width, height).unwrap();
     pixmap.fill(tiny_skia::Color::WHITE);
     
     let mut links = Vec::new();
+    let mut form_controls = Vec::new();
+
     if let Some(layout) = layout_tree {
-        println!("--- Layout Tree (Content Height: {}) ---", height);
-        layout::print_layout_tree(&layout, 0);
         render::render_layout_tree(&layout, &mut pixmap);
         links = layout.get_links();
+        
+        // Extract form control positions
+        for (rect, node) in layout.get_form_controls() {
+            let mut initial_val = String::new();
+            if let markup5ever_rcdom::NodeData::Element { ref attrs, .. } = node.node.data {
+                for attr in attrs.borrow().iter() {
+                    if attr.name.local.to_string() == "value" {
+                        initial_val = attr.value.to_string();
+                    }
+                }
+            }
+            form_controls.push((rect, initial_val));
+        }
     }
 
     let absolute_links = links.into_iter().map(|(rect, link)| {
@@ -138,6 +147,7 @@ fn fetch_and_process(url_str: &str) -> Result<PageData, Box<dyn Error + Send + S
         width,
         height,
         links: absolute_links,
+        form_controls,
     })
 }
 
@@ -145,16 +155,9 @@ impl eframe::App for BrowserApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::TopBottomPanel::top("browser_chrome").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("<-").clicked() {
-                    self.navigate_back();
-                }
-                if ui.button("->").clicked() {
-                    self.navigate_forward();
-                }
-                if ui.button("R").clicked() {
-                    let url = self.url.clone();
-                    self.load_url_direct(url);
-                }
+                if ui.button("<-").clicked() { self.navigate_back(); }
+                if ui.button("->").clicked() { self.navigate_forward(); }
+                if ui.button("R").clicked() { let url = self.url.clone(); self.load_url_direct(url); }
 
                 ui.label("URL:");
                 let edit = ui.text_edit_singleline(&mut self.url);
@@ -172,14 +175,8 @@ impl eframe::App for BrowserApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(promise) = &self.content_promise {
                 match promise.ready() {
-                    None => {
-                        ui.spinner();
-                        ui.label("Loading...");
-                    }
-                    Some(Err(e)) => {
-                        self.error = Some(e.clone());
-                        self.content_promise = None;
-                    }
+                    None => { ui.spinner(); ui.label("Loading..."); }
+                    Some(Err(e)) => { self.error = Some(e.clone()); self.content_promise = None; }
                     Some(Ok(page_data)) => {
                         let image = egui::ColorImage::from_rgba_unmultiplied(
                             [page_data.width as usize, page_data.height as usize],
@@ -187,27 +184,39 @@ impl eframe::App for BrowserApp {
                         );
                         self.texture = Some(ctx.load_texture("page_content", image, Default::default()));
                         self.current_links = page_data.links.clone();
+                        self.current_form_controls = page_data.form_controls.clone();
+                        self.form_values.clear();
+                        for (i, (_, val)) in page_data.form_controls.iter().enumerate() {
+                            self.form_values.insert(i, val.clone());
+                        }
                         self.content_promise = None;
                     }
                 }
             }
 
-            if let Some(err) = &self.error {
-                ui.colored_label(egui::Color32::RED, format!("Error: {}", err));
-            }
+            if let Some(err) = &self.error { ui.colored_label(egui::Color32::RED, format!("Error: {}", err)); }
 
             if let Some(texture) = &self.texture {
                 let mut url_to_load = None;
                 egui::ScrollArea::both().show(ui, |ui| {
-                    let response = ui.image((texture.id(), texture.size_vec2()));
+                    let (rect, response) = ui.allocate_at_least(texture.size_vec2(), egui::Sense::click());
+                    ui.painter().image(texture.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
                     
+                    // Overlay Form Controls
+                    for (i, (l_rect, _)) in self.current_form_controls.iter().enumerate() {
+                        let val = self.form_values.entry(i).or_default();
+                        let screen_pos = rect.min + egui::vec2(l_rect.x, l_rect.y);
+                        let screen_rect = egui::Rect::from_min_size(screen_pos, egui::vec2(l_rect.width, l_rect.height));
+                        
+                        ui.put(screen_rect, egui::TextEdit::singleline(val).hint_text("Type here..."));
+                    }
+
                     if response.clicked() {
                         if let Some(pointer_pos) = response.interact_pointer_pos() {
-                            let rel_pos = pointer_pos - response.rect.min;
-                            // Check link clicks
-                            for (rect, link) in &self.current_links {
-                                if rel_pos.x >= rect.x && rel_pos.x <= rect.x + rect.width &&
-                                   rel_pos.y >= rect.y && rel_pos.y <= rect.y + rect.height {
+                            let rel_pos = pointer_pos - rect.min;
+                            for (l_rect, link) in &self.current_links {
+                                if rel_pos.x >= l_rect.x && rel_pos.x <= l_rect.x + l_rect.width &&
+                                   rel_pos.y >= l_rect.y && rel_pos.y <= l_rect.y + l_rect.height {
                                     url_to_load = Some(link.clone());
                                     break;
                                 }
@@ -215,12 +224,11 @@ impl eframe::App for BrowserApp {
                         }
                     }
 
-                    // Change cursor if hovering a link
                     if let Some(pointer_pos) = response.hover_pos() {
-                        let rel_pos = pointer_pos - response.rect.min;
-                        for (rect, _) in &self.current_links {
-                            if rel_pos.x >= rect.x && rel_pos.x <= rect.x + rect.width &&
-                               rel_pos.y >= rect.y && rel_pos.y <= rect.y + rect.height {
+                        let rel_pos = pointer_pos - rect.min;
+                        for (l_rect, _) in &self.current_links {
+                            if rel_pos.x >= l_rect.x && rel_pos.x <= l_rect.x + l_rect.width &&
+                               rel_pos.y >= l_rect.y && rel_pos.y <= l_rect.y + l_rect.height {
                                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                 break;
                             }
@@ -228,9 +236,7 @@ impl eframe::App for BrowserApp {
                     }
                 });
 
-                if let Some(url) = url_to_load {
-                    self.load_url(url);
-                }
+                if let Some(url) = url_to_load { self.load_url(url); }
             } else {
                 ui.label("Enter a URL and press Go to load a page.");
             }

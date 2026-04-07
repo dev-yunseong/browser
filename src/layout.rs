@@ -1,7 +1,7 @@
 use crate::style::StyledNode;
 use crate::css::{Value, Unit};
 
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone, Copy, PartialEq)]
 pub struct Rect {
     pub x: f32,
     pub y: f32,
@@ -9,11 +9,13 @@ pub struct Rect {
     pub height: f32,
 }
 
+#[derive(Debug, Clone)]
 pub struct LayoutBox<'a> {
     pub dimensions: Rect,
     pub style_node: &'a StyledNode,
     pub children: Vec<LayoutBox<'a>>,
     pub link_url: Option<String>,
+    pub display: DisplayType,
 }
 
 #[derive(PartialEq, Debug, Clone, Copy)]
@@ -21,6 +23,11 @@ pub enum DisplayType {
     Block,
     Inline,
     InlineBlock,
+    ListItem,
+    Table,
+    TableRow,
+    TableCell,
+    Input,
 }
 
 fn get_display_type(style_node: &StyledNode) -> DisplayType {
@@ -33,6 +40,10 @@ fn get_display_type(style_node: &StyledNode) -> DisplayType {
             "block" => return DisplayType::Block,
             "inline" => return DisplayType::Inline,
             "inline-block" => return DisplayType::InlineBlock,
+            "list-item" => return DisplayType::ListItem,
+            "table" => return DisplayType::Table,
+            "table-row" => return DisplayType::TableRow,
+            "table-cell" => return DisplayType::TableCell,
             _ => {}
         }
     }
@@ -41,9 +52,14 @@ fn get_display_type(style_node: &StyledNode) -> DisplayType {
         let tag = name.local.to_string();
         match tag.as_str() {
             "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | 
-            "ul" | "li" | "header" | "footer" | "nav" | "section" | "article" | "body" | "html" => {
+            "ul" | "header" | "footer" | "nav" | "section" | "article" | "body" | "html" => {
                 DisplayType::Block
             }
+            "li" => DisplayType::ListItem,
+            "table" => DisplayType::Table,
+            "tr" => DisplayType::TableRow,
+            "td" | "th" => DisplayType::TableCell,
+            "input" | "textarea" => DisplayType::Input,
             _ => DisplayType::Inline,
         }
     } else {
@@ -131,6 +147,7 @@ pub fn build_layout_tree<'a>(
             style_node,
             children: Vec::new(),
             link_url: None,
+            display,
         };
 
         let next_x;
@@ -147,29 +164,43 @@ pub fn build_layout_tree<'a>(
     }
 
     // 4. 일반 박스 처리
-    let layout_width_spec = match style_node.specified_values.get("width") {
+    let mut layout_width_spec = match style_node.specified_values.get("width") {
         Some(Value::Length(w, Unit::Px)) => *w,
         Some(Value::Length(w, Unit::Vw)) => container_width * (*w / 100.0),
-        _ => if let DisplayType::Block = display { container_width - (margin * 2.0) } else { 0.0 },
+        _ => if let DisplayType::Block | DisplayType::ListItem | DisplayType::Table | DisplayType::TableRow = display { 
+            container_width - (margin * 2.0) 
+        } else if let DisplayType::Input = display {
+            200.0 // Default input width
+        } else { 
+            0.0 
+        },
     };
 
-    if let DisplayType::Block = display {
+    let force_new_line = match display {
+        DisplayType::Block | DisplayType::ListItem | DisplayType::Table | DisplayType::TableRow => true,
+        _ => false,
+    };
+
+    if force_new_line {
         if current_x > container_start_x {
             current_y += 25.0; 
             current_x = container_start_x;
         }
     }
 
+    let x_offset = if let DisplayType::ListItem = display { 20.0 } else { 0.0 };
+
     let mut layout = LayoutBox {
         dimensions: Rect {
-            x: current_x + margin,
+            x: current_x + margin + x_offset,
             y: current_y + margin,
-            width: layout_width_spec,
+            width: layout_width_spec - x_offset,
             height: 0.0,
         },
         style_node,
         children: Vec::new(),
         link_url: None,
+        display,
     };
 
     if let markup5ever_rcdom::NodeData::Element { ref attrs, ref name, .. } = style_node.node.data {
@@ -183,10 +214,17 @@ pub fn build_layout_tree<'a>(
     }
 
     // 5. 자식 노드 배치
-    let child_container_width = if layout.dimensions.width > 0.0 { layout.dimensions.width } else { container_width } - (padding * 2.0);
-    let mut child_start_x = layout.dimensions.x + padding;
-    let mut child_current_x = child_start_x;
+    let mut child_current_x = layout.dimensions.x + padding;
     let mut child_current_y = layout.dimensions.y + padding;
+    let mut child_start_x = child_current_x;
+    
+    let children_count = style_node.children.len() as f32;
+    let cell_width = if let DisplayType::TableRow = display {
+        (layout.dimensions.width - (padding * 2.0)) / children_count.max(1.0)
+    } else {
+        0.0
+    };
+
     let mut max_y_in_box = child_current_y;
     let mut max_x_in_box = child_current_x;
 
@@ -198,12 +236,14 @@ pub fn build_layout_tree<'a>(
             }
         }
 
+        let child_container_w = if let DisplayType::TableRow = display { cell_width } else { layout.dimensions.width - (padding * 2.0) };
+
         let (child_layout, next_x, next_y) = build_layout_tree(
             child,
             child_start_x,
             child_current_x,
             child_current_y,
-            child_container_width
+            child_container_w
         );
 
         if let Some(child_box) = child_layout {
@@ -215,14 +255,16 @@ pub fn build_layout_tree<'a>(
         }
     }
 
-    if layout.dimensions.width == 0.0 {
+    if layout.dimensions.width <= 0.0 {
         layout.dimensions.width = (max_x_in_box - layout.dimensions.x + padding).min(container_width - (margin * 2.0));
     }
-    layout.dimensions.height = (max_y_in_box - layout.dimensions.y + padding).max(20.0);
+    
+    let min_h = if let DisplayType::Input = display { 24.0 } else { 20.0 };
+    layout.dimensions.height = (max_y_in_box - layout.dimensions.y + padding).max(min_h);
 
     let final_x;
     let final_y;
-    if let DisplayType::Block = display {
+    if force_new_line {
         final_x = container_start_x;
         final_y = layout.dimensions.y + layout.dimensions.height + margin;
     } else {
@@ -258,6 +300,17 @@ impl<'a> LayoutBox<'a> {
         }
         links
     }
+
+    pub fn get_form_controls(&self) -> Vec<(Rect, &'a StyledNode)> {
+        let mut controls = Vec::new();
+        if let DisplayType::Input = self.display {
+            controls.push((self.dimensions, self.style_node));
+        }
+        for child in &self.children {
+            controls.extend(child.get_form_controls());
+        }
+        controls
+    }
 }
 
 pub fn print_layout_tree(layout: &LayoutBox, indent: usize) {
@@ -270,8 +323,8 @@ pub fn print_layout_tree(layout: &LayoutBox, indent: usize) {
         "Node".to_string()
     };
 
-    println!("{}{} [x: {:.1}, y: {:.1}, w: {:.1}, h: {:.1}]", 
-        indent_str, tag, 
+    println!("{}{} [{:?}] [x: {:.1}, y: {:.1}, w: {:.1}, h: {:.1}]", 
+        indent_str, tag, layout.display,
         layout.dimensions.x, layout.dimensions.y, 
         layout.dimensions.width, layout.dimensions.height);
 
