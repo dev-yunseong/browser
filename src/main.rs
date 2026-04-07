@@ -19,8 +19,8 @@ struct BrowserApp {
     texture: Option<egui::TextureHandle>,
     error: Option<String>,
     current_links: Vec<(layout::Rect, String)>,
-    current_form_controls: Vec<(layout::Rect, String)>, // (Rect, InitialValue)
-    form_values: HashMap<usize, String>, // Map index to current text
+    current_form_controls: Vec<(layout::Rect, String)>, 
+    form_values: HashMap<usize, String>, 
 }
 
 struct PageData {
@@ -32,7 +32,15 @@ struct PageData {
 }
 
 impl BrowserApp {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // [FONT CONFIG] Setup egui to support Korean
+        let mut fonts = egui::FontDefinitions::default();
+        let nanum_data = include_bytes!("../assets/fonts/NanumGothic.ttf");
+        fonts.font_data.insert("nanum".to_owned(), egui::FontData::from_static(nanum_data));
+        fonts.families.get_mut(&egui::FontFamily::Proportional).unwrap().insert(0, "nanum".to_owned());
+        fonts.families.get_mut(&egui::FontFamily::Monospace).unwrap().push("nanum".to_owned());
+        cc.egui_ctx.set_fonts(fonts);
+
         Self {
             url: "https://yunseong.dev".to_string(),
             history: vec![],
@@ -133,8 +141,6 @@ fn fetch_and_process(url_str: &str) -> Result<PageData, Box<dyn Error + Send + S
         }
     }
 
-    println!("Loaded {} links and {} inputs", links.len(), form_controls.len());
-
     let absolute_links = links.into_iter().map(|(rect, link)| {
         let abs_link = base_url.join(&link).map(|u| u.to_string()).unwrap_or(link);
         (rect, abs_link)
@@ -200,22 +206,24 @@ impl eframe::App for BrowserApp {
                     let (rect, response) = ui.allocate_at_least(texture.size_vec2(), egui::Sense::click());
                     ui.painter().image(texture.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
                     
-                    // Overlay Form Controls
+                    // Overlay Form Controls (Before link click check to avoid blocking)
                     for (i, (l_rect, _)) in self.current_form_controls.iter().enumerate() {
                         let val = self.form_values.entry(i).or_default();
-                        let screen_pos = rect.min + egui::vec2(l_rect.x, l_rect.y);
-                        let screen_rect = egui::Rect::from_min_size(screen_pos, egui::vec2(l_rect.width, l_rect.height));
-                        ui.put(screen_rect, egui::TextEdit::singleline(val).hint_text("Input..."));
+                        let screen_rect = egui::Rect::from_min_size(
+                            rect.min + egui::vec2(l_rect.x, l_rect.y),
+                            egui::vec2(l_rect.width, l_rect.height)
+                        );
+                        
+                        // Use a unique ID for each input
+                        ui.put(screen_rect, egui::TextEdit::singleline(val).id_source(i));
                     }
 
                     if response.clicked() {
                         if let Some(pointer_pos) = response.interact_pointer_pos() {
                             let rel_pos = pointer_pos - rect.min;
-                            println!("[Click Attempt] x: {:.1}, y: {:.1}", rel_pos.x, rel_pos.y);
                             for (l_rect, link) in &self.current_links {
                                 if rel_pos.x >= l_rect.x && rel_pos.x <= l_rect.x + l_rect.width &&
                                    rel_pos.y >= l_rect.y && rel_pos.y <= l_rect.y + l_rect.height {
-                                    println!("[Navigation] To: {}", link);
                                     url_to_load = Some(link.clone());
                                     break;
                                 }
