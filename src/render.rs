@@ -1,7 +1,7 @@
-use tiny_skia::{Pixmap, Paint, Rect, Transform, Stroke, PathBuilder, FillRule};
+use tiny_skia::{Pixmap, Paint, Rect, Transform, Stroke, PathBuilder};
 use ab_glyph::{Font, FontRef, PxScale, point};
 use crate::layout::{LayoutBox, DisplayType};
-use crate::css::{Value, Unit};
+use crate::css::Value;
 use markup5ever_rcdom::NodeData;
 use std::collections::HashMap;
 
@@ -98,10 +98,6 @@ fn render_text_wrapped(text: String, layout: &LayoutBox, pixmap: &mut Pixmap) {
     let scale = PxScale::from(font_size);
     let units = font.units_per_em().unwrap_or(1000.0) as f32;
 
-    let mut paint = Paint::default();
-    paint.set_color_rgba8(color.r, color.g, color.b, color.a);
-    paint.anti_alias = true;
-
     let mut current_y = layout.dimensions.y + (font_size * 0.85);
     let mut current_x = layout.dimensions.x;
     let space_w = font.h_advance_unscaled(font.glyph_id(' ')) * (scale.x / units);
@@ -124,17 +120,9 @@ fn render_text_wrapped(text: String, layout: &LayoutBox, pixmap: &mut Pixmap) {
         for (gid, adv) in glyphs {
             let glyph = gid.with_scale_and_position(scale, point(current_x, current_y));
             if let Some(outline) = font.outline_glyph(glyph) {
-                let mut pb = PathBuilder::new();
                 outline.draw(|gx, gy, coverage| {
-                    if coverage > 0.1 {
-                        if let Some(r) = Rect::from_xywh(gx as f32, gy as f32, 1.0, 1.0) {
-                            pb.push_rect(r);
-                        }
-                    }
+                    blend_glyph_pixel(pixmap, gx as u32, gy as u32, coverage, &color);
                 });
-                if let Some(path) = pb.finish() {
-                    pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
-                }
             }
             current_x += adv;
         }
@@ -143,3 +131,38 @@ fn render_text_wrapped(text: String, layout: &LayoutBox, pixmap: &mut Pixmap) {
 }
 
 fn word_width_check(w: f32, _l: &LayoutBox, _cx: f32) -> f32 { w }
+
+fn blend_glyph_pixel(
+    pixmap: &mut Pixmap,
+    x: u32,
+    y: u32,
+    coverage: f32,
+    color: &crate::css::Color,
+) {
+    if coverage <= 0.0 || x >= pixmap.width() || y >= pixmap.height() {
+        return;
+    }
+
+    let alpha = (coverage * (color.a as f32 / 255.0)).clamp(0.0, 1.0);
+    if alpha <= 0.0 {
+        return;
+    }
+
+    let index = (y * pixmap.width() + x) as usize;
+    let pixels = pixmap.pixels_mut();
+    let pixel = &mut pixels[index];
+    let dst = pixel.demultiply();
+
+    let blend = |src: u8, dst: u8| -> u8 {
+        ((src as f32 * alpha) + (dst as f32 * (1.0 - alpha))).round() as u8
+    };
+    let out_a = ((alpha + (dst.alpha() as f32 / 255.0) * (1.0 - alpha)) * 255.0).round() as u8;
+
+    *pixel = tiny_skia::ColorU8::from_rgba(
+        blend(color.r, dst.red()),
+        blend(color.g, dst.green()),
+        blend(color.b, dst.blue()),
+        out_a,
+    )
+    .premultiply();
+}

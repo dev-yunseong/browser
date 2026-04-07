@@ -215,9 +215,11 @@ self.dimensions.width = width;
             }
         }
         max_w = max_w.max(line_w);
+        self.dimensions.x = current_x + self.margin.left;
+        self.dimensions.y = current_y + self.margin.top;
         self.dimensions.width = max_w.min(container_width);
         self.dimensions.height = lines_count as f32 * (font_size * 1.4);
-        let final_x = current_x + self.dimensions.width + self.margin.right;
+        let final_x = self.dimensions.x + self.dimensions.width + self.margin.right;
         (Some(self.clone()), final_x, current_y)
     }
 }
@@ -357,5 +359,63 @@ mod tests {
         
         assert_eq!(layout.dimensions.width, 500.0);
         assert_eq!(layout.dimensions.x, 250.0); // (1000 - 500) / 2
+    }
+
+    #[test]
+    fn test_text_keeps_parent_flow_position() {
+        let html = r#"<div style="margin-left: 48px; margin-top: 24px;">Hello world</div>"#;
+        let dom = dom::parse_html(html);
+        let stylesheet = css::parse_css("");
+        let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new());
+
+        let div_node = style_tree
+            .children
+            .iter()
+            .find(|child| {
+                matches!(
+                    child.node.data,
+                    NodeData::Element { ref name, .. } if name.local.to_string() == "html"
+                )
+            })
+            .and_then(|html| {
+                html.children.iter().find(|child| {
+                    matches!(
+                        child.node.data,
+                        NodeData::Element { ref name, .. } if name.local.to_string() == "body"
+                    )
+                })
+            })
+            .and_then(|body| {
+                body.children.iter().find(|child| {
+                    matches!(
+                        child.node.data,
+                        NodeData::Element { ref name, .. } if name.local.to_string() == "div"
+                    )
+                })
+            })
+            .unwrap();
+
+        let (layout_opt, _, _) = build_layout_tree(div_node, 0.0, 0.0, 0.0, 800.0);
+        let layout = layout_opt.unwrap();
+        let text = find_first_inline(&layout).unwrap();
+
+        assert_eq!(text.dimensions.x, 48.0);
+        assert_eq!(text.dimensions.y, 24.0);
+        assert!(text.dimensions.width > 0.0);
+        assert!(text.dimensions.height > 0.0);
+    }
+
+    fn find_first_inline<'a>(layout: &'a LayoutBox<'a>) -> Option<&'a LayoutBox<'a>> {
+        if matches!(layout.display, DisplayType::Inline) {
+            return Some(layout);
+        }
+
+        for child in &layout.children {
+            if let Some(found) = find_first_inline(child) {
+                return Some(found);
+            }
+        }
+
+        None
     }
 }
