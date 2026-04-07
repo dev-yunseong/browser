@@ -92,8 +92,8 @@ fn fetch_and_process(url_str: &str) -> Result<PageData, Box<dyn Error + Send + S
     let width = 800;
     let (layout_tree, _, final_y) = layout::build_layout_tree(&style_tree, 0.0, 0.0, 0.0, width as f32);
 
-    // Set height to content height, with a minimum of 600
-    let height = (final_y.ceil() as u32).max(600);
+    // FIX: Cap the height to 16384 to prevent texture size panic in egui/GPU
+    let height = (final_y.ceil() as u32).clamp(600, 16384);
     
     let mut pixmap = tiny_skia::Pixmap::new(width, height).unwrap();
     pixmap.fill(tiny_skia::Color::WHITE);
