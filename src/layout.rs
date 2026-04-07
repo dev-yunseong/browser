@@ -39,7 +39,19 @@ pub fn build_layout_tree<'a>(
         _ => 0.0,
     };
 
-    // 3. 링크 추출
+    // 3. 노드 타입에 따른 기본 높이 설정
+    let mut min_height = 0.0;
+    if let markup5ever_rcdom::NodeData::Text { ref contents } = style_node.node.data {
+        let text = contents.borrow().to_string();
+        if !text.trim().is_empty() {
+            // 텍스트 노드는 최소한 폰트 크기만큼 높이를 차지해야 함
+            min_height = 20.0; 
+        } else {
+            return (None, current_y); // 빈 텍스트 노드는 제외
+        }
+    }
+
+    // 4. 링크 추출
     let mut link_url = None;
     if let markup5ever_rcdom::NodeData::Element { ref attrs, ref name, .. } = style_node.node.data {
         if name.local.to_string() == "a" {
@@ -51,7 +63,7 @@ pub fn build_layout_tree<'a>(
         }
     }
 
-    // 4. 절대 좌표 및 크기 계산
+    // 5. 절대 좌표 및 크기 계산
     let mut layout_width = parent_width - (margin * 2.0);
     if let Some(Value::Length(w, Unit::Px)) = style_node.specified_values.get("width") {
         layout_width = *w;
@@ -67,7 +79,7 @@ pub fn build_layout_tree<'a>(
             x: box_x,
             y: box_y,
             width: layout_width,
-            height: 0.0, // 자식 노드 순회 후 결정
+            height: 0.0,
         },
         style_node,
         children: Vec::new(),
@@ -77,9 +89,8 @@ pub fn build_layout_tree<'a>(
     let child_start_x = box_x + padding;
     let mut child_current_y = box_y + padding;
 
-    // 5. 자식 노드 레이아웃 (재귀)
+    // 6. 자식 노드 레이아웃 (재귀)
     for child in &style_node.children {
-        // 레이아웃에서 제외할 태그들
         if let markup5ever_rcdom::NodeData::Element { ref name, .. } = child.node.data {
             let t = name.local.to_string();
             if t == "head" || t == "style" || t == "meta" || t == "title" || t == "script" {
@@ -100,8 +111,9 @@ pub fn build_layout_tree<'a>(
         }
     }
 
-    // 6. 최종 높이 결정
-    let final_y = child_current_y + padding + margin;
+    // 7. 최종 높이 결정 (텍스트 노드인 경우 최소 높이 보장)
+    let content_height = (child_current_y - (box_y + padding)).max(min_height);
+    let final_y = (box_y + padding) + content_height + padding + margin;
     layout.dimensions.height = final_y - box_y - margin;
 
     (Some(layout), final_y)
@@ -131,5 +143,25 @@ impl<'a> LayoutBox<'a> {
             links.extend(child.get_links());
         }
         links
+    }
+}
+
+pub fn print_layout_tree(layout: &LayoutBox, indent: usize) {
+    let indent_str = " ".repeat(indent * 2);
+    let tag = if let markup5ever_rcdom::NodeData::Element { ref name, .. } = layout.style_node.node.data {
+        name.local.to_string()
+    } else if let markup5ever_rcdom::NodeData::Text { ref contents } = layout.style_node.node.data {
+        format!("Text({:?})", contents.borrow().trim())
+    } else {
+        "Node".to_string()
+    };
+
+    println!("{}{} [x: {:.1}, y: {:.1}, w: {:.1}, h: {:.1}]", 
+        indent_str, tag, 
+        layout.dimensions.x, layout.dimensions.y, 
+        layout.dimensions.width, layout.dimensions.height);
+
+    for child in &layout.children {
+        print_layout_tree(child, indent + 1);
     }
 }

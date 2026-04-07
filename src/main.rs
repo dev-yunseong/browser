@@ -98,6 +98,8 @@ fn fetch_and_process(url_str: &str) -> Result<PageData, Box<dyn Error + Send + S
     
     let mut links = Vec::new();
     if let Some(layout) = layout_tree {
+        println!("--- Layout Tree ---");
+        layout::print_layout_tree(&layout, 0);
         render::render_layout_tree(&layout, &mut pixmap);
         links = layout.get_links();
     }
