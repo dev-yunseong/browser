@@ -5,6 +5,17 @@ pub enum Value {
     Keyword(String),
     Length(f32, Unit),
     Color(Color),
+    BoxShadow(BoxShadow),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoxShadow {
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub blur: f32,
+    pub spread: f32,
+    pub color: Color,
+    pub inset: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -21,6 +32,7 @@ pub enum Unit {
     Vw,
     Vh,
     Em,
+    Percent,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -40,7 +52,6 @@ impl Selector {
     }
 
     pub fn specificity(&self) -> (usize, usize, usize) {
-        // (ID, Class, Tag)
         let id_count = if self.id.is_some() { 1 } else { 0 };
         let class_count = self.class.len();
         let tag_count = if self.tag.is_some() { 1 } else { 0 };
@@ -62,43 +73,109 @@ pub struct Stylesheet {
 pub fn parse_css(source: &str) -> Stylesheet {
     let mut rules = Vec::new();
     let source = source.replace('\n', " ");
-    
+
+    // Skip @-rules (media queries, keyframes, etc.) by stripping them
+    let source = strip_at_rules(&source);
+
     let blocks: Vec<&str> = source.split('}').collect();
     for block in blocks {
         if block.trim().is_empty() { continue; }
-        
-        let mut parts = block.split('{');
+
+        let mut parts = block.splitn(2, '{');
         let selectors_str = parts.next().unwrap_or("").trim();
         let declarations_str = parts.next().unwrap_or("").trim();
-        
+
+        if selectors_str.is_empty() || declarations_str.is_empty() { continue; }
+
         let mut selectors = Vec::new();
         for s in selectors_str.split(',') {
             let s = s.trim();
-            if !s.is_empty() {
+            if !s.is_empty() && !s.starts_with('@') {
                 selectors.push(parse_selector(s));
             }
         }
-        
+
+        if selectors.is_empty() { continue; }
+
         let mut declarations = HashMap::new();
         for decl in declarations_str.split(';') {
             let decl = decl.trim();
             if decl.is_empty() { continue; }
-            let mut kv = decl.split(':');
-            let key = kv.next().unwrap_or("").trim().to_string();
+            // Use splitn(2, ':') to correctly handle values containing colons (urls, etc.)
+            let mut kv = decl.splitn(2, ':');
+            let key = kv.next().unwrap_or("").trim().to_lowercase();
             let val_str = kv.next().unwrap_or("").trim().to_string();
-            if !key.is_empty() && !val_str.is_empty() {
-                if key == "border" {
-                    parse_border_shorthand(&val_str, &mut declarations);
-                } else {
+            if key.is_empty() || val_str.is_empty() { continue; }
+
+            match key.as_str() {
+                "border" => parse_border_shorthand(&val_str, &mut declarations),
+                "box-shadow" => {
+                    if let Some(shadow) = parse_box_shadow(&val_str) {
+                        declarations.insert(key, Value::BoxShadow(shadow));
+                    }
+                }
+                "padding" => parse_quad_shorthand("padding", &val_str, &mut declarations),
+                "margin" => parse_quad_shorthand("margin", &val_str, &mut declarations),
+                _ => {
                     declarations.insert(key, parse_value(&val_str));
                 }
             }
         }
-        
+
         rules.push(Rule { selectors, declarations });
     }
-    
+
     Stylesheet { rules }
+}
+
+fn strip_at_rules(source: &str) -> String {
+    let mut result = String::with_capacity(source.len());
+    let mut depth = 0usize;
+    let mut in_at_rule = false;
+    let chars: Vec<char> = source.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '@' && depth == 0 {
+            in_at_rule = true;
+        }
+        if in_at_rule {
+            if c == '{' {
+                depth += 1;
+            } else if c == '}' {
+                if depth > 0 {
+                    depth -= 1;
+                }
+                if depth == 0 {
+                    in_at_rule = false;
+                }
+            } else if c == ';' && depth == 0 {
+                in_at_rule = false;
+            }
+        } else {
+            result.push(c);
+        }
+        i += 1;
+    }
+    result
+}
+
+fn parse_quad_shorthand(prefix: &str, val: &str, declarations: &mut HashMap<String, Value>) {
+    let parts: Vec<&str> = val.split_whitespace().collect();
+    let (top, right, bottom, left) = match parts.len() {
+        1 => (parts[0], parts[0], parts[0], parts[0]),
+        2 => (parts[0], parts[1], parts[0], parts[1]),
+        3 => (parts[0], parts[1], parts[2], parts[1]),
+        4 => (parts[0], parts[1], parts[2], parts[3]),
+        _ => return,
+    };
+    declarations.insert(format!("{}-top", prefix), parse_value(top));
+    declarations.insert(format!("{}-right", prefix), parse_value(right));
+    declarations.insert(format!("{}-bottom", prefix), parse_value(bottom));
+    declarations.insert(format!("{}-left", prefix), parse_value(left));
+    // Also set the combined shorthand for backward compatibility
+    declarations.insert(prefix.to_string(), parse_value(top));
 }
 
 fn parse_selector(s: &str) -> Selector {
@@ -106,8 +183,13 @@ fn parse_selector(s: &str) -> Selector {
     let mut current = String::new();
     let mut last_char = ' ';
 
+    // Handle combinators and pseudo-classes by taking only the last simple selector
+    let s = s.split_whitespace().last().unwrap_or(s);
+    // Remove pseudo-classes/elements (:hover, ::before, etc.)
+    let s = s.split(':').next().unwrap_or(s);
+
     for c in s.chars().chain(std::iter::once(' ')) {
-        if c == '#' || c == '.' || c == ' ' {
+        if c == '#' || c == '.' || c == ' ' || c == '[' {
             if !current.is_empty() {
                 match last_char {
                     '#' => selector.id = Some(current.clone()),
@@ -116,6 +198,7 @@ fn parse_selector(s: &str) -> Selector {
                 }
                 current.clear();
             }
+            if c == '[' { break; } // Skip attribute selectors
             last_char = c;
         } else {
             current.push(c);
@@ -131,20 +214,83 @@ fn parse_border_shorthand(val: &str, declarations: &mut HashMap<String, Value>) 
             declarations.insert("border-width".to_string(), parse_value(part));
         } else if let Some(color) = parse_color(part) {
             declarations.insert("border-color".to_string(), Value::Color(color));
-        } else if part == "solid" || part == "dashed" || part == "dotted" {
+        } else if matches!(part, "solid" | "dashed" | "dotted" | "none") {
             declarations.insert("border-style".to_string(), Value::Keyword(part.to_string()));
         }
     }
 }
 
+/// Split a string by spaces while respecting parentheses nesting.
+pub fn split_respecting_parens(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut depth: i32 = 0;
+
+    for c in s.chars() {
+        match c {
+            '(' => { depth += 1; current.push(c); }
+            ')' => { depth -= 1; current.push(c); }
+            ' ' | '\t' if depth == 0 => {
+                let t = current.trim().to_string();
+                if !t.is_empty() { parts.push(t); }
+                current.clear();
+            }
+            _ => current.push(c),
+        }
+    }
+    let t = current.trim().to_string();
+    if !t.is_empty() { parts.push(t); }
+    parts
+}
+
+pub fn parse_box_shadow(s: &str) -> Option<BoxShadow> {
+    if s == "none" { return None; }
+    let parts = split_respecting_parens(s);
+    let mut values: Vec<f32> = Vec::new();
+    let mut color = Color { r: 0, g: 0, b: 0, a: 128 };
+    let mut inset = false;
+
+    for part in &parts {
+        if part == "inset" {
+            inset = true;
+        } else if let Some(c) = parse_color(part) {
+            color = c;
+        } else {
+            let num_str = part.trim_end_matches("px");
+            if let Ok(v) = num_str.parse::<f32>() {
+                values.push(v);
+            }
+        }
+    }
+
+    if values.is_empty() { return None; }
+
+    Some(BoxShadow {
+        offset_x: values.get(0).copied().unwrap_or(0.0),
+        offset_y: values.get(1).copied().unwrap_or(0.0),
+        blur: values.get(2).copied().unwrap_or(0.0),
+        spread: values.get(3).copied().unwrap_or(0.0),
+        color,
+        inset,
+    })
+}
+
 pub fn parse_value(val: &str) -> Value {
     let val = val.trim();
+    // Strip !important
+    let val = val.trim_end_matches("!important").trim();
+
     if val.ends_with("px") {
         Value::Length(val.trim_end_matches("px").parse().unwrap_or(0.0), Unit::Px)
     } else if val.ends_with("vw") {
         Value::Length(val.trim_end_matches("vw").parse().unwrap_or(0.0), Unit::Vw)
-    } else if val.ends_with("em") {
-        Value::Length(val.trim_end_matches("em").parse().unwrap_or(0.0), Unit::Em)
+    } else if val.ends_with("vh") {
+        Value::Length(val.trim_end_matches("vh").parse().unwrap_or(0.0), Unit::Vh)
+    } else if val.ends_with("em") || val.ends_with("rem") {
+        let num = val.trim_end_matches("rem").trim_end_matches("em");
+        Value::Length(num.parse().unwrap_or(1.0), Unit::Em)
+    } else if val.ends_with('%') {
+        Value::Length(val.trim_end_matches('%').parse().unwrap_or(0.0), Unit::Percent)
     } else if let Some(color) = parse_color(val) {
         Value::Color(color)
     } else {
@@ -156,30 +302,30 @@ pub fn parse_color(s: &str) -> Option<Color> {
     let s = s.trim().to_lowercase();
     if s.starts_with('#') {
         let hex = &s[1..];
-        match hex.len() {
+        return match hex.len() {
             3 => {
                 let r = u8::from_str_radix(&hex[0..1].repeat(2), 16).ok()?;
                 let g = u8::from_str_radix(&hex[1..2].repeat(2), 16).ok()?;
                 let b = u8::from_str_radix(&hex[2..3].repeat(2), 16).ok()?;
-                return Some(Color { r, g, b, a: 255 });
+                Some(Color { r, g, b, a: 255 })
             }
             6 => {
                 let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
                 let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
                 let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-                return Some(Color { r, g, b, a: 255 });
+                Some(Color { r, g, b, a: 255 })
             }
             8 => {
                 let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
                 let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
                 let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
                 let a = u8::from_str_radix(&hex[6..8], 16).ok()?;
-                return Some(Color { r, g, b, a });
+                Some(Color { r, g, b, a })
             }
-            _ => return None,
-        }
+            _ => None,
+        };
     }
-    if s.starts_with("rgb") {
+    if s.starts_with("rgba(") || s.starts_with("rgb(") {
         if let Some(content) = s.split(|c| c == '(' || c == ')').nth(1) {
             let parts: Vec<&str> = content.split(',').map(|p| p.trim()).collect();
             if parts.len() >= 3 {
@@ -195,27 +341,88 @@ pub fn parse_color(s: &str) -> Option<Color> {
             }
         }
     }
-    let mut names = HashMap::new();
-    names.insert("white", Color { r: 255, g: 255, b: 255, a: 255 });
-    names.insert("black", Color { r: 0, g: 0, b: 0, a: 255 });
-    names.insert("red", Color { r: 255, g: 0, b: 0, a: 255 });
-    names.insert("green", Color { r: 0, g: 128, b: 0, a: 255 });
-    names.insert("blue", Color { r: 0, g: 0, b: 255, a: 255 });
-    names.insert("yellow", Color { r: 255, g: 255, b: 0, a: 255 });
-    names.insert("cyan", Color { r: 0, g: 255, b: 255, a: 255 });
-    names.insert("magenta", Color { r: 255, g: 0, b: 255, a: 255 });
-    names.insert("silver", Color { r: 192, g: 192, b: 192, a: 255 });
-    names.insert("gray", Color { r: 128, g: 128, b: 128, a: 255 });
-    names.insert("grey", Color { r: 128, g: 128, b: 128, a: 255 });
-    names.insert("orange", Color { r: 255, g: 165, b: 0, a: 255 });
-    names.insert("purple", Color { r: 128, g: 0, b: 128, a: 255 });
-    names.insert("pink", Color { r: 255, g: 192, b: 203, a: 255 });
-    names.insert("gold", Color { r: 255, g: 215, b: 0, a: 255 });
-    names.insert("transparent", Color { r: 0, g: 0, b: 0, a: 0 });
-    if let Some(color) = names.get(s.as_str()) {
-        return Some(color.clone());
+    // hsl() - approximate conversion
+    if s.starts_with("hsl(") {
+        if let Some(content) = s.split(|c| c == '(' || c == ')').nth(1) {
+            let parts: Vec<&str> = content.split(',').map(|p| p.trim()).collect();
+            if parts.len() >= 3 {
+                let h: f32 = parts[0].parse().ok()?;
+                let s_pct: f32 = parts[1].trim_end_matches('%').parse().ok()?;
+                let l_pct: f32 = parts[2].trim_end_matches('%').parse().ok()?;
+                let (r, g, b) = hsl_to_rgb(h, s_pct / 100.0, l_pct / 100.0);
+                return Some(Color { r, g, b, a: 255 });
+            }
+        }
     }
-    None
+    named_color(&s)
+}
+
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r1, g1, b1) = if h < 60.0 { (c, x, 0.0) }
+        else if h < 120.0 { (x, c, 0.0) }
+        else if h < 180.0 { (0.0, c, x) }
+        else if h < 240.0 { (0.0, x, c) }
+        else if h < 300.0 { (x, 0.0, c) }
+        else { (c, 0.0, x) };
+    (
+        ((r1 + m) * 255.0) as u8,
+        ((g1 + m) * 255.0) as u8,
+        ((b1 + m) * 255.0) as u8,
+    )
+}
+
+fn named_color(s: &str) -> Option<Color> {
+    let color = match s {
+        "white"       => Color { r: 255, g: 255, b: 255, a: 255 },
+        "black"       => Color { r: 0,   g: 0,   b: 0,   a: 255 },
+        "red"         => Color { r: 255, g: 0,   b: 0,   a: 255 },
+        "green"       => Color { r: 0,   g: 128, b: 0,   a: 255 },
+        "blue"        => Color { r: 0,   g: 0,   b: 255, a: 255 },
+        "yellow"      => Color { r: 255, g: 255, b: 0,   a: 255 },
+        "cyan"        => Color { r: 0,   g: 255, b: 255, a: 255 },
+        "magenta"     => Color { r: 255, g: 0,   b: 255, a: 255 },
+        "silver"      => Color { r: 192, g: 192, b: 192, a: 255 },
+        "gray"        => Color { r: 128, g: 128, b: 128, a: 255 },
+        "grey"        => Color { r: 128, g: 128, b: 128, a: 255 },
+        "orange"      => Color { r: 255, g: 165, b: 0,   a: 255 },
+        "purple"      => Color { r: 128, g: 0,   b: 128, a: 255 },
+        "pink"        => Color { r: 255, g: 192, b: 203, a: 255 },
+        "gold"        => Color { r: 255, g: 215, b: 0,   a: 255 },
+        "transparent" => Color { r: 0,   g: 0,   b: 0,   a: 0   },
+        "navy"        => Color { r: 0,   g: 0,   b: 128, a: 255 },
+        "teal"        => Color { r: 0,   g: 128, b: 128, a: 255 },
+        "lime"        => Color { r: 0,   g: 255, b: 0,   a: 255 },
+        "maroon"      => Color { r: 128, g: 0,   b: 0,   a: 255 },
+        "olive"       => Color { r: 128, g: 128, b: 0,   a: 255 },
+        "aqua"        => Color { r: 0,   g: 255, b: 255, a: 255 },
+        "fuchsia"     => Color { r: 255, g: 0,   b: 255, a: 255 },
+        "coral"       => Color { r: 255, g: 127, b: 80,  a: 255 },
+        "salmon"      => Color { r: 250, g: 128, b: 114, a: 255 },
+        "tomato"      => Color { r: 255, g: 99,  b: 71,  a: 255 },
+        "indigo"      => Color { r: 75,  g: 0,   b: 130, a: 255 },
+        "violet"      => Color { r: 238, g: 130, b: 238, a: 255 },
+        "khaki"       => Color { r: 240, g: 230, b: 140, a: 255 },
+        "beige"       => Color { r: 245, g: 245, b: 220, a: 255 },
+        "ivory"       => Color { r: 255, g: 255, b: 240, a: 255 },
+        "lavender"    => Color { r: 230, g: 230, b: 250, a: 255 },
+        "lightgray" | "lightgrey" => Color { r: 211, g: 211, b: 211, a: 255 },
+        "darkgray" | "darkgrey"   => Color { r: 169, g: 169, b: 169, a: 255 },
+        "lightblue"   => Color { r: 173, g: 216, b: 230, a: 255 },
+        "darkblue"    => Color { r: 0,   g: 0,   b: 139, a: 255 },
+        "lightgreen"  => Color { r: 144, g: 238, b: 144, a: 255 },
+        "darkgreen"   => Color { r: 0,   g: 100, b: 0,   a: 255 },
+        "lightyellow" => Color { r: 255, g: 255, b: 224, a: 255 },
+        "mintcream"   => Color { r: 245, g: 255, b: 250, a: 255 },
+        "whitesmoke"  => Color { r: 245, g: 245, b: 245, a: 255 },
+        "gainsboro"   => Color { r: 220, g: 220, b: 220, a: 255 },
+        "aliceblue"   => Color { r: 240, g: 248, b: 255, a: 255 },
+        "currentcolor" | "inherit" | "initial" | "unset" => return None,
+        _ => return None,
+    };
+    Some(color)
 }
 
 #[cfg(test)]
@@ -228,5 +435,27 @@ mod tests {
         assert_eq!(s.tag, Some("div".to_string()));
         assert_eq!(s.id, Some("main".to_string()));
         assert_eq!(s.class, vec!["header".to_string(), "active".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_box_shadow() {
+        let s = parse_box_shadow("0px 2px 8px rgba(0, 0, 0, 0.15)");
+        assert!(s.is_some());
+        let s = s.unwrap();
+        assert_eq!(s.offset_x, 0.0);
+        assert_eq!(s.offset_y, 2.0);
+        assert_eq!(s.blur, 8.0);
+    }
+
+    #[test]
+    fn test_parse_percent() {
+        let v = parse_value("50%");
+        assert_eq!(v, Value::Length(50.0, Unit::Percent));
+    }
+
+    #[test]
+    fn test_named_color() {
+        assert!(parse_color("navy").is_some());
+        assert!(parse_color("transparent").is_some());
     }
 }
