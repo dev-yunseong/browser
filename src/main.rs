@@ -87,7 +87,7 @@ fn fetch_and_process(url_str: &str) -> Result<PageData, Box<dyn Error + Send + S
     let dom_tree = dom::parse_html(&body);
     let css_source = style::extract_css_from_dom(&dom_tree.document);
     let stylesheet = css::parse_css(&css_source);
-    let style_tree = style::build_style_tree(&dom_tree.document, &stylesheet);
+    let style_tree = style::build_style_tree(&dom_tree.document, &stylesheet, None);
     
     let width = 800;
     let (layout_tree, _, final_y) = layout::build_layout_tree(&style_tree, 0.0, 0.0, 0.0, width as f32);

@@ -10,10 +10,21 @@ pub struct StyledNode {
     pub children: Vec<StyledNode>,
 }
 
-pub fn build_style_tree(root: &Handle, stylesheet: &Stylesheet) -> StyledNode {
+pub fn build_style_tree(root: &Handle, stylesheet: &Stylesheet, parent_style: Option<&PropertyMap>) -> StyledNode {
     let mut specified_values = HashMap::new();
 
-    // Naive matching: if it's an element, match tag name against rules.
+    // 1. Apply inherited values from parent
+    if let Some(parent) = parent_style {
+        // Properties that are inherited by default in CSS
+        let inheritable = ["color", "font-size", "font-family"];
+        for prop in inheritable {
+            if let Some(val) = parent.get(prop) {
+                specified_values.insert(prop.to_string(), val.clone());
+            }
+        }
+    }
+
+    // 2. Match tag-specific rules
     if let NodeData::Element { ref name, .. } = root.data {
         let tag_name = name.local.to_string();
 
@@ -21,7 +32,6 @@ pub fn build_style_tree(root: &Handle, stylesheet: &Stylesheet) -> StyledNode {
             for selector in &rule.selectors {
                 if let Some(ref s_tag) = selector.tag {
                     if *s_tag == tag_name {
-                        // Match found, apply declarations
                         for (k, v) in &rule.declarations {
                             specified_values.insert(k.clone(), v.clone());
                         }
@@ -34,7 +44,7 @@ pub fn build_style_tree(root: &Handle, stylesheet: &Stylesheet) -> StyledNode {
     let children = root.children
         .borrow()
         .iter()
-        .map(|child| build_style_tree(child, stylesheet))
+        .map(|child| build_style_tree(child, stylesheet, Some(&specified_values)))
         .collect();
 
     StyledNode {

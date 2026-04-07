@@ -4,12 +4,15 @@ use crate::layout::LayoutBox;
 use crate::css::{Value, Unit};
 use markup5ever_rcdom::NodeData;
 
-// Using a bundled font included in the project assets
-const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/DejaVuSans.ttf");
+// Using a bundled font that supports Korean (Nanum Gothic)
+const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/NanumGothic.ttf");
 
 pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap) {
     // 1. Render Background
-    if let Some(Value::Color(c)) = layout.style_node.specified_values.get("background") {
+    let bg_color = layout.style_node.specified_values.get("background-color")
+        .or_else(|| layout.style_node.specified_values.get("background"));
+
+    if let Some(Value::Color(c)) = bg_color {
         if c.a > 0 {
             let mut paint = Paint::default();
             paint.set_color_rgba8(c.r, c.g, c.b, c.a);
@@ -27,10 +30,10 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap) {
         }
     }
 
-    // 2. Render Border (Only if specified in CSS)
+    // 2. Render Border
     let border_width = match layout.style_node.specified_values.get("border-width") {
         Some(Value::Length(v, Unit::Px)) => *v,
-        _ => 0.0, // Default to 0 (no debug borders)
+        _ => 0.0, 
     };
     
     if border_width > 0.0 {
@@ -63,17 +66,18 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap) {
         }
     }
 
-    // 3. Render Text (With wrapping support)
+    // 3. Render Text (With wrapping and style support)
     if let NodeData::Text { ref contents } = layout.style_node.node.data {
         let text = contents.borrow().to_string();
         let trimmed = text.trim();
         if !trimmed.is_empty() {
             let color = match layout.style_node.specified_values.get("color") {
                 Some(Value::Color(c)) => c.clone(),
-                _ => crate::css::Color { r: 0, g: 0, b: 0, a: 255 },
+                _ => crate::css::Color { r: 0, g: 0, b: 0, a: 255 }, // Default black
             };
             let font_size = match layout.style_node.specified_values.get("font-size") {
                 Some(Value::Length(v, Unit::Px)) => *v,
+                Some(Value::Length(v, Unit::Em)) => *v * 16.0, // Basic em support
                 _ => 16.0,
             };
             render_text_wrapped(trimmed, layout, pixmap, color, font_size);
@@ -131,18 +135,26 @@ fn render_text_wrapped(text: &str, layout: &LayoutBox, pixmap: &mut Pixmap, colo
                 let bounds = outline.px_bounds();
                 outline.draw(|gx, gy, coverage| {
                     if coverage > 0.0 {
-                        let px = (bounds.min.x as i32 + gx as i32);
-                        let py = (bounds.min.y as i32 + gy as i32);
+                        let px = bounds.min.x as i32 + gx as i32 ;
+                        let py = bounds.min.y as i32 + gy as i32 ;
                         
                         if px >= 0 && px < pix_width as i32 && py >= 0 && py < pix_height as i32 {
                             let idx = ((py as u32 * pix_width + px as u32) * 4) as usize;
                             let data = pixmap.data_mut();
+                            
                             let alpha = (coverage * color.a as f32) as u8;
                             if alpha > 0 {
-                                data[idx] = color.r;
-                                data[idx + 1] = color.g;
-                                data[idx + 2] = color.b;
-                                data[idx + 3] = alpha;
+                                // Basic alpha blending: simpler but effective
+                                let old_a = data[idx + 3] as f32 / 255.0;
+                                let new_a = alpha as f32 / 255.0;
+                                let out_a = new_a + old_a * (1.0 - new_a);
+                                
+                                if out_a > 0.0 {
+                                    data[idx] = ((color.r as f32 * new_a + data[idx] as f32 * old_a * (1.0 - new_a)) / out_a) as u8;
+                                    data[idx + 1] = ((color.g as f32 * new_a + data[idx + 1] as f32 * old_a * (1.0 - new_a)) / out_a) as u8;
+                                    data[idx + 2] = ((color.b as f32 * new_a + data[idx + 2] as f32 * old_a * (1.0 - new_a)) / out_a) as u8;
+                                    data[idx + 3] = (out_a * 255.0) as u8;
+                                }
                             }
                         }
                     }
@@ -150,7 +162,7 @@ fn render_text_wrapped(text: &str, layout: &LayoutBox, pixmap: &mut Pixmap, colo
             }
             current_x += font.h_advance_unscaled(glyph_id) * (scale.x / font.units_per_em().unwrap_or(1000.0) as f32);
         }
-        current_y += 20.0 * (font_size / 16.0); // Next line
+        current_y += font_size * 1.25; 
     }
 }
 
