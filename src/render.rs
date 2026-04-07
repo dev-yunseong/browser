@@ -3,10 +3,11 @@ use ab_glyph::{Font, FontRef, PxScale, point};
 use crate::layout::{LayoutBox, DisplayType};
 use crate::css::{Value, Unit};
 use markup5ever_rcdom::NodeData;
+use std::collections::HashMap;
 
 const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/NanumGothic.ttf");
 
-pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap) {
+pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap, image_cache: &HashMap<String, Vec<u8>>) {
     // 1. Render Background
     let bg_color = layout.style_node.specified_values.get("background-color")
         .or_else(|| layout.style_node.specified_values.get("background"));
@@ -72,7 +73,42 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap) {
         }
     }
 
-    // 4. Render Text
+    // 4. Render Image
+    if let DisplayType::Image = layout.display {
+        if let Some(ref url) = layout.image_url {
+            if let Some(data) = image_cache.get(url) {
+                if let Ok(img) = image::load_from_memory(data) {
+                    let rgba = img.to_rgba8();
+                    let width = rgba.width();
+                    let height = rgba.height();
+                    
+                    if let Some(mut img_pixmap) = Pixmap::new(width, height) {
+                        img_pixmap.data_mut().copy_from_slice(&rgba);
+                        
+                        let scale_x = layout.dimensions.width / width as f32;
+                        let scale_y = layout.dimensions.height / height as f32;
+                        
+                        pixmap.draw_pixmap(
+                            layout.dimensions.x as i32,
+                            layout.dimensions.y as i32,
+                            img_pixmap.as_ref(),
+                            &tiny_skia::PixmapPaint::default(),
+                            Transform::from_scale(scale_x, scale_y),
+                            None
+                        );
+                    }
+                }
+            } else {
+                let mut paint = Paint::default();
+                paint.set_color_rgba8(240, 240, 240, 255);
+                if let Some(rect) = Rect::from_xywh(layout.dimensions.x, layout.dimensions.y, layout.dimensions.width, layout.dimensions.height) {
+                    pixmap.fill_rect(rect, &paint, Transform::identity(), None);
+                }
+            }
+        }
+    }
+
+    // 5. Render Text
     if let NodeData::Text { ref contents } = layout.style_node.node.data {
         let text = contents.borrow().to_string();
         let trimmed = text.trim();
@@ -99,7 +135,7 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap) {
 
     // Render children
     for child in &layout.children {
-        render_layout_tree(child, pixmap);
+        render_layout_tree(child, pixmap, image_cache);
     }
 }
 

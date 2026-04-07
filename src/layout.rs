@@ -1,5 +1,6 @@
 use crate::style::StyledNode;
 use crate::css::{Value, Unit};
+use std::collections::HashMap;
 
 #[derive(Default, Debug, Clone, Copy, PartialEq)]
 pub struct Rect {
@@ -15,6 +16,8 @@ pub struct LayoutBox<'a> {
     pub style_node: &'a StyledNode,
     pub children: Vec<LayoutBox<'a>>,
     pub link_url: Option<String>,
+    pub image_url: Option<String>,
+    pub event_handlers: HashMap<String, String>, // Added for onclick, etc.
     pub display: DisplayType,
 }
 
@@ -28,6 +31,7 @@ pub enum DisplayType {
     TableRow,
     TableCell,
     Input,
+    Image,
 }
 
 fn get_display_type(style_node: &StyledNode) -> DisplayType {
@@ -60,6 +64,7 @@ fn get_display_type(style_node: &StyledNode) -> DisplayType {
             "tr" => DisplayType::TableRow,
             "td" | "th" => DisplayType::TableCell,
             "input" | "textarea" | "button" => DisplayType::Input,
+            "img" => DisplayType::Image,
             _ => DisplayType::Inline,
         }
     } else {
@@ -91,7 +96,7 @@ pub fn build_layout_tree<'a>(
         _ => 0.0,
     };
 
-    // 3. 텍스트 노드 특수 처리
+    // 1. Text Node Handling
     if let markup5ever_rcdom::NodeData::Text { ref contents } = style_node.node.data {
         let text = contents.borrow().to_string();
         let trimmed = text.trim();
@@ -147,6 +152,8 @@ pub fn build_layout_tree<'a>(
             style_node,
             children: Vec::new(),
             link_url: None,
+            image_url: None,
+            event_handlers: HashMap::new(),
             display,
         };
 
@@ -163,7 +170,7 @@ pub fn build_layout_tree<'a>(
         return (Some(layout), next_x, next_y);
     }
 
-    // 4. 일반 박스 처리
+    // 2. Element Handling
     let layout_width_spec = match style_node.specified_values.get("width") {
         Some(Value::Length(w, Unit::Px)) => *w,
         Some(Value::Length(w, Unit::Vw)) => container_width * (*w / 100.0),
@@ -171,6 +178,8 @@ pub fn build_layout_tree<'a>(
             container_width - (margin * 2.0) 
         } else if let DisplayType::Input = display {
             200.0
+        } else if let DisplayType::Image = display {
+            100.0 
         } else { 
             0.0 
         },
@@ -200,25 +209,32 @@ pub fn build_layout_tree<'a>(
         style_node,
         children: Vec::new(),
         link_url: None,
+        image_url: None,
+        event_handlers: HashMap::new(),
         display,
     };
 
-    // [ENHANCED LINK DETECTION] Search for links in current element OR nearest interactive parent
     if let markup5ever_rcdom::NodeData::Element { ref attrs, ref name, .. } = style_node.node.data {
         let t_name = name.local.to_string();
-        if t_name == "a" {
-            for attr in attrs.borrow().iter() {
-                if attr.name.local.to_string() == "href" {
-                    layout.link_url = Some(attr.value.to_string());
-                }
+        for attr in attrs.borrow().iter() {
+            let attr_name = attr.name.local.to_string();
+            let attr_val = attr.value.to_string();
+            
+            if t_name == "a" && attr_name == "href" {
+                layout.link_url = Some(attr_val.clone());
+            } else if t_name == "img" && attr_name == "src" {
+                layout.image_url = Some(attr_val.clone());
+            } else if attr_name == "onclick" {
+                layout.event_handlers.insert("click".to_string(), attr_val);
             }
-        } else if t_name == "button" {
-            // Placeholder for button actions
-            layout.link_url = Some("#button-clicked".to_string());
+        }
+        
+        if t_name == "img" {
+            layout.dimensions.height = 100.0;
         }
     }
 
-    // 5. 자식 노드 배치
+    // 3. Child Placement
     let mut child_current_x = layout.dimensions.x + padding;
     let mut child_current_y = layout.dimensions.y + padding;
     let child_start_x = child_current_x;
@@ -264,7 +280,11 @@ pub fn build_layout_tree<'a>(
         layout.dimensions.width = (max_x_in_box - layout.dimensions.x + padding).min(container_width - (margin * 2.0));
     }
     
-    let min_h = if let DisplayType::Input = display { 24.0 } else { 20.0 };
+    let min_h = match display {
+        DisplayType::Input => 24.0,
+        DisplayType::Image => 100.0,
+        _ => 20.0,
+    };
     layout.dimensions.height = (max_y_in_box - layout.dimensions.y + padding).max(min_h);
 
     let final_x;
@@ -281,7 +301,7 @@ pub fn build_layout_tree<'a>(
 }
 
 impl<'a> LayoutBox<'a> {
-    pub fn hit_test(&self, x: f32, y: f32) -> Option<&'a StyledNode> {
+    pub fn hit_test(&self, x: f32, y: f32) -> Option<&LayoutBox<'a>> {
         if x >= self.dimensions.x && x <= self.dimensions.x + self.dimensions.width &&
            y >= self.dimensions.y && y <= self.dimensions.y + self.dimensions.height {
             
@@ -290,7 +310,7 @@ impl<'a> LayoutBox<'a> {
                     return Some(node);
                 }
             }
-            return Some(self.style_node);
+            return Some(self);
         }
         None
     }
@@ -315,6 +335,17 @@ impl<'a> LayoutBox<'a> {
             controls.extend(child.get_form_controls());
         }
         controls
+    }
+
+    pub fn get_images(&self) -> Vec<(Rect, String)> {
+        let mut images = Vec::new();
+        if let Some(ref url) = self.image_url {
+            images.push((self.dimensions, url.clone()));
+        }
+        for child in &self.children {
+            images.extend(child.get_images());
+        }
+        images
     }
 }
 
