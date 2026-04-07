@@ -104,47 +104,100 @@ fn parse_value(val: &str) -> Value {
     }
 }
 
-fn parse_color(s: &str) -> Option<Color> {
-    let s = s.to_lowercase();
+pub fn parse_color(s: &str) -> Option<Color> {
+    let s = s.trim().to_lowercase();
+    
+    // 1. HEX Color (#fff, #ffffff)
     if s.starts_with('#') {
         let hex = &s[1..];
-        if hex.len() == 3 {
-            let r = u8::from_str_radix(&hex[0..1].repeat(2), 16).ok()?;
-            let g = u8::from_str_radix(&hex[1..2].repeat(2), 16).ok()?;
-            let b = u8::from_str_radix(&hex[2..3].repeat(2), 16).ok()?;
-            return Some(Color { r, g, b, a: 255 });
-        } else if hex.len() == 6 {
-            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-            return Some(Color { r, g, b, a: 255 });
+        match hex.len() {
+            3 => {
+                let r = u8::from_str_radix(&hex[0..1].repeat(2), 16).ok()?;
+                let g = u8::from_str_radix(&hex[1..2].repeat(2), 16).ok()?;
+                let b = u8::from_str_radix(&hex[2..3].repeat(2), 16).ok()?;
+                return Some(Color { r, g, b, a: 255 });
+            }
+            6 => {
+                let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+                let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+                let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+                return Some(Color { r, g, b, a: 255 });
+            }
+            8 => {
+                let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+                let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+                let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+                let a = u8::from_str_radix(&hex[6..8], 16).ok()?;
+                return Some(Color { r, g, b, a });
+            }
+            _ => return None,
         }
-    } else if s.starts_with("rgb") {
-        let parts: Vec<&str> = s.split(|c| c == '(' || c == ')' || c == ',')
-            .filter(|p| !p.trim().is_empty() && !p.contains("rgb"))
-            .collect();
+    }
+    
+    // 2. RGB/RGBA Color (rgb(255, 0, 0), rgba(255, 0, 0, 0.5))
+    if s.starts_with("rgb") {
+        let content = s.split(|c| c == '(' || c == ')').nth(1)?;
+        let parts: Vec<&str> = content.split(',').map(|p| p.trim()).collect();
         if parts.len() >= 3 {
-            let r = parts[0].trim().parse().ok()?;
-            let g = parts[1].trim().parse().ok()?;
-            let b = parts[2].trim().parse().ok()?;
+            let r = parts[0].parse().ok()?;
+            let g = parts[1].parse().ok()?;
+            let b = parts[2].parse().ok()?;
             let a = if parts.len() == 4 {
-                (parts[3].trim().parse::<f32>().ok()? * 255.0) as u8
+                (parts[3].parse::<f32>().ok()? * 255.0).clamp(0.0, 255.0) as u8
             } else {
                 255
             };
             return Some(Color { r, g, b, a });
         }
-    } else {
-        match s.as_str() {
-            "white" => return Some(Color { r: 255, g: 255, b: 255, a: 255 }),
-            "black" => return Some(Color { r: 0, g: 0, b: 0, a: 255 }),
-            "red" => return Some(Color { r: 255, g: 0, b: 0, a: 255 }),
-            "blue" => return Some(Color { r: 0, g: 0, b: 255, a: 255 }),
-            "green" => return Some(Color { r: 0, g: 128, b: 0, a: 255 }),
-            "gray" | "grey" => return Some(Color { r: 128, g: 128, b: 128, a: 255 }),
-            "silver" => return Some(Color { r: 192, g: 192, b: 192, a: 255 }),
-            _ => {}
-        }
     }
+    
+    // 3. Named Colors
+    let mut names = HashMap::new();
+    names.insert("white", Color { r: 255, g: 255, b: 255, a: 255 });
+    names.insert("black", Color { r: 0, g: 0, b: 0, a: 255 });
+    names.insert("red", Color { r: 255, g: 0, b: 0, a: 255 });
+    names.insert("green", Color { r: 0, g: 128, b: 0, a: 255 });
+    names.insert("blue", Color { r: 0, g: 0, b: 255, a: 255 });
+    names.insert("yellow", Color { r: 255, g: 255, b: 0, a: 255 });
+    names.insert("cyan", Color { r: 0, g: 255, b: 255, a: 255 });
+    names.insert("magenta", Color { r: 255, g: 0, b: 255, a: 255 });
+    names.insert("silver", Color { r: 192, g: 192, b: 192, a: 255 });
+    names.insert("gray", Color { r: 128, g: 128, b: 128, a: 255 });
+    names.insert("grey", Color { r: 128, g: 128, b: 128, a: 255 });
+    names.insert("orange", Color { r: 255, g: 165, b: 0, a: 255 });
+    names.insert("purple", Color { r: 128, g: 0, b: 128, a: 255 });
+    names.insert("pink", Color { r: 255, g: 192, b: 203, a: 255 });
+    names.insert("gold", Color { r: 255, g: 215, b: 0, a: 255 });
+    names.insert("transparent", Color { r: 0, g: 0, b: 0, a: 0 });
+
+    if let Some(color) = names.get(s.as_str()) {
+        return Some(color.clone());
+    }
+    
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_color_hex() {
+        assert_eq!(parse_color("#ff0000"), Some(Color { r: 255, g: 0, b: 0, a: 255 }));
+        assert_eq!(parse_color("#00f"), Some(Color { r: 0, g: 0, b: 255, a: 255 }));
+        assert_eq!(parse_color("#ff000080"), Some(Color { r: 255, g: 0, b: 0, a: 128 }));
+    }
+
+    #[test]
+    fn test_parse_color_rgb() {
+        assert_eq!(parse_color("rgb(255, 0, 0)"), Some(Color { r: 255, g: 0, b: 0, a: 255 }));
+        assert_eq!(parse_color("rgba(0, 255, 0, 0.5)"), Some(Color { r: 0, g: 255, b: 0, a: 127 }));
+        assert_eq!(parse_color("rgb(  0,  0,  0  )"), Some(Color { r: 0, g: 0, b: 0, a: 255 }));
+    }
+
+    #[test]
+    fn test_parse_color_names() {
+        assert_eq!(parse_color("White"), Some(Color { r: 255, g: 255, b: 255, a: 255 }));
+        assert_eq!(parse_color("transparent"), Some(Color { r: 0, g: 0, b: 0, a: 0 }));
+    }
 }
