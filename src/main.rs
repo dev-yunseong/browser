@@ -90,15 +90,17 @@ fn fetch_and_process(url_str: &str) -> Result<PageData, Box<dyn Error + Send + S
     let style_tree = style::build_style_tree(&dom_tree.document, &stylesheet);
     
     let width = 800;
-    let height = 600;
-    let (layout_tree, _, _) = layout::build_layout_tree(&style_tree, 0.0, 0.0, 0.0, width as f32);
+    let (layout_tree, _, final_y) = layout::build_layout_tree(&style_tree, 0.0, 0.0, 0.0, width as f32);
 
+    // Set height to content height, with a minimum of 600
+    let height = (final_y.ceil() as u32).max(600);
+    
     let mut pixmap = tiny_skia::Pixmap::new(width, height).unwrap();
     pixmap.fill(tiny_skia::Color::WHITE);
     
     let mut links = Vec::new();
     if let Some(layout) = layout_tree {
-        println!("--- Layout Tree ---");
+        println!("--- Layout Tree (Content Height: {}) ---", height);
         layout::print_layout_tree(&layout, 0);
         render::render_layout_tree(&layout, &mut pixmap);
         links = layout.get_links();
