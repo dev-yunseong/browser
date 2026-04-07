@@ -95,9 +95,13 @@ fn fetch_and_process(url_str: &str) -> Result<PageData, Box<dyn Error + Send + S
 
     let mut pixmap = tiny_skia::Pixmap::new(width, height).unwrap();
     pixmap.fill(tiny_skia::Color::WHITE);
-    render::render_layout_tree(&layout_tree, &mut pixmap);
+    
+    let mut links = Vec::new();
+    if let Some(layout) = layout_tree {
+        render::render_layout_tree(&layout, &mut pixmap);
+        links = layout.get_links();
+    }
 
-    let links = layout_tree.get_links();
     let absolute_links = links.into_iter().map(|(rect, link)| {
         let abs_link = base_url.join(&link).map(|u| u.to_string()).unwrap_or(link);
         (rect, abs_link)

@@ -1,7 +1,7 @@
-use tiny_skia::{Pixmap, Paint, Rect, Transform, Stroke, PathBuilder};
+use tiny_skia::{Pixmap, Paint, Rect, Transform, Stroke, PathBuilder, FillRule};
 use ab_glyph::{Font, FontRef, PxScale, point};
 use crate::layout::LayoutBox;
-use crate::css::Value;
+use crate::css::{Value, Unit};
 use markup5ever_rcdom::NodeData;
 
 // Using a bundled font included in the project assets
@@ -28,29 +28,37 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap) {
     }
 
     // 2. Render Border
-    if let Some(Value::Keyword(border)) = layout.style_node.specified_values.get("border") {
-        if !border.is_empty() {
-            let mut paint = Paint::default();
-            paint.set_color_rgba8(200, 200, 200, 255); // Light gray border
+    let border_width = match layout.style_node.specified_values.get("border-width") {
+        Some(Value::Length(v, Unit::Px)) => *v,
+        _ => 0.0,
+    };
+    
+    if border_width > 0.0 {
+        let border_color = match layout.style_node.specified_values.get("border-color") {
+            Some(Value::Color(c)) => c.clone(),
+            _ => crate::css::Color { r: 0, g: 0, b: 0, a: 255 },
+        };
+        
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(border_color.r, border_color.g, border_color.b, border_color.a);
+        
+        if let Some(rect) = Rect::from_xywh(
+            layout.dimensions.x,
+            layout.dimensions.y,
+            layout.dimensions.width,
+            layout.dimensions.height,
+        ) {
+            let mut pb = PathBuilder::new();
+            pb.move_to(rect.left(), rect.top());
+            pb.line_to(rect.right(), rect.top());
+            pb.line_to(rect.right(), rect.bottom());
+            pb.line_to(rect.left(), rect.bottom());
+            pb.close();
             
-            if let Some(rect) = Rect::from_xywh(
-                layout.dimensions.x,
-                layout.dimensions.y,
-                layout.dimensions.width,
-                layout.dimensions.height,
-            ) {
-                let mut pb = PathBuilder::new();
-                pb.move_to(rect.left(), rect.top());
-                pb.line_to(rect.right(), rect.top());
-                pb.line_to(rect.right(), rect.bottom());
-                pb.line_to(rect.left(), rect.bottom());
-                pb.close();
-                
-                if let Some(path) = pb.finish() {
-                    let mut stroke = Stroke::default();
-                    stroke.width = 1.0;
-                    pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
-                }
+            if let Some(path) = pb.finish() {
+                let mut stroke = Stroke::default();
+                stroke.width = border_width;
+                pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
             }
         }
     }
@@ -60,12 +68,15 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap) {
         let text = contents.borrow().to_string();
         let trimmed = text.trim();
         if !trimmed.is_empty() {
-            // Default text color: black for visibility
             let color = match layout.style_node.specified_values.get("color") {
                 Some(Value::Color(c)) => c.clone(),
                 _ => crate::css::Color { r: 0, g: 0, b: 0, a: 255 },
             };
-            render_text(trimmed, layout.dimensions.x, layout.dimensions.y, pixmap, color);
+            let font_size = match layout.style_node.specified_values.get("font-size") {
+                Some(Value::Length(v, Unit::Px)) => *v,
+                _ => 16.0,
+            };
+            render_text(trimmed, layout.dimensions.x, layout.dimensions.y, pixmap, color, font_size);
         }
     }
 
@@ -75,15 +86,15 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap) {
     }
 }
 
-fn render_text(text: &str, x: f32, y: f32, pixmap: &mut Pixmap, color: crate::css::Color) {
+fn render_text(text: &str, x: f32, y: f32, pixmap: &mut Pixmap, color: crate::css::Color, font_size: f32) {
     let font = match FontRef::try_from_slice(FONT_DATA) {
         Ok(f) => f,
         Err(_) => return,
     };
-    let scale = PxScale::from(16.0);
+    let scale = PxScale::from(font_size);
     
     let mut current_x = x;
-    let baseline_y = y + 14.0;
+    let baseline_y = y + (font_size * 0.85); // Adjust baseline based on font size
     let pix_width = pixmap.width();
     let pix_height = pixmap.height();
 

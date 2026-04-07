@@ -81,7 +81,12 @@ pub fn parse_css(source: &str) -> Stylesheet {
             let key = kv.next().unwrap_or("").trim().to_string();
             let val_str = kv.next().unwrap_or("").trim().to_string();
             if !key.is_empty() && !val_str.is_empty() {
-                declarations.insert(key, parse_value(&val_str));
+                // Special handling for border shorthand
+                if key == "border" {
+                    parse_border_shorthand(&val_str, &mut declarations);
+                } else {
+                    declarations.insert(key, parse_value(&val_str));
+                }
             }
         }
         
@@ -91,12 +96,27 @@ pub fn parse_css(source: &str) -> Stylesheet {
     Stylesheet { rules }
 }
 
-fn parse_value(val: &str) -> Value {
+fn parse_border_shorthand(val: &str, declarations: &mut HashMap<String, Value>) {
+    let parts: Vec<&str> = val.split_whitespace().collect();
+    for part in parts {
+        if part.ends_with("px") || part.chars().all(|c| c.is_numeric()) {
+            declarations.insert("border-width".to_string(), parse_value(part));
+        } else if let Some(color) = parse_color(part) {
+            declarations.insert("border-color".to_string(), Value::Color(color));
+        } else if part == "solid" || part == "dashed" || part == "dotted" {
+            declarations.insert("border-style".to_string(), Value::Keyword(part.to_string()));
+        }
+    }
+}
+
+pub fn parse_value(val: &str) -> Value {
     let val = val.trim();
     if val.ends_with("px") {
         Value::Length(val.trim_end_matches("px").parse().unwrap_or(0.0), Unit::Px)
     } else if val.ends_with("vw") {
         Value::Length(val.trim_end_matches("vw").parse().unwrap_or(0.0), Unit::Vw)
+    } else if val.ends_with("em") {
+        Value::Length(val.trim_end_matches("em").parse().unwrap_or(0.0), Unit::Em)
     } else if let Some(color) = parse_color(val) {
         Value::Color(color)
     } else {
@@ -136,18 +156,19 @@ pub fn parse_color(s: &str) -> Option<Color> {
     
     // 2. RGB/RGBA Color (rgb(255, 0, 0), rgba(255, 0, 0, 0.5))
     if s.starts_with("rgb") {
-        let content = s.split(|c| c == '(' || c == ')').nth(1)?;
-        let parts: Vec<&str> = content.split(',').map(|p| p.trim()).collect();
-        if parts.len() >= 3 {
-            let r = parts[0].parse().ok()?;
-            let g = parts[1].parse().ok()?;
-            let b = parts[2].parse().ok()?;
-            let a = if parts.len() == 4 {
-                (parts[3].parse::<f32>().ok()? * 255.0).clamp(0.0, 255.0) as u8
-            } else {
-                255
-            };
-            return Some(Color { r, g, b, a });
+        if let Some(content) = s.split(|c| c == '(' || c == ')').nth(1) {
+            let parts: Vec<&str> = content.split(',').map(|p| p.trim()).collect();
+            if parts.len() >= 3 {
+                let r = parts[0].parse().ok()?;
+                let g = parts[1].parse().ok()?;
+                let b = parts[2].parse().ok()?;
+                let a = if parts.len() == 4 {
+                    (parts[3].parse::<f32>().ok()? * 255.0).clamp(0.0, 255.0) as u8
+                } else {
+                    255
+                };
+                return Some(Color { r, g, b, a });
+            }
         }
     }
     
@@ -199,5 +220,12 @@ mod tests {
     fn test_parse_color_names() {
         assert_eq!(parse_color("White"), Some(Color { r: 255, g: 255, b: 255, a: 255 }));
         assert_eq!(parse_color("transparent"), Some(Color { r: 0, g: 0, b: 0, a: 0 }));
+    }
+
+    #[test]
+    fn test_parse_value() {
+        assert_eq!(parse_value("10px"), Value::Length(10.0, Unit::Px));
+        assert_eq!(parse_value("50vw"), Value::Length(50.0, Unit::Vw));
+        assert_eq!(parse_value("bold"), Value::Keyword("bold".to_string()));
     }
 }
