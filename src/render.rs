@@ -280,28 +280,40 @@ fn render_text_wrapped(
 
             if let Some(outline) = font.outline_glyph(glyph) {
                 let bounds = outline.px_bounds();
-                outline.draw(|gx, gy, coverage| {
-                    if coverage > 0.01 {
-                        let px = bounds.min.x as i32 + gx as i32;
-                        let py = bounds.min.y as i32 + gy as i32;
-                        if px >= 0 && px < pix_w && py >= 0 && py < pix_h {
-                            let idx = ((py as u32 * pix_w as u32 + px as u32) * 4) as usize;
-                            let data = pixmap.data_mut();
-                            let alpha = (coverage * color.a as f32) as u8;
-                            if alpha > 0 {
-                                let old_a = data[idx + 3] as f32 / 255.0;
-                                let new_a = alpha as f32 / 255.0;
-                                let out_a = new_a + old_a * (1.0 - new_a);
-                                if out_a > 0.0 {
-                                    data[idx]     = ((color.r as f32 * new_a + data[idx]     as f32 * old_a * (1.0 - new_a)) / out_a) as u8;
-                                    data[idx + 1] = ((color.g as f32 * new_a + data[idx + 1] as f32 * old_a * (1.0 - new_a)) / out_a) as u8;
-                                    data[idx + 2] = ((color.b as f32 * new_a + data[idx + 2] as f32 * old_a * (1.0 - new_a)) / out_a) as u8;
-                                    data[idx + 3] = (out_a * 255.0) as u8;
+                let width = bounds.width() as u32;
+                let height = bounds.height() as u32;
+                
+                if width > 0 && height > 0 {
+                    if let Some(mut glyph_pixmap) = tiny_skia::Pixmap::new(width, height) {
+                        outline.draw(|gx, gy, coverage| {
+                            if coverage > 0.05 { // Filter out extreme noise
+                                let idx = ((gy as u32 * width + gx as u32) * 4) as usize;
+                                if idx + 3 < glyph_pixmap.data().len() {
+                                    let alpha = (coverage * color.a as f32) as u8;
+                                    // tiny-skia requires premultiplied RGBA
+                                    let r = (color.r as f32 * alpha as f32 / 255.0) as u8;
+                                    let g = (color.g as f32 * alpha as f32 / 255.0) as u8;
+                                    let b = (color.b as f32 * alpha as f32 / 255.0) as u8;
+                                    
+                                    let data = glyph_pixmap.data_mut();
+                                    data[idx] = r;
+                                    data[idx + 1] = g;
+                                    data[idx + 2] = b;
+                                    data[idx + 3] = alpha;
                                 }
                             }
-                        }
+                        });
+                        
+                        pixmap.draw_pixmap(
+                            bounds.min.x as i32,
+                            bounds.min.y as i32,
+                            glyph_pixmap.as_ref(),
+                            &tiny_skia::PixmapPaint::default(),
+                            Transform::identity(),
+                            None,
+                        );
                     }
-                });
+                }
             }
             let advance = font.h_advance_unscaled(glyph_id) * (scale.x / units);
             current_x += advance;

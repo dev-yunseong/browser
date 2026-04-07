@@ -2,6 +2,9 @@ use crate::style::StyledNode;
 use crate::css::{Value, Unit};
 use std::collections::HashMap;
 use markup5ever_rcdom::NodeData;
+use ab_glyph::{Font, FontRef, PxScale};
+
+const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/NanumGothic.ttf");
 
 #[derive(Default, Debug, Clone, Copy, PartialEq)]
 pub struct Rect {
@@ -132,11 +135,11 @@ pub fn build_layout_tree<'a>(
         .max(get_length(style_node, "margin", 0.0, container_width));
     let margin_bottom = get_length(style_node, "margin-bottom", 0.0, container_width)
         .max(get_length(style_node, "margin", 0.0, container_width));
-    let margin_left = get_length(style_node, "margin-left", 0.0, container_width)
+    let mut margin_left = get_length(style_node, "margin-left", 0.0, container_width)
         .max(get_length(style_node, "margin", 0.0, container_width));
-    let margin_right = get_length(style_node, "margin-right", 0.0, container_width)
+    let mut margin_right = get_length(style_node, "margin-right", 0.0, container_width)
         .max(get_length(style_node, "margin", 0.0, container_width));
-    let margin_h = margin_left + margin_right;
+    let mut margin_h = margin_left + margin_right;
 
     // ── Text node ────────────────────────────────────────────────────────────
     if let NodeData::Text { ref contents } = style_node.node.data {
@@ -147,43 +150,55 @@ pub fn build_layout_tree<'a>(
         }
 
         let font_size = get_length(style_node, "font-size", 16.0, container_width);
-        let avg_char_width = 8.0 * (font_size / 16.0);
         let line_height = font_size * 1.4;
 
+        let font = match ab_glyph::FontRef::try_from_slice(include_bytes!("../assets/fonts/NanumGothic.ttf")) {
+            Ok(f) => f,
+            Err(_) => return (None, current_x, current_y),
+        };
+        let scale = ab_glyph::PxScale::from(font_size);
+        let units = font.units_per_em().unwrap_or(1000.0) as f32;
+
+        let space_width = font.h_advance_unscaled(font.glyph_id(' ')) * (scale.x / units);
+
         let available_width = container_width - (current_x - container_start_x) - margin_h;
-        if available_width < avg_char_width && current_x > container_start_x {
+        if available_width < space_width && current_x > container_start_x {
             current_y += line_height;
             current_x = container_start_x;
         }
 
         let words: Vec<&str> = trimmed.split_whitespace().collect();
-        let max_chars = ((container_width - padding_h) / avg_char_width).max(1.0) as usize;
+        let mut lines_count = 1;
+        let mut line_w: f32 = 0.0;
+        let mut max_w: f32 = 0.0;
 
-        let mut lines_count = 0;
-        let mut current_line_len = 0usize;
-        let mut estimated_width: f32 = 0.0;
-
-        for word in &words {
-            if current_line_len + word.len() + 1 > max_chars && current_line_len > 0 {
+        for word in words {
+            let mut word_w = 0.0;
+            for c in word.chars() {
+                word_w += font.h_advance_unscaled(font.glyph_id(c)) * (scale.x / units);
+            }
+            if line_w + word_w + space_width > container_width - margin_h && line_w > 0.0 {
+                max_w = max_w.max(line_w);
+                line_w = word_w;
                 lines_count += 1;
-                estimated_width = estimated_width.max(current_line_len as f32 * avg_char_width);
-                current_line_len = word.len();
             } else {
-                if current_line_len > 0 { current_line_len += 1; }
-                current_line_len += word.len();
+                if line_w > 0.0 { line_w += space_width; }
+                line_w += word_w;
             }
         }
-        if current_line_len > 0 {
-            lines_count += 1;
-            estimated_width = estimated_width.max(current_line_len as f32 * avg_char_width);
-        }
+        max_w = max_w.max(line_w);
 
         let total_height = lines_count as f32 * line_height;
         let layout_width = if lines_count > 1 {
             container_width - margin_h
         } else {
-            estimated_width
+            max_w
         };
+
+        if current_x > container_start_x && current_x + layout_width > container_start_x + container_width {
+            current_y += line_height;
+            current_x = container_start_x;
+        }
 
         let layout = LayoutBox {
             dimensions: Rect {
@@ -242,6 +257,34 @@ pub fn build_layout_tree<'a>(
         _ => f32::MAX,
     };
     let layout_width = layout_width.min(max_width);
+
+    if is_block && layout_width < container_width {
+        let ml_auto = match style_node.specified_values.get("margin-left") {
+            Some(Value::Keyword(s)) => s == "auto",
+            _ => match style_node.specified_values.get("margin") {
+                Some(Value::Keyword(s)) => s.contains("auto"),
+                _ => false,
+            }
+        };
+        let mr_auto = match style_node.specified_values.get("margin-right") {
+            Some(Value::Keyword(s)) => s == "auto",
+            _ => match style_node.specified_values.get("margin") {
+                Some(Value::Keyword(s)) => s.contains("auto"),
+                _ => false,
+            }
+        };
+
+        if ml_auto && mr_auto {
+            let space = (container_width - layout_width).max(0.0);
+            margin_left = space / 2.0;
+            margin_right = space / 2.0;
+        } else if mr_auto {
+            margin_right = (container_width - layout_width - margin_left).max(0.0);
+        } else if ml_auto {
+            margin_left = (container_width - layout_width - margin_right).max(0.0);
+        }
+        margin_h = margin_left + margin_right;
+    }
 
     let x_offset = if let DisplayType::ListItem = display { 20.0 } else { 0.0 };
 
