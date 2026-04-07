@@ -8,6 +8,7 @@ mod css;
 mod style;
 mod layout;
 mod render;
+mod js;
 
 struct BrowserApp {
     url: String,
@@ -89,6 +90,14 @@ fn fetch_and_process(url_str: &str) -> Result<PageData, Box<dyn Error + Send + S
     let stylesheet = css::parse_css(&css_source);
     let style_tree = style::build_style_tree(&dom_tree.document, &stylesheet, None);
     
+    // Execute JavaScript
+    println!("Executing Scripts...");
+    let mut js_runtime = js::JsRuntime::new();
+    let scripts = js::extract_scripts_from_dom(&dom_tree.document);
+    for script in scripts {
+        js_runtime.execute(&script);
+    }
+
     let width = 800;
     let (layout_tree, _, final_y) = layout::build_layout_tree(&style_tree, 0.0, 0.0, 0.0, width as f32);
 

@@ -6,6 +6,7 @@ edition = "2021"
 
 [dependencies]
 ab_glyph = "0.2.32"
+boa_engine = "0.21.1"
 cssparser = "0.37.0"
 eframe = "0.29"
 egui = "0.29"
