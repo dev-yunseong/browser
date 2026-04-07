@@ -14,9 +14,20 @@ pub struct Rect {
     pub height: f32,
 }
 
+#[derive(Default, Debug, Clone, Copy)]
+pub struct EdgeSizes {
+    pub left: f32,
+    pub right: f32,
+    pub top: f32,
+    pub bottom: f32,
+}
+
 #[derive(Debug, Clone)]
 pub struct LayoutBox<'a> {
     pub dimensions: Rect,
+    pub padding: EdgeSizes,
+    pub border: EdgeSizes,
+    pub margin: EdgeSizes,
     pub style_node: &'a StyledNode,
     pub children: Vec<LayoutBox<'a>>,
     pub link_url: Option<String>,
@@ -39,174 +50,29 @@ pub enum DisplayType {
     Flex,
 }
 
-fn get_display_type(style_node: &StyledNode) -> DisplayType {
-    if let NodeData::Text { .. } = style_node.node.data {
-        return DisplayType::Inline;
-    }
-
-    if let Some(Value::Keyword(ref d)) = style_node.specified_values.get("display") {
-        match d.as_str() {
-            "block" => return DisplayType::Block,
-            "inline" => return DisplayType::Inline,
-            "inline-block" => return DisplayType::InlineBlock,
-            "list-item" => return DisplayType::ListItem,
-            "table" => return DisplayType::Table,
-            "table-row" => return DisplayType::TableRow,
-            "table-cell" => return DisplayType::TableCell,
-            "flex" | "inline-flex" => return DisplayType::Flex,
-            "none" => {}
-            _ => {}
-        }
-    }
-
-    if let NodeData::Element { ref name, .. } = style_node.node.data {
-        let tag = name.local.to_string();
-        match tag.as_str() {
-            "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" |
-            "ul" | "ol" | "header" | "footer" | "nav" | "section" |
-            "article" | "main" | "aside" | "body" | "html" | "form" |
-            "fieldset" | "blockquote" | "pre" | "hr" | "figure" => DisplayType::Block,
-            "li" => DisplayType::ListItem,
-            "table" => DisplayType::Table,
-            "tr" => DisplayType::TableRow,
-            "td" | "th" => DisplayType::TableCell,
-            "input" | "textarea" | "button" | "select" => DisplayType::Input,
-            "img" => DisplayType::Image,
-            _ => DisplayType::Inline,
-        }
-    } else {
-        DisplayType::Block
-    }
-}
-
-fn should_skip(child: &StyledNode) -> bool {
-    if let NodeData::Element { ref name, .. } = child.node.data {
-        let t = name.local.to_string();
-        matches!(t.as_str(), "head" | "style" | "meta" | "title" | "script" | "link" | "noscript")
-    } else {
-        false
-    }
-}
-
-fn get_length(style_node: &StyledNode, prop: &str, default: f32, container_width: f32) -> f32 {
-    match style_node.specified_values.get(prop) {
-        Some(Value::Length(v, Unit::Px)) => *v,
-        Some(Value::Length(v, Unit::Vw)) => container_width * (v / 100.0),
-        Some(Value::Length(v, Unit::Percent)) => container_width * (v / 100.0),
-        Some(Value::Length(v, Unit::Em)) => v * 16.0,
-        _ => default,
-    }
-}
-
-fn get_keyword<'a>(style_node: &'a StyledNode, prop: &str) -> Option<&'a str> {
-    match style_node.specified_values.get(prop) {
-        Some(Value::Keyword(s)) => Some(s.as_str()),
-        _ => None,
-    }
-}
-
 pub fn build_layout_tree<'a>(
     style_node: &'a StyledNode,
     container_start_x: f32,
-    mut current_x: f32,
-    mut current_y: f32,
+    current_x: f32,
+    current_y: f32,
     container_width: f32,
 ) -> (Option<LayoutBox<'a>>, f32, f32) {
-    if let Some(Value::Keyword(d)) = style_node.specified_values.get("display") {
-        if d == "none" {
-            return (None, current_x, current_y);
-        }
+    let mut layout = LayoutBox::new(style_node);
+    if layout.display == DisplayType::Inline && is_none_display(style_node) {
+        return (None, current_x, current_y);
     }
+    layout.measure_box_model(container_width);
+    layout.perform_layout(container_start_x, current_x, current_y, container_width)
+}
 
-    let display = get_display_type(style_node);
-
-    // ── Spacing ──────────────────────────────────────────────────────────────
-    let padding_top = get_length(style_node, "padding-top", 0.0, container_width)
-        .max(get_length(style_node, "padding", 0.0, container_width));
-    let padding_bottom = get_length(style_node, "padding-bottom", 0.0, container_width)
-        .max(get_length(style_node, "padding", 0.0, container_width));
-    let padding_left = get_length(style_node, "padding-left", 0.0, container_width)
-        .max(get_length(style_node, "padding", 0.0, container_width));
-    let padding_right = get_length(style_node, "padding-right", 0.0, container_width)
-        .max(get_length(style_node, "padding", 0.0, container_width));
-    let padding_h = padding_left + padding_right;
-
-    let margin_top = get_length(style_node, "margin-top", 0.0, container_width)
-        .max(get_length(style_node, "margin", 0.0, container_width));
-    let margin_bottom = get_length(style_node, "margin-bottom", 0.0, container_width)
-        .max(get_length(style_node, "margin", 0.0, container_width));
-    let mut margin_left = get_length(style_node, "margin-left", 0.0, container_width)
-        .max(get_length(style_node, "margin", 0.0, container_width));
-    let mut margin_right = get_length(style_node, "margin-right", 0.0, container_width)
-        .max(get_length(style_node, "margin", 0.0, container_width));
-    let mut margin_h = margin_left + margin_right;
-
-    // ── Text node ────────────────────────────────────────────────────────────
-    if let NodeData::Text { ref contents } = style_node.node.data {
-        let text = contents.borrow().to_string();
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            return (None, current_x, current_y);
-        }
-
-        let font_size = get_length(style_node, "font-size", 16.0, container_width);
-        let line_height = font_size * 1.4;
-
-        let font = match ab_glyph::FontRef::try_from_slice(include_bytes!("../assets/fonts/NanumGothic.ttf")) {
-            Ok(f) => f,
-            Err(_) => return (None, current_x, current_y),
-        };
-        let scale = ab_glyph::PxScale::from(font_size);
-        let units = font.units_per_em().unwrap_or(1000.0) as f32;
-
-        let space_width = font.h_advance_unscaled(font.glyph_id(' ')) * (scale.x / units);
-
-        let available_width = container_width - (current_x - container_start_x) - margin_h;
-        if available_width < space_width && current_x > container_start_x {
-            current_y += line_height;
-            current_x = container_start_x;
-        }
-
-        let words: Vec<&str> = trimmed.split_whitespace().collect();
-        let mut lines_count = 1;
-        let mut line_w: f32 = 0.0;
-        let mut max_w: f32 = 0.0;
-
-        for word in words {
-            let mut word_w = 0.0;
-            for c in word.chars() {
-                word_w += font.h_advance_unscaled(font.glyph_id(c)) * (scale.x / units);
-            }
-            if line_w + word_w + space_width > container_width - margin_h && line_w > 0.0 {
-                max_w = max_w.max(line_w);
-                line_w = word_w;
-                lines_count += 1;
-            } else {
-                if line_w > 0.0 { line_w += space_width; }
-                line_w += word_w;
-            }
-        }
-        max_w = max_w.max(line_w);
-
-        let total_height = lines_count as f32 * line_height;
-        let layout_width = if lines_count > 1 {
-            container_width - margin_h
-        } else {
-            max_w
-        };
-
-        if current_x > container_start_x && current_x + layout_width > container_start_x + container_width {
-            current_y += line_height;
-            current_x = container_start_x;
-        }
-
-        let layout = LayoutBox {
-            dimensions: Rect {
-                x: current_x + margin_left,
-                y: current_y + margin_top,
-                width: layout_width.min(container_width - margin_h),
-                height: total_height,
-            },
+impl<'a> LayoutBox<'a> {
+    fn new(style_node: &'a StyledNode) -> Self {
+        let display = get_display_type(style_node);
+        let mut layout = LayoutBox {
+            dimensions: Rect::default(),
+            padding: EdgeSizes::default(),
+            border: EdgeSizes::default(),
+            margin: EdgeSizes::default(),
             style_node,
             children: Vec::new(),
             link_url: None,
@@ -215,379 +81,281 @@ pub fn build_layout_tree<'a>(
             display,
         };
 
-        let (next_x, next_y) = if lines_count > 1 {
-            (container_start_x, current_y + total_height + margin_bottom)
-        } else {
-            (current_x + layout.dimensions.width + margin_right, current_y)
-        };
-
-        return (Some(layout), next_x, next_y);
-    }
-
-    // ── Element node ─────────────────────────────────────────────────────────
-    let is_block = matches!(display,
-        DisplayType::Block | DisplayType::ListItem | DisplayType::Table |
-        DisplayType::TableRow | DisplayType::Flex
-    );
-
-    if is_block && current_x > container_start_x {
-        current_y += 0.0; // block already starts on new line
-        current_x = container_start_x;
-    }
-
-    // Explicit width
-    let layout_width = match style_node.specified_values.get("width") {
-        Some(Value::Length(w, Unit::Px)) => *w,
-        Some(Value::Length(w, Unit::Vw)) => container_width * (w / 100.0),
-        Some(Value::Length(w, Unit::Percent)) => (container_width - margin_h) * (w / 100.0),
-        Some(Value::Length(w, Unit::Em)) => w * 16.0,
-        _ => match display {
-            DisplayType::Block | DisplayType::ListItem | DisplayType::Table |
-            DisplayType::Flex => container_width - margin_h,
-            DisplayType::Input => 200.0,
-            DisplayType::Image => 100.0,
-            _ => 0.0,
-        },
-    };
-
-    // Cap at max-width
-    let max_width = match style_node.specified_values.get("max-width") {
-        Some(Value::Length(w, Unit::Px)) => *w,
-        Some(Value::Length(w, Unit::Percent)) => container_width * (w / 100.0),
-        _ => f32::MAX,
-    };
-    let layout_width = layout_width.min(max_width);
-
-    if is_block && layout_width < container_width {
-        let ml_auto = match style_node.specified_values.get("margin-left") {
-            Some(Value::Keyword(s)) => s == "auto",
-            _ => match style_node.specified_values.get("margin") {
-                Some(Value::Keyword(s)) => s.contains("auto"),
-                _ => false,
-            }
-        };
-        let mr_auto = match style_node.specified_values.get("margin-right") {
-            Some(Value::Keyword(s)) => s == "auto",
-            _ => match style_node.specified_values.get("margin") {
-                Some(Value::Keyword(s)) => s.contains("auto"),
-                _ => false,
-            }
-        };
-
-        if ml_auto && mr_auto {
-            let space = (container_width - layout_width).max(0.0);
-            margin_left = space / 2.0;
-            margin_right = space / 2.0;
-        } else if mr_auto {
-            margin_right = (container_width - layout_width - margin_left).max(0.0);
-        } else if ml_auto {
-            margin_left = (container_width - layout_width - margin_right).max(0.0);
-        }
-        margin_h = margin_left + margin_right;
-    }
-
-    let x_offset = if let DisplayType::ListItem = display { 20.0 } else { 0.0 };
-
-    let mut layout = LayoutBox {
-        dimensions: Rect {
-            x: current_x + margin_left + x_offset,
-            y: current_y + margin_top,
-            width: layout_width,
-            height: 0.0,
-        },
-        style_node,
-        children: Vec::new(),
-        link_url: None,
-        image_url: None,
-        event_handlers: HashMap::new(),
-        display,
-    };
-
-    // Collect element attributes
-    if let NodeData::Element { ref attrs, ref name, .. } = style_node.node.data {
-        let tag = name.local.to_string();
-        for attr in attrs.borrow().iter() {
-            let attr_name = attr.name.local.to_string();
-            let attr_val = attr.value.to_string();
-            match attr_name.as_str() {
-                "href" if tag == "a" => layout.link_url = Some(attr_val),
-                "src" if tag == "img" => layout.image_url = Some(attr_val),
-                "onclick" => { layout.event_handlers.insert("click".to_string(), attr_val); }
-                _ => {}
+        if let NodeData::Element { ref attrs, ref name, .. } = style_node.node.data {
+            let tag = name.local.to_string();
+            for attr in attrs.borrow().iter() {
+                let name = attr.name.local.to_string();
+                let value = attr.value.to_string();
+                match name.as_str() {
+                    "href" if tag == "a" => layout.link_url = Some(value),
+                    "src" if tag == "img" => layout.image_url = Some(value),
+                    "onclick" => { layout.event_handlers.insert("click".to_string(), value); }
+                    _ => {}
+                }
             }
         }
-        if tag == "img" {
-            let h = get_length(style_node, "height", 100.0, container_width);
-            layout.dimensions.height = h;
-            if layout_width == 100.0 {
-                layout.dimensions.width = get_length(style_node, "width", 100.0, container_width);
+        layout
+    }
+
+    fn measure_box_model(&mut self, container_width: f32) {
+        let sn = self.style_node;
+        self.margin.top = get_prop(sn, "margin-top", "margin", container_width);
+        self.margin.bottom = get_prop(sn, "margin-bottom", "margin", container_width);
+        self.margin.left = get_prop(sn, "margin-left", "margin", container_width);
+        self.margin.right = get_prop(sn, "margin-right", "margin", container_width);
+        self.padding.top = get_prop(sn, "padding-top", "padding", container_width);
+        self.padding.bottom = get_prop(sn, "padding-bottom", "padding", container_width);
+        self.padding.left = get_prop(sn, "padding-left", "padding", container_width);
+        self.padding.right = get_prop(sn, "padding-right", "padding", container_width);
+
+        let b_width = match sn.specified_values.get("border-width") {
+            Some(Value::Length(v, Unit::Px)) => *v,
+            _ => if self.display == DisplayType::Input { 1.0 } else { 0.0 },
+        };
+        self.border = EdgeSizes { left: b_width, right: b_width, top: b_width, bottom: b_width };
+    }
+
+    fn perform_layout(
+        &mut self, 
+        container_start_x: f32, 
+        mut current_x: f32, 
+        mut current_y: f32, 
+        container_width: f32
+    ) -> (Option<LayoutBox<'a>>, f32, f32) {
+        let is_block = is_block_level(self.display);
+        if is_block && current_x > container_start_x {
+            current_x = container_start_x;
+            current_y += 5.0;
+        }
+
+        let mut width = match self.style_node.specified_values.get("width") {
+            Some(Value::Length(v, Unit::Px)) => *v,
+            Some(Value::Length(v, Unit::Percent)) => container_width * (v / 100.0),
+            _ => if is_block { (container_width - self.margin.left - self.margin.right).max(0.0) } else { 0.0 },
+        };
+// margin: auto 처리 (너비가 결정된 후 수행)
+        if is_block && width < container_width {
+            let mut is_auto = false;
+            for prop in ["margin", "margin-left", "margin-right"] {
+                if let Some(val) = self.style_node.specified_values.get(prop) {
+                    match val {
+                        Value::Keyword(s) if s.contains("auto") => { is_auto = true; break; }
+                        _ => {}
+                    }
+                }
+            }
+            
+            if is_auto {
+                let leftover = (container_width - width).max(0.0);
+                self.margin.left = leftover / 2.0;
+                self.margin.right = leftover / 2.0;
             }
         }
-    }
+self.dimensions.x = current_x + self.margin.left;
+self.dimensions.y = current_y + self.margin.top;
+self.dimensions.width = width;
 
-    // ── Dispatch to flex layout ───────────────────────────────────────────────
-    if let DisplayType::Flex = display {
-        return build_flex_layout(style_node, layout, padding_left, padding_right, padding_top, padding_bottom, margin_bottom, container_start_x);
-    }
 
-    // ── Normal child layout ───────────────────────────────────────────────────
-    let child_container_width = layout.dimensions.width - padding_h;
-    let child_start_x = layout.dimensions.x + padding_left;
-    let mut child_current_x = child_start_x;
-    let mut child_current_y = layout.dimensions.y + padding_top;
-
-    let children_count = style_node.children.iter()
-        .filter(|c| !should_skip(c))
-        .count() as f32;
-    let cell_width = if let DisplayType::TableRow = display {
-        (child_container_width) / children_count.max(1.0)
-    } else {
-        0.0
-    };
-
-    let mut max_y_in_box = child_current_y;
-
-    for child in &style_node.children {
-        if should_skip(child) { continue; }
-
-        let child_w = if let DisplayType::TableRow = display {
-            cell_width
-        } else {
-            child_container_width
-        };
-
-        let (child_layout, next_x, next_y) = build_layout_tree(
-            child,
-            child_start_x,
-            child_current_x,
-            child_current_y,
-            child_w,
-        );
-
-        if let Some(child_box) = child_layout {
-            max_y_in_box = max_y_in_box.max(child_box.dimensions.y + child_box.dimensions.height);
-            layout.children.push(child_box);
-            child_current_x = next_x;
-            child_current_y = next_y;
+        if let NodeData::Text { ref contents } = self.style_node.node.data {
+            return self.layout_text(contents.borrow().to_string(), current_x, current_y, container_width);
         }
+
+        let child_container_w = if width > 0.0 { width } else { container_width } 
+                                - self.padding.left - self.padding.right - self.border.left - self.border.right;
+        let mut child_x = self.dimensions.x + self.padding.left + self.border.left;
+        let mut child_y = self.dimensions.y + self.padding.top + self.border.top;
+        let mut max_child_y = child_y;
+        let mut max_child_x = child_x;
+
+        for child_node in &self.style_node.children {
+            if should_skip(child_node) { continue; }
+            let (child_box, next_x, next_y) = build_layout_tree(child_node, self.dimensions.x + self.padding.left, child_x, child_y, child_container_w);
+            if let Some(cb) = child_box {
+                max_child_y = max_child_y.max(cb.dimensions.y + cb.dimensions.height + cb.margin.bottom);
+                max_child_x = max_child_x.max(cb.dimensions.x + cb.dimensions.width + cb.margin.right);
+                self.children.push(cb);
+                child_x = next_x;
+                child_y = next_y;
+            }
+        }
+
+        if self.dimensions.width <= 0.0 {
+            self.dimensions.width = (max_child_x - self.dimensions.x + self.padding.right + self.border.right).min(container_width);
+        }
+        self.dimensions.height = (max_child_y - self.dimensions.y + self.padding.bottom + self.border.bottom).max(20.0);
+
+        let final_x = if is_block { container_start_x } else { self.dimensions.x + self.dimensions.width + self.margin.right };
+        let final_y = if is_block { self.dimensions.y + self.dimensions.height + self.margin.bottom } else { current_y };
+        (Some(self.clone()), final_x, final_y)
     }
 
-    // Auto-size width if not specified
-    if layout.dimensions.width <= 0.0 {
-        layout.dimensions.width = (child_current_x - layout.dimensions.x + padding_right)
-            .min(container_width - margin_h);
+    fn layout_text(&mut self, text: String, current_x: f32, current_y: f32, container_width: f32) -> (Option<LayoutBox<'a>>, f32, f32) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() { return (None, current_x, current_y); }
+        let font_size = get_prop(self.style_node, "font-size", "", container_width).max(16.0);
+        let font = FontRef::try_from_slice(FONT_DATA).unwrap();
+        let scale = PxScale::from(font_size);
+        let units = font.units_per_em().unwrap_or(1000.0) as f32;
+
+        let mut lines_count = 1;
+        let mut line_w: f32 = 0.0;
+        let mut max_w: f32 = 0.0;
+        let space_w = font.h_advance_unscaled(font.glyph_id(' ')) * (scale.x / units);
+
+        for word in trimmed.split_whitespace() {
+            let mut word_w = 0.0;
+            for c in word.chars() { word_w += font.h_advance_unscaled(font.glyph_id(c)) * (scale.x / units); }
+            if line_w + word_w > container_width && line_w > 0.0 {
+                max_w = max_w.max(line_w);
+                line_w = word_w;
+                lines_count += 1;
+            } else {
+                if line_w > 0.0 { line_w += space_w; }
+                line_w += word_w;
+            }
+        }
+        max_w = max_w.max(line_w);
+        self.dimensions.width = max_w.min(container_width);
+        self.dimensions.height = lines_count as f32 * (font_size * 1.4);
+        let final_x = current_x + self.dimensions.width + self.margin.right;
+        (Some(self.clone()), final_x, current_y)
     }
+}
 
-    // Explicit height
-    let explicit_height = match style_node.specified_values.get("height") {
-        Some(Value::Length(h, Unit::Px)) => Some(*h),
-        Some(Value::Length(_h, Unit::Percent)) => None, // skip for now
-        _ => None,
-    };
-
-    let min_height = match display {
-        DisplayType::Input => 30.0,
-        DisplayType::Image => 100.0,
+fn get_prop(sn: &StyledNode, p1: &str, p2: &str, cw: f32) -> f32 {
+    match sn.specified_values.get(p1).or(sn.specified_values.get(p2)) {
+        Some(Value::Length(v, Unit::Px)) => *v,
+        Some(Value::Length(v, Unit::Percent)) => cw * (v / 100.0),
         _ => 0.0,
-    };
-
-    layout.dimensions.height = if let Some(h) = explicit_height {
-        h
-    } else {
-        (max_y_in_box - layout.dimensions.y + padding_bottom).max(min_height)
-    };
-
-    let (final_x, final_y) = if is_block {
-        (container_start_x, layout.dimensions.y + layout.dimensions.height + margin_bottom)
-    } else {
-        (layout.dimensions.x + layout.dimensions.width + margin_right, current_y)
-    };
-
-    (Some(layout), final_x, final_y)
+    }
 }
 
-/// Flexbox layout: positions children according to flex rules.
-fn build_flex_layout<'a>(
-    style_node: &'a StyledNode,
-    mut layout: LayoutBox<'a>,
-    padding_left: f32,
-    padding_right: f32,
-    padding_top: f32,
-    padding_bottom: f32,
-    margin_bottom: f32,
-    container_start_x: f32,
-) -> (Option<LayoutBox<'a>>, f32, f32) {
-    let flex_direction = get_keyword(style_node, "flex-direction").unwrap_or("row");
-    let justify_content = get_keyword(style_node, "justify-content").unwrap_or("flex-start");
-    let align_items = get_keyword(style_node, "align-items").unwrap_or("stretch");
-
-    let inner_x = layout.dimensions.x + padding_left;
-    let inner_y = layout.dimensions.y + padding_top;
-    let inner_width = layout.dimensions.width - padding_left - padding_right;
-
-    // Build all children at (0,0) to get their natural sizes
-    let mut children: Vec<LayoutBox<'a>> = Vec::new();
-    for child in &style_node.children {
-        if should_skip(child) { continue; }
-        let (child_box, _, _) = build_layout_tree(child, 0.0, 0.0, 0.0, inner_width);
-        if let Some(cb) = child_box {
-            children.push(cb);
+fn get_display_type(sn: &StyledNode) -> DisplayType {
+    if let NodeData::Text { .. } = sn.node.data { return DisplayType::Inline; }
+    if let Some(Value::Keyword(d)) = sn.specified_values.get("display") {
+        match d.as_str() {
+            "block" => return DisplayType::Block,
+            "inline-block" => return DisplayType::InlineBlock,
+            "flex" => return DisplayType::Flex,
+            "none" => return DisplayType::Inline, // will be handled by is_none_display
+            _ => {}
         }
     }
-
-    if flex_direction == "column" {
-        // Stack children vertically
-        let mut current_y = inner_y;
-        for child in &mut children {
-            let dx = inner_x - child.dimensions.x;
-            let dy = current_y - child.dimensions.y;
-            offset_layout_box(child, dx, dy);
-            current_y += child.dimensions.height;
+    if let NodeData::Element { ref name, .. } = sn.node.data {
+        match name.local.to_string().as_str() {
+            "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" |
+            "body" | "header" | "footer" | "nav" | "section" | "article" |
+            "ul" | "ol" | "li" | "main" | "aside" => DisplayType::Block,
+            "input" | "button" => DisplayType::Input,
+            "img" => DisplayType::Image,
+            _ => DisplayType::Inline,
         }
-        let total_height = (current_y - inner_y + padding_bottom).max(20.0);
-        layout.dimensions.height = total_height;
-        layout.children = children;
-        let final_y = layout.dimensions.y + layout.dimensions.height + margin_bottom;
-        return (Some(layout), container_start_x, final_y);
-    }
-
-    // Row layout
-    let total_child_width: f32 = children.iter().map(|c| c.dimensions.width).sum();
-    let max_child_height: f32 = children.iter()
-        .map(|c| c.dimensions.height)
-        .fold(0.0_f32, f32::max);
-    let n = children.len();
-
-    let (start_x, gap) = match justify_content {
-        "center" => (
-            inner_x + (inner_width - total_child_width) / 2.0,
-            0.0
-        ),
-        "flex-end" => (inner_x + inner_width - total_child_width, 0.0),
-        "space-between" => {
-            let gap = if n > 1 {
-                (inner_width - total_child_width) / (n as f32 - 1.0)
-            } else {
-                0.0
-            };
-            (inner_x, gap.max(0.0))
-        }
-        "space-around" => {
-            let unit = if n > 0 {
-                (inner_width - total_child_width) / n as f32
-            } else {
-                0.0
-            };
-            (inner_x + unit / 2.0, unit.max(0.0))
-        }
-        "space-evenly" => {
-            let unit = if n > 0 {
-                (inner_width - total_child_width) / (n as f32 + 1.0)
-            } else {
-                0.0
-            };
-            (inner_x + unit, unit.max(0.0))
-        }
-        _ => (inner_x, 0.0), // flex-start
-    };
-
-    let mut current_x = start_x;
-    for child in &mut children {
-        let child_y = match align_items {
-            "center" => inner_y + (max_child_height - child.dimensions.height) / 2.0,
-            "flex-end" => inner_y + max_child_height - child.dimensions.height,
-            "stretch" => {
-                // Stretch child height to fill container
-                child.dimensions.height = max_child_height;
-                inner_y
-            }
-            _ => inner_y, // flex-start
-        };
-
-        let dx = current_x - child.dimensions.x;
-        let dy = child_y - child.dimensions.y;
-        offset_layout_box(child, dx, dy);
-        current_x += child.dimensions.width + gap;
-    }
-
-    let total_height = (max_child_height + padding_top + padding_bottom).max(20.0);
-    layout.dimensions.height = total_height;
-    layout.children = children;
-    let final_y = layout.dimensions.y + layout.dimensions.height + margin_bottom;
-    (Some(layout), container_start_x, final_y)
+    } else { DisplayType::Block }
 }
 
-/// Recursively offset a layout box and all its descendants.
+
+fn is_block_level(d: DisplayType) -> bool {
+    matches!(d, DisplayType::Block | DisplayType::ListItem | DisplayType::Table | DisplayType::Flex)
+}
+
+fn is_none_display(sn: &StyledNode) -> bool {
+    if let Some(Value::Keyword(d)) = sn.specified_values.get("display") { d == "none" } else { false }
+}
+
+fn should_skip(child: &StyledNode) -> bool {
+    if let NodeData::Element { ref name, .. } = child.node.data {
+        let t = name.local.to_string();
+        matches!(t.as_str(), "head" | "style" | "meta" | "title" | "script" | "link" | "noscript")
+    } else { false }
+}
+
 pub fn offset_layout_box(layout: &mut LayoutBox, dx: f32, dy: f32) {
     layout.dimensions.x += dx;
     layout.dimensions.y += dy;
-    for child in &mut layout.children {
-        offset_layout_box(child, dx, dy);
-    }
+    for child in &mut layout.children { offset_layout_box(child, dx, dy); }
 }
-
-// ── LayoutBox methods ─────────────────────────────────────────────────────────
 
 impl<'a> LayoutBox<'a> {
     pub fn hit_test(&self, x: f32, y: f32) -> Option<&LayoutBox<'a>> {
         let d = self.dimensions;
         if x >= d.x && x <= d.x + d.width && y >= d.y && y <= d.y + d.height {
             for child in self.children.iter().rev() {
-                if let Some(node) = child.hit_test(x, y) {
-                    return Some(node);
-                }
+                if let Some(node) = child.hit_test(x, y) { return Some(node); }
             }
             return Some(self);
         }
         None
     }
-
-    pub fn get_links(&self) -> Vec<(Rect, String)> {
-        let mut links = Vec::new();
-        if let Some(ref url) = self.link_url {
-            links.push((self.dimensions, url.clone()));
-        }
-        for child in &self.children {
-            links.extend(child.get_links());
-        }
-        links
+    pub fn collect_links(&self, list: &mut Vec<(Rect, String)>) {
+        if let Some(ref url) = self.link_url { list.push((self.dimensions, url.clone())); }
+        for child in &self.children { child.collect_links(list); }
     }
-
-    pub fn get_form_controls(&self) -> Vec<(Rect, &'a StyledNode)> {
-        let mut controls = Vec::new();
-        if let DisplayType::Input = self.display {
-            controls.push((self.dimensions, self.style_node));
-        }
-        for child in &self.children {
-            controls.extend(child.get_form_controls());
-        }
-        controls
+    pub fn collect_event_handlers(&self, list: &mut Vec<(Rect, String)>) {
+        if let Some(script) = self.event_handlers.get("click") { list.push((self.dimensions, script.clone())); }
+        for child in &self.children { child.collect_event_handlers(list); }
     }
-
-    pub fn get_images(&self) -> Vec<(Rect, String)> {
-        let mut images = Vec::new();
-        if let Some(ref url) = self.image_url {
-            images.push((self.dimensions, url.clone()));
-        }
-        for child in &self.children {
-            images.extend(child.get_images());
-        }
-        images
+    pub fn collect_form_controls(&self, list: &mut Vec<(Rect, &'a StyledNode)>) {
+        if self.display == DisplayType::Input { list.push((self.dimensions, self.style_node)); }
+        for child in &self.children { child.collect_form_controls(list); }
+    }
+    pub fn collect_images(&self, list: &mut Vec<(Rect, String)>) {
+        if let Some(ref url) = self.image_url { list.push((self.dimensions, url.clone())); }
+        for child in &self.children { child.collect_images(list); }
     }
 }
 
 pub fn print_layout_tree(layout: &LayoutBox, indent: usize) {
     let indent_str = " ".repeat(indent * 2);
-    let tag = match &layout.style_node.node.data {
-        NodeData::Element { ref name, .. } => name.local.to_string(),
-        NodeData::Text { ref contents } => format!("Text({:?})", &contents.borrow()[..contents.borrow().len().min(20)]),
-        _ => "Node".to_string(),
-    };
-    println!("{}{} [{:?}] [{:.1},{:.1} {:.1}x{:.1}]",
-        indent_str, tag, layout.display,
-        layout.dimensions.x, layout.dimensions.y,
-        layout.dimensions.width, layout.dimensions.height);
-    for child in &layout.children {
-        print_layout_tree(child, indent + 1);
+    println!("{}{} [{:?}] [{:.1},{:.1} {:.1}x{:.1}]", indent_str, "Node", layout.display, layout.dimensions.x, layout.dimensions.y, layout.dimensions.width, layout.dimensions.height);
+    for child in &layout.children { print_layout_tree(child, indent + 1); }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dom;
+    use crate::css;
+    use crate::style;
+
+    #[test]
+    fn test_button_coordinate_collection() {
+        let html = r#"<button onclick="alert(1)" style="width: 100px; height: 50px; margin: 10px;">Click me</button>"#;
+        let dom = dom::parse_html(html);
+        let stylesheet = css::parse_css("");
+        let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new());
+        
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 1024.0);
+        let layout = layout_opt.unwrap();
+        
+        let mut handlers = Vec::new();
+        layout.collect_event_handlers(&mut handlers);
+        
+        assert_eq!(handlers.len(), 1);
+        let (rect, script) = &handlers[0];
+        assert_eq!(script, "alert(1)");
+        // x: current_x(0) + margin_left(10) = 10.0
+        assert_eq!(rect.x, 10.0);
+        assert_eq!(rect.width, 100.0);
+    }
+
+    #[test]
+    fn test_margin_auto_centering() {
+        let html = r#"<div style="display: block; width: 500px; margin: auto;">Content</div>"#;
+        let dom = dom::parse_html(html);
+        let stylesheet = css::parse_css("");
+        let mut style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new());
+        
+        // Ensure the style is manually set if parser was ambiguous
+        if let NodeData::Element { .. } = style_tree.children[0].node.data {
+            style_tree.children[0].specified_values.insert("display".to_string(), css::Value::Keyword("block".to_string()));
+            style_tree.children[0].specified_values.insert("width".to_string(), css::Value::Length(500.0, css::Unit::Px));
+            style_tree.children[0].specified_values.insert("margin".to_string(), css::Value::Keyword("auto".to_string()));
+        }
+
+        let (layout_opt, _, _) = build_layout_tree(&style_tree.children[0], 0.0, 0.0, 0.0, 1000.0);
+        let layout = layout_opt.unwrap();
+        
+        assert_eq!(layout.dimensions.width, 500.0);
+        assert_eq!(layout.dimensions.x, 250.0); // (1000 - 500) / 2
     }
 }

@@ -194,30 +194,29 @@ fn process_html_with_cache(
     let mut pixmap = tiny_skia::Pixmap::new(width, height).unwrap();
     pixmap.fill(tiny_skia::Color::WHITE);
 
-    let mut links = Vec::new();
+    let mut links: Vec<(layout::Rect, String)> = Vec::new();
     let mut form_controls = Vec::new();
     let mut event_handlers = Vec::new();
     let mut image_urls = Vec::new();
 
     if let Some(ref root) = layout_tree {
         render::render_layout_tree(root, &mut pixmap, image_cache);
-        links = root.get_links();
-
-        image_urls = root.get_images().into_iter().map(|(_, url)| {
+        
+        let mut links = Vec::new();
+        root.collect_links(&mut links);
+        
+        root.collect_event_handlers(&mut event_handlers);
+        
+        let mut controls_with_nodes = Vec::new();
+        root.collect_form_controls(&mut controls_with_nodes);
+        
+        let mut image_urls_raw = Vec::new();
+        root.collect_images(&mut image_urls_raw);
+        image_urls = image_urls_raw.into_iter().map(|(_, url)| {
             base_url.join(&url).map(|u| u.to_string()).unwrap_or(url)
         }).collect();
 
-        fn collect_handlers(l: &layout::LayoutBox, out: &mut Vec<(layout::Rect, String)>) {
-            for (evt, script) in &l.event_handlers {
-                if evt == "click" {
-                    out.push((l.dimensions, script.clone()));
-                }
-            }
-            for child in &l.children { collect_handlers(child, out); }
-        }
-        collect_handlers(root, &mut event_handlers);
-
-        for (rect, node) in root.get_form_controls() {
+        for (rect, node) in controls_with_nodes {
             let mut val = String::new();
             if let markup5ever_rcdom::NodeData::Element { ref attrs, .. } = node.node.data {
                 for attr in attrs.borrow().iter() {
