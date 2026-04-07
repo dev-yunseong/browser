@@ -4,8 +4,8 @@ use crate::layout::LayoutBox;
 use crate::css::Value;
 use markup5ever_rcdom::NodeData;
 
-// Using a common system font path
-const FONT_DATA: &[u8] = include_bytes!("/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf");
+// Using a bundled font included in the project assets
+const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/DejaVuSans.ttf");
 
 pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap) {
     // 1. Render Background
