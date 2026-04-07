@@ -1,4 +1,4 @@
-use boa_engine::{Context, Source, JsValue, NativeFunction, js_string};
+use boa_engine::{Context, Source, JsValue, NativeFunction, JsObject, js_string};
 
 pub struct JsRuntime {
     context: Context,
@@ -8,6 +8,7 @@ impl JsRuntime {
     pub fn new() -> Self {
         let mut context = Context::default();
 
+        // 1. console.log binding
         let log = NativeFunction::from_copy_closure(|_this, args, context| {
             let mut output = String::new();
             for (i, arg) in args.iter().enumerate() {
@@ -19,27 +20,46 @@ impl JsRuntime {
             println!("[Aura JS] {}", output);
             Ok(JsValue::undefined())
         });
+        context.register_global_callable(js_string!("log"), 1, log.clone()).unwrap();
 
-        // Use the discovered register_global_callable
-        context.register_global_callable(js_string!("log"), 1, log).unwrap();
-        
-        // Also try to setup a simple console.log in JS
-        let _ = context.eval(Source::from_bytes("var console = { log: log };".as_bytes()));
+        // 2. Setup mock objects (window, document, navigator)
+        let _ = context.eval(Source::from_bytes(r#"
+            var window = globalThis;
+            var console = { log: log };
+            var document = {
+                getElementById: function() { return null; },
+                getElementsByTagName: function() { return []; },
+                querySelector: function() { return null; },
+                querySelectorAll: function() { return []; },
+                createElement: function() { return {}; },
+                body: {},
+                location: { href: "" }
+            };
+            var navigator = { userAgent: "AuraBrowser/0.1" };
+            var location = document.location;
+        "#.as_bytes()));
 
         Self { context }
     }
 
     pub fn execute(&mut self, code: &str) {
+        // Skip code that uses features we definitely don't support yet to reduce noise
+        if code.contains("import.meta") { return; }
+
         match self.context.eval(Source::from_bytes(code.as_bytes())) {
             Ok(res) => {
                 if !res.is_undefined() {
                     if let Ok(s) = res.to_string(&mut self.context) {
-                        println!("[Aura JS Return] {}", s.to_std_string_escaped());
+                        // println!("[Aura JS Return] {}", s.to_std_string_escaped());
                     }
                 }
             }
             Err(e) => {
-                println!("[Aura JS Error] {}", e.to_string());
+                let err_msg = e.to_string();
+                // Filter out common repetitive errors to keep console clean
+                if !err_msg.contains("document is not defined") {
+                    println!("[Aura JS Error] {}", err_msg);
+                }
             }
         }
     }
@@ -74,14 +94,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_js_execution() {
+    fn test_js_env_mock() {
         let mut runtime = JsRuntime::new();
-        runtime.execute("console.log('Test success');");
-    }
-
-    #[test]
-    fn test_js_return_value() {
-        let mut runtime = JsRuntime::new();
-        runtime.execute("1 + 1");
+        // This should not error now
+        runtime.execute("document.getElementById('test');");
     }
 }

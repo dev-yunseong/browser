@@ -59,7 +59,7 @@ fn get_display_type(style_node: &StyledNode) -> DisplayType {
             "table" => DisplayType::Table,
             "tr" => DisplayType::TableRow,
             "td" | "th" => DisplayType::TableCell,
-            "input" | "textarea" => DisplayType::Input,
+            "input" | "textarea" | "button" => DisplayType::Input,
             _ => DisplayType::Inline,
         }
     } else {
@@ -91,7 +91,7 @@ pub fn build_layout_tree<'a>(
         _ => 0.0,
     };
 
-    // 1. Text Node Handling
+    // 3. 텍스트 노드 특수 처리
     if let markup5ever_rcdom::NodeData::Text { ref contents } = style_node.node.data {
         let text = contents.borrow().to_string();
         let trimmed = text.trim();
@@ -163,7 +163,7 @@ pub fn build_layout_tree<'a>(
         return (Some(layout), next_x, next_y);
     }
 
-    // 2. Element Handling
+    // 4. 일반 박스 처리
     let layout_width_spec = match style_node.specified_values.get("width") {
         Some(Value::Length(w, Unit::Px)) => *w,
         Some(Value::Length(w, Unit::Vw)) => container_width * (*w / 100.0),
@@ -203,17 +203,22 @@ pub fn build_layout_tree<'a>(
         display,
     };
 
+    // [ENHANCED LINK DETECTION] Search for links in current element OR nearest interactive parent
     if let markup5ever_rcdom::NodeData::Element { ref attrs, ref name, .. } = style_node.node.data {
-        if name.local.to_string() == "a" {
+        let t_name = name.local.to_string();
+        if t_name == "a" {
             for attr in attrs.borrow().iter() {
                 if attr.name.local.to_string() == "href" {
                     layout.link_url = Some(attr.value.to_string());
                 }
             }
+        } else if t_name == "button" {
+            // Placeholder for button actions
+            layout.link_url = Some("#button-clicked".to_string());
         }
     }
 
-    // 3. Child Placement
+    // 5. 자식 노드 배치
     let mut child_current_x = layout.dimensions.x + padding;
     let mut child_current_y = layout.dimensions.y + padding;
     let child_start_x = child_current_x;
@@ -293,7 +298,6 @@ impl<'a> LayoutBox<'a> {
     pub fn get_links(&self) -> Vec<(Rect, String)> {
         let mut links = Vec::new();
         if let Some(ref url) = self.link_url {
-            // Use parent box dimensions for links to ensure they cover children
             links.push((self.dimensions, url.clone()));
         }
         for child in &self.children {
