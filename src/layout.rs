@@ -237,7 +237,7 @@ impl<'a> LayoutBox<'a> {
 
             if child_is_block {
                 if !current_line.members.is_empty() {
-                    let old_line = std::mem::replace(&mut current_line, Line { members: Vec::new(), width: 0.0, height: 0.0 });
+                    let old_line = std::mem::replace(&mut current_line, Line { members: Vec::new(), width: 0.0, height: 0.0, ascent: 0.0, descent: 0.0 });
                     items.push(LayoutItem::Line(old_line));
                 }
                 let (cb_opt, _, _) = build_layout_tree(child_node, self.dimensions.x + self.padding.left + self.border.left, self.dimensions.x + self.padding.left + self.border.left, 0.0, inner_width, vw, vh);
@@ -249,7 +249,7 @@ impl<'a> LayoutBox<'a> {
                 if let Some(cb) = cb_opt {
                     let item_w = cb.dimensions.width + cb.margin.left + cb.margin.right;
                     if current_line.width + item_w > inner_width && !current_line.members.is_empty() {
-                        let old_line = std::mem::replace(&mut current_line, Line { members: Vec::new(), width: 0.0, height: 0.0 });
+                        let old_line = std::mem::replace(&mut current_line, Line { members: Vec::new(), width: 0.0, height: 0.0, ascent: 0.0, descent: 0.0 });
                         items.push(LayoutItem::Line(old_line));
                         let (new_cb_opt, _, _) = build_layout_tree(child_node, self.dimensions.x + self.padding.left + self.border.left, self.dimensions.x + self.padding.left + self.border.left, 0.0, inner_width, vw, vh);
                         if let Some(new_cb) = new_cb_opt {

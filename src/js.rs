@@ -1,18 +1,21 @@
 use boa_engine::{Context, Source, JsValue, NativeFunction, js_string};
 use std::collections::{HashMap, VecDeque};
-use markup5ever_rcdom::NodeData;
+use markup5ever_rcdom::{NodeData, Handle, Node};
 use std::cell::RefCell;
+use html5ever::{QualName, LocalName, Namespace, ns, local_name};
 
 thread_local! {
     static MACRO_TASKS: RefCell<VecDeque<Box<dyn FnOnce(&mut Context)>>> = RefCell::new(VecDeque::new());
+    static MICRO_TASKS: RefCell<VecDeque<Box<dyn FnOnce(&mut Context)>>> = RefCell::new(VecDeque::new());
 }
 
 pub struct JsRuntime {
     context: Context,
+    dom: Option<Handle>,
 }
 
 impl JsRuntime {
-    pub fn new() -> Self {
+    pub fn new(dom: Option<Handle>) -> Self {
         let mut context = Context::default();
 
         // Register native console.log
@@ -46,24 +49,83 @@ impl JsRuntime {
         });
         context.register_global_callable(js_string!("__aura_queue_task"), 1, queue_task).unwrap();
 
+        // Register native queueMicrotask
+        let queue_microtask = NativeFunction::from_copy_closure(|_this, args, _context| {
+            if let Some(callback) = args.get(0).cloned() {
+                if let Some(obj) = callback.as_object() {
+                    if obj.is_callable() {
+                        MICRO_TASKS.with(|tasks| {
+                            tasks.borrow_mut().push_back(Box::new(move |ctx| {
+                                let _ = callback.as_callable().unwrap().call(&JsValue::undefined(), &[], ctx);
+                            }));
+                        });
+                    }
+                }
+            }
+            Ok(JsValue::undefined())
+        });
+        context.register_global_callable(js_string!("queueMicrotask"), 1, queue_microtask).unwrap();
+
+        // Register native __aura_append_child
+        let dom_ref = dom.clone();
+        let append_child = NativeFunction::from_copy_closure(move |_this, args, context| {
+            let parent_id = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            let child_tag = args.get(1).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            
+            if let Some(ref root) = dom_ref {
+                if let Some(parent) = find_element_by_id(root, &parent_id) {
+                    let name = QualName::new(
+                        None, 
+                        Namespace::from("http://www.w3.org/1999/xhtml"), 
+                        LocalName::from(child_tag)
+                    );
+                    let new_node = Node::new(NodeData::Element {
+                        name,
+                        attrs: RefCell::new(Vec::new()),
+                        template_contents: RefCell::new(None),
+                        mathml_annotation_xml_integration_point: false,
+                    });
+                    // Set parent of the new node to allow traversal upwards
+                    new_node.parent.set(Some(std::rc::Rc::downgrade(&parent)));
+                    parent.children.borrow_mut().push(new_node);
+                    println!("[Aura JS] Appended <{}> to #{}", child_tag, parent_id);
+                }
+            }
+            Ok(JsValue::undefined())
+        });
+        context.register_global_callable(js_string!("__aura_append_child"), 2, append_child).unwrap();
+
         // Load the full JS environment
         const BOOTSTRAP: &[u8] = include_bytes!("js_bootstrap.js");
         if let Err(e) = context.eval(Source::from_bytes(BOOTSTRAP)) {
             println!("[Aura JS Bootstrap Error] {}", e);
         }
 
-        Self { context }
+        Self { context, dom }
     }
 
-    /// Drain and run all queued macro-tasks.
+    /// Drain and run all queued macro-tasks and their associated micro-tasks.
     pub fn run_queued_tasks(&mut self) {
-        let mut tasks_to_run = VecDeque::new();
-        MACRO_TASKS.with(|tasks| {
-            tasks_to_run = std::mem::take(&mut *tasks.borrow_mut());
-        });
+        loop {
+            let task = MACRO_TASKS.with(|tasks| tasks.borrow_mut().pop_front());
+            if let Some(task) = task {
+                task(&mut self.context);
+                // Run all microtasks after each macro-task (spec compliant)
+                self.run_microtasks();
+            } else {
+                break;
+            }
+        }
+    }
 
-        while let Some(task) = tasks_to_run.pop_front() {
-            task(&mut self.context);
+    pub fn run_microtasks(&mut self) {
+        loop {
+            let micro = MICRO_TASKS.with(|tasks| tasks.borrow_mut().pop_front());
+            if let Some(m) = micro {
+                m(&mut self.context);
+            } else {
+                break;
+            }
         }
     }
 
@@ -105,6 +167,31 @@ impl JsRuntime {
         let _ = self.context.eval(Source::from_bytes(b"__aura_style_log = [];"));
         result
     }
+
+    pub fn context(&mut self) -> &mut Context {
+        &mut self.context
+    }
+}
+
+fn find_element_by_id(handle: &Handle, id: &str) -> Option<Handle> {
+    if let NodeData::Element { ref name, ref attrs, .. } = handle.data {
+        // Special case: if ID is "body", also match the <body> tag itself
+        if id == "body" && name.local.to_string() == "body" {
+            return Some(handle.clone());
+        }
+
+        for attr in attrs.borrow().iter() {
+            if attr.name.local.to_string() == "id" && attr.value.to_string() == id {
+                return Some(handle.clone());
+            }
+        }
+    }
+    for child in handle.children.borrow().iter() {
+        if let Some(found) = find_element_by_id(child, id) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 pub fn extract_scripts_from_dom(handle: &markup5ever_rcdom::Handle) -> Vec<String> {
