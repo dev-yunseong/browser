@@ -214,6 +214,7 @@ fn process_html_with_cache(
     js_overrides: &HashMap<String, HashMap<String, String>>,
     width: f32,
 ) -> Result<StaticPageData, Box<dyn Error + Send + Sync>> {
+    let width = width.max(1.0);
     let dom_tree = dom::parse_html(body);
 
     // Collect inline + external CSS in order (C6)
@@ -227,9 +228,9 @@ fn process_html_with_cache(
         layout::build_layout_tree(&style_tree, 0.0, 0.0, 0.0, width, width, 768.0);
 
     let height = (final_y.ceil() as u32).clamp(600, 16384);
-    let w = (width as u32).max(1);
-    let mut pixmap = tiny_skia::Pixmap::new(w, height)
-        .ok_or_else(|| format!("Failed to create pixmap with size {}x{}", w, height))?;
+    let w_u32 = width as u32;
+    let mut pixmap = tiny_skia::Pixmap::new(w_u32, height)
+        .ok_or_else(|| format!("Failed to create pixmap with size {}x{}", w_u32, height))?;
 
     pixmap.fill(tiny_skia::Color::WHITE);
 
@@ -343,7 +344,9 @@ impl eframe::App for BrowserApp {
                         if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             let url = self.url.clone();
                             let width = ui.available_width();
-                            self.load_url(url, width);
+                            if width >= 1.0 {
+                                self.load_url(url, width);
+                            }
                         }
                     });
 
@@ -357,7 +360,9 @@ impl eframe::App for BrowserApp {
                     ).clicked() {
                         let url = self.url.clone();
                         let width = ui.available_width();
-                        self.load_url(url, width);
+                        if width >= 1.0 {
+                            self.load_url(url, width);
+                        }
                     }
                 });
 
