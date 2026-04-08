@@ -161,7 +161,7 @@ fn strip_at_rules(source: &str) -> String {
     result
 }
 
-fn parse_quad_shorthand(prefix: &str, val: &str, declarations: &mut HashMap<String, Value>) {
+pub fn parse_quad_shorthand(prefix: &str, val: &str, declarations: &mut HashMap<String, Value>) {
     let parts: Vec<&str> = val.split_whitespace().collect();
     let (top, right, bottom, left) = match parts.len() {
         1 => (parts[0], parts[0], parts[0], parts[0]),
@@ -205,6 +205,10 @@ fn parse_selector(s: &str) -> Selector {
         }
     }
     selector
+}
+
+pub fn parse_border_shorthand_pub(val: &str, declarations: &mut HashMap<String, Value>) {
+    parse_border_shorthand(val, declarations);
 }
 
 fn parse_border_shorthand(val: &str, declarations: &mut HashMap<String, Value>) {

@@ -120,8 +120,16 @@ fn render_text_wrapped(text: String, layout: &LayoutBox, pixmap: &mut Pixmap) {
         for (gid, adv) in glyphs {
             let glyph = gid.with_scale_and_position(scale, point(current_x, current_y));
             if let Some(outline) = font.outline_glyph(glyph) {
+                // px_bounds().min gives the glyph's top-left position in page space.
+                // draw() gives (gx, gy) as offsets *within* that bounding box (0-based).
+                // We must add min to get the actual page-space pixel coordinate.
+                let bounds = outline.px_bounds();
                 outline.draw(|gx, gy, coverage| {
-                    blend_glyph_pixel(pixmap, gx as u32, gy as u32, coverage, &color);
+                    let px = bounds.min.x as i32 + gx as i32;
+                    let py = bounds.min.y as i32 + gy as i32;
+                    if px >= 0 && py >= 0 {
+                        blend_glyph_pixel(pixmap, px as u32, py as u32, coverage, &color);
+                    }
                 });
             }
             current_x += adv;

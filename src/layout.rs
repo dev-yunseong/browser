@@ -160,29 +160,88 @@ self.dimensions.width = width;
             return self.layout_text(contents.borrow().to_string(), current_x, current_y, container_width);
         }
 
-        let child_container_w = if width > 0.0 { width } else { container_width } 
+        let child_container_w = if width > 0.0 { width } else { container_width }
                                 - self.padding.left - self.padding.right - self.border.left - self.border.right;
         let mut child_x = self.dimensions.x + self.padding.left + self.border.left;
         let mut child_y = self.dimensions.y + self.padding.top + self.border.top;
         let mut max_child_y = child_y;
         let mut max_child_x = child_x;
 
-        for child_node in &self.style_node.children {
-            if should_skip(child_node) { continue; }
-            let (child_box, next_x, next_y) = build_layout_tree(child_node, self.dimensions.x + self.padding.left, child_x, child_y, child_container_w);
-            if let Some(cb) = child_box {
+        if self.display == DisplayType::Flex {
+            // Basic flex row layout (B11): lay children out in a horizontal row.
+            // flex-direction: row is the default; column is not yet implemented.
+            let justify = self.style_node.specified_values.get("justify-content")
+                .and_then(|v| if let Value::Keyword(k) = v { Some(k.as_str()) } else { None })
+                .unwrap_or("flex-start");
+
+            // First pass: measure all children at their natural widths.
+            let mut flex_children: Vec<LayoutBox> = Vec::new();
+            let mut total_child_w = 0.0f32;
+            let mut max_child_h = 0.0f32;
+            let mut flex_x = child_x;
+            for child_node in &self.style_node.children {
+                if should_skip(child_node) { continue; }
+                let (child_box, next_x, _) = build_layout_tree(child_node, child_x, flex_x, child_y, child_container_w);
+                if let Some(cb) = child_box {
+                    let cw = cb.dimensions.width + cb.margin.left + cb.margin.right;
+                    let ch = cb.dimensions.height + cb.margin.top + cb.margin.bottom;
+                    total_child_w += cw;
+                    max_child_h = max_child_h.max(ch);
+                    flex_children.push(cb);
+                    flex_x = next_x;
+                }
+            }
+
+            // Second pass: apply justification offsets.
+            let free_space = (child_container_w - total_child_w).max(0.0);
+            let (start_offset, gap) = match justify {
+                "center" => (free_space / 2.0, 0.0),
+                "flex-end" => (free_space, 0.0),
+                "space-between" => {
+                    let n = flex_children.len().saturating_sub(1);
+                    (0.0, if n > 0 { free_space / n as f32 } else { 0.0 })
+                }
+                "space-around" => {
+                    let n = flex_children.len();
+                    let g = if n > 0 { free_space / n as f32 } else { 0.0 };
+                    (g / 2.0, g)
+                }
+                _ => (0.0, 0.0), // flex-start
+            };
+
+            let mut cursor_x = child_x + start_offset;
+            for (i, mut cb) in flex_children.into_iter().enumerate() {
+                let dx = cursor_x - cb.dimensions.x;
+                offset_layout_box(&mut cb, dx, 0.0);
+                cursor_x += cb.dimensions.width + cb.margin.left + cb.margin.right + if i > 0 { gap } else { 0.0 };
                 max_child_y = max_child_y.max(cb.dimensions.y + cb.dimensions.height + cb.margin.bottom);
                 max_child_x = max_child_x.max(cb.dimensions.x + cb.dimensions.width + cb.margin.right);
                 self.children.push(cb);
-                child_x = next_x;
-                child_y = next_y;
+            }
+        } else {
+            for child_node in &self.style_node.children {
+                if should_skip(child_node) { continue; }
+                let (child_box, next_x, next_y) = build_layout_tree(child_node, self.dimensions.x + self.padding.left, child_x, child_y, child_container_w);
+                if let Some(cb) = child_box {
+                    max_child_y = max_child_y.max(cb.dimensions.y + cb.dimensions.height + cb.margin.bottom);
+                    max_child_x = max_child_x.max(cb.dimensions.x + cb.dimensions.width + cb.margin.right);
+                    self.children.push(cb);
+                    child_x = next_x;
+                    child_y = next_y;
+                }
             }
         }
 
         if self.dimensions.width <= 0.0 {
             self.dimensions.width = (max_child_x - self.dimensions.x + self.padding.right + self.border.right).min(container_width);
         }
-        self.dimensions.height = (max_child_y - self.dimensions.y + self.padding.bottom + self.border.bottom).max(20.0);
+        // Respect explicit height (B9); otherwise derive from children.
+        // Remove the unconditional max(20.0) clamp — it was distorting small boxes.
+        let content_height = (max_child_y - self.dimensions.y + self.padding.bottom + self.border.bottom).max(0.0);
+        self.dimensions.height = match self.style_node.specified_values.get("height") {
+            Some(Value::Length(v, Unit::Px)) => v.max(0.0),
+            _ => content_height,
+        };
 
         let final_x = if is_block { container_start_x } else { self.dimensions.x + self.dimensions.width + self.margin.right };
         let final_y = if is_block { self.dimensions.y + self.dimensions.height + self.margin.bottom } else { current_y };
@@ -192,7 +251,12 @@ self.dimensions.width = width;
     fn layout_text(&mut self, text: String, current_x: f32, current_y: f32, container_width: f32) -> (Option<LayoutBox<'a>>, f32, f32) {
         let trimmed = text.trim();
         if trimmed.is_empty() { return (None, current_x, current_y); }
-        let font_size = get_prop(self.style_node, "font-size", "", container_width).max(16.0);
+        // Use the actual specified font-size; fall back to 16px only when unspecified.
+        // Do NOT clamp to 16px — that causes layout/paint to diverge for small fonts (B4).
+        let font_size = match self.style_node.specified_values.get("font-size") {
+            Some(Value::Length(v, Unit::Px)) => v.max(1.0),
+            _ => 16.0,
+        };
         let font = FontRef::try_from_slice(FONT_DATA).unwrap();
         let scale = PxScale::from(font_size);
         let units = font.units_per_em().unwrap_or(1000.0) as f32;
@@ -220,7 +284,9 @@ self.dimensions.width = width;
         self.dimensions.width = max_w.min(container_width);
         self.dimensions.height = lines_count as f32 * (font_size * 1.4);
         let final_x = self.dimensions.x + self.dimensions.width + self.margin.right;
-        (Some(self.clone()), final_x, current_y)
+        // Advance y past the text block so the next sibling starts below (B8).
+        let final_y = self.dimensions.y + self.dimensions.height + self.margin.bottom;
+        (Some(self.clone()), final_x, final_y)
     }
 }
 
@@ -245,10 +311,15 @@ fn get_display_type(sn: &StyledNode) -> DisplayType {
     }
     if let NodeData::Element { ref name, .. } = sn.node.data {
         match name.local.to_string().as_str() {
+            // html is a block-level container (B10: was falling through to Inline)
+            "html" |
             "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" |
             "body" | "header" | "footer" | "nav" | "section" | "article" |
-            "ul" | "ol" | "li" | "main" | "aside" => DisplayType::Block,
-            "input" | "button" => DisplayType::Input,
+            "ul" | "ol" | "li" | "main" | "aside" | "form" | "table" |
+            "thead" | "tbody" | "tfoot" | "tr" | "th" | "td" | "caption" |
+            "details" | "summary" | "figure" | "figcaption" | "address" |
+            "blockquote" | "pre" | "hr" | "fieldset" | "legend" => DisplayType::Block,
+            "input" | "button" | "select" | "textarea" => DisplayType::Input,
             "img" => DisplayType::Image,
             _ => DisplayType::Inline,
         }

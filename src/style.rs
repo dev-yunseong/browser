@@ -76,15 +76,16 @@ pub fn build_style_tree(
             }
         }
 
-        // 4. Apply inline style attribute (higher priority than CSS rules)
+        // 4. Apply element-specific attribute styles (presentational, lower priority than inline)
+        // C7: attribute styles must come BEFORE inline style so inline style can override them.
+        apply_attribute_styles(&tag_name, &attrs.borrow(), &mut specified_values);
+
+        // 5. Apply inline style attribute (highest priority among author styles)
         for attr in attrs.borrow().iter() {
             if attr.name.local.to_string() == "style" {
                 parse_inline_style(&attr.value.to_string(), &mut specified_values);
             }
         }
-
-        // 5. Apply element-specific attribute styles
-        apply_attribute_styles(&tag_name, &attrs.borrow(), &mut specified_values);
 
         // 6. Apply JS overrides (highest priority)
         if let Some(ref element_id) = id {
@@ -110,6 +111,7 @@ pub fn build_style_tree(
 }
 
 /// Parse `style="..."` attribute content and insert into a property map.
+/// Handles shorthand expansion for `padding`, `margin`, `border` (B6).
 pub fn parse_inline_style(style_str: &str, map: &mut PropertyMap) {
     for decl in style_str.split(';') {
         let decl = decl.trim();
@@ -118,7 +120,12 @@ pub fn parse_inline_style(style_str: &str, map: &mut PropertyMap) {
         let key = kv.next().unwrap_or("").trim().to_lowercase();
         let val_str = kv.next().unwrap_or("").trim().to_string();
         if key.is_empty() || val_str.is_empty() { continue; }
-        map.insert(key, parse_value(&val_str));
+        match key.as_str() {
+            "padding" => crate::css::parse_quad_shorthand("padding", &val_str, map),
+            "margin"  => crate::css::parse_quad_shorthand("margin",  &val_str, map),
+            "border"  => crate::css::parse_border_shorthand_pub(&val_str, map),
+            _ => { map.insert(key, parse_value(&val_str)); }
+        }
     }
 }
 
@@ -222,6 +229,11 @@ fn apply_attribute_styles(tag: &str, attrs_borrow: &std::cell::Ref<Vec<html5ever
 }
 
 fn matches_selector(selector: &Selector, tag: &str, id: Option<&str>, classes: &[String]) -> bool {
+    // C3: an empty selector (no tag, id, or class constraint) would match everything.
+    // Treat it as a non-match to prevent unintended global rule application.
+    if selector.tag.is_none() && selector.id.is_none() && selector.class.is_empty() {
+        return false;
+    }
     if let Some(ref s_tag) = selector.tag {
         if s_tag != tag { return false; }
     }
