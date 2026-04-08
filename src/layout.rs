@@ -120,16 +120,17 @@ impl<'a> LayoutBox<'a> {
     fn perform_layout(
         &mut self, 
         container_start_x: f32, 
-        mut current_x: f32, 
+        _initial_x: f32, 
         mut current_y: f32, 
         container_width: f32,
         vw: f32,
         vh: f32,
     ) -> (Option<LayoutBox<'a>>, f32, f32) {
         let is_block = is_block_level(self.display);
-        if is_block && current_x > container_start_x {
-            current_x = container_start_x;
-            current_y += 5.0;
+        
+        // Block formatting context or similar check
+        if is_block && _initial_x > container_start_x {
+            current_y += 5.0; // Break line before block
         }
 
         let mut width = match self.style_node.specified_values.get("width") {
@@ -147,48 +148,37 @@ impl<'a> LayoutBox<'a> {
             _ => if is_block { (container_width - self.margin.left - self.margin.right).max(0.0) } else { 0.0 },
         };
 
-        // Handle box-sizing: border-box (B5)
-        // If border-box is used, subtract padding and border from the specified width
         let box_sizing = self.style_node.specified_values.get("box-sizing")
             .and_then(|v| if let Value::Keyword(k) = v { Some(k.as_str()) } else { None })
-            .unwrap_or("content-box"); // Default is content-box
+            .unwrap_or("content-box");
 
         if box_sizing == "border-box" && width > 0.0 {
             width = (width - self.padding.left - self.padding.right - self.border.left - self.border.right).max(0.0);
         }
 
-        if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get("max-width") {
-            width = width.min(*v);
-        }
-        if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get("min-width") {
-            width = width.max(*v);
-        }
-// margin: auto 처리 (너비가 결정된 후 수행)
+        if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get("max-width") { width = width.min(*v); }
+        if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get("min-width") { width = width.max(*v); }
+
         if is_block && width < container_width {
             let mut is_auto = false;
             for prop in ["margin", "margin-left", "margin-right"] {
-                if let Some(val) = self.style_node.specified_values.get(prop) {
-                    match val {
-                        Value::Keyword(s) if s.contains("auto") => { is_auto = true; break; }
-                        _ => {}
-                    }
+                if let Some(Value::Keyword(s)) = self.style_node.specified_values.get(prop) {
+                    if s.contains("auto") { is_auto = true; break; }
                 }
             }
-            
             if is_auto {
                 let leftover = (container_width - width).max(0.0);
                 self.margin.left = leftover / 2.0;
                 self.margin.right = leftover / 2.0;
             }
         }
-self.dimensions.x = current_x + self.margin.left;
-self.dimensions.y = current_y + self.margin.top;
-self.dimensions.width = width;
 
+        self.dimensions.x = container_start_x + self.margin.left;
+        self.dimensions.y = current_y + self.margin.top;
+        self.dimensions.width = width;
 
         let height = match self.style_node.specified_values.get("height") {
             Some(Value::Length(v, Unit::Px)) => *v,
-            Some(Value::Length(_, Unit::Percent)) => 0.0, // viewport height or parent height needed
             Some(Value::Length(v, Unit::Vw)) => vw * (v / 100.0),
             Some(Value::Length(v, Unit::Vh)) => vh * (v / 100.0),
             Some(Value::Length(v, Unit::Em)) => {
@@ -202,174 +192,104 @@ self.dimensions.width = width;
         };
 
         if let NodeData::Text { ref contents } = self.style_node.node.data {
-            return self.layout_text(contents.borrow().to_string(), current_x, current_y, container_width);
+            return self.layout_text(contents.borrow().to_string(), self.dimensions.x, current_y, container_width);
         }
 
-        // For shrink-wrap contexts (inline/table-cell with no explicit width), pass
-        // INFINITY so text inside computes its natural unwrapped width instead of
-        // wrapping to container_width and inflating the element to full container width.
-        // Block-level children inside such a context must still receive a finite width,
-        // so we keep a separate finite fallback for them.
-        let effective_cw = if !is_block && width == 0.0 {
-            f32::INFINITY
-        } else if width > 0.0 {
-            width
-        } else {
-            container_width
-        };
-        let child_container_w = (effective_cw
-            - self.padding.left - self.padding.right
-            - self.border.left - self.border.right)
-            .max(0.0);
-        // Finite child container width used for block-level children nested inside
-        // a shrink-wrap parent (INFINITY must not reach block children or their
-        // width would become INFINITY).
-        let finite_child_cw = (if width > 0.0 { width } else { container_width }
-            - self.padding.left - self.padding.right
-            - self.border.left - self.border.right)
-            .max(0.0);
-        let mut child_x = self.dimensions.x + self.padding.left + self.border.left;
-        let mut child_y = self.dimensions.y + self.padding.top + self.border.top;
-        let mut max_child_y = child_y;
-        let mut max_child_x = child_x;
+        // --- NEW UNIFIED LINE-BOX MODEL ---
+        let inner_width = if width > 0.0 { width } else { (container_width - self.padding.left - self.padding.right - self.border.left - self.border.right).max(0.0) };
+        let mut max_child_x = self.dimensions.x;
 
-        if self.display == DisplayType::Flex {
-            // Basic flex row layout (B11): lay children out in a horizontal row.
-            // flex-direction: row is the default; column is not yet implemented.
-            let justify = self.style_node.specified_values.get("justify-content")
-                .and_then(|v| if let Value::Keyword(k) = v { Some(k.as_str()) } else { None })
-                .unwrap_or("flex-start");
+        struct Line<'a> {
+            members: Vec<LayoutBox<'a>>,
+            width: f32,
+            height: f32,
+        }
 
-            // First pass: measure all children at their natural widths.
-            let mut flex_children: Vec<LayoutBox> = Vec::new();
-            let mut total_child_w = 0.0f32;
-            let mut max_child_h = 0.0f32;
-            let mut flex_x = child_x;
-            for child_node in &self.style_node.children {
-                if should_skip(child_node) { continue; }
-                let (child_box, next_x, _) = build_layout_tree(child_node, child_x, flex_x, child_y, child_container_w, vw, vh);
-                if let Some(cb) = child_box {
-                    let cw = cb.dimensions.width + cb.margin.left + cb.margin.right;
-                    let ch = cb.dimensions.height + cb.margin.top + cb.margin.bottom;
-                    total_child_w += cw;
-                    max_child_h = max_child_h.max(ch);
-                    flex_children.push(cb);
-                    flex_x = next_x;
+        enum LayoutItem<'a> {
+            Line(Line<'a>),
+            Block(LayoutBox<'a>),
+        }
+
+        let mut items: Vec<LayoutItem> = Vec::new();
+        let mut current_line = Line { members: Vec::new(), width: 0.0, height: 0.0 };
+
+        for child_node in &self.style_node.children {
+            if should_skip(child_node) { continue; }
+            let child_display = get_display_type(child_node);
+            let child_is_block = is_block_level(child_display);
+
+            if child_is_block {
+                if !current_line.members.is_empty() {
+                    let old_line = std::mem::replace(&mut current_line, Line { members: Vec::new(), width: 0.0, height: 0.0 });
+                    items.push(LayoutItem::Line(old_line));
                 }
-            }
-
-            // Second pass: apply justification offsets.
-            let free_space = (child_container_w - total_child_w).max(0.0);
-            let (start_offset, gap) = match justify {
-                "center" => (free_space / 2.0, 0.0),
-                "flex-end" => (free_space, 0.0),
-                "space-between" => {
-                    let n = flex_children.len().saturating_sub(1);
-                    (0.0, if n > 0 { free_space / n as f32 } else { 0.0 })
+                let (cb_opt, _, _) = build_layout_tree(child_node, self.dimensions.x + self.padding.left + self.border.left, self.dimensions.x + self.padding.left + self.border.left, 0.0, inner_width, vw, vh);
+                if let Some(cb) = cb_opt {
+                    items.push(LayoutItem::Block(cb));
                 }
-                "space-around" => {
-                    let n = flex_children.len();
-                    let g = if n > 0 { free_space / n as f32 } else { 0.0 };
-                    (g / 2.0, g)
-                }
-                _ => (0.0, 0.0), // flex-start
-            };
-
-            let mut cursor_x = child_x + start_offset;
-            for (i, mut cb) in flex_children.into_iter().enumerate() {
-                let dx = cursor_x - cb.dimensions.x;
-                offset_layout_box(&mut cb, dx, 0.0);
-                cursor_x += cb.dimensions.width + cb.margin.left + cb.margin.right + if i > 0 { gap } else { 0.0 };
-                max_child_y = max_child_y.max(cb.dimensions.y + cb.dimensions.height + cb.margin.bottom);
-                max_child_x = max_child_x.max(cb.dimensions.x + cb.dimensions.width + cb.margin.right);
-                self.children.push(cb);
-            }
-        } else {
-            let mut line_height = 0.0f32;
-            for child_node in &self.style_node.children {
-                if should_skip(child_node) { continue; }
-                
-                let child_display = get_display_type(child_node);
-                let child_is_block = is_block_level(child_display);
-                
-                if child_is_block {
-                    // Start a new line if we were in the middle of one
-                    if child_x > self.dimensions.x + self.padding.left + self.border.left {
-                        child_x = self.dimensions.x + self.padding.left + self.border.left;
-                        child_y += line_height;
-                        line_height = 0.0;
-                    }
-                } else {
-                    // Proactive wrapping: check if this inline-like element fits in the remaining width
-                    // We need a quick measure pass or estimate. For now, we'll build it and move it if it overflows.
-                }
-
-                // Block-level children must not receive INFINITY as their container width
-                let cw = if child_container_w.is_infinite() && child_is_block {
-                    finite_child_cw
-                } else {
-                    child_container_w
-                };
-                
-                let (child_box, next_x, next_y) = build_layout_tree(child_node, self.dimensions.x + self.padding.left + self.border.left, child_x, child_y, cw, vw, vh);
-                
-                if let Some(mut cb) = child_box {
-                    if !child_is_block {
-                        // If this inline element pushed current_x past the right edge, wrap it
-                        let right_edge = self.dimensions.x + self.padding.left + self.border.left + child_container_w;
-                        if child_x > self.dimensions.x + self.padding.left + self.border.left && next_x > right_edge && child_container_w.is_finite() {
-                            child_x = self.dimensions.x + self.padding.left + self.border.left;
-                            child_y += line_height;
-                            line_height = 0.0;
-                            
-                            // Re-layout at the new position
-                            let (new_cb, new_nx, _) = build_layout_tree(child_node, self.dimensions.x + self.padding.left + self.border.left, child_x, child_y, cw, vw, vh);
-                            if let Some(ncb) = new_cb {
-                                cb = ncb;
-                                child_x = new_nx;
-                            }
-                        } else {
-                            child_x = next_x;
+            } else {
+                let (cb_opt, _next_x, _) = build_layout_tree(child_node, self.dimensions.x + self.padding.left + self.border.left, self.dimensions.x + self.padding.left + self.border.left + current_line.width, 0.0, inner_width, vw, vh);
+                if let Some(cb) = cb_opt {
+                    let item_w = cb.dimensions.width + cb.margin.left + cb.margin.right;
+                    if current_line.width + item_w > inner_width && !current_line.members.is_empty() {
+                        let old_line = std::mem::replace(&mut current_line, Line { members: Vec::new(), width: 0.0, height: 0.0 });
+                        items.push(LayoutItem::Line(old_line));
+                        let (new_cb_opt, _, _) = build_layout_tree(child_node, self.dimensions.x + self.padding.left + self.border.left, self.dimensions.x + self.padding.left + self.border.left, 0.0, inner_width, vw, vh);
+                        if let Some(new_cb) = new_cb_opt {
+                            let new_item_w = new_cb.dimensions.width + new_cb.margin.left + new_cb.margin.right;
+                            current_line.width = new_item_w;
+                            current_line.height = new_cb.dimensions.height + new_cb.margin.top + new_cb.margin.bottom;
+                            current_line.members.push(new_cb);
                         }
-                        line_height = line_height.max(cb.dimensions.height + cb.margin.top + cb.margin.bottom);
                     } else {
-                        child_y = next_y;
-                        child_x = self.dimensions.x + self.padding.left + self.border.left;
-                        line_height = 0.0;
+                        current_line.width += item_w;
+                        current_line.height = current_line.height.max(cb.dimensions.height + cb.margin.top + cb.margin.bottom);
+                        current_line.members.push(cb);
                     }
-                    
-                    max_child_y = max_child_y.max(child_y + line_height);
-                    max_child_x = max_child_x.max(cb.dimensions.x + cb.dimensions.width + cb.margin.right);
-                    self.children.push(cb);
+                }
+            }
+        }
+        if !current_line.members.is_empty() { items.push(LayoutItem::Line(current_line)); }
+
+        // Position Pass: Stack items vertically
+        let mut cursor_y = self.dimensions.y + self.padding.top + self.border.top;
+        for item in items {
+            match item {
+                LayoutItem::Line(line) => {
+                    let mut cursor_x = self.dimensions.x + self.padding.left + self.border.left;
+                    for mut member in line.members {
+                        let dx = cursor_x - (member.dimensions.x - member.margin.left);
+                        let dy = cursor_y - (member.dimensions.y - member.margin.top);
+                        offset_layout_box(&mut member, dx, dy);
+                        max_child_x = max_child_x.max(member.dimensions.x + member.dimensions.width + member.margin.right);
+                        cursor_x += member.dimensions.width + member.margin.left + member.margin.right;
+                        self.children.push(member);
+                    }
+                    cursor_y += line.height;
+                }
+                LayoutItem::Block(mut block) => {
+                    let dy = cursor_y - (block.dimensions.y - block.margin.top);
+                    offset_layout_box(&mut block, 0.0, dy);
+                    max_child_x = max_child_x.max(block.dimensions.x + block.dimensions.width + block.margin.right);
+                    cursor_y = block.dimensions.y + block.dimensions.height + block.margin.bottom;
+                    self.children.push(block);
                 }
             }
         }
 
         if self.dimensions.width <= 0.0 {
             let derived = max_child_x - self.dimensions.x + self.padding.right + self.border.right;
-            // Clamp to the finite container_width. When container_width is INFINITY
-            // (shrink-wrap context), use the derived natural width directly.
-            self.dimensions.width = if container_width.is_finite() {
-                derived.min(container_width)
-            } else {
-                derived  // natural shrink-wrap width; finite because block children used finite_child_cw
-            };
+            self.dimensions.width = if container_width.is_finite() { derived.min(container_width) } else { derived };
         }
-        // Respect explicit height (B9); otherwise derive from children.
-        // Remove the unconditional max(20.0) clamp — it was distorting small boxes.
-        let content_height = (max_child_y - self.dimensions.y + self.padding.bottom + self.border.bottom).max(0.0);
-        let mut final_h = if height > 0.0 { height } else { content_height };
 
-        if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get("max-height") {
-            final_h = final_h.min(*v);
-        }
-        if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get("min-height") {
-            final_h = final_h.max(*v);
-        }
+        let content_height = (cursor_y - self.dimensions.y + self.padding.bottom + self.border.bottom).max(0.0);
+        let mut final_h = if height > 0.0 { height } else { content_height };
+        if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get("max-height") { final_h = final_h.min(*v); }
+        if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get("min-height") { final_h = final_h.max(*v); }
         self.dimensions.height = final_h;
 
         let final_x = if is_block { container_start_x } else { self.dimensions.x + self.dimensions.width + self.margin.right };
-        let final_y = if is_block { self.dimensions.y + self.dimensions.height + self.margin.bottom } else { current_y };
+        let final_y = if is_block { self.dimensions.y + self.dimensions.height + self.margin.bottom } else { cursor_y };
         (Some(self.clone()), final_x, final_y)
     }
 
@@ -388,9 +308,6 @@ self.dimensions.width = width;
         let mut line_w: f32 = 0.0;
         let mut max_w: f32 = 0.0;
         let space_w = font.h_advance_unscaled(font.glyph_id(' ')) * (scale.x / units);
-
-        // Start x relative to parent container start
-        let mut rel_x = current_x - (self.dimensions.x - self.margin.left);
 
         for word in trimmed.split_whitespace() {
             let mut word_w = 0.0;
