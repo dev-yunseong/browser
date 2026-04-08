@@ -154,12 +154,21 @@ pub fn parse_quad_shorthand(prefix: &str, val: &str, declarations: &mut HashMap<
     declarations.insert(prefix.to_string(), parse_value(top));
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum Combinator {
+    Descendant,
+    Child,
+    NextSibling,
+    SubsequentSibling,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Selector {
     pub tag: Option<String>,
     pub id: Option<String>,
     pub class: Vec<String>,
-    pub descendant: Option<Box<Selector>>,
+    pub combinator: Option<Combinator>,
+    pub ancestor: Option<Box<Selector>>,
 }
 
 impl Selector {
@@ -173,7 +182,7 @@ impl Selector {
         b += self.class.len();
         if self.tag.is_some() { c += 1; }
         
-        if let Some(ref d) = self.descendant {
+        if let Some(ref d) = self.ancestor {
             let (da, db, dc) = d.specificity();
             a += da; b += db; c += dc;
         }
@@ -182,52 +191,56 @@ impl Selector {
 }
 
 pub fn parse_selector(s: &str) -> Selector {
+    // Pre-process string to ensure spaces around combinators for easy splitting
+    let s = s.replace('>', " > ").replace('+', " + ").replace('~', " ~ ");
     let parts: Vec<&str> = s.split_whitespace().collect();
     if parts.is_empty() { return Selector::new(); }
 
-    // Build descendant chain from left to right
-    // ".card .title" -> Selector(.title, descendant: Selector(.card))
     let mut root: Option<Selector> = None;
+    let mut pending_combinator: Option<Combinator> = None;
 
     for part in parts {
-        // Remove pseudo-classes/elements (:hover, ::before, etc.)
-        let part = part.split(':').next().unwrap_or(part);
-        if part.is_empty() { continue; }
+        match part {
+            ">" => pending_combinator = Some(Combinator::Child),
+            "+" => pending_combinator = Some(Combinator::NextSibling),
+            "~" => pending_combinator = Some(Combinator::SubsequentSibling),
+            _ => {
+                let part = part.split(':').next().unwrap_or(part);
+                if part.is_empty() { continue; }
 
-        let mut current_sel = Selector::new();
-        let mut current_token = String::new();
-        let mut last_char = ' ';
+                let mut current_sel = Selector::new();
+                let mut current_token = String::new();
+                let mut last_char = ' ';
 
-        for c in part.chars().chain(std::iter::once(' ')) {
-            if c == '#' || c == '.' || c == ' ' || c == '[' {
-                if !current_token.is_empty() {
-                    match last_char {
-                        '#' => current_sel.id = Some(current_token.clone()),
-                        '.' => current_sel.class.push(current_token.clone()),
-                        _ => current_sel.tag = Some(current_token.clone()),
+                for c in part.chars().chain(std::iter::once(' ')) {
+                    if c == '#' || c == '.' || c == ' ' || c == '[' {
+                        if !current_token.is_empty() {
+                            match last_char {
+                                '#' => current_sel.id = Some(current_token.clone()),
+                                '.' => current_sel.class.push(current_token.clone()),
+                                _ => current_sel.tag = Some(current_token.clone()),
+                            }
+                            current_token.clear();
+                        }
+                        if c == '[' { break; }
+                        last_char = c;
+                    } else {
+                        current_token.push(c);
                     }
-                    current_token.clear();
                 }
-                if c == '[' { break; } // Skip attribute selectors (C3/C4)
-                last_char = c;
-            } else {
-                current_token.push(c);
+                
+                // Inherit combinator from previous part, or default to Descendant if there was a previous element
+                let combinator = pending_combinator.take().unwrap_or(if root.is_some() { Combinator::Descendant } else { Combinator::Descendant });
+                
+                if let Some(prev) = root {
+                    current_sel.ancestor = Some(Box::new(prev));
+                    current_sel.combinator = Some(combinator);
+                }
+                root = Some(current_sel);
             }
         }
-        
-        if let Some(prev) = root {
-            current_sel.descendant = Some(Box::new(prev));
-        }
-        root = Some(current_sel);
     }
 
-    // Wait, the chain should be "Deepest child matches first, then check ancestors"
-    // So "div .card p" should have p as the primary match, and "div .card" as the descendant requirement.
-    // CSS matching works from right to left.
-    // Let's re-orient: Selector is for the RIGHTMOST part.
-    // "div .card p" -> Selector { tag: "p", ancestor: Some(Selector { class: "card", ancestor: Some(Selector { tag: "div" }) }) }
-    
-    // I'll rename descendant to ancestor for clarity.
     root.unwrap_or_default()
 }
 
