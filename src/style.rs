@@ -20,6 +20,7 @@ pub fn build_style_tree(
     stylesheet: &Stylesheet,
     parent_style: Option<&PropertyMap>,
     js_overrides: &HashMap<String, HashMap<String, String>>,
+    hovered_id: Option<&str>,
 ) -> StyledNode {
     let mut specified_values = HashMap::new();
 
@@ -63,7 +64,7 @@ pub fn build_style_tree(
         for rule in &stylesheet.rules {
             let mut highest_match: Option<(usize, usize, usize)> = None;
             for selector in &rule.selectors {
-                if matches_selector(selector, root) {
+                if matches_selector(selector, root, hovered_id) {
                     let spec = selector.specificity();
                     if highest_match.is_none() || spec > highest_match.unwrap() {
                         highest_match = Some(spec);
@@ -118,7 +119,7 @@ pub fn build_style_tree(
     let children = root.children
         .borrow()
         .iter()
-        .map(|child| build_style_tree(child, stylesheet, Some(&specified_values), js_overrides))
+        .map(|child| build_style_tree(child, stylesheet, Some(&specified_values), js_overrides, hovered_id))
         .collect();
 
     StyledNode {
@@ -253,7 +254,7 @@ fn get_parent(handle: &Handle) -> Option<Handle> {
     res
 }
 
-fn matches_selector(selector: &Selector, handle: &Handle) -> bool {
+fn matches_selector(selector: &Selector, handle: &Handle, hovered_id: Option<&str>) -> bool {
     // Check current node matches primary part of selector
     if let NodeData::Element { ref name, ref attrs, .. } = handle.data {
         let tag = name.local.to_string();
@@ -268,7 +269,7 @@ fn matches_selector(selector: &Selector, handle: &Handle) -> bool {
         }
 
         // Base match
-        let has_constraint = selector.tag.is_some() || selector.id.is_some() || !selector.class.is_empty() || !selector.attributes.is_empty();
+        let has_constraint = selector.tag.is_some() || selector.id.is_some() || !selector.class.is_empty() || !selector.attributes.is_empty() || selector.pseudo_class.is_some();
         if !has_constraint { return false; }
 
         if let Some(ref s_tag) = selector.tag {
@@ -279,6 +280,17 @@ fn matches_selector(selector: &Selector, handle: &Handle) -> bool {
         }
         for s_class in &selector.class {
             if !classes.contains(s_class) { return false; }
+        }
+
+        // Pseudo-class match
+        if let Some(ref pseudo) = selector.pseudo_class {
+            if pseudo == "hover" {
+                if Some(id.as_deref()) != Some(hovered_id) || id.is_none() {
+                    return false;
+                }
+            } else {
+                return false;
+            }
         }
 
         // Attribute match
@@ -306,7 +318,7 @@ fn matches_selector(selector: &Selector, handle: &Handle) -> bool {
                     let mut current = get_parent(handle);
                     let mut matched = false;
                     while let Some(parent_handle) = current {
-                        if matches_selector(ancestor_sel, &parent_handle) {
+                        if matches_selector(ancestor_sel, &parent_handle, hovered_id) {
                             matched = true;
                             break;
                         }
@@ -316,7 +328,7 @@ fn matches_selector(selector: &Selector, handle: &Handle) -> bool {
                 }
                 Combinator::Child => {
                     if let Some(p) = get_parent(handle) {
-                        if !matches_selector(ancestor_sel, &p) {
+                        if !matches_selector(ancestor_sel, &p, hovered_id) {
                             return false;
                         }
                     } else {
@@ -332,7 +344,7 @@ fn matches_selector(selector: &Selector, handle: &Handle) -> bool {
                             for prev_idx in (0..idx).rev() {
                                 let sib = &children[prev_idx];
                                 if let NodeData::Element { .. } = sib.data {
-                                    if matches_selector(ancestor_sel, sib) {
+                                    if matches_selector(ancestor_sel, sib, hovered_id) {
                                         found = true;
                                     }
                                     break;
@@ -355,7 +367,7 @@ fn matches_selector(selector: &Selector, handle: &Handle) -> bool {
                             for prev_idx in 0..idx {
                                 let sib = &children[prev_idx];
                                 if let NodeData::Element { .. } = sib.data {
-                                    if matches_selector(ancestor_sel, sib) {
+                                    if matches_selector(ancestor_sel, sib, hovered_id) {
                                         matched = true;
                                         break;
                                     }

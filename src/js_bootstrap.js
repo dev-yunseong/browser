@@ -122,12 +122,14 @@ var document = {
 
 var location = document.location;
 
-// -- Timers (fire immediately or no-op) --------------------------------------
+// -- Timers (fire via macro-task queue) --------------------------------------
 var __timer_id = 0;
 window.setTimeout = function(fn, delay) {
     __timer_id++;
     if (typeof fn === 'function') {
-        try { fn(); } catch(e) {}
+        __aura_queue_task(fn);
+    } else if (typeof fn === 'string') {
+        __aura_queue_task(function() { eval(fn); });
     }
     return __timer_id;
 };

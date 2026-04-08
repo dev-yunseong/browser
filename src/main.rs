@@ -21,6 +21,8 @@ struct BrowserApp {
     current_links: Vec<(layout::Rect, String)>,
     current_form_controls: Vec<(layout::Rect, String)>,
     current_event_handlers: Vec<(layout::Rect, String)>,
+    current_element_ids: Vec<(layout::Rect, String)>,
+    hovered_id: Option<String>,
     form_values: HashMap<usize, String>,
     image_cache: HashMap<String, Vec<u8>>,
     image_promises: HashMap<String, Promise<Result<(String, Vec<u8>), String>>>,
@@ -39,6 +41,7 @@ struct StaticPageData {
     links: Vec<(layout::Rect, String)>,
     form_controls: Vec<(layout::Rect, String)>,
     event_handlers: Vec<(layout::Rect, String)>,
+    element_ids: Vec<(layout::Rect, String)>,
     image_urls: Vec<String>,
     body: String,
     base_url: Url,
@@ -73,6 +76,8 @@ impl BrowserApp {
             current_links: vec![],
             current_form_controls: vec![],
             current_event_handlers: vec![],
+            current_element_ids: vec![],
+            hovered_id: None,
             form_values: HashMap::new(),
             image_cache: HashMap::new(),
             image_promises: HashMap::new(),
@@ -116,8 +121,9 @@ impl BrowserApp {
         self.js_style_overrides.clear();
         self.js_runtime = js::JsRuntime::new();
         self.is_loading = true;
+        self.hovered_id = None;
         self.content_promise = Some(Promise::spawn_thread("fetcher", move || {
-            fetch_and_process(&url, &HashMap::new(), &HashMap::new(), width)
+            fetch_and_process(&url, &HashMap::new(), &HashMap::new(), None, width)
                 .map_err(|e| e.to_string())
         }));
     }
@@ -128,9 +134,10 @@ impl BrowserApp {
             let body = self.last_body.clone();
             let cache = self.image_cache.clone();
             let overrides = self.js_style_overrides.clone();
+            let hovered_id = self.hovered_id.clone();
 
             let join_handle = std::thread::spawn(move || {
-                process_html_with_cache(&body, &base_url, &cache, &overrides, width)
+                process_html_with_cache(&body, &base_url, &cache, &overrides, hovered_id.as_deref(), width)
             });
 
             match join_handle.join() {
@@ -156,6 +163,7 @@ impl BrowserApp {
         self.current_links = page_data.links;
         self.current_form_controls = page_data.form_controls;
         self.current_event_handlers = page_data.event_handlers;
+        self.current_element_ids = page_data.element_ids;
     }
 }
 
@@ -199,12 +207,13 @@ fn fetch_and_process(
     url_str: &str,
     image_cache: &HashMap<String, Vec<u8>>,
     js_overrides: &HashMap<String, HashMap<String, String>>,
+    hovered_id: Option<&str>,
     width: f32,
 ) -> Result<StaticPageData, Box<dyn Error + Send + Sync>> {
     let response = reqwest::blocking::get(url_str)?;
     let body = response.text()?;
     let base_url = Url::parse(url_str)?;
-    process_html_with_cache(&body, &base_url, image_cache, js_overrides, width)
+    process_html_with_cache(&body, &base_url, image_cache, js_overrides, hovered_id, width)
 }
 
 fn process_html_with_cache(
@@ -212,6 +221,7 @@ fn process_html_with_cache(
     base_url: &Url,
     image_cache: &HashMap<String, Vec<u8>>,
     js_overrides: &HashMap<String, HashMap<String, String>>,
+    hovered_id: Option<&str>,
     width: f32,
 ) -> Result<StaticPageData, Box<dyn Error + Send + Sync>> {
     let width = width.max(1.0);
@@ -222,7 +232,7 @@ fn process_html_with_cache(
     collect_css_in_order(&dom_tree.document, base_url, &mut css_source);
 
     let stylesheet = css::parse_css(&css_source);
-    let style_tree = style::build_style_tree(&dom_tree.document, &stylesheet, None, js_overrides);
+    let style_tree = style::build_style_tree(&dom_tree.document, &stylesheet, None, js_overrides, hovered_id);
 
     let (layout_tree, _, final_y) =
         layout::build_layout_tree(&style_tree, 0.0, 0.0, 0.0, width, width, 768.0);
@@ -237,6 +247,7 @@ fn process_html_with_cache(
     let mut links: Vec<(layout::Rect, String)> = Vec::new();
     let mut form_controls = Vec::new();
     let mut event_handlers = Vec::new();
+    let mut element_ids = Vec::new();
     let mut image_urls = Vec::new();
 
     if let Some(ref root) = layout_tree {
@@ -245,6 +256,8 @@ fn process_html_with_cache(
         root.collect_links(&mut links);
         
         root.collect_event_handlers(&mut event_handlers);
+
+        root.collect_element_ids(&mut element_ids);
         
         let mut controls_with_nodes = Vec::new();
         root.collect_form_controls(&mut controls_with_nodes);
@@ -280,6 +293,7 @@ fn process_html_with_cache(
         links: absolute_links,
         form_controls,
         event_handlers,
+        element_ids,
         image_urls,
         body: body.to_string(),
         base_url: base_url.clone(),
@@ -380,6 +394,16 @@ impl eframe::App for BrowserApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(egui::Color32::WHITE))
             .show(ctx, |ui| {
+                // Periodically run any queued JS macro-tasks (setTimeout, etc.)
+                self.js_runtime.run_queued_tasks();
+                let overrides = self.js_runtime.get_style_overrides();
+                if !overrides.is_empty() {
+                    for (id, props) in overrides {
+                        self.js_style_overrides.entry(id).or_default().extend(props);
+                    }
+                    self.trigger_re_render(ctx, ui.available_width());
+                }
+
                 // Handle pending page-load promise
                 if let Some(promise) = &self.content_promise {
                     match promise.ready() {
@@ -406,6 +430,7 @@ impl eframe::App for BrowserApp {
                                 links: page_data.links.clone(),
                                 form_controls: page_data.form_controls.clone(),
                                 event_handlers: page_data.event_handlers.clone(),
+                                element_ids: page_data.element_ids.clone(),
                                 image_urls: image_urls.clone(),
                                 body: body.clone(),
                                 base_url: base_url.clone(),
@@ -537,6 +562,25 @@ impl eframe::App for BrowserApp {
                             if hovering {
                                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                             }
+
+                            // Update hovered ID and re-render if changed
+                            let mut new_hovered_id = None;
+                            // Search in reverse to find the innermost (top-most in layout) element
+                            for (l_rect, id) in self.current_element_ids.iter().rev() {
+                                if hit(rel, l_rect) {
+                                    new_hovered_id = Some(id.clone());
+                                    break;
+                                }
+                            }
+                            if new_hovered_id != self.hovered_id {
+                                self.hovered_id = new_hovered_id;
+                                let width = ui.available_width();
+                                self.trigger_re_render(ctx, width);
+                            }
+                        } else if self.hovered_id.is_some() {
+                            self.hovered_id = None;
+                            let width = ui.available_width();
+                            self.trigger_re_render(ctx, width);
                         }
                     });
 

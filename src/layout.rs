@@ -218,6 +218,8 @@ impl<'a> LayoutBox<'a> {
             members: Vec<LayoutBox<'a>>,
             width: f32,
             height: f32,
+            ascent: f32,
+            descent: f32,
         }
 
         enum LayoutItem<'a> {
@@ -226,7 +228,7 @@ impl<'a> LayoutBox<'a> {
         }
 
         let mut items: Vec<LayoutItem> = Vec::new();
-        let mut current_line = Line { members: Vec::new(), width: 0.0, height: 0.0 };
+        let mut current_line = Line { members: Vec::new(), width: 0.0, height: 0.0, ascent: 0.0, descent: 0.0 };
 
         for child_node in &self.style_node.children {
             if should_skip(child_node) { continue; }
@@ -268,9 +270,13 @@ impl<'a> LayoutBox<'a> {
 
         // Position Pass: Stack items vertically
         let mut cursor_y = self.dimensions.y + self.padding.top + self.border.top;
+        let mut prev_margin_bottom = 0.0f32;
+
         for item in items {
             match item {
                 LayoutItem::Line(line) => {
+                    // Lines don't collapse margins in the same way blocks do, 
+                    // but we ensure they start after the previous block's collapsed margin.
                     let mut cursor_x = self.dimensions.x + self.padding.left + self.border.left;
                     for mut member in line.members {
                         let dx = cursor_x - (member.dimensions.x - member.margin.left);
@@ -281,16 +287,22 @@ impl<'a> LayoutBox<'a> {
                         self.children.push(member);
                     }
                     cursor_y += line.height;
+                    prev_margin_bottom = 0.0; // Reset after line
                 }
                 LayoutItem::Block(mut block) => {
-                    let dy = cursor_y - (block.dimensions.y - block.margin.top);
+                    // Simple vertical margin collapsing: max(prev_bottom, current_top)
+                    let collapsed_margin = prev_margin_bottom.max(block.margin.top);
+                    let dy = (cursor_y + collapsed_margin) - (block.dimensions.y + block.margin.top);
                     offset_layout_box(&mut block, 0.0, dy);
+                    
                     max_child_x = max_child_x.max(block.dimensions.x + block.dimensions.width + block.margin.right);
-                    cursor_y = block.dimensions.y + block.dimensions.height + block.margin.bottom;
+                    cursor_y = block.dimensions.y + block.dimensions.height;
+                    prev_margin_bottom = block.margin.bottom;
                     self.children.push(block);
                 }
             }
         }
+        cursor_y += prev_margin_bottom;
 
         if self.dimensions.width <= 0.0 {
             let derived = max_child_x - self.dimensions.x + self.padding.right + self.border.right;
@@ -476,6 +488,29 @@ impl<'a> LayoutBox<'a> {
     pub fn collect_images(&self, list: &mut Vec<(Rect, String)>) {
         if let Some(ref url) = self.image_url { list.push((self.dimensions, url.clone())); }
         for child in &self.children { child.collect_images(list); }
+    }
+    pub fn collect_element_ids(&self, list: &mut Vec<(Rect, String)>) {
+        if let NodeData::Element { ref attrs, .. } = self.style_node.node.data {
+            for attr in attrs.borrow().iter() {
+                if attr.name.local.to_string() == "id" {
+                    list.push((self.dimensions, attr.value.to_string()));
+                }
+            }
+        }
+        for child in &self.children { child.collect_element_ids(list); }
+    }
+    pub fn establishes_bfc(&self) -> bool {
+        match self.display {
+            DisplayType::InlineBlock | DisplayType::Flex | DisplayType::TableCell => true,
+            _ => {
+                // overflow != visible also establishes BFC
+                if let Some(Value::Keyword(v)) = self.style_node.specified_values.get("overflow") {
+                    v != "visible"
+                } else {
+                    false
+                }
+            }
+        }
     }
 }
 

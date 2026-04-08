@@ -180,6 +180,7 @@ pub struct Selector {
     pub id: Option<String>,
     pub class: Vec<String>,
     pub attributes: Vec<AttributeSelector>,
+    pub pseudo_class: Option<String>,
     pub combinator: Option<Combinator>,
     pub ancestor: Option<Box<Selector>>,
 }
@@ -194,6 +195,7 @@ impl Selector {
         if self.id.is_some() { a += 1; }
         b += self.class.len();
         b += self.attributes.len();
+        if self.pseudo_class.is_some() { b += 1; }
         if self.tag.is_some() { c += 1; }
         
         if let Some(ref d) = self.ancestor {
@@ -219,14 +221,18 @@ pub fn parse_selector(s: &str) -> Selector {
             "+" => pending_combinator = Some(Combinator::NextSibling),
             "~" => pending_combinator = Some(Combinator::SubsequentSibling),
             _ => {
-                let part = part.split(':').next().unwrap_or(part);
-                if part.is_empty() { continue; }
+                let mut p_parts = part.splitn(2, ':');
+                let base_part = p_parts.next().unwrap_or(part);
+                let pseudo = p_parts.next().map(|s| s.to_string());
+                
+                if base_part.is_empty() && pseudo.is_none() { continue; }
 
                 let mut current_sel = Selector::new();
+                current_sel.pseudo_class = pseudo;
                 let mut current_token = String::new();
                 let mut last_char = ' ';
 
-                let mut chars = part.chars().chain(std::iter::once(' ')).peekable();
+                let mut chars = base_part.chars().chain(std::iter::once(' ')).peekable();
                 while let Some(c) = chars.next() {
                     if c == '#' || c == '.' || c == ' ' || c == '[' {
                         if !current_token.is_empty() {
