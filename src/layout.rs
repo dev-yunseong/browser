@@ -311,14 +311,19 @@ fn get_display_type(sn: &StyledNode) -> DisplayType {
     }
     if let NodeData::Element { ref name, .. } = sn.node.data {
         match name.local.to_string().as_str() {
-            // html is a block-level container (B10: was falling through to Inline)
+            // Genuine block-level elements (fill container width, force line break)
             "html" |
             "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" |
             "body" | "header" | "footer" | "nav" | "section" | "article" |
-            "ul" | "ol" | "li" | "main" | "aside" | "form" | "table" |
-            "thead" | "tbody" | "tfoot" | "tr" | "th" | "td" | "caption" |
+            "ul" | "ol" | "li" | "main" | "aside" | "form" |
             "details" | "summary" | "figure" | "figcaption" | "address" |
             "blockquote" | "pre" | "hr" | "fieldset" | "legend" => DisplayType::Block,
+            // table and its sub-elements: use TableRow/TableCell so they shrink-wrap
+            // rather than expand to full container width like block elements do.
+            "table" => DisplayType::Table,
+            "tr" => DisplayType::TableRow,
+            "th" | "td" => DisplayType::TableCell,
+            "thead" | "tbody" | "tfoot" | "caption" => DisplayType::Block,
             "input" | "button" | "select" | "textarea" => DisplayType::Input,
             "img" => DisplayType::Image,
             _ => DisplayType::Inline,
@@ -328,7 +333,9 @@ fn get_display_type(sn: &StyledNode) -> DisplayType {
 
 
 fn is_block_level(d: DisplayType) -> bool {
-    matches!(d, DisplayType::Block | DisplayType::ListItem | DisplayType::Table | DisplayType::Flex)
+    // Table/TableRow/TableCell are NOT block-level: they shrink-wrap to content
+    // rather than filling the full container width.
+    matches!(d, DisplayType::Block | DisplayType::ListItem | DisplayType::Flex)
 }
 
 fn is_none_display(sn: &StyledNode) -> bool {
