@@ -56,13 +56,15 @@ pub fn build_layout_tree<'a>(
     current_x: f32,
     current_y: f32,
     container_width: f32,
+    vw: f32,
+    vh: f32,
 ) -> (Option<LayoutBox<'a>>, f32, f32) {
     let mut layout = LayoutBox::new(style_node);
     if layout.display == DisplayType::Inline && is_none_display(style_node) {
         return (None, current_x, current_y);
     }
-    layout.measure_box_model(container_width);
-    layout.perform_layout(container_start_x, current_x, current_y, container_width)
+    layout.measure_box_model(container_width, vw, vh);
+    layout.perform_layout(container_start_x, current_x, current_y, container_width, vw, vh)
 }
 
 impl<'a> LayoutBox<'a> {
@@ -97,16 +99,16 @@ impl<'a> LayoutBox<'a> {
         layout
     }
 
-    fn measure_box_model(&mut self, container_width: f32) {
+    fn measure_box_model(&mut self, container_width: f32, vw: f32, vh: f32) {
         let sn = self.style_node;
-        self.margin.top = get_prop(sn, "margin-top", "margin", container_width);
-        self.margin.bottom = get_prop(sn, "margin-bottom", "margin", container_width);
-        self.margin.left = get_prop(sn, "margin-left", "margin", container_width);
-        self.margin.right = get_prop(sn, "margin-right", "margin", container_width);
-        self.padding.top = get_prop(sn, "padding-top", "padding", container_width);
-        self.padding.bottom = get_prop(sn, "padding-bottom", "padding", container_width);
-        self.padding.left = get_prop(sn, "padding-left", "padding", container_width);
-        self.padding.right = get_prop(sn, "padding-right", "padding", container_width);
+        self.margin.top = get_prop(sn, "margin-top", "margin", container_width, vw, vh);
+        self.margin.bottom = get_prop(sn, "margin-bottom", "margin", container_width, vw, vh);
+        self.margin.left = get_prop(sn, "margin-left", "margin", container_width, vw, vh);
+        self.margin.right = get_prop(sn, "margin-right", "margin", container_width, vw, vh);
+        self.padding.top = get_prop(sn, "padding-top", "padding", container_width, vw, vh);
+        self.padding.bottom = get_prop(sn, "padding-bottom", "padding", container_width, vw, vh);
+        self.padding.left = get_prop(sn, "padding-left", "padding", container_width, vw, vh);
+        self.padding.right = get_prop(sn, "padding-right", "padding", container_width, vw, vh);
 
         let b_width = match sn.specified_values.get("border-width") {
             Some(Value::Length(v, Unit::Px)) => *v,
@@ -120,7 +122,9 @@ impl<'a> LayoutBox<'a> {
         container_start_x: f32, 
         mut current_x: f32, 
         mut current_y: f32, 
-        container_width: f32
+        container_width: f32,
+        vw: f32,
+        vh: f32,
     ) -> (Option<LayoutBox<'a>>, f32, f32) {
         let is_block = is_block_level(self.display);
         if is_block && current_x > container_start_x {
@@ -131,8 +135,24 @@ impl<'a> LayoutBox<'a> {
         let mut width = match self.style_node.specified_values.get("width") {
             Some(Value::Length(v, Unit::Px)) => *v,
             Some(Value::Length(v, Unit::Percent)) => container_width * (v / 100.0),
+            Some(Value::Length(v, Unit::Vw)) => vw * (v / 100.0),
+            Some(Value::Length(v, Unit::Vh)) => vh * (v / 100.0),
+            Some(Value::Length(v, Unit::Em)) => {
+                let fs = match self.style_node.specified_values.get("font-size") {
+                    Some(Value::Length(fv, Unit::Px)) => *fv,
+                    _ => 16.0,
+                };
+                fs * v
+            }
             _ => if is_block { (container_width - self.margin.left - self.margin.right).max(0.0) } else { 0.0 },
         };
+
+        if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get("max-width") {
+            width = width.min(*v);
+        }
+        if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get("min-width") {
+            width = width.max(*v);
+        }
 // margin: auto 처리 (너비가 결정된 후 수행)
         if is_block && width < container_width {
             let mut is_auto = false;
@@ -155,6 +175,21 @@ self.dimensions.x = current_x + self.margin.left;
 self.dimensions.y = current_y + self.margin.top;
 self.dimensions.width = width;
 
+
+        let mut height = match self.style_node.specified_values.get("height") {
+            Some(Value::Length(v, Unit::Px)) => *v,
+            Some(Value::Length(_, Unit::Percent)) => 0.0, // viewport height or parent height needed
+            Some(Value::Length(v, Unit::Vw)) => vw * (v / 100.0),
+            Some(Value::Length(v, Unit::Vh)) => vh * (v / 100.0),
+            Some(Value::Length(v, Unit::Em)) => {
+                let fs = match self.style_node.specified_values.get("font-size") {
+                    Some(Value::Length(fv, Unit::Px)) => *fv,
+                    _ => 16.0,
+                };
+                fs * v
+            }
+            _ => 0.0,
+        };
 
         if let NodeData::Text { ref contents } = self.style_node.node.data {
             return self.layout_text(contents.borrow().to_string(), current_x, current_y, container_width);
@@ -202,7 +237,7 @@ self.dimensions.width = width;
             let mut flex_x = child_x;
             for child_node in &self.style_node.children {
                 if should_skip(child_node) { continue; }
-                let (child_box, next_x, _) = build_layout_tree(child_node, child_x, flex_x, child_y, child_container_w);
+                let (child_box, next_x, _) = build_layout_tree(child_node, child_x, flex_x, child_y, child_container_w, vw, vh);
                 if let Some(cb) = child_box {
                     let cw = cb.dimensions.width + cb.margin.left + cb.margin.right;
                     let ch = cb.dimensions.height + cb.margin.top + cb.margin.bottom;
@@ -240,22 +275,52 @@ self.dimensions.width = width;
                 self.children.push(cb);
             }
         } else {
+            let mut line_height = 0.0f32;
             for child_node in &self.style_node.children {
                 if should_skip(child_node) { continue; }
+                
+                let child_display = get_display_type(child_node);
+                let child_is_block = is_block_level(child_display);
+                
+                if child_is_block {
+                    // Start a new line if we were in the middle of one
+                    if child_x > self.dimensions.x + self.padding.left + self.border.left {
+                        child_x = self.dimensions.x + self.padding.left + self.border.left;
+                        child_y += line_height;
+                        line_height = 0.0;
+                    }
+                }
+
                 // Block-level children must not receive INFINITY as their container width
-                // (they compute width = container_width - margins, which would be INFINITY).
-                let cw = if child_container_w.is_infinite() && is_block_level(get_display_type(child_node)) {
+                let cw = if child_container_w.is_infinite() && child_is_block {
                     finite_child_cw
                 } else {
                     child_container_w
                 };
-                let (child_box, next_x, next_y) = build_layout_tree(child_node, self.dimensions.x + self.padding.left, child_x, child_y, cw);
+                
+                let (child_box, next_x, next_y) = build_layout_tree(child_node, self.dimensions.x + self.padding.left + self.border.left, child_x, child_y, cw, vw, vh);
+                
                 if let Some(cb) = child_box {
-                    max_child_y = max_child_y.max(cb.dimensions.y + cb.dimensions.height + cb.margin.bottom);
+                    if child_is_block {
+                        child_y = next_y;
+                        child_x = self.dimensions.x + self.padding.left + self.border.left;
+                        line_height = 0.0;
+                    } else {
+                        // Inline/InlineBlock: advance x and track line height
+                        child_x = next_x;
+                        line_height = line_height.max(cb.dimensions.height + cb.margin.top + cb.margin.bottom);
+                        
+                        // Simple wrapping: if next_x exceeds container, wrap to next line
+                        if child_x > self.dimensions.x + self.padding.left + self.border.left + child_container_w && child_container_w.is_finite() {
+                            child_x = self.dimensions.x + self.padding.left + self.border.left;
+                            child_y += line_height;
+                            line_height = 0.0;
+                        }
+                    }
+                    
+                    max_child_y = max_child_y.max(child_y + line_height);
                     max_child_x = max_child_x.max(cb.dimensions.x + cb.dimensions.width + cb.margin.right);
                     self.children.push(cb);
-                    child_x = next_x;
-                    child_y = next_y;
                 }
             }
         }
@@ -273,10 +338,15 @@ self.dimensions.width = width;
         // Respect explicit height (B9); otherwise derive from children.
         // Remove the unconditional max(20.0) clamp — it was distorting small boxes.
         let content_height = (max_child_y - self.dimensions.y + self.padding.bottom + self.border.bottom).max(0.0);
-        self.dimensions.height = match self.style_node.specified_values.get("height") {
-            Some(Value::Length(v, Unit::Px)) => v.max(0.0),
-            _ => content_height,
-        };
+        let mut final_h = if height > 0.0 { height } else { content_height };
+
+        if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get("max-height") {
+            final_h = final_h.min(*v);
+        }
+        if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get("min-height") {
+            final_h = final_h.max(*v);
+        }
+        self.dimensions.height = final_h;
 
         let final_x = if is_block { container_start_x } else { self.dimensions.x + self.dimensions.width + self.margin.right };
         let final_y = if is_block { self.dimensions.y + self.dimensions.height + self.margin.bottom } else { current_y };
@@ -332,10 +402,20 @@ self.dimensions.width = width;
     }
 }
 
-fn get_prop(sn: &StyledNode, p1: &str, p2: &str, cw: f32) -> f32 {
+fn get_prop(sn: &StyledNode, p1: &str, p2: &str, cw: f32, vw: f32, vh: f32) -> f32 {
     match sn.specified_values.get(p1).or(sn.specified_values.get(p2)) {
         Some(Value::Length(v, Unit::Px)) => *v,
         Some(Value::Length(v, Unit::Percent)) => cw * (v / 100.0),
+        Some(Value::Length(v, Unit::Vw)) => vw * (v / 100.0),
+        Some(Value::Length(v, Unit::Vh)) => vh * (v / 100.0),
+        Some(Value::Length(v, Unit::Em)) => {
+            // Em should be relative to current element's font-size
+            let fs = match sn.specified_values.get("font-size") {
+                Some(Value::Length(fv, Unit::Px)) => *fv,
+                _ => 16.0,
+            };
+            fs * v
+        }
         _ => 0.0,
     }
 }

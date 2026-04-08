@@ -20,9 +20,26 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap, image_cache: 
     if let Some(Value::BoxShadow(shadow)) = layout.style_node.specified_values.get("box-shadow") {
         if !shadow.inset {
             let mut paint = Paint::default();
-            paint.set_color_rgba8(shadow.color.r, shadow.color.g, shadow.color.b, shadow.color.a / 3);
-            if let Some(r) = Rect::from_xywh(d.x + shadow.offset_x, d.y + shadow.offset_y, d.width, d.height) {
+            // Simple approximation: use lower alpha for the "shadow"
+            paint.set_color_rgba8(shadow.color.r, shadow.color.g, shadow.color.b, shadow.color.a / 2);
+            
+            // spread expands the shadow in all directions
+            let sx = d.x + shadow.offset_x - shadow.spread;
+            let sy = d.y + shadow.offset_y - shadow.spread;
+            let sw = d.width + (shadow.spread * 2.0);
+            let sh = d.height + (shadow.spread * 2.0);
+            
+            if let Some(r) = Rect::from_xywh(sx, sy, sw, sh) {
                 pixmap.fill_rect(r, &paint, Transform::identity(), None);
+                
+                // If there's blur, we could do more passes, but for now just one slightly larger rect
+                if shadow.blur > 0.0 {
+                    paint.set_color_rgba8(shadow.color.r, shadow.color.g, shadow.color.b, shadow.color.a / 4);
+                    let b = shadow.blur / 2.0;
+                    if let Some(r2) = Rect::from_xywh(sx - b, sy - b, sw + shadow.blur, sh + shadow.blur) {
+                        pixmap.fill_rect(r2, &paint, Transform::identity(), None);
+                    }
+                }
             }
         }
     }

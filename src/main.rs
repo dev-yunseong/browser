@@ -4,12 +4,12 @@ use std::error::Error;
 use url::Url;
 use std::collections::HashMap;
 
-mod dom;
-mod css;
-mod style;
-mod layout;
-mod render;
-mod js;
+pub mod dom;
+pub mod css;
+pub mod style;
+pub mod layout;
+pub mod render;
+pub mod js;
 
 struct BrowserApp {
     url: String,
@@ -84,32 +84,32 @@ impl BrowserApp {
         }
     }
 
-    fn load_url(&mut self, url: String) {
+    fn load_url(&mut self, url: String, width: f32) {
         if self.history.is_empty() || self.history[self.history_index] != url {
             self.history.truncate(self.history_index + 1);
             self.history.push(url.clone());
             self.history_index = self.history.len() - 1;
         }
-        self.load_url_direct(url);
+        self.load_url_direct(url, width);
     }
 
-    fn navigate_back(&mut self) {
+    fn navigate_back(&mut self, width: f32) {
         if self.history_index > 0 {
             self.history_index -= 1;
             let url = self.history[self.history_index].clone();
-            self.load_url_direct(url);
+            self.load_url_direct(url, width);
         }
     }
 
-    fn navigate_forward(&mut self) {
+    fn navigate_forward(&mut self, width: f32) {
         if self.history_index + 1 < self.history.len() {
             self.history_index += 1;
             let url = self.history[self.history_index].clone();
-            self.load_url_direct(url);
+            self.load_url_direct(url, width);
         }
     }
 
-    fn load_url_direct(&mut self, url: String) {
+    fn load_url_direct(&mut self, url: String, width: f32) {
         self.url = url.clone();
         self.error = None;
         self.image_promises.clear();
@@ -117,20 +117,20 @@ impl BrowserApp {
         self.js_runtime = js::JsRuntime::new();
         self.is_loading = true;
         self.content_promise = Some(Promise::spawn_thread("fetcher", move || {
-            fetch_and_process(&url, &HashMap::new(), &HashMap::new())
+            fetch_and_process(&url, &HashMap::new(), &HashMap::new(), width)
                 .map_err(|e| e.to_string())
         }));
     }
 
     /// Re-render the current page using `self.js_style_overrides` and `self.image_cache`.
-    fn trigger_re_render(&mut self, ctx: &egui::Context) {
+    fn trigger_re_render(&mut self, ctx: &egui::Context, width: f32) {
         if let Some(base_url) = self.last_base_url.clone() {
             let body = self.last_body.clone();
             let cache = self.image_cache.clone();
             let overrides = self.js_style_overrides.clone();
 
             let result = std::thread::spawn(move || {
-                process_html_with_cache(&body, &base_url, &cache, &overrides)
+                process_html_with_cache(&body, &base_url, &cache, &overrides, width)
             })
             .join()
             .unwrap();
@@ -153,15 +153,52 @@ impl BrowserApp {
     }
 }
 
+fn collect_css_in_order(handle: &markup5ever_rcdom::Handle, base_url: &Url, css_source: &mut String) {
+    if let markup5ever_rcdom::NodeData::Element { ref name, ref attrs, .. } = handle.data {
+        let tag = name.local.to_string();
+        if tag == "style" {
+            for child in handle.children.borrow().iter() {
+                if let markup5ever_rcdom::NodeData::Text { ref contents } = child.data {
+                    css_source.push_str(&contents.borrow());
+                }
+            }
+        } else if tag == "link" {
+            let mut is_stylesheet = false;
+            let mut href = None;
+            for attr in attrs.borrow().iter() {
+                if attr.name.local.to_string() == "rel" && attr.value.to_string() == "stylesheet" {
+                    is_stylesheet = true;
+                } else if attr.name.local.to_string() == "href" {
+                    href = Some(attr.value.to_string());
+                }
+            }
+            if is_stylesheet {
+                if let Some(h) = href {
+                    let abs_url = base_url.join(&h).map(|u| u.to_string()).unwrap_or(h);
+                    if let Ok(resp) = reqwest::blocking::get(&abs_url) {
+                        if let Ok(text) = resp.text() {
+                            css_source.push_str(&text);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for child in handle.children.borrow().iter() {
+        collect_css_in_order(child, base_url, css_source);
+    }
+}
+
 fn fetch_and_process(
     url_str: &str,
     image_cache: &HashMap<String, Vec<u8>>,
     js_overrides: &HashMap<String, HashMap<String, String>>,
+    width: f32,
 ) -> Result<StaticPageData, Box<dyn Error + Send + Sync>> {
     let response = reqwest::blocking::get(url_str)?;
     let body = response.text()?;
     let base_url = Url::parse(url_str)?;
-    process_html_with_cache(&body, &base_url, image_cache, js_overrides)
+    process_html_with_cache(&body, &base_url, image_cache, js_overrides, width)
 }
 
 fn process_html_with_cache(
@@ -169,29 +206,23 @@ fn process_html_with_cache(
     base_url: &Url,
     image_cache: &HashMap<String, Vec<u8>>,
     js_overrides: &HashMap<String, HashMap<String, String>>,
+    width: f32,
 ) -> Result<StaticPageData, Box<dyn Error + Send + Sync>> {
     let dom_tree = dom::parse_html(body);
 
-    // Collect inline + external CSS
-    let mut css_source = style::extract_css_from_dom(&dom_tree.document);
-    for link in style::extract_external_css_links(&dom_tree.document) {
-        let abs_url = base_url.join(&link).map(|u| u.to_string()).unwrap_or(link);
-        if let Ok(resp) = reqwest::blocking::get(&abs_url) {
-            if let Ok(text) = resp.text() {
-                css_source.push_str(&text);
-            }
-        }
-    }
+    // Collect inline + external CSS in order (C6)
+    let mut css_source = String::new();
+    collect_css_in_order(&dom_tree.document, base_url, &mut css_source);
 
     let stylesheet = css::parse_css(&css_source);
     let style_tree = style::build_style_tree(&dom_tree.document, &stylesheet, None, js_overrides);
 
-    let width = 800u32;
     let (layout_tree, _, final_y) =
-        layout::build_layout_tree(&style_tree, 0.0, 0.0, 0.0, width as f32);
+        layout::build_layout_tree(&style_tree, 0.0, 0.0, 0.0, width, width, 768.0);
 
     let height = (final_y.ceil() as u32).clamp(600, 16384);
-    let mut pixmap = tiny_skia::Pixmap::new(width, height).unwrap();
+    let mut pixmap = tiny_skia::Pixmap::new(width as u32, height).unwrap();
+
     pixmap.fill(tiny_skia::Color::WHITE);
 
     let mut links: Vec<(layout::Rect, String)> = Vec::new();
@@ -235,7 +266,7 @@ fn process_html_with_cache(
 
     Ok(StaticPageData {
         pixmap_bytes: pixmap.data().to_vec(),
-        width,
+        width: width as u32,
         height,
         links: absolute_links,
         form_controls,
@@ -276,14 +307,14 @@ impl eframe::App for BrowserApp {
                     };
 
                     if btn_style(ui, "←", self.history_index > 0).clicked() {
-                        self.navigate_back();
+                        self.navigate_back(ui.available_width());
                     }
                     if btn_style(ui, "→", self.history_index + 1 < self.history.len()).clicked() {
-                        self.navigate_forward();
+                        self.navigate_forward(ui.available_width());
                     }
                     if btn_style(ui, "⟳", true).clicked() {
                         let url = self.url.clone();
-                        self.load_url_direct(url);
+                        self.load_url_direct(url, ui.available_width());
                     }
 
                     ui.spacing_mut().item_spacing.x = 8.0;
@@ -303,7 +334,8 @@ impl eframe::App for BrowserApp {
                         let resp = ui.add(edit);
                         if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             let url = self.url.clone();
-                            self.load_url(url);
+                            let width = ui.available_width();
+                            self.load_url(url, width);
                         }
                     });
 
@@ -316,7 +348,8 @@ impl eframe::App for BrowserApp {
                         .min_size(egui::vec2(50.0, 28.0)),
                     ).clicked() {
                         let url = self.url.clone();
-                        self.load_url(url);
+                        let width = ui.available_width();
+                        self.load_url(url, width);
                     }
                 });
 
@@ -403,7 +436,7 @@ impl eframe::App for BrowserApp {
                             let overrides = self.js_runtime.get_style_overrides();
                             if !overrides.is_empty() {
                                 self.js_style_overrides = overrides;
-                                self.trigger_re_render(ctx);
+                                self.trigger_re_render(ctx, ui.available_width());
                             }
                         }
                     }
@@ -423,7 +456,8 @@ impl eframe::App for BrowserApp {
                     }
                 });
                 if newly_loaded {
-                    self.trigger_re_render(ctx);
+                    let width = ui.available_width();
+                    self.trigger_re_render(ctx, width);
                 }
 
                 // Error message
@@ -502,12 +536,13 @@ impl eframe::App for BrowserApp {
                             for (id, props) in overrides {
                                 self.js_style_overrides.entry(id).or_default().extend(props);
                             }
-                            self.trigger_re_render(ctx);
+                            self.trigger_re_render(ctx, ui.available_width());
                         }
                     }
 
                     if let Some(url) = url_to_load {
-                        self.load_url(url);
+                        let width = ui.available_width();
+                        self.load_url(url, width);
                     }
                 }
             });

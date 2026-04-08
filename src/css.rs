@@ -35,30 +35,6 @@ pub enum Unit {
     Percent,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Selector {
-    pub tag: Option<String>,
-    pub id: Option<String>,
-    pub class: Vec<String>,
-}
-
-impl Selector {
-    pub fn new() -> Self {
-        Selector {
-            tag: None,
-            id: None,
-            class: Vec::new(),
-        }
-    }
-
-    pub fn specificity(&self) -> (usize, usize, usize) {
-        let id_count = if self.id.is_some() { 1 } else { 0 };
-        let class_count = self.class.len();
-        let tag_count = if self.tag.is_some() { 1 } else { 0 };
-        (id_count, class_count, tag_count)
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct Rule {
     pub selectors: Vec<Selector>,
@@ -178,33 +154,81 @@ pub fn parse_quad_shorthand(prefix: &str, val: &str, declarations: &mut HashMap<
     declarations.insert(prefix.to_string(), parse_value(top));
 }
 
-fn parse_selector(s: &str) -> Selector {
-    let mut selector = Selector::new();
-    let mut current = String::new();
-    let mut last_char = ' ';
+#[derive(Debug, Clone, Default)]
+pub struct Selector {
+    pub tag: Option<String>,
+    pub id: Option<String>,
+    pub class: Vec<String>,
+    pub descendant: Option<Box<Selector>>,
+}
 
-    // Handle combinators and pseudo-classes by taking only the last simple selector
-    let s = s.split_whitespace().last().unwrap_or(s);
-    // Remove pseudo-classes/elements (:hover, ::before, etc.)
-    let s = s.split(':').next().unwrap_or(s);
-
-    for c in s.chars().chain(std::iter::once(' ')) {
-        if c == '#' || c == '.' || c == ' ' || c == '[' {
-            if !current.is_empty() {
-                match last_char {
-                    '#' => selector.id = Some(current.clone()),
-                    '.' => selector.class.push(current.clone()),
-                    _ => selector.tag = Some(current.clone()),
-                }
-                current.clear();
-            }
-            if c == '[' { break; } // Skip attribute selectors
-            last_char = c;
-        } else {
-            current.push(c);
-        }
+impl Selector {
+    pub fn new() -> Self {
+        Self::default()
     }
-    selector
+
+    pub fn specificity(&self) -> (usize, usize, usize) {
+        let (mut a, mut b, mut c) = (0, 0, 0);
+        if self.id.is_some() { a += 1; }
+        b += self.class.len();
+        if self.tag.is_some() { c += 1; }
+        
+        if let Some(ref d) = self.descendant {
+            let (da, db, dc) = d.specificity();
+            a += da; b += db; c += dc;
+        }
+        (a, b, c)
+    }
+}
+
+pub fn parse_selector(s: &str) -> Selector {
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.is_empty() { return Selector::new(); }
+
+    // Build descendant chain from left to right
+    // ".card .title" -> Selector(.title, descendant: Selector(.card))
+    let mut root: Option<Selector> = None;
+
+    for part in parts {
+        // Remove pseudo-classes/elements (:hover, ::before, etc.)
+        let part = part.split(':').next().unwrap_or(part);
+        if part.is_empty() { continue; }
+
+        let mut current_sel = Selector::new();
+        let mut current_token = String::new();
+        let mut last_char = ' ';
+
+        for c in part.chars().chain(std::iter::once(' ')) {
+            if c == '#' || c == '.' || c == ' ' || c == '[' {
+                if !current_token.is_empty() {
+                    match last_char {
+                        '#' => current_sel.id = Some(current_token.clone()),
+                        '.' => current_sel.class.push(current_token.clone()),
+                        _ => current_sel.tag = Some(current_token.clone()),
+                    }
+                    current_token.clear();
+                }
+                if c == '[' { break; } // Skip attribute selectors (C3/C4)
+                last_char = c;
+            } else {
+                current_token.push(c);
+            }
+        }
+        
+        if let Some(prev) = root {
+            current_sel.descendant = Some(Box::new(prev));
+        }
+        root = Some(current_sel);
+    }
+
+    // Wait, the chain should be "Deepest child matches first, then check ancestors"
+    // So "div .card p" should have p as the primary match, and "div .card" as the descendant requirement.
+    // CSS matching works from right to left.
+    // Let's re-orient: Selector is for the RIGHTMOST part.
+    // "div .card p" -> Selector { tag: "p", ancestor: Some(Selector { class: "card", ancestor: Some(Selector { tag: "div" }) }) }
+    
+    // I'll rename descendant to ancestor for clarity.
+    root.unwrap_or_default()
 }
 
 pub fn parse_border_shorthand_pub(val: &str, declarations: &mut HashMap<String, Value>) {

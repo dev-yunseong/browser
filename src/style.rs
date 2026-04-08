@@ -45,13 +45,6 @@ pub fn build_style_tree(
             let attr_name = attr.name.local.to_string();
             match attr_name.as_str() {
                 "id" => id = Some(attr.value.to_string()),
-                "class" => {
-                    classes = attr.value
-                        .to_string()
-                        .split_whitespace()
-                        .map(|s| s.to_string())
-                        .collect();
-                }
                 _ => {}
             }
         }
@@ -62,11 +55,17 @@ pub fn build_style_tree(
         // 3. Match CSS rules, sorted by specificity (lowest first → highest wins)
         let mut matches = Vec::new();
         for rule in &stylesheet.rules {
+            let mut highest_match: Option<(usize, usize, usize)> = None;
             for selector in &rule.selectors {
-                if matches_selector(selector, &tag_name, id.as_deref(), &classes) {
-                    matches.push((selector.specificity(), rule));
-                    break;
+                if matches_selector(selector, root) {
+                    let spec = selector.specificity();
+                    if highest_match.is_none() || spec > highest_match.unwrap() {
+                        highest_match = Some(spec);
+                    }
                 }
+            }
+            if let Some(spec) = highest_match {
+                matches.push((spec, rule));
             }
         }
         matches.sort_by(|a, b| a.0.cmp(&b.0));
@@ -85,6 +84,19 @@ pub fn build_style_tree(
             if attr.name.local.to_string() == "style" {
                 parse_inline_style(&attr.value.to_string(), &mut specified_values);
             }
+        }
+
+        // B4: If font-size is a percentage, it must be resolved against the *inherited* font-size
+        // before other properties use it (if any do). Currently layout uses specified_values directly.
+        if let Some(Value::Length(v, crate::css::Unit::Percent)) = specified_values.get("font-size") {
+            let parent_fs = match parent_style {
+                Some(parent) => match parent.get("font-size") {
+                    Some(Value::Length(pv, crate::css::Unit::Px)) => *pv,
+                    _ => 16.0,
+                },
+                _ => 16.0,
+            };
+            specified_values.insert("font-size".to_string(), Value::Length(parent_fs * (v / 100.0), crate::css::Unit::Px));
         }
 
         // 6. Apply JS overrides (highest priority)
@@ -228,22 +240,63 @@ fn apply_attribute_styles(tag: &str, attrs_borrow: &std::cell::Ref<Vec<html5ever
     }
 }
 
-fn matches_selector(selector: &Selector, tag: &str, id: Option<&str>, classes: &[String]) -> bool {
-    // C3: an empty selector (no tag, id, or class constraint) would match everything.
-    // Treat it as a non-match to prevent unintended global rule application.
-    if selector.tag.is_none() && selector.id.is_none() && selector.class.is_empty() {
-        return false;
+fn matches_selector(selector: &Selector, handle: &Handle) -> bool {
+    // Check current node matches primary part of selector
+    if let NodeData::Element { ref name, ref attrs, .. } = handle.data {
+        let tag = name.local.to_string();
+        let mut id = None;
+        let mut classes = Vec::new();
+        for attr in attrs.borrow().iter() {
+            match attr.name.local.as_ref() {
+                "id" => id = Some(attr.value.to_string()),
+                "class" => classes = attr.value.to_string().split_whitespace().map(|s| s.to_string()).collect(),
+                _ => {}
+            }
+        }
+
+        // Base match
+        let has_constraint = selector.tag.is_some() || selector.id.is_some() || !selector.class.is_empty();
+        if !has_constraint { return false; }
+
+        if let Some(ref s_tag) = selector.tag {
+            if s_tag != &tag && s_tag != "*" { return false; }
+        }
+        if let Some(ref s_id) = selector.id {
+            if Some(s_id.as_str()) != id.as_deref() { return false; }
+        }
+        for s_class in &selector.class {
+            if !classes.contains(s_class) { return false; }
+        }
+
+        // If there's an ancestor requirement (misnamed descendant in struct), check it
+        if let Some(ref ancestor_sel) = selector.descendant {
+            let mut current = {
+                let p = handle.parent.take();
+                let res = p.as_ref().and_then(|p| p.upgrade());
+                handle.parent.set(p);
+                res
+            };
+            let mut matched = false;
+            while let Some(parent_handle) = current {
+                if matches_selector(ancestor_sel, &parent_handle) {
+                    matched = true;
+                    break;
+                }
+                current = {
+                    let p = parent_handle.parent.take();
+                    let res = p.as_ref().and_then(|p| p.upgrade());
+                    parent_handle.parent.set(p);
+                    res
+                };
+            }
+            if !matched { return false; }
+        }
+
+
+        true
+    } else {
+        false
     }
-    if let Some(ref s_tag) = selector.tag {
-        if s_tag != tag { return false; }
-    }
-    if let Some(ref s_id) = selector.id {
-        if Some(s_id.as_str()) != id { return false; }
-    }
-    for s_class in &selector.class {
-        if !classes.contains(s_class) { return false; }
-    }
-    true
 }
 
 pub fn extract_css_from_dom(handle: &Handle) -> String {
