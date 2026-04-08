@@ -490,14 +490,16 @@ impl eframe::App for BrowserApp {
                     let mut url_to_load: Option<String> = None;
                     let mut scripts_to_run: Vec<String> = Vec::new();
 
-                    egui::ScrollArea::both().show(ui, |ui| {
-                        let (rect, response) = ui.allocate_at_least(texture_size, egui::Sense::click());
-                        ui.painter().image(
-                            texture_id,
-                            rect,
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            egui::Color32::WHITE,
-                        );
+                    egui::ScrollArea::both()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let (rect, response) = ui.allocate_at_least(texture_size, egui::Sense::click());
+                            ui.painter().image(
+                                texture_id,
+                                rect,
+                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                egui::Color32::WHITE,
+                            );
 
                         // Overlay interactive form controls
                         for (i, (l_rect, _)) in self.current_form_controls.iter().enumerate() {

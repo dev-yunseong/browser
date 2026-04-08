@@ -299,6 +299,9 @@ self.dimensions.width = width;
                         child_y += line_height;
                         line_height = 0.0;
                     }
+                } else {
+                    // Proactive wrapping: check if this inline-like element fits in the remaining width
+                    // We need a quick measure pass or estimate. For now, we'll build it and move it if it overflows.
                 }
 
                 // Block-level children must not receive INFINITY as their container width
@@ -310,22 +313,29 @@ self.dimensions.width = width;
                 
                 let (child_box, next_x, next_y) = build_layout_tree(child_node, self.dimensions.x + self.padding.left + self.border.left, child_x, child_y, cw, vw, vh);
                 
-                if let Some(cb) = child_box {
-                    if child_is_block {
-                        child_y = next_y;
-                        child_x = self.dimensions.x + self.padding.left + self.border.left;
-                        line_height = 0.0;
-                    } else {
-                        // Inline/InlineBlock: advance x and track line height
-                        child_x = next_x;
-                        line_height = line_height.max(cb.dimensions.height + cb.margin.top + cb.margin.bottom);
-                        
-                        // Simple wrapping: if next_x exceeds container, wrap to next line
-                        if child_x > self.dimensions.x + self.padding.left + self.border.left + child_container_w && child_container_w.is_finite() {
+                if let Some(mut cb) = child_box {
+                    if !child_is_block {
+                        // If this inline element pushed current_x past the right edge, wrap it
+                        let right_edge = self.dimensions.x + self.padding.left + self.border.left + child_container_w;
+                        if child_x > self.dimensions.x + self.padding.left + self.border.left && next_x > right_edge && child_container_w.is_finite() {
                             child_x = self.dimensions.x + self.padding.left + self.border.left;
                             child_y += line_height;
                             line_height = 0.0;
+                            
+                            // Re-layout at the new position
+                            let (new_cb, new_nx, _) = build_layout_tree(child_node, self.dimensions.x + self.padding.left + self.border.left, child_x, child_y, cw, vw, vh);
+                            if let Some(ncb) = new_cb {
+                                cb = ncb;
+                                child_x = new_nx;
+                            }
+                        } else {
+                            child_x = next_x;
                         }
+                        line_height = line_height.max(cb.dimensions.height + cb.margin.top + cb.margin.bottom);
+                    } else {
+                        child_y = next_y;
+                        child_x = self.dimensions.x + self.padding.left + self.border.left;
+                        line_height = 0.0;
                     }
                     
                     max_child_y = max_child_y.max(child_y + line_height);
@@ -366,8 +376,6 @@ self.dimensions.width = width;
     fn layout_text(&mut self, text: String, current_x: f32, current_y: f32, container_width: f32) -> (Option<LayoutBox<'a>>, f32, f32) {
         let trimmed = text.trim();
         if trimmed.is_empty() { return (None, current_x, current_y); }
-        // Use the actual specified font-size; fall back to 16px only when unspecified.
-        // Do NOT clamp to 16px — that causes layout/paint to diverge for small fonts (B4).
         let font_size = match self.style_node.specified_values.get("font-size") {
             Some(Value::Length(v, Unit::Px)) => v.max(1.0),
             _ => 16.0,
@@ -381,32 +389,44 @@ self.dimensions.width = width;
         let mut max_w: f32 = 0.0;
         let space_w = font.h_advance_unscaled(font.glyph_id(' ')) * (scale.x / units);
 
+        // Start x relative to parent container start
+        let mut rel_x = current_x - (self.dimensions.x - self.margin.left);
+
         for word in trimmed.split_whitespace() {
             let mut word_w = 0.0;
             for c in word.chars() { word_w += font.h_advance_unscaled(font.glyph_id(c)) * (scale.x / units); }
-            // Only wrap when container_width is a real finite constraint.
-            // INFINITY = shrink-wrap context: compute natural single-line width.
+            
+            // If word is too long for current line
             if container_width.is_finite() && line_w + word_w > container_width && line_w > 0.0 {
                 max_w = max_w.max(line_w);
-                line_w = word_w;
+                line_w = 0.0;
                 lines_count += 1;
+            }
+
+            // If a single word is LONGER than the entire container, we must break it char-by-char
+            if container_width.is_finite() && word_w > container_width {
+                for c in word.chars() {
+                    let char_w = font.h_advance_unscaled(font.glyph_id(c)) * (scale.x / units);
+                    if line_w + char_w > container_width && line_w > 0.0 {
+                        max_w = max_w.max(line_w);
+                        line_w = 0.0;
+                        lines_count += 1;
+                    }
+                    line_w += char_w;
+                }
             } else {
                 if line_w > 0.0 { line_w += space_w; }
                 line_w += word_w;
             }
         }
         max_w = max_w.max(line_w);
+        
         self.dimensions.x = current_x + self.margin.left;
         self.dimensions.y = current_y + self.margin.top;
-        // In shrink-wrap context (INFINITY), use the natural text width directly.
-        self.dimensions.width = if container_width.is_finite() {
-            max_w.min(container_width)
-        } else {
-            max_w
-        };
+        self.dimensions.width = if container_width.is_finite() { max_w.min(container_width) } else { max_w };
         self.dimensions.height = lines_count as f32 * (font_size * 1.4);
+        
         let final_x = self.dimensions.x + self.dimensions.width + self.margin.right;
-        // Advance y past the text block so the next sibling starts below (B8).
         let final_y = self.dimensions.y + self.dimensions.height + self.margin.bottom;
         (Some(self.clone()), final_x, final_y)
     }
