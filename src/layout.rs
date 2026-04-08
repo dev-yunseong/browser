@@ -147,6 +147,16 @@ impl<'a> LayoutBox<'a> {
             _ => if is_block { (container_width - self.margin.left - self.margin.right).max(0.0) } else { 0.0 },
         };
 
+        // Handle box-sizing: border-box (B5)
+        // If border-box is used, subtract padding and border from the specified width
+        let box_sizing = self.style_node.specified_values.get("box-sizing")
+            .and_then(|v| if let Value::Keyword(k) = v { Some(k.as_str()) } else { None })
+            .unwrap_or("content-box"); // Default is content-box
+
+        if box_sizing == "border-box" && width > 0.0 {
+            width = (width - self.padding.left - self.padding.right - self.border.left - self.border.right).max(0.0);
+        }
+
         if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get("max-width") {
             width = width.min(*v);
         }
@@ -537,7 +547,7 @@ mod tests {
         let stylesheet = css::parse_css("");
         let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new());
         
-        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 1024.0);
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 1024.0, 1024.0, 768.0);
         let layout = layout_opt.unwrap();
         
         let mut handlers = Vec::new();
@@ -565,7 +575,7 @@ mod tests {
             style_tree.children[0].specified_values.insert("margin".to_string(), css::Value::Keyword("auto".to_string()));
         }
 
-        let (layout_opt, _, _) = build_layout_tree(&style_tree.children[0], 0.0, 0.0, 0.0, 1000.0);
+        let (layout_opt, _, _) = build_layout_tree(&style_tree.children[0], 0.0, 0.0, 0.0, 1000.0, 1000.0, 768.0);
         let layout = layout_opt.unwrap();
         
         assert_eq!(layout.dimensions.width, 500.0);
@@ -606,7 +616,7 @@ mod tests {
             })
             .unwrap();
 
-        let (layout_opt, _, _) = build_layout_tree(div_node, 0.0, 0.0, 0.0, 800.0);
+        let (layout_opt, _, _) = build_layout_tree(div_node, 0.0, 0.0, 0.0, 800.0, 800.0, 768.0);
         let layout = layout_opt.unwrap();
         let text = find_first_inline(&layout).unwrap();
 
@@ -639,7 +649,7 @@ mod tests {
         let stylesheet = css::parse_css("");
         let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new());
 
-        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0);
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 768.0);
         let layout = layout_opt.unwrap();
 
         fn find_span<'a>(b: &'a LayoutBox<'a>) -> Option<&'a LayoutBox<'a>> {

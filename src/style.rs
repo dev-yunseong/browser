@@ -23,7 +23,14 @@ pub fn build_style_tree(
 ) -> StyledNode {
     let mut specified_values = HashMap::new();
 
-    // 1. Inherit selected properties from parent
+    // 1. Set initial defaults for root (or inherit from parent)
+    if parent_style.is_none() {
+        // Default color for the very first node (usually <html>)
+        specified_values.insert("color".to_string(), Value::Color(crate::css::Color { r: 0, g: 0, b: 0, a: 255 }));
+        specified_values.insert("font-size".to_string(), Value::Length(16.0, crate::css::Unit::Px));
+    }
+
+    // 2. Inherit properties from parent
     if let Some(parent) = parent_style {
         let inheritable = [
             "color", "font-size", "font-family", "font-weight",

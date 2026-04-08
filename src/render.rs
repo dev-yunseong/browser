@@ -8,11 +8,14 @@ use std::collections::HashMap;
 const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/NanumGothic.ttf");
 
 pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap, image_cache: &HashMap<String, Vec<u8>>) {
-    let d = layout.dimensions;
+    render_backgrounds(layout, pixmap);
+    render_foregrounds(layout, pixmap, image_cache);
+}
 
-    // 가시성이 없는 박스는 렌더링 스킵 (잔상 및 검은 블록 방지)
+fn render_backgrounds(layout: &LayoutBox, pixmap: &mut Pixmap) {
+    let d = layout.dimensions;
     if d.width < 0.1 || d.height < 0.1 {
-        for child in &layout.children { render_layout_tree(child, pixmap, image_cache); }
+        for child in &layout.children { render_backgrounds(child, pixmap); }
         return;
     }
 
@@ -20,19 +23,13 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap, image_cache: 
     if let Some(Value::BoxShadow(shadow)) = layout.style_node.specified_values.get("box-shadow") {
         if !shadow.inset {
             let mut paint = Paint::default();
-            // Simple approximation: use lower alpha for the "shadow"
             paint.set_color_rgba8(shadow.color.r, shadow.color.g, shadow.color.b, shadow.color.a / 2);
-            
-            // spread expands the shadow in all directions
             let sx = d.x + shadow.offset_x - shadow.spread;
             let sy = d.y + shadow.offset_y - shadow.spread;
             let sw = d.width + (shadow.spread * 2.0);
             let sh = d.height + (shadow.spread * 2.0);
-            
             if let Some(r) = Rect::from_xywh(sx, sy, sw, sh) {
                 pixmap.fill_rect(r, &paint, Transform::identity(), None);
-                
-                // If there's blur, we could do more passes, but for now just one slightly larger rect
                 if shadow.blur > 0.0 {
                     paint.set_color_rgba8(shadow.color.r, shadow.color.g, shadow.color.b, shadow.color.a / 4);
                     let b = shadow.blur / 2.0;
@@ -59,7 +56,7 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap, image_cache: 
     // ── 3. Border ──
     if layout.border.left > 0.0 {
         let mut paint = Paint::default();
-        paint.set_color_rgba8(180, 180, 180, 255); // 기본 회색 테두리
+        paint.set_color_rgba8(180, 180, 180, 255);
         let mut stroke = Stroke::default();
         stroke.width = layout.border.left;
         if let Some(r) = Rect::from_xywh(d.x, d.y, d.width, d.height) {
@@ -69,6 +66,18 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap, image_cache: 
                 pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
             }
         }
+    }
+
+    for child in &layout.children {
+        render_backgrounds(child, pixmap);
+    }
+}
+
+fn render_foregrounds(layout: &LayoutBox, pixmap: &mut Pixmap, image_cache: &HashMap<String, Vec<u8>>) {
+    let d = layout.dimensions;
+    if d.width < 0.1 || d.height < 0.1 {
+        for child in &layout.children { render_foregrounds(child, pixmap, image_cache); }
+        return;
     }
 
     // ── 4. Image ──
@@ -92,9 +101,8 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap, image_cache: 
         render_text_wrapped(contents.borrow().to_string(), layout, pixmap);
     }
 
-    // ── 6. Children ──
     for child in &layout.children {
-        render_layout_tree(child, pixmap, image_cache);
+        render_foregrounds(child, pixmap, image_cache);
     }
 }
 

@@ -21,8 +21,10 @@ fn test_complex_selector_matching_c1_c2() {
     let title_inside = &card_div.children[0]; // <div class="title"> inside card
     let title_outside = &body_node.children[1]; // <div class="title"> outside card
     
-    assert_eq!(title_inside.specified_values.get("color").unwrap(), &css::Value::Color(css::Color { r: 255, g: 0, b: 0, a: 255 }));
-    assert!(title_outside.specified_values.get("color").is_none());
+    let red = css::Value::Color(css::Color { r: 255, g: 0, b: 0, a: 255 });
+    assert_eq!(title_inside.specified_values.get("color").unwrap(), &red);
+    // title_outside should inherit default black from root, not red from the rule
+    assert_ne!(title_outside.specified_values.get("color").unwrap(), &red);
 }
 
 #[test]
@@ -35,7 +37,8 @@ fn test_empty_selector_no_global_match_c3() {
     let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new());
     let div_style = find_node_by_tag(&style_tree, "div").expect("div not found");
     
-    assert!(div_style.specified_values.get("color").is_none());
+    let red = css::Value::Color(css::Color { r: 255, g: 0, b: 0, a: 255 });
+    assert_ne!(div_style.specified_values.get("color").unwrap(), &red);
 }
 
 #[test]
