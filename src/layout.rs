@@ -160,8 +160,29 @@ self.dimensions.width = width;
             return self.layout_text(contents.borrow().to_string(), current_x, current_y, container_width);
         }
 
-        let child_container_w = if width > 0.0 { width } else { container_width }
-                                - self.padding.left - self.padding.right - self.border.left - self.border.right;
+        // For shrink-wrap contexts (inline/table-cell with no explicit width), pass
+        // INFINITY so text inside computes its natural unwrapped width instead of
+        // wrapping to container_width and inflating the element to full container width.
+        // Block-level children inside such a context must still receive a finite width,
+        // so we keep a separate finite fallback for them.
+        let effective_cw = if !is_block && width == 0.0 {
+            f32::INFINITY
+        } else if width > 0.0 {
+            width
+        } else {
+            container_width
+        };
+        let child_container_w = (effective_cw
+            - self.padding.left - self.padding.right
+            - self.border.left - self.border.right)
+            .max(0.0);
+        // Finite child container width used for block-level children nested inside
+        // a shrink-wrap parent (INFINITY must not reach block children or their
+        // width would become INFINITY).
+        let finite_child_cw = (if width > 0.0 { width } else { container_width }
+            - self.padding.left - self.padding.right
+            - self.border.left - self.border.right)
+            .max(0.0);
         let mut child_x = self.dimensions.x + self.padding.left + self.border.left;
         let mut child_y = self.dimensions.y + self.padding.top + self.border.top;
         let mut max_child_y = child_y;
@@ -221,7 +242,14 @@ self.dimensions.width = width;
         } else {
             for child_node in &self.style_node.children {
                 if should_skip(child_node) { continue; }
-                let (child_box, next_x, next_y) = build_layout_tree(child_node, self.dimensions.x + self.padding.left, child_x, child_y, child_container_w);
+                // Block-level children must not receive INFINITY as their container width
+                // (they compute width = container_width - margins, which would be INFINITY).
+                let cw = if child_container_w.is_infinite() && is_block_level(get_display_type(child_node)) {
+                    finite_child_cw
+                } else {
+                    child_container_w
+                };
+                let (child_box, next_x, next_y) = build_layout_tree(child_node, self.dimensions.x + self.padding.left, child_x, child_y, cw);
                 if let Some(cb) = child_box {
                     max_child_y = max_child_y.max(cb.dimensions.y + cb.dimensions.height + cb.margin.bottom);
                     max_child_x = max_child_x.max(cb.dimensions.x + cb.dimensions.width + cb.margin.right);
@@ -233,7 +261,14 @@ self.dimensions.width = width;
         }
 
         if self.dimensions.width <= 0.0 {
-            self.dimensions.width = (max_child_x - self.dimensions.x + self.padding.right + self.border.right).min(container_width);
+            let derived = max_child_x - self.dimensions.x + self.padding.right + self.border.right;
+            // Clamp to the finite container_width. When container_width is INFINITY
+            // (shrink-wrap context), use the derived natural width directly.
+            self.dimensions.width = if container_width.is_finite() {
+                derived.min(container_width)
+            } else {
+                derived  // natural shrink-wrap width; finite because block children used finite_child_cw
+            };
         }
         // Respect explicit height (B9); otherwise derive from children.
         // Remove the unconditional max(20.0) clamp — it was distorting small boxes.
@@ -269,7 +304,9 @@ self.dimensions.width = width;
         for word in trimmed.split_whitespace() {
             let mut word_w = 0.0;
             for c in word.chars() { word_w += font.h_advance_unscaled(font.glyph_id(c)) * (scale.x / units); }
-            if line_w + word_w > container_width && line_w > 0.0 {
+            // Only wrap when container_width is a real finite constraint.
+            // INFINITY = shrink-wrap context: compute natural single-line width.
+            if container_width.is_finite() && line_w + word_w > container_width && line_w > 0.0 {
                 max_w = max_w.max(line_w);
                 line_w = word_w;
                 lines_count += 1;
@@ -281,7 +318,12 @@ self.dimensions.width = width;
         max_w = max_w.max(line_w);
         self.dimensions.x = current_x + self.margin.left;
         self.dimensions.y = current_y + self.margin.top;
-        self.dimensions.width = max_w.min(container_width);
+        // In shrink-wrap context (INFINITY), use the natural text width directly.
+        self.dimensions.width = if container_width.is_finite() {
+            max_w.min(container_width)
+        } else {
+            max_w
+        };
         self.dimensions.height = lines_count as f32 * (font_size * 1.4);
         let final_x = self.dimensions.x + self.dimensions.width + self.margin.right;
         // Advance y past the text block so the next sibling starts below (B8).
@@ -506,5 +548,32 @@ mod tests {
         }
 
         None
+    }
+
+    #[test]
+    fn test_inline_element_shrinks_to_content() {
+        // An inline <span> should derive its width from text content,
+        // NOT expand to the full container_width (800px).
+        let html = r#"<span>Hi</span>"#;
+        let dom = dom::parse_html(html);
+        let stylesheet = css::parse_css("");
+        let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new());
+
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0);
+        let layout = layout_opt.unwrap();
+
+        fn find_span<'a>(b: &'a LayoutBox<'a>) -> Option<&'a LayoutBox<'a>> {
+            if let NodeData::Element { ref name, .. } = b.style_node.node.data {
+                if name.local.to_string() == "span" { return Some(b); }
+            }
+            for c in &b.children { if let Some(f) = find_span(c) { return Some(f); } }
+            None
+        }
+
+        let span = find_span(&layout).expect("span not found");
+        assert!(span.dimensions.width > 0.0, "span width must be > 0");
+        assert!(span.dimensions.width < 800.0,
+            "span width {} must be < container_width 800 (should shrink to content)",
+            span.dimensions.width);
     }
 }
