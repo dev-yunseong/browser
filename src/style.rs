@@ -274,8 +274,8 @@ fn matches_selector(selector: &Selector, handle: &Handle) -> bool {
             if !classes.contains(s_class) { return false; }
         }
 
-        // If there's an ancestor requirement (misnamed descendant in struct), check it
-        if let Some(ref ancestor_sel) = selector.descendant {
+        // If there's an ancestor requirement, check it
+        if let Some(ref ancestor_sel) = selector.ancestor {
             let mut current = {
                 let p = handle.parent.take();
                 let res = p.as_ref().and_then(|p| p.upgrade());
