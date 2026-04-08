@@ -226,7 +226,8 @@ pub fn parse_selector(s: &str) -> Selector {
                 let mut current_token = String::new();
                 let mut last_char = ' ';
 
-                for c in part.chars().chain(std::iter::once(' ')) {
+                let mut chars = part.chars().chain(std::iter::once(' ')).peekable();
+                while let Some(c) = chars.next() {
                     if c == '#' || c == '.' || c == ' ' || c == '[' {
                         if !current_token.is_empty() {
                             match last_char {
@@ -236,7 +237,31 @@ pub fn parse_selector(s: &str) -> Selector {
                             }
                             current_token.clear();
                         }
-                        if c == '[' { break; }
+                        if c == '[' {
+                            // Parse attribute selector [attr=val]
+                            let mut attr_content = String::new();
+                            while let Some(ac) = chars.next() {
+                                if ac == ']' { break; }
+                                attr_content.push(ac);
+                            }
+                            if !attr_content.is_empty() {
+                                if let Some(eq_idx) = attr_content.find('=') {
+                                    let name = attr_content[..eq_idx].trim().to_string();
+                                    let val = attr_content[eq_idx+1..].trim().trim_matches('"').trim_matches('\'').to_string();
+                                    current_sel.attributes.push(AttributeSelector {
+                                        name,
+                                        value: AttributeMatch::Equals(val),
+                                    });
+                                } else {
+                                    current_sel.attributes.push(AttributeSelector {
+                                        name: attr_content.trim().to_string(),
+                                        value: AttributeMatch::Exists,
+                                    });
+                                }
+                            }
+                            last_char = ' '; // Reset after attribute
+                            continue;
+                        }
                         last_char = c;
                     } else {
                         current_token.push(c);

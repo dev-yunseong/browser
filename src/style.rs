@@ -1,4 +1,4 @@
-use crate::css::{Stylesheet, Value, Selector, parse_value, parse_color};
+use crate::css::{Stylesheet, Value, Selector, parse_value, parse_color, Combinator};
 use markup5ever_rcdom::{Handle, NodeData};
 use std::collections::HashMap;
 
@@ -246,6 +246,13 @@ fn apply_attribute_styles(tag: &str, attrs_borrow: &std::cell::Ref<Vec<html5ever
     }
 }
 
+fn get_parent(handle: &Handle) -> Option<Handle> {
+    let p = handle.parent.take();
+    let res = p.as_ref().and_then(|p| p.upgrade());
+    handle.parent.set(p);
+    res
+}
+
 fn matches_selector(selector: &Selector, handle: &Handle) -> bool {
     // Check current node matches primary part of selector
     if let NodeData::Element { ref name, ref attrs, .. } = handle.data {
@@ -261,7 +268,7 @@ fn matches_selector(selector: &Selector, handle: &Handle) -> bool {
         }
 
         // Base match
-        let has_constraint = selector.tag.is_some() || selector.id.is_some() || !selector.class.is_empty();
+        let has_constraint = selector.tag.is_some() || selector.id.is_some() || !selector.class.is_empty() || !selector.attributes.is_empty();
         if !has_constraint { return false; }
 
         if let Some(ref s_tag) = selector.tag {
@@ -274,30 +281,96 @@ fn matches_selector(selector: &Selector, handle: &Handle) -> bool {
             if !classes.contains(s_class) { return false; }
         }
 
-        // If there's an ancestor requirement, check it
-        if let Some(ref ancestor_sel) = selector.ancestor {
-            let mut current = {
-                let p = handle.parent.take();
-                let res = p.as_ref().and_then(|p| p.upgrade());
-                handle.parent.set(p);
-                res
-            };
+        // Attribute match
+        for attr_sel in &selector.attributes {
             let mut matched = false;
-            while let Some(parent_handle) = current {
-                if matches_selector(ancestor_sel, &parent_handle) {
-                    matched = true;
-                    break;
+            for attr in attrs.borrow().iter() {
+                if attr.name.local.as_ref() == attr_sel.name {
+                    match &attr_sel.value {
+                        crate::css::AttributeMatch::Exists => { matched = true; break; }
+                        crate::css::AttributeMatch::Equals(v) => {
+                            if attr.value.as_ref() == v { matched = true; break; }
+                        }
+                    }
                 }
-                current = {
-                    let p = parent_handle.parent.take();
-                    let res = p.as_ref().and_then(|p| p.upgrade());
-                    parent_handle.parent.set(p);
-                    res
-                };
             }
             if !matched { return false; }
         }
 
+        // If there's an ancestor requirement, check it
+        if let Some(ref ancestor_sel) = selector.ancestor {
+            let combinator = selector.combinator.as_ref().unwrap_or(&Combinator::Descendant);
+            
+            match combinator {
+                Combinator::Descendant => {
+                    let mut current = get_parent(handle);
+                    let mut matched = false;
+                    while let Some(parent_handle) = current {
+                        if matches_selector(ancestor_sel, &parent_handle) {
+                            matched = true;
+                            break;
+                        }
+                        current = get_parent(&parent_handle);
+                    }
+                    if !matched { return false; }
+                }
+                Combinator::Child => {
+                    if let Some(p) = get_parent(handle) {
+                        if !matches_selector(ancestor_sel, &p) {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                Combinator::NextSibling => {
+                    if let Some(p) = get_parent(handle) {
+                        let children = p.children.borrow();
+                        let index = children.iter().position(|child| std::ptr::eq(child, handle));
+                        if let Some(idx) = index {
+                            let mut found = false;
+                            for prev_idx in (0..idx).rev() {
+                                let sib = &children[prev_idx];
+                                if let NodeData::Element { .. } = sib.data {
+                                    if matches_selector(ancestor_sel, sib) {
+                                        found = true;
+                                    }
+                                    break;
+                                }
+                            }
+                            if !found { return false; }
+                        } else {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                Combinator::SubsequentSibling => {
+                    if let Some(p) = get_parent(handle) {
+                        let children = p.children.borrow();
+                        let index = children.iter().position(|child| std::ptr::eq(child, handle));
+                        if let Some(idx) = index {
+                            let mut matched = false;
+                            for prev_idx in 0..idx {
+                                let sib = &children[prev_idx];
+                                if let NodeData::Element { .. } = sib.data {
+                                    if matches_selector(ancestor_sel, sib) {
+                                        matched = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !matched { return false; }
+                        } else {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+            }
+        }
 
         true
     } else {
