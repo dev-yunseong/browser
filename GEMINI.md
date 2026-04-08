@@ -47,12 +47,14 @@ cargo clippy
 
 ## Mandatory Workflow
 
-All development tasks MUST follow the **Plan-Review-Act** steps below:
+All development tasks MUST follow the **Plan-Review-Act-Verify** steps below:
 
 1.  **Plan:** Formulate a detailed technical plan for the task.
-2.  **Review:** Pass the plan to the 'Reviewer Agent' (`generalist` sub-agent) for critique.
+2.  **Pre-Review:** Pass the plan to the 'Reviewer Agent' (`generalist` sub-agent) for critique.
 3.  **Iteration:** Revise the plan based on feedback until the Reviewer declares **'Pass'**.
-4.  **Development:** Start actual code modification ONLY after explicit **'Pass'** approval.
+4.  **Development (Act):** Start actual code modification ONLY after explicit **'Pre-Review Pass'**.
+5.  **Verification:** After implementation, invoke the 'Reviewer Agent' again to compare the original **Plan** with the actual **Code**.
+6.  **Final Pass:** If the Reviewer provides feedback, revise the code (or plan) and repeat until a final **'Pass'** is granted.
 
 ### 1. Language Policy
 - **Internal thoughts and code comments:** English
