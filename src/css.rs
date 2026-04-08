@@ -162,11 +162,24 @@ pub enum Combinator {
     SubsequentSibling,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum AttributeMatch {
+    Exists,
+    Equals(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttributeSelector {
+    pub name: String,
+    pub value: AttributeMatch,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Selector {
     pub tag: Option<String>,
     pub id: Option<String>,
     pub class: Vec<String>,
+    pub attributes: Vec<AttributeSelector>,
     pub combinator: Option<Combinator>,
     pub ancestor: Option<Box<Selector>>,
 }
@@ -180,6 +193,7 @@ impl Selector {
         let (mut a, mut b, mut c) = (0, 0, 0);
         if self.id.is_some() { a += 1; }
         b += self.class.len();
+        b += self.attributes.len();
         if self.tag.is_some() { c += 1; }
         
         if let Some(ref d) = self.ancestor {
