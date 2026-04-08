@@ -368,7 +368,18 @@ impl<'a> LayoutBox<'a> {
         for child in &self.children { child.collect_event_handlers(list); }
     }
     pub fn collect_form_controls(&self, list: &mut Vec<(Rect, &'a StyledNode)>) {
-        if self.display == DisplayType::Input { list.push((self.dimensions, self.style_node)); }
+        // Only collect text-input-like controls, NOT buttons.
+        // Buttons are handled via collect_event_handlers (onclick).
+        // If we add buttons here, egui puts a TextEdit overlay on top which
+        // consumes the click before the onclick handler can fire.
+        if self.display == DisplayType::Input {
+            if let NodeData::Element { ref name, .. } = self.style_node.node.data {
+                let tag = name.local.to_string();
+                if matches!(tag.as_str(), "input" | "textarea" | "select") {
+                    list.push((self.dimensions, self.style_node));
+                }
+            }
+        }
         for child in &self.children { child.collect_form_controls(list); }
     }
     pub fn collect_images(&self, list: &mut Vec<(Rect, String)>) {

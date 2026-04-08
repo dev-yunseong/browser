@@ -201,8 +201,7 @@ fn process_html_with_cache(
 
     if let Some(ref root) = layout_tree {
         render::render_layout_tree(root, &mut pixmap, image_cache);
-        
-        let mut links = Vec::new();
+
         root.collect_links(&mut links);
         
         root.collect_event_handlers(&mut event_handlers);

@@ -124,10 +124,14 @@ fn render_text_wrapped(text: String, layout: &LayoutBox, pixmap: &mut Pixmap) {
                 // draw() gives (gx, gy) as offsets *within* that bounding box (0-based).
                 // We must add min to get the actual page-space pixel coordinate.
                 let bounds = outline.px_bounds();
+                let bx = bounds.min.x.floor() as i32;
+                let by = bounds.min.y.floor() as i32;
+                let pw = pixmap.width() as i32;
+                let ph = pixmap.height() as i32;
                 outline.draw(|gx, gy, coverage| {
-                    let px = bounds.min.x as i32 + gx as i32;
-                    let py = bounds.min.y as i32 + gy as i32;
-                    if px >= 0 && py >= 0 {
+                    let px = bx + gx as i32;
+                    let py = by + gy as i32;
+                    if px >= 0 && py >= 0 && px < pw && py < ph {
                         blend_glyph_pixel(pixmap, px as u32, py as u32, coverage, &color);
                     }
                 });
