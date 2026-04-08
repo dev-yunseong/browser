@@ -102,8 +102,6 @@ fn test_selector_list_specificity_c5() {
     // h1, .big { color: red } matched on <h1 class="big"> should use .big's specificity (0,1,1)
     // if matched against another rule .big { color: blue }
     // Actually, we just need to verify it picks the max specificity.
-    let stylesheet = css::parse_css("h1, .big { color: red; }");
-    let rule = &stylesheet.rules[0];
     
     let html = r#"<h1 class="big"></h1>"#;
     let dom = dom::parse_html(html);

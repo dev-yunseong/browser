@@ -176,7 +176,7 @@ self.dimensions.y = current_y + self.margin.top;
 self.dimensions.width = width;
 
 
-        let mut height = match self.style_node.specified_values.get("height") {
+        let height = match self.style_node.specified_values.get("height") {
             Some(Value::Length(v, Unit::Px)) => *v,
             Some(Value::Length(_, Unit::Percent)) => 0.0, // viewport height or parent height needed
             Some(Value::Length(v, Unit::Vw)) => vw * (v / 100.0),

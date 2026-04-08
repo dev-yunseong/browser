@@ -129,14 +129,20 @@ impl BrowserApp {
             let cache = self.image_cache.clone();
             let overrides = self.js_style_overrides.clone();
 
-            let result = std::thread::spawn(move || {
+            let join_handle = std::thread::spawn(move || {
                 process_html_with_cache(&body, &base_url, &cache, &overrides, width)
-            })
-            .join()
-            .unwrap();
+            });
 
-            if let Ok(page_data) = result {
-                self.apply_page_data(page_data, ctx);
+            match join_handle.join() {
+                Ok(Ok(page_data)) => {
+                    self.apply_page_data(page_data, ctx);
+                }
+                Ok(Err(e)) => {
+                    self.error = Some(format!("Re-render error: {}", e));
+                }
+                Err(_) => {
+                    self.error = Some("Render thread panicked".to_string());
+                }
             }
         }
     }
@@ -221,7 +227,9 @@ fn process_html_with_cache(
         layout::build_layout_tree(&style_tree, 0.0, 0.0, 0.0, width, width, 768.0);
 
     let height = (final_y.ceil() as u32).clamp(600, 16384);
-    let mut pixmap = tiny_skia::Pixmap::new(width as u32, height).unwrap();
+    let w = (width as u32).max(1);
+    let mut pixmap = tiny_skia::Pixmap::new(w, height)
+        .ok_or_else(|| format!("Failed to create pixmap with size {}x{}", w, height))?;
 
     pixmap.fill(tiny_skia::Color::WHITE);
 

@@ -39,7 +39,6 @@ pub fn build_style_tree(
     if let NodeData::Element { ref name, ref attrs, .. } = root.data {
         let tag_name = name.local.to_string();
         let mut id: Option<String> = None;
-        let mut classes: Vec<String> = Vec::new();
 
         for attr in attrs.borrow().iter() {
             let attr_name = attr.name.local.to_string();
