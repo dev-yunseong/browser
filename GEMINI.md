@@ -45,7 +45,15 @@ cargo test
 cargo clippy
 ```
 
-## 개발 컨벤션 (Development Conventions)
+## 개발 워크플로우 (Mandatory Workflow)
+
+모든 개발 작업은 반드시 아래의 **Plan-Review-Act** 단계를 거쳐야 합니다.
+
+1.  **Plan (계획):** 수행할 작업에 대한 상세한 기술적 계획을 수립합니다.
+2.  **Review (검토):** 계획을 'Reviewer Agent'(`generalist` sub-agent)에게 전달하여 검토를 요청합니다.
+3.  **Iteration (반복):** Reviewer가 'Pass'를 선언할 때까지 피드백을 반영하여 계획을 수정하고 재검토를 받습니다.
+4.  **Development (개발):** Reviewer가 명시적으로 **'Pass'**라고 승인한 경우에만 실제 코드 수정을 시작합니다.
+
 
 ### 1. 언어 정책
 - **내부 사고 및 코드 주석:** 영문 (English)
