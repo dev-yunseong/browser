@@ -1,31 +1,66 @@
-# 렌더링 엔진 고도화 계획 (3대 핵심 강화)
+# Rendering Engine Refactoring Plan: Modern Compositor Architecture
 
-현재 화면에 아무것도 보이지 않는 문제를 해결하고, 실제 웹페이지와 유사한 시각적 결과를 얻기 위해 세 가지 핵심 렌더링 기능을 고도화합니다.
-
-## 1. 색상 파싱 고도화 (Advanced Color Parsing)
-*   **목표:** 단순 문자열 매칭 방식에서 정규식 및 수치 기반 파싱으로 전환하여 다양한 색상 포맷 지원.
-*   **지원 범위:**
-    *   **3/6자리 HEX:** `#f00`, `#ff0000` (반투명 지원 포함 `#ff0000aa`)
-    *   **RGB/RGBA:** `rgb(255, 0, 0)`, `rgba(0, 0, 255, 0.5)`
-    *   **확장된 색상 이름:** `white`, `black`, `gray`, `silver`, `gold` 등 주요 명칭 지원.
-
-## 2. 텍스트 렌더링 (Text Rendering)
-*   **목표:** `ab_glyph` 라이브러리를 사용하여 실제 글꼴(TTF/OTF)을 픽셀로 변환하여 화면에 출력.
-*   **세부 단계:**
-    *   **기본 글꼴 통합:** 프로젝트에 기본 오픈소스 글꼴(예: `DejaVuSans.ttf`)을 내장하거나 시스템 폰트를 로드하는 로직 구축.
-    *   **글리프 생성:** 각 문자의 모양을 래스터화하여 `tiny-skia` 픽셀 버퍼에 합성.
-    *   **간단한 배치:** 한 줄씩 텍스트가 끊기지 않고 출력되도록 렌더링 루프 개선.
-
-## 3. 박스 시각화 및 테두리 (Box Visualization & Borders)
-*   **목표:** 레이아웃 박스의 경계를 명확히 보여주기 위해 테두리(Border) 기능을 추가.
-*   **세부 단계:**
-    *   **CSS 속성 파싱:** `border: 1px solid black` 등 테두리 두께, 스타일, 색상 정보를 추출.
-    *   **획(Stroke) 그리기:** `tiny-skia`의 `stroke_rect` 기능을 사용하여 레이아웃 박스의 외곽선을 렌더링.
-    *   **디버그 모드(선택):** 개발 중에는 모든 `div`나 `p` 태그에 옅은 가이드라인을 그리는 기능 추가.
+This document outlines the 7-depth strategic roadmap for transitioning the rendering engine from a direct layout-to-pixel approach to a modern, layer-based compositing system.
 
 ---
 
-## 작업 순서 (Implementation Order)
-1.  **CSS/Style 강화:** 색상 및 테두리 정보를 더 잘 인식하도록 파서 및 스타일 트리 수정.
-2.  **렌더링 엔진 업데이트:** `render.rs`에서 색상을 실제 RGBA 값으로 변환하고, 테두리와 텍스트를 그리는 로직 추가.
-3.  **레이아웃 엔진 미세 조정:** 텍스트가 차지하는 영역에 따라 박스 높이가 유동적으로 변하도록 개선.
+## Depth 1: Strategic Vision (The Goal)
+### Issue #1: High-Performance, Correct Rendering Engine
+Transform the browser's rendering pipeline to match modern standards, ensuring correct visual stacking, high-performance updates, and modularity.
+
+---
+
+## Depth 2: Tactical Architecture (The Strategy)
+### Issue #2: Layer-Based Compositing & Stacking Contexts
+Introduce the concept of "Layers" to handle complex CSS stacking rules (Z-index, Opacity, Transforms) correctly.
+- **Sub-Issue #2.1:** Implement Stacking Context resolution logic in `src/style.rs`.
+- **Sub-Issue #2.2:** Define a `LayerTree` structure that represents independent paint layers.
+
+---
+
+## Depth 3: Structural System (The Framework)
+### Issue #3: Decoupling Painting from Rasterization (Display Lists)
+Move away from "drawing pixels while traversing the tree" to "generating commands while traversing, then executing commands".
+- **Sub-Issue #3.1:** Define `PaintCommand` enum (DrawRect, DrawText, etc.).
+- **Sub-Issue #3.2:** Implement `DisplayList` container to hold sequences of commands for each layer.
+
+---
+
+## Depth 4: Functional Module (The Manager)
+### Issue #4: Layer Management System
+Logic to manage layer lifecycle, dirty regions, and final composition.
+- **Sub-Issue #4.1:** Implement `Compositor` to merge multiple layers into the final `Pixmap`.
+- **Sub-Issue #4.2:** Add clipping support at the layer level.
+
+---
+
+## Depth 5: Operational Primitives (The Tools)
+### Issue #5: Specialized & Optimized Paint Primitives
+Optimize how individual shapes and text are rendered within the command buffer.
+- **Sub-Issue #5.1:** Refactor `render_text_wrapped` into a high-performance `TextPaint` primitive.
+- **Sub-Issue #5.2:** Implement dedicated `ImagePaint` with caching and scaling support.
+- **Sub-Issue #5.3:** Support for advanced effects like `opacity` and `border-radius`.
+
+---
+
+## Depth 6: Implementation Logic (The Code)
+### Issue #6: Refactor `src/render.rs` and `src/main.rs`
+Rewrite the rendering entry points to utilize the new compositor and display list system.
+- **Sub-Issue #6.1:** Transition `render_layout_tree` to `generate_display_list`.
+- **Sub-Issue #6.2:** Update `BrowserApp::update` to trigger compositor passes.
+
+---
+
+## Depth 7: Surgical Refinement (The Precision)
+### Issue #7: Micro-Optimizations & Visual Fidelity
+Fine-tune the individual rendering operations for maximum visual quality.
+- **Sub-Issue #7.1:** Precise pixel blending algorithm refinement.
+- **Sub-Issue #7.2:** Anti-aliasing improvements for fonts and borders.
+- **Sub-Issue #7.3:** Bounds checking and memory safety audits in pixel buffers.
+
+---
+
+## Verification Plan (Verify)
+Each depth will be verified by the `Reviewer Agent` comparing the implementation against these requirements.
+1. **Pass criteria:** Successful rendering of complex Z-index sites.
+2. **Performance criteria:** Measurable reduction in re-paint time for large pages.
