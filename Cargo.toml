@@ -1,11 +1,12 @@
 [package]
-name = "aura-browser"
+name = "browser"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "aura_browser"
+name = "browser"
 path = "src/main.rs"
+
 
 [dependencies]
 ab_glyph = "0.2.32"

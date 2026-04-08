@@ -574,11 +574,11 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1024.0, 768.0])
-            .with_title("Aura Browser"),
+            .with_title("Browser"),
         ..Default::default()
     };
     eframe::run_native(
-        "Aura Browser",
+        "Browser",
         options,
         Box::new(|cc| Ok(Box::new(BrowserApp::new(cc)))),
     )

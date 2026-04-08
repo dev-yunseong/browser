@@ -14,6 +14,21 @@ pub struct Rect {
     pub height: f32,
 }
 
+impl Rect {
+    pub fn intersect(&self, other: &Rect) -> Rect {
+        let x = self.x.max(other.x);
+        let y = self.y.max(other.y);
+        let x2 = (self.x + self.width).min(other.x + other.width);
+        let y2 = (self.y + self.height).min(other.y + other.height);
+        Rect {
+            x,
+            y,
+            width: (x2 - x).max(0.0),
+            height: (y2 - y).max(0.0),
+        }
+    }
+}
+
 #[derive(Default, Debug, Clone, Copy)]
 pub struct EdgeSizes {
     pub left: f32,
@@ -468,6 +483,17 @@ pub fn print_layout_tree(layout: &LayoutBox, indent: usize) {
     let indent_str = " ".repeat(indent * 2);
     println!("{}{} [{:?}] [{:.1},{:.1} {:.1}x{:.1}]", indent_str, "Node", layout.display, layout.dimensions.x, layout.dimensions.y, layout.dimensions.width, layout.dimensions.height);
     for child in &layout.children { print_layout_tree(child, indent + 1); }
+}
+
+impl<'a> LayoutBox<'a> {
+    pub fn get_content_rect(&self) -> Rect {
+        Rect {
+            x: self.dimensions.x + self.border.left + self.padding.left,
+            y: self.dimensions.y + self.border.top + self.padding.top,
+            width: (self.dimensions.width - self.border.left - self.border.right - self.padding.left - self.padding.right).max(0.0),
+            height: (self.dimensions.height - self.border.top - self.border.bottom - self.padding.top - self.padding.bottom).max(0.0),
+        }
+    }
 }
 
 #[cfg(test)]

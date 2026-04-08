@@ -461,25 +461,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aura-browser"
-version = "0.1.0"
-dependencies = [
- "ab_glyph",
- "boa_engine",
- "cssparser",
- "eframe",
- "egui",
- "html5ever",
- "image",
- "markup5ever_rcdom",
- "poll-promise",
- "reqwest",
- "tiny-skia 0.12.0",
- "tokio",
- "url",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -774,6 +755,25 @@ dependencies = [
  "rustc-hash 2.1.2",
  "ryu-js",
  "static_assertions",
+]
+
+[[package]]
+name = "browser"
+version = "0.1.0"
+dependencies = [
+ "ab_glyph",
+ "boa_engine",
+ "cssparser",
+ "eframe",
+ "egui",
+ "html5ever",
+ "image",
+ "markup5ever_rcdom",
+ "poll-promise",
+ "reqwest",
+ "tiny-skia 0.12.0",
+ "tokio",
+ "url",
 ]
 
 [[package]]

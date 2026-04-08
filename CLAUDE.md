@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Aura Browser** — a web browser built from scratch in Rust. It fetches HTML/CSS from the network, parses and lays out the document, and renders it as a texture inside an `eframe`/`egui` native window.
+**Browser** — a web browser built from scratch in Rust. It fetches HTML/CSS from the network, parses and lays out the document, and renders it as a texture inside an `eframe`/`egui` native window.
 
 ## Commands
 

@@ -1,10 +1,10 @@
-# Aura Browser (GEMINI.md)
+# Browser (GEMINI.md)
 
-This file provides the structure, configuration, and development conventions for the Aura Browser project. Use this document to understand the context when collaborating with AI agents.
+This file provides the structure, configuration, and development conventions for the Browser project. Use this document to understand the context when collaborating with AI agents.
 
 ## Project Overview
 
-**Aura Browser** is a web browser being built from scratch using Rust. It aims to implement core browser pipelines directly—from network calls to HTML/CSS parsing, layout calculation, 2D rendering, and a JavaScript execution engine.
+**Browser** is a web browser being built from scratch using Rust. It aims to implement core browser pipelines directly—from network calls to HTML/CSS parsing, layout calculation, 2D rendering, and a JavaScript execution engine.
 
 ### Core Tech Stack
 - **Language:** Rust (Edition 2021)

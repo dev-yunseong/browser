@@ -1,7 +1,7 @@
-use aura_browser::layout::{build_layout_tree, DisplayType, LayoutBox};
-use aura_browser::dom;
-use aura_browser::css;
-use aura_browser::style;
+use browser::layout::{build_layout_tree, DisplayType, LayoutBox};
+use browser::dom;
+use browser::css;
+use browser::style;
 use std::collections::HashMap;
 use markup5ever_rcdom::NodeData;
 

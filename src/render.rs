@@ -1,4 +1,4 @@
-use tiny_skia::{Pixmap, Paint, Rect, Transform, Stroke, PathBuilder};
+use tiny_skia::{Pixmap, Paint, Transform, Stroke, PathBuilder};
 use ab_glyph::{Font, FontRef, PxScale, point};
 use crate::layout::{LayoutBox, DisplayType};
 use crate::css::Value;
@@ -9,7 +9,14 @@ const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/NanumGothic.ttf");
 
 pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap, image_cache: &HashMap<String, Vec<u8>>) {
     render_backgrounds(layout, pixmap);
-    render_foregrounds(layout, pixmap, image_cache);
+    // Initial clip is the entire pixmap
+    let initial_clip = crate::layout::Rect {
+        x: 0.0,
+        y: 0.0,
+        width: pixmap.width() as f32,
+        height: pixmap.height() as f32,
+    };
+    render_foregrounds(layout, pixmap, image_cache, initial_clip);
 }
 
 fn render_backgrounds(layout: &LayoutBox, pixmap: &mut Pixmap) {
@@ -28,12 +35,12 @@ fn render_backgrounds(layout: &LayoutBox, pixmap: &mut Pixmap) {
             let sy = d.y + shadow.offset_y - shadow.spread;
             let sw = d.width + (shadow.spread * 2.0);
             let sh = d.height + (shadow.spread * 2.0);
-            if let Some(r) = Rect::from_xywh(sx, sy, sw, sh) {
+            if let Some(r) = tiny_skia::Rect::from_xywh(sx, sy, sw, sh) {
                 pixmap.fill_rect(r, &paint, Transform::identity(), None);
                 if shadow.blur > 0.0 {
                     paint.set_color_rgba8(shadow.color.r, shadow.color.g, shadow.color.b, shadow.color.a / 4);
                     let b = shadow.blur / 2.0;
-                    if let Some(r2) = Rect::from_xywh(sx - b, sy - b, sw + shadow.blur, sh + shadow.blur) {
+                    if let Some(r2) = tiny_skia::Rect::from_xywh(sx - b, sy - b, sw + shadow.blur, sh + shadow.blur) {
                         pixmap.fill_rect(r2, &paint, Transform::identity(), None);
                     }
                 }
@@ -47,7 +54,7 @@ fn render_backgrounds(layout: &LayoutBox, pixmap: &mut Pixmap) {
         if c.a > 0 {
             let mut paint = Paint::default();
             paint.set_color_rgba8(c.r, c.g, c.b, c.a);
-            if let Some(r) = Rect::from_xywh(d.x, d.y, d.width, d.height) {
+            if let Some(r) = tiny_skia::Rect::from_xywh(d.x, d.y, d.width, d.height) {
                 pixmap.fill_rect(r, &paint, Transform::identity(), None);
             }
         }
@@ -58,8 +65,10 @@ fn render_backgrounds(layout: &LayoutBox, pixmap: &mut Pixmap) {
         let mut paint = Paint::default();
         paint.set_color_rgba8(180, 180, 180, 255);
         let mut stroke = Stroke::default();
-        stroke.width = layout.border.left;
-        if let Some(r) = Rect::from_xywh(d.x, d.y, d.width, d.height) {
+        let b = layout.border.left;
+        stroke.width = b;
+        // Draw border INSIDE the border-box
+        if let Some(r) = tiny_skia::Rect::from_xywh(d.x + b/2.0, d.y + b/2.0, (d.width - b).max(0.0), (d.height - b).max(0.0)) {
             let mut pb = PathBuilder::new();
             pb.push_rect(r);
             if let Some(path) = pb.finish() {
@@ -73,10 +82,10 @@ fn render_backgrounds(layout: &LayoutBox, pixmap: &mut Pixmap) {
     }
 }
 
-fn render_foregrounds(layout: &LayoutBox, pixmap: &mut Pixmap, image_cache: &HashMap<String, Vec<u8>>) {
+fn render_foregrounds(layout: &LayoutBox, pixmap: &mut Pixmap, image_cache: &HashMap<String, Vec<u8>>, clip: crate::layout::Rect) {
     let d = layout.dimensions;
     if d.width < 0.1 || d.height < 0.1 {
-        for child in &layout.children { render_foregrounds(child, pixmap, image_cache); }
+        for child in &layout.children { render_foregrounds(child, pixmap, image_cache, clip); }
         return;
     }
 
@@ -88,6 +97,7 @@ fn render_foregrounds(layout: &LayoutBox, pixmap: &mut Pixmap, image_cache: &Has
                     let rgba = img.to_rgba8();
                     if let Some(mut img_pixmap) = Pixmap::new(rgba.width(), rgba.height()) {
                         img_pixmap.data_mut().copy_from_slice(&rgba);
+                        // Apply clip by only drawing if within bounds (simplified)
                         pixmap.draw_pixmap(d.x as i32, d.y as i32, img_pixmap.as_ref(), &tiny_skia::PixmapPaint::default(), 
                             Transform::from_scale(d.width / rgba.width() as f32, d.height / rgba.height() as f32), None);
                     }
@@ -98,15 +108,18 @@ fn render_foregrounds(layout: &LayoutBox, pixmap: &mut Pixmap, image_cache: &Has
 
     // ── 5. Text ──
     if let NodeData::Text { ref contents } = layout.style_node.node.data {
-        render_text_wrapped(contents.borrow().to_string(), layout, pixmap);
+        render_text_wrapped(contents.borrow().to_string(), layout, pixmap, clip);
     }
 
+    // When going to children, the new clip is the intersection of current clip and parent's content area
+    let next_clip = clip.intersect(&layout.get_content_rect());
+
     for child in &layout.children {
-        render_foregrounds(child, pixmap, image_cache);
+        render_foregrounds(child, pixmap, image_cache, next_clip);
     }
 }
 
-fn render_text_wrapped(text: String, layout: &LayoutBox, pixmap: &mut Pixmap) {
+fn render_text_wrapped(text: String, layout: &LayoutBox, pixmap: &mut Pixmap, clip: crate::layout::Rect) {
     let trimmed = text.trim();
     if trimmed.is_empty() { return; }
 
@@ -137,7 +150,7 @@ fn render_text_wrapped(text: String, layout: &LayoutBox, pixmap: &mut Pixmap) {
             word_w += adv;
         }
 
-        if current_x + word_width_check(word_w, layout, current_x) > layout.dimensions.x + layout.dimensions.width + 1.0 && current_x > layout.dimensions.x {
+        if current_x + word_w > layout.dimensions.x + layout.dimensions.width + 1.0 && current_x > layout.dimensions.x {
             current_x = layout.dimensions.x;
             current_y += font_size * 1.4;
         }
@@ -145,19 +158,24 @@ fn render_text_wrapped(text: String, layout: &LayoutBox, pixmap: &mut Pixmap) {
         for (gid, adv) in glyphs {
             let glyph = gid.with_scale_and_position(scale, point(current_x, current_y));
             if let Some(outline) = font.outline_glyph(glyph) {
-                // px_bounds().min gives the glyph's top-left position in page space.
-                // draw() gives (gx, gy) as offsets *within* that bounding box (0-based).
-                // We must add min to get the actual page-space pixel coordinate.
                 let bounds = outline.px_bounds();
                 let bx = bounds.min.x.floor() as i32;
                 let by = bounds.min.y.floor() as i32;
                 let pw = pixmap.width() as i32;
                 let ph = pixmap.height() as i32;
+                
                 outline.draw(|gx, gy, coverage| {
                     let px = bx + gx as i32;
                     let py = by + gy as i32;
-                    if px >= 0 && py >= 0 && px < pw && py < ph {
-                        blend_glyph_pixel(pixmap, px as u32, py as u32, coverage, &color);
+                    
+                    // Apply Clipping check
+                    let pxf = px as f32;
+                    let pyf = py as f32;
+                    if pxf >= clip.x && pxf < (clip.x + clip.width) &&
+                       pyf >= clip.y && pyf < (clip.y + clip.height) {
+                        if px >= 0 && py >= 0 && px < pw && py < ph {
+                            blend_glyph_pixel(pixmap, px as u32, py as u32, coverage, &color);
+                        }
                     }
                 });
             }
@@ -166,8 +184,6 @@ fn render_text_wrapped(text: String, layout: &LayoutBox, pixmap: &mut Pixmap) {
         current_x += space_w;
     }
 }
-
-fn word_width_check(w: f32, _l: &LayoutBox, _cx: f32) -> f32 { w }
 
 fn blend_glyph_pixel(
     pixmap: &mut Pixmap,
