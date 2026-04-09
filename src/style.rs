@@ -120,17 +120,45 @@ pub fn build_style_tree(
             specified_values.insert(k, v);
         }
 
-        // B4: If font-size is a percentage, it must be resolved against the *inherited* font-size
-        // before other properties use it (if any do). Currently layout uses specified_values directly.
-        if let Some(Value::Length(v, crate::css::Unit::Percent)) = specified_values.get("font-size") {
-            let parent_fs = match parent_style {
-                Some(parent) => match parent.get("font-size") {
-                    Some(Value::Length(pv, crate::css::Unit::Px)) => *pv,
-                    _ => 16.0,
-                },
-                _ => 16.0,
-            };
-            specified_values.insert("font-size".to_string(), Value::Length(parent_fs * (v / 100.0), crate::css::Unit::Px));
+        // --- Issue #10: Computed Value Resolution ---
+        // Resolve 'font-size' first because other 'em' units depend on it.
+        let mut resolved_fs = 16.0f32;
+        if let Some(val) = specified_values.get("font-size") {
+            match val {
+                Value::Length(v, crate::css::Unit::Px) => resolved_fs = *v,
+                Value::Length(v, crate::css::Unit::Percent) => {
+                    let parent_fs = match parent_style {
+                        Some(parent) => match parent.get("font-size") {
+                            Some(Value::Length(pv, crate::css::Unit::Px)) => *pv,
+                            _ => 16.0,
+                        },
+                        _ => 16.0,
+                    };
+                    resolved_fs = parent_fs * (v / 100.0);
+                }
+                Value::Length(v, crate::css::Unit::Em) => {
+                    let parent_fs = match parent_style {
+                        Some(parent) => match parent.get("font-size") {
+                            Some(Value::Length(pv, crate::css::Unit::Px)) => *pv,
+                            _ => 16.0,
+                        },
+                        _ => 16.0,
+                    };
+                    resolved_fs = parent_fs * v;
+                }
+                _ => {}
+            }
+        }
+        // Force font-size to be absolute pixels
+        specified_values.insert("font-size".to_string(), Value::Length(resolved_fs, crate::css::Unit::Px));
+
+        // Resolve all other 'em' units to absolute 'px'
+        let keys: Vec<String> = specified_values.keys().cloned().collect();
+        for k in keys {
+            if k == "font-size" { continue; }
+            if let Some(Value::Length(v, crate::css::Unit::Em)) = specified_values.get(&k) {
+                specified_values.insert(k, Value::Length(v * resolved_fs, crate::css::Unit::Px));
+            }
         }
 
         // 6. Apply JS overrides (highest priority)

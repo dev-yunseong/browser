@@ -159,13 +159,6 @@ impl<'a> LayoutBox<'a> {
             Some(Value::Length(v, Unit::Percent)) => container_width * (v / 100.0),
             Some(Value::Length(v, Unit::Vw)) => vw * (v / 100.0),
             Some(Value::Length(v, Unit::Vh)) => vh * (v / 100.0),
-            Some(Value::Length(v, Unit::Em)) => {
-                let fs = match self.style_node.specified_values.get("font-size") {
-                    Some(Value::Length(fv, Unit::Px)) => *fv,
-                    _ => 16.0,
-                };
-                fs * v
-            }
             _ => if is_block { (container_width - self.margin.left - self.margin.right).max(0.0) } else { 0.0 },
         };
 
@@ -202,13 +195,6 @@ impl<'a> LayoutBox<'a> {
             Some(Value::Length(v, Unit::Px)) => *v,
             Some(Value::Length(v, Unit::Vw)) => vw * (v / 100.0),
             Some(Value::Length(v, Unit::Vh)) => vh * (v / 100.0),
-            Some(Value::Length(v, Unit::Em)) => {
-                let fs = match self.style_node.specified_values.get("font-size") {
-                    Some(Value::Length(fv, Unit::Px)) => *fv,
-                    _ => 16.0,
-                };
-                fs * v
-            }
             _ => 0.0,
         };
 
@@ -216,10 +202,94 @@ impl<'a> LayoutBox<'a> {
             return self.layout_text(contents.borrow().to_string(), self.dimensions.x, current_y, container_width);
         }
 
-        // --- NEW UNIFIED LINE-BOX MODEL ---
         let inner_width = if width > 0.0 { width } else { (container_width - self.padding.left - self.padding.right - self.border.left - self.border.right).max(0.0) };
+        let mut child_y = self.dimensions.y + self.padding.top + self.border.top;
         let mut max_child_x = self.dimensions.x;
 
+        if self.display == DisplayType::Flex {
+            let flex_direction = self.style_node.specified_values.get("flex-direction")
+                .and_then(|v| if let Value::Keyword(k) = v { Some(k.as_str()) } else { None })
+                .unwrap_or("row");
+            let justify = self.style_node.specified_values.get("justify-content")
+                .and_then(|v| if let Value::Keyword(k) = v { Some(k.as_str()) } else { None })
+                .unwrap_or("flex-start");
+
+            let mut flex_children = Vec::new();
+            let mut total_main_size = 0.0f32;
+            let mut max_cross_size = 0.0f32;
+
+            for child_node in &self.style_node.children {
+                if should_skip(child_node) { continue; }
+                // In flex, we often want children to shrink-wrap first
+                let (cb_opt, _, _) = build_layout_tree(child_node, 0.0, 0.0, 0.0, f32::INFINITY, vw, vh);
+                if let Some(cb) = cb_opt {
+                    if flex_direction == "row" {
+                        total_main_size += cb.dimensions.width + cb.margin.left + cb.margin.right;
+                        max_cross_size = max_cross_size.max(cb.dimensions.height + cb.margin.top + cb.margin.bottom);
+                    } else {
+                        total_main_size += cb.dimensions.height + cb.margin.top + cb.margin.bottom;
+                        max_cross_size = max_cross_size.max(cb.dimensions.width + cb.margin.left + cb.margin.right);
+                    }
+                    flex_children.push(cb);
+                }
+            }
+
+            let main_container_size = if flex_direction == "row" { inner_width } else { height.max(total_main_size) };
+            let free_space = (main_container_size - total_main_size).max(0.0);
+            
+            // Simple flex-grow: distribute free space equally among children for now
+            let grow_share = if !flex_children.is_empty() { free_space / flex_children.len() as f32 } else { 0.0 };
+
+            let mut main_cursor = 0.0f32;
+            // Apply justification offsets if no grow
+            if free_space > 0.0 && grow_share < 0.1 {
+                match justify {
+                    "center" => main_cursor += free_space / 2.0,
+                    "flex-end" => main_cursor += free_space,
+                    _ => {}
+                }
+            }
+
+            for mut cb in flex_children {
+                let main_grow = if flex_direction == "row" { grow_share } else { 0.0 };
+                let cross_grow = if flex_direction == "row" { 0.0 } else { grow_share };
+                
+                cb.dimensions.width += main_grow;
+                cb.dimensions.height += cross_grow;
+
+                let (x, y) = if flex_direction == "row" {
+                    (self.dimensions.x + self.padding.left + self.border.left + main_cursor + cb.margin.left,
+                     self.dimensions.y + self.padding.top + self.border.top + cb.margin.top)
+                } else {
+                    (self.dimensions.x + self.padding.left + self.border.left + cb.margin.left,
+                     self.dimensions.y + self.padding.top + self.border.top + main_cursor + cb.margin.top)
+                };
+                
+                let dx = x - cb.dimensions.x;
+                let dy = y - cb.dimensions.y;
+                offset_layout_box(&mut cb, dx, dy);
+                
+                main_cursor += if flex_direction == "row" { 
+                    cb.dimensions.width + cb.margin.left + cb.margin.right 
+                } else { 
+                    cb.dimensions.height + cb.margin.top + cb.margin.bottom 
+                };
+                
+                max_child_x = max_child_x.max(cb.dimensions.x + cb.dimensions.width + cb.margin.right);
+                child_y = child_y.max(cb.dimensions.y + cb.dimensions.height + cb.margin.bottom);
+                self.children.push(cb);
+            }
+            
+            // Finalize flex container size
+            if self.dimensions.width <= 0.0 { self.dimensions.width = if flex_direction == "row" { main_container_size } else { max_cross_size }; }
+            self.dimensions.height = if flex_direction == "row" { max_cross_size } else { main_container_size };
+            
+            let final_x = if is_block { container_start_x } else { self.dimensions.x + self.dimensions.width + self.margin.right };
+            let final_y = self.dimensions.y + self.dimensions.height + self.margin.bottom;
+            return (Some(self.clone()), final_x, final_y);
+        }
+
+        // --- NEW UNIFIED LINE-BOX MODEL ---
         struct Line<'a> {
             members: Vec<LayoutBox<'a>>,
             width: f32,
@@ -374,7 +444,9 @@ impl<'a> LayoutBox<'a> {
         self.dimensions.x = current_x + self.margin.left;
         self.dimensions.y = current_y + self.margin.top;
         self.dimensions.width = if container_width.is_finite() { max_w.min(container_width) } else { max_w };
-        self.dimensions.height = lines_count as f32 * (font_size * 1.4);
+        
+        let line_height = font_size * 1.4;
+        self.dimensions.height = lines_count as f32 * line_height;
         
         let final_x = self.dimensions.x + self.dimensions.width + self.margin.right;
         let final_y = self.dimensions.y + self.dimensions.height + self.margin.bottom;
@@ -388,14 +460,6 @@ fn get_prop(sn: &StyledNode, p1: &str, p2: &str, cw: f32, vw: f32, vh: f32) -> f
         Some(Value::Length(v, Unit::Percent)) => cw * (v / 100.0),
         Some(Value::Length(v, Unit::Vw)) => vw * (v / 100.0),
         Some(Value::Length(v, Unit::Vh)) => vh * (v / 100.0),
-        Some(Value::Length(v, Unit::Em)) => {
-            // Em should be relative to current element's font-size
-            let fs = match sn.specified_values.get("font-size") {
-                Some(Value::Length(fv, Unit::Px)) => *fv,
-                _ => 16.0,
-            };
-            fs * v
-        }
         _ => 0.0,
     }
 }
