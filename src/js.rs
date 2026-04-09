@@ -135,16 +135,19 @@ impl JsRuntime {
 
         let get_parent_id = NativeFunction::from_copy_closure(|_this, args, _context| {
             let node_id = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
-            let pid = NODE_REGISTRY.with(|reg| {
+            // Extract the parent Handle before releasing NODE_REGISTRY borrow,
+            // then call register_node separately to avoid a double-borrow panic.
+            let parent_handle = NODE_REGISTRY.with(|reg| {
                 if let Some(node) = reg.borrow().get(&node_id) {
-                    if let Some(p) = node.parent.take().and_then(|p| p.upgrade()) {
-                        let pid = register_node(p.clone());
+                    node.parent.take().and_then(|p| p.upgrade()).map(|p| {
                         node.parent.set(Some(std::rc::Rc::downgrade(&p)));
-                        return Some(pid);
-                    }
+                        p
+                    })
+                } else {
+                    None
                 }
-                None
             });
+            let pid = parent_handle.map(register_node);
             Ok(pid.map(JsValue::from).unwrap_or(JsValue::null()))
         });
         context.register_global_callable(js_string!("__aura_get_parent_id"), 1, get_parent_id).unwrap();
