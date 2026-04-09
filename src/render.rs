@@ -1,4 +1,4 @@
-use tiny_skia::{Pixmap, Paint, Transform, Stroke, PathBuilder};
+use tiny_skia::{Pixmap, Paint, Transform, Stroke, PathBuilder, PixmapPaint};
 use ab_glyph::{Font, FontRef, PxScale, point};
 use crate::layout::{LayoutBox, DisplayType, Rect as LayoutRect};
 use crate::css::{Value, Color};
@@ -9,8 +9,8 @@ const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/NanumGothic.ttf");
 
 #[derive(Debug, Clone)]
 pub enum PaintCommand {
-    Rect(LayoutRect, Color),
-    Border(LayoutRect, f32, Color),
+    Rect(LayoutRect, Color, f32), // Rect, Color, Radius
+    Border(LayoutRect, f32, Color, f32), // Rect, Width, Color, Radius
     Image(LayoutRect, String),
     Text {
         rect: LayoutRect,
@@ -22,13 +22,15 @@ pub enum PaintCommand {
     Shadow(LayoutRect, crate::css::BoxShadow),
 }
 
-pub struct DisplayList {
+pub struct Layer {
+    pub z_index: i32,
+    pub opacity: f32,
     pub commands: Vec<PaintCommand>,
 }
 
-impl DisplayList {
-    pub fn new() -> Self {
-        Self { commands: Vec::new() }
+impl Layer {
+    pub fn new(z_index: i32, opacity: f32) -> Self {
+        Self { z_index, opacity, commands: Vec::new() }
     }
 
     pub fn add(&mut self, command: PaintCommand) {
@@ -36,116 +38,168 @@ impl DisplayList {
     }
 }
 
+pub struct Compositor {
+    pub layers: Vec<Layer>,
+}
+
+impl Compositor {
+    pub fn new() -> Self {
+        Self { layers: Vec::new() }
+    }
+
+    pub fn add_layer(&mut self, layer: Layer) {
+        self.layers.push(layer);
+    }
+
+    pub fn render(&mut self, pixmap: &mut Pixmap, image_cache: &HashMap<String, Vec<u8>>) {
+        // Sort layers by z-index
+        self.layers.sort_by_key(|l| l.z_index);
+
+        for layer in &self.layers {
+            if layer.opacity <= 0.0 { continue; }
+            
+            if layer.opacity < 1.0 {
+                // For partial opacity, we should ideally render to an intermediate pixmap
+                // and then blend with global alpha. For now, we'll just execute with alpha tweak if possible.
+                // Simple version: just execute. (In real browsers, this creates a new stacking context layer).
+                execute_layer(layer, pixmap, image_cache);
+            } else {
+                execute_layer(layer, pixmap, image_cache);
+            }
+        }
+    }
+}
+
 pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap, image_cache: &HashMap<String, Vec<u8>>) {
-    let mut display_list = DisplayList::new();
+    let mut compositor = Compositor::new();
+    let mut root_layer = Layer::new(0, 1.0);
     
-    // Pass 1: Backgrounds and Shadows
-    generate_backgrounds(layout, &mut display_list);
-    
-    // Pass 2: Foregrounds (Images, Text)
+    // Initial clip is the entire pixmap
     let initial_clip = LayoutRect {
         x: 0.0,
         y: 0.0,
         width: pixmap.width() as f32,
         height: pixmap.height() as f32,
     };
-    generate_foregrounds(layout, &mut display_list, initial_clip);
 
-    // Execute Display List
-    execute_display_list(&display_list, pixmap, image_cache);
+    generate_layers(layout, &mut compositor, &mut root_layer, initial_clip);
+    compositor.add_layer(root_layer);
+
+    compositor.render(pixmap, image_cache);
 }
 
-fn generate_backgrounds(layout: &LayoutBox, list: &mut DisplayList) {
+fn generate_layers(layout: &LayoutBox, compositor: &mut Compositor, current_layer: &mut Layer, clip: LayoutRect) {
     let d = layout.dimensions;
     if d.width < 0.1 || d.height < 0.1 {
-        for child in &layout.children { generate_backgrounds(child, list); }
+        for child in &layout.children { generate_layers(child, compositor, current_layer, clip); }
         return;
     }
 
-    // ── 1. Box Shadow ──
+    // Check if this box establishes a new stacking context
+    if layout.establishes_stacking_context() {
+        let mut new_layer = Layer::new(layout.z_index, 1.0); // opacity to be parsed from style
+        
+        // Add backgrounds/shadows to the new layer
+        add_box_decorations(layout, &mut new_layer);
+        
+        // Recursively add children to the new layer
+        let next_clip = clip.intersect(&layout.get_content_rect());
+        for child in &layout.children {
+            generate_layers(child, compositor, &mut new_layer, next_clip);
+        }
+        
+        compositor.add_layer(new_layer);
+    } else {
+        // Just add to current layer
+        add_box_decorations(layout, current_layer);
+        
+        // Foregrounds (Text, Image)
+        if layout.display == DisplayType::Image {
+            if let Some(ref url) = layout.image_url {
+                current_layer.add(PaintCommand::Image(d, url.clone()));
+            }
+        }
+        if let NodeData::Text { ref contents } = layout.style_node.node.data {
+            let font_size = match layout.style_node.specified_values.get("font-size") {
+                Some(Value::Length(v, _)) => *v,
+                _ => 16.0,
+            };
+            let color = match layout.style_node.specified_values.get("color") {
+                Some(Value::Color(c)) => c.clone(),
+                _ => Color { r: 0, g: 0, b: 0, a: 255 },
+            };
+            current_layer.add(PaintCommand::Text {
+                rect: d,
+                text: contents.borrow().to_string(),
+                font_size,
+                color,
+                clip,
+            });
+        }
+
+        let next_clip = clip.intersect(&layout.get_content_rect());
+        for child in &layout.children {
+            generate_layers(child, compositor, current_layer, next_clip);
+        }
+    }
+}
+
+fn add_box_decorations(layout: &LayoutBox, layer: &mut Layer) {
+    let d = layout.dimensions;
+    let radius = match layout.style_node.specified_values.get("border-radius") {
+        Some(Value::Length(v, _)) => *v,
+        _ => 0.0,
+    };
+
+    // Box Shadow
     if let Some(Value::BoxShadow(shadow)) = layout.style_node.specified_values.get("box-shadow") {
         if !shadow.inset {
-            list.add(PaintCommand::Shadow(d, shadow.clone()));
+            layer.add(PaintCommand::Shadow(d, shadow.clone()));
         }
     }
 
-    // ── 2. Background ──
+    // Background
     let bg = layout.style_node.specified_values.get("background-color").or(layout.style_node.specified_values.get("background"));
     if let Some(Value::Color(c)) = bg {
         if c.a > 0 {
-            list.add(PaintCommand::Rect(d, c.clone()));
+            layer.add(PaintCommand::Rect(d, c.clone(), radius));
         }
     }
 
-    // ── 3. Border ──
+    // Border
     if layout.border.left > 0.0 {
         let color = match layout.style_node.specified_values.get("border-color") {
             Some(Value::Color(c)) => c.clone(),
             _ => Color { r: 180, g: 180, b: 180, a: 255 },
         };
-        list.add(PaintCommand::Border(d, layout.border.left, color));
-    }
-
-    for child in &layout.children {
-        generate_backgrounds(child, list);
+        layer.add(PaintCommand::Border(d, layout.border.left, color, radius));
     }
 }
 
-fn generate_foregrounds(layout: &LayoutBox, list: &mut DisplayList, clip: LayoutRect) {
-    let d = layout.dimensions;
-    if d.width < 0.1 || d.height < 0.1 {
-        for child in &layout.children { generate_foregrounds(child, list, clip); }
-        return;
-    }
-
-    // ── 4. Image ──
-    if layout.display == DisplayType::Image {
-        if let Some(ref url) = layout.image_url {
-            list.add(PaintCommand::Image(d, url.clone()));
-        }
-    }
-
-    // ── 5. Text ──
-    if let NodeData::Text { ref contents } = layout.style_node.node.data {
-        let font_size = match layout.style_node.specified_values.get("font-size") {
-            Some(Value::Length(v, _)) => *v,
-            _ => 16.0,
-        };
-        let color = match layout.style_node.specified_values.get("color") {
-            Some(Value::Color(c)) => c.clone(),
-            _ => Color { r: 0, g: 0, b: 0, a: 255 },
-        };
-        list.add(PaintCommand::Text {
-            rect: d,
-            text: contents.borrow().to_string(),
-            font_size,
-            color,
-            clip,
-        });
-    }
-
-    let next_clip = clip.intersect(&layout.get_content_rect());
-    for child in &layout.children {
-        generate_foregrounds(child, list, next_clip);
-    }
-}
-
-fn execute_display_list(list: &DisplayList, pixmap: &mut Pixmap, image_cache: &HashMap<String, Vec<u8>>) {
-    for cmd in &list.commands {
+fn execute_layer(layer: &Layer, pixmap: &mut Pixmap, image_cache: &HashMap<String, Vec<u8>>) {
+    for cmd in &layer.commands {
         match cmd {
-            PaintCommand::Rect(r, c) => {
+            PaintCommand::Rect(r, c, radius) => {
                 let mut paint = Paint::default();
                 paint.set_color_rgba8(c.r, c.g, c.b, c.a);
-                if let Some(tr) = tiny_skia::Rect::from_xywh(r.x, r.y, r.width, r.height) {
+                if *radius > 0.0 {
+                    if let Some(path) = create_rounded_rect_path(*r, *radius) {
+                        pixmap.fill_path(&path, &paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
+                    }
+                } else if let Some(tr) = tiny_skia::Rect::from_xywh(r.x, r.y, r.width, r.height) {
                     pixmap.fill_rect(tr, &paint, Transform::identity(), None);
                 }
             }
-            PaintCommand::Border(r, w, c) => {
+            PaintCommand::Border(r, w, c, radius) => {
                 let mut paint = Paint::default();
                 paint.set_color_rgba8(c.r, c.g, c.b, c.a);
                 let mut stroke = Stroke::default();
                 stroke.width = *w;
-                if let Some(tr) = tiny_skia::Rect::from_xywh(r.x + w/2.0, r.y + w/2.0, (r.width - w).max(0.0), (r.height - w).max(0.0)) {
+                if *radius > 0.0 {
+                    if let Some(path) = create_rounded_rect_path(*r, *radius) {
+                        pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+                    }
+                } else if let Some(tr) = tiny_skia::Rect::from_xywh(r.x + w/2.0, r.y + w/2.0, (r.width - w).max(0.0), (r.height - w).max(0.0)) {
                     let mut pb = PathBuilder::new();
                     pb.push_rect(tr);
                     if let Some(path) = pb.finish() {
@@ -159,7 +213,7 @@ fn execute_display_list(list: &DisplayList, pixmap: &mut Pixmap, image_cache: &H
                         let rgba = img.to_rgba8();
                         if let Some(mut img_pixmap) = Pixmap::new(rgba.width(), rgba.height()) {
                             img_pixmap.data_mut().copy_from_slice(&rgba);
-                            pixmap.draw_pixmap(r.x as i32, r.y as i32, img_pixmap.as_ref(), &tiny_skia::PixmapPaint::default(), 
+                            pixmap.draw_pixmap(r.x as i32, r.y as i32, img_pixmap.as_ref(), &PixmapPaint::default(), 
                                 Transform::from_scale(r.width / rgba.width() as f32, r.height / rgba.height() as f32), None);
                         }
                     }
@@ -177,17 +231,29 @@ fn execute_display_list(list: &DisplayList, pixmap: &mut Pixmap, image_cache: &H
                 let sh = r.height + (s.spread * 2.0);
                 if let Some(tr) = tiny_skia::Rect::from_xywh(sx, sy, sw, sh) {
                     pixmap.fill_rect(tr, &paint, Transform::identity(), None);
-                    if s.blur > 0.0 {
-                        paint.set_color_rgba8(s.color.r, s.color.g, s.color.b, s.color.a / 4);
-                        let b = s.blur / 2.0;
-                        if let Some(r2) = tiny_skia::Rect::from_xywh(sx - b, sy - b, sw + s.blur, sh + s.blur) {
-                            pixmap.fill_rect(r2, &paint, Transform::identity(), None);
-                        }
-                    }
                 }
             }
         }
     }
+}
+
+fn create_rounded_rect_path(r: LayoutRect, radius: f32) -> Option<tiny_skia::Path> {
+    let mut pb = PathBuilder::new();
+    let rect = tiny_skia::Rect::from_xywh(r.x, r.y, r.width, r.height)?;
+    
+    // Simple rounded rect implementation
+    pb.move_to(rect.left() + radius, rect.top());
+    pb.line_to(rect.right() - radius, rect.top());
+    pb.quad_to(rect.right(), rect.top(), rect.right(), rect.top() + radius);
+    pb.line_to(rect.right(), rect.bottom() - radius);
+    pb.quad_to(rect.right(), rect.bottom(), rect.right() - radius, rect.bottom());
+    pb.line_to(rect.left() + radius, rect.bottom());
+    pb.quad_to(rect.left(), rect.bottom(), rect.left(), rect.bottom() - radius);
+    pb.line_to(rect.left(), rect.top() + radius);
+    pb.quad_to(rect.left(), rect.top(), rect.left() + radius, rect.top());
+    pb.close();
+    
+    pb.finish()
 }
 
 fn render_text_raw(text: String, rect: LayoutRect, font_size: f32, color: &Color, clip: LayoutRect, pixmap: &mut Pixmap) {
