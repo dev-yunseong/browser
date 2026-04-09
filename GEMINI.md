@@ -55,6 +55,7 @@ All development tasks MUST follow the **Plan-Review-Act-Verify** steps below:
 4.  **Development (Act):** Start actual code modification ONLY after explicit **'Pre-Review Pass'**.
 5.  **Verification:** After implementation, invoke the 'Reviewer Agent' again to compare the original **Plan** with the actual **Code**.
 6.  **Final Pass:** If the Reviewer provides feedback, revise the code (or plan) and repeat until a final **'Pass'** is granted.
+7.  **Verification (Mandatory):** ALWAYS run `cargo build` and `cargo test` locally before pushing to ensure no regressions or build breaks.
 
 ### 1. Language Policy
 - **Internal thoughts and code comments:** English
