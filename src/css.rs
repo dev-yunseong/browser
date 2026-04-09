@@ -6,6 +6,7 @@ pub enum Value {
     Length(f32, Unit),
     Color(Color),
     BoxShadow(BoxShadow),
+    Number(f32),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -36,21 +37,62 @@ pub enum Unit {
 }
 
 #[derive(Debug, Clone)]
+pub struct Declaration {
+    pub name: String,
+    pub value: Value,
+    pub important: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct Rule {
     pub selectors: Vec<Selector>,
-    pub declarations: HashMap<String, Value>,
+    pub declarations: Vec<Declaration>,
+}
+
+#[derive(Debug, Clone)]
+pub enum AtRule {
+    Media {
+        query: String,
+        rules: Vec<Rule>,
+    },
+    Unknown(String),
+}
+
+#[derive(Debug, Clone)]
+pub enum RuleOrAtRule {
+    Rule(Rule),
+    AtRule(AtRule),
 }
 
 #[derive(Debug, Clone)]
 pub struct Stylesheet {
-    pub rules: Vec<Rule>,
+    pub items: Vec<RuleOrAtRule>,
+}
+
+impl Stylesheet {
+    pub fn all_rules(&self) -> Vec<&Rule> {
+        let mut rules = Vec::new();
+        for item in &self.items {
+            match item {
+                RuleOrAtRule::Rule(r) => rules.push(r),
+                RuleOrAtRule::AtRule(AtRule::Media { rules: r, .. }) => {
+                    for m_rule in r { rules.push(m_rule); }
+                }
+                _ => {}
+            }
+        }
+        rules
+    }
 }
 
 pub fn parse_css(source: &str) -> Stylesheet {
-    let mut rules = Vec::new();
+    let mut items = Vec::new();
+    // Pre-processing to handle comments and whitespace better
     let source = source.replace('\n', " ");
-
-    // Skip @-rules (media queries, keyframes, etc.) by stripping them
+    
+    // Simple @rule preservation (Issue #21)
+    // For now, we still strip them to avoid breaking the simple parser, 
+    // but we'll implement a proper @media parser soon.
     let source = strip_at_rules(&source);
 
     let blocks: Vec<&str> = source.split('}').collect();
@@ -66,42 +108,65 @@ pub fn parse_css(source: &str) -> Stylesheet {
         let mut selectors = Vec::new();
         for s in selectors_str.split(',') {
             let s = s.trim();
-            if !s.is_empty() && !s.starts_with('@') {
+            if !s.is_empty() {
                 selectors.push(parse_selector(s));
             }
         }
 
         if selectors.is_empty() { continue; }
 
-        let mut declarations = HashMap::new();
+        let mut declarations = Vec::new();
         for decl in declarations_str.split(';') {
             let decl = decl.trim();
             if decl.is_empty() { continue; }
-            // Use splitn(2, ':') to correctly handle values containing colons (urls, etc.)
+            
             let mut kv = decl.splitn(2, ':');
             let key = kv.next().unwrap_or("").trim().to_lowercase();
-            let val_str = kv.next().unwrap_or("").trim().to_string();
-            if key.is_empty() || val_str.is_empty() { continue; }
+            let mut val_raw = kv.next().unwrap_or("").trim().to_string();
+            if key.is_empty() || val_raw.is_empty() { continue; }
+
+            let important = val_raw.ends_with("!important");
+            if important {
+                val_raw = val_raw.trim_end_matches("!important").trim().to_string();
+            }
 
             match key.as_str() {
-                "border" => parse_border_shorthand(&val_str, &mut declarations),
-                "box-shadow" => {
-                    if let Some(shadow) = parse_box_shadow(&val_str) {
-                        declarations.insert(key, Value::BoxShadow(shadow));
+                "border" => {
+                    let mut temp_map = HashMap::new();
+                    parse_border_shorthand(&val_raw, &mut temp_map);
+                    for (k, v) in temp_map {
+                        declarations.push(Declaration { name: k, value: v, important });
                     }
                 }
-                "padding" => parse_quad_shorthand("padding", &val_str, &mut declarations),
-                "margin" => parse_quad_shorthand("margin", &val_str, &mut declarations),
+                "padding" => {
+                    let mut temp_map = HashMap::new();
+                    parse_quad_shorthand("padding", &val_raw, &mut temp_map);
+                    for (k, v) in temp_map {
+                        declarations.push(Declaration { name: k, value: v, important });
+                    }
+                }
+                "margin" => {
+                    let mut temp_map = HashMap::new();
+                    parse_quad_shorthand("margin", &val_raw, &mut temp_map);
+                    for (k, v) in temp_map {
+                        declarations.push(Declaration { name: k, value: v, important });
+                    }
+                }
+                "box-shadow" => {
+                    if let Some(shadow) = parse_box_shadow(&val_raw) {
+                        declarations.push(Declaration { name: key, value: Value::BoxShadow(shadow), important });
+                    }
+                }
                 _ => {
-                    declarations.insert(key, parse_value(&val_str));
+                    declarations.push(Declaration { name: key, value: parse_value(&val_raw), important });
                 }
             }
         }
 
-        rules.push(Rule { selectors, declarations });
+        items.push(RuleOrAtRule::Rule(Rule { selectors, declarations }));
     }
 
-    Stylesheet { rules }
+    Stylesheet { items }
 }
 
 fn strip_at_rules(source: &str) -> String {
@@ -379,6 +444,8 @@ pub fn parse_value(val: &str) -> Value {
         Value::Length(val.trim_end_matches('%').parse().unwrap_or(0.0), Unit::Percent)
     } else if let Some(color) = parse_color(val) {
         Value::Color(color)
+    } else if let Ok(num) = val.parse::<f32>() {
+        Value::Number(num)
     } else {
         Value::Keyword(val.to_string())
     }

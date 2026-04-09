@@ -56,12 +56,12 @@ pub fn build_style_tree(
             }
         }
 
-        // 2. Apply default browser styles
+        // 2. Apply default browser styles (UA origin)
         apply_default_styles(&tag_name, &mut specified_values);
 
-        // 3. Match CSS rules, sorted by specificity (lowest first → highest wins)
+        // 3. Match CSS rules and collect declarations
         let mut matches = Vec::new();
-        for rule in &stylesheet.rules {
+        for rule in stylesheet.all_rules() {
             let mut highest_match: Option<(usize, usize, usize)> = None;
             for selector in &rule.selectors {
                 if matches_selector(selector, root, hovered_id) {
@@ -75,22 +75,49 @@ pub fn build_style_tree(
                 matches.push((spec, rule));
             }
         }
+        
+        // Sort by specificity and source order
         matches.sort_by(|a, b| a.0.cmp(&b.0));
-        for (_, rule) in matches {
-            for (k, v) in &rule.declarations {
-                specified_values.insert(k.clone(), v.clone());
+
+        // Track importance to allow !important to override
+        let mut important_properties = HashMap::new();
+
+        // Apply normal declarations from rules
+        for (_, rule) in &matches {
+            for decl in &rule.declarations {
+                if !decl.important {
+                    specified_values.insert(decl.name.clone(), decl.value.clone());
+                } else {
+                    important_properties.insert(decl.name.clone(), decl.value.clone());
+                }
             }
         }
 
-        // 4. Apply element-specific attribute styles (presentational, lower priority than inline)
-        // C7: attribute styles must come BEFORE inline style so inline style can override them.
+        // 4. Apply element-specific attribute styles (normal priority)
         apply_attribute_styles(&tag_name, &attrs.borrow(), &mut specified_values);
 
-        // 5. Apply inline style attribute (highest priority among author styles)
+        // 5. Apply inline style attribute (normal priority)
+        let mut inline_important = HashMap::new();
         for attr in attrs.borrow().iter() {
             if attr.name.local.to_string() == "style" {
-                parse_inline_style(&attr.value.to_string(), &mut specified_values);
+                let mut inline_map = Vec::new();
+                parse_inline_style_into_vec(&attr.value.to_string(), &mut inline_map);
+                for decl in inline_map {
+                    if !decl.important {
+                        specified_values.insert(decl.name, decl.value);
+                    } else {
+                        inline_important.insert(decl.name, decl.value);
+                    }
+                }
             }
+        }
+
+        // Apply Author !important declarations (rules then inline)
+        for (k, v) in important_properties {
+            specified_values.insert(k, v);
+        }
+        for (k, v) in inline_important {
+            specified_values.insert(k, v);
         }
 
         // B4: If font-size is a percentage, it must be resolved against the *inherited* font-size
@@ -129,22 +156,59 @@ pub fn build_style_tree(
     }
 }
 
-/// Parse `style="..."` attribute content and insert into a property map.
-/// Handles shorthand expansion for `padding`, `margin`, `border` (B6).
-pub fn parse_inline_style(style_str: &str, map: &mut PropertyMap) {
+/// Parse `style="..."` attribute content and return a list of declarations.
+pub fn parse_inline_style_into_vec(style_str: &str, list: &mut Vec<crate::css::Declaration>) {
     for decl in style_str.split(';') {
         let decl = decl.trim();
         if decl.is_empty() { continue; }
         let mut kv = decl.splitn(2, ':');
         let key = kv.next().unwrap_or("").trim().to_lowercase();
-        let val_str = kv.next().unwrap_or("").trim().to_string();
-        if key.is_empty() || val_str.is_empty() { continue; }
-        match key.as_str() {
-            "padding" => crate::css::parse_quad_shorthand("padding", &val_str, map),
-            "margin"  => crate::css::parse_quad_shorthand("margin",  &val_str, map),
-            "border"  => crate::css::parse_border_shorthand_pub(&val_str, map),
-            _ => { map.insert(key, parse_value(&val_str)); }
+        let mut val_raw = kv.next().unwrap_or("").trim().to_string();
+        if key.is_empty() || val_raw.is_empty() { continue; }
+
+        let important = val_raw.ends_with("!important");
+        if important {
+            val_raw = val_raw.trim_end_matches("!important").trim().to_string();
         }
+
+        match key.as_str() {
+            "padding" => {
+                let mut temp_map = HashMap::new();
+                crate::css::parse_quad_shorthand("padding", &val_raw, &mut temp_map);
+                for (k, v) in temp_map {
+                    list.push(crate::css::Declaration { name: k, value: v, important });
+                }
+            }
+            "margin" => {
+                let mut temp_map = HashMap::new();
+                crate::css::parse_quad_shorthand("margin", &val_raw, &mut temp_map);
+                for (k, v) in temp_map {
+                    list.push(crate::css::Declaration { name: k, value: v, important });
+                }
+            }
+            "border" => {
+                let mut temp_map = HashMap::new();
+                crate::css::parse_border_shorthand_pub(&val_raw, &mut temp_map);
+                for (k, v) in temp_map {
+                    list.push(crate::css::Declaration { name: k, value: v, important });
+                }
+            }
+            _ => {
+                list.push(crate::css::Declaration {
+                    name: key,
+                    value: parse_value(&val_raw),
+                    important,
+                });
+            }
+        }
+    }
+}
+
+pub fn parse_inline_style(style_str: &str, map: &mut PropertyMap) {
+    let mut list = Vec::new();
+    parse_inline_style_into_vec(style_str, &mut list);
+    for decl in list {
+        map.insert(decl.name, decl.value);
     }
 }
 

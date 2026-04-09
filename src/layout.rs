@@ -49,6 +49,7 @@ pub struct LayoutBox<'a> {
     pub image_url: Option<String>,
     pub event_handlers: HashMap<String, String>,
     pub display: DisplayType,
+    pub z_index: i32,
 }
 
 #[derive(PartialEq, Debug, Clone, Copy)]
@@ -85,6 +86,10 @@ pub fn build_layout_tree<'a>(
 impl<'a> LayoutBox<'a> {
     fn new(style_node: &'a StyledNode) -> Self {
         let display = get_display_type(style_node);
+        let z_index = match style_node.specified_values.get("z-index") {
+            Some(Value::Number(n)) => *n as i32,
+            _ => 0,
+        };
         let mut layout = LayoutBox {
             dimensions: Rect::default(),
             padding: EdgeSizes::default(),
@@ -96,6 +101,7 @@ impl<'a> LayoutBox<'a> {
             image_url: None,
             event_handlers: HashMap::new(),
             display,
+            z_index,
         };
 
         if let NodeData::Element { ref attrs, ref name, .. } = style_node.node.data {
@@ -499,6 +505,10 @@ impl<'a> LayoutBox<'a> {
         }
         for child in &self.children { child.collect_element_ids(list); }
     }
+    pub fn establishes_stacking_context(&self) -> bool {
+        self.z_index != 0 || self.establishes_bfc()
+    }
+
     pub fn establishes_bfc(&self) -> bool {
         match self.display {
             DisplayType::InlineBlock | DisplayType::Flex | DisplayType::TableCell => true,
