@@ -541,6 +541,14 @@ impl eframe::App for BrowserApp {
                         if response.clicked() {
                             if let Some(ptr) = response.interact_pointer_pos() {
                                 let rel = ptr - rect.min;
+                                
+                                // Dispatch standard JS 'click' events for elements with IDs
+                                for (l_rect, id) in &self.current_element_ids {
+                                    if hit(rel, l_rect) {
+                                        self.js_runtime.trigger_event(id, "click");
+                                    }
+                                }
+
                                 for (l_rect, script) in &self.current_event_handlers {
                                     if hit(rel, l_rect) {
                                         scripts_to_run.push(script.clone());

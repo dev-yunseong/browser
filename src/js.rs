@@ -1,7 +1,8 @@
-use boa_engine::{Context, Source, JsValue, NativeFunction, js_string, JsObject};
+use boa_engine::{Context, Source, JsValue, NativeFunction, js_string};
 use std::collections::{HashMap, VecDeque};
-use markup5ever_rcdom::{NodeData, Handle};
+use markup5ever_rcdom::{NodeData, Handle, Node};
 use std::cell::RefCell;
+use html5ever::{QualName, LocalName, Namespace};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 thread_local! {
@@ -59,7 +60,7 @@ impl JsRuntime {
         context.register_global_callable(js_string!("__aura_queue_task"), 1, queue_task).unwrap();
 
         // Register native __aura_fetch
-        let aura_fetch = NativeFunction::from_copy_closure(|_this, args, context| {
+        let aura_fetch = NativeFunction::from_copy_closure(|_this, args, _context| {
             let url = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
             let resolve = args.get(1).cloned().unwrap_or(JsValue::undefined());
             let reject = args.get(2).cloned().unwrap_or(JsValue::undefined());
@@ -117,24 +118,7 @@ impl JsRuntime {
         });
         context.register_global_callable(js_string!("__aura_fetch"), 3, aura_fetch).unwrap();
 
-        // Register native queueMicrotask
-        let queue_microtask = NativeFunction::from_copy_closure(|_this, args, _context| {
-            if let Some(callback) = args.get(0).cloned() {
-                if let Some(obj) = callback.as_object() {
-                    if obj.is_callable() {
-                        MICRO_TASKS.with(|tasks| {
-                            tasks.borrow_mut().push_back(Box::new(move |ctx| {
-                                let _ = obj.call(&JsValue::undefined(), &[], ctx);
-                            }));
-                        });
-                    }
-                }
-            }
-            Ok(JsValue::undefined())
-        });
-        context.register_global_callable(js_string!("queueMicrotask"), 1, queue_microtask).unwrap();
-
-        // --- DOM Bridges ---
+        // DOM Bridges
         let get_el_by_id = NativeFunction::from_copy_closure(|_this, args, _context| {
             let id_str = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
             let id = DOM_ROOT.with(|root_cell| {
@@ -148,6 +132,48 @@ impl JsRuntime {
             Ok(id.map(JsValue::from).unwrap_or(JsValue::null()))
         });
         context.register_global_callable(js_string!("__aura_get_element_by_id"), 1, get_el_by_id).unwrap();
+
+        let get_parent_id = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let node_id = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
+            let pid = NODE_REGISTRY.with(|reg| {
+                if let Some(node) = reg.borrow().get(&node_id) {
+                    if let Some(p) = node.parent.take().and_then(|p| p.upgrade()) {
+                        let pid = register_node(p.clone());
+                        node.parent.set(Some(std::rc::Rc::downgrade(&p)));
+                        return Some(pid);
+                    }
+                }
+                None
+            });
+            Ok(pid.map(JsValue::from).unwrap_or(JsValue::null()))
+        });
+        context.register_global_callable(js_string!("__aura_get_parent_id"), 1, get_parent_id).unwrap();
+
+        let get_body = NativeFunction::from_copy_closure(|_this, _args, _context| {
+            let bid = DOM_ROOT.with(|root_cell| {
+                if let Some(ref root) = *root_cell.borrow() {
+                    if let Some(body) = find_element_by_tag(root, "body") {
+                        return Some(register_node(body));
+                    }
+                }
+                None
+            });
+            Ok(bid.map(JsValue::from).unwrap_or(JsValue::null()))
+        });
+        context.register_global_callable(js_string!("__aura_get_body"), 0, get_body).unwrap();
+
+        let create_element = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let tag = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            let name = QualName::new(None, Namespace::from("http://www.w3.org/1999/xhtml"), LocalName::from(tag));
+            let new_node = Node::new(NodeData::Element {
+                name,
+                attrs: RefCell::new(Vec::new()),
+                template_contents: RefCell::new(None),
+                mathml_annotation_xml_integration_point: false,
+            });
+            Ok(JsValue::from(register_node(new_node)))
+        });
+        context.register_global_callable(js_string!("__aura_create_element"), 1, create_element).unwrap();
 
         let append_child = NativeFunction::from_copy_closure(|_this, args, _context| {
             let parent_id = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
@@ -163,6 +189,7 @@ impl JsRuntime {
         });
         context.register_global_callable(js_string!("__aura_append_child"), 2, append_child).unwrap();
 
+        // Load the full JS environment
         const BOOTSTRAP: &[u8] = include_bytes!("js_bootstrap.js");
         if let Err(e) = context.eval(Source::from_bytes(BOOTSTRAP)) {
             println!("[Aura JS Bootstrap Error] {}", e);
@@ -189,6 +216,20 @@ impl JsRuntime {
         loop {
             let micro = MICRO_TASKS.with(|tasks| tasks.borrow_mut().pop_front());
             if let Some(m) = micro { m(&mut self.context); } else { break; }
+        }
+    }
+
+    pub fn trigger_event(&mut self, target_id: &str, event_type: &str) {
+        // Find native ID from DOM string ID
+        let native_id = DOM_ROOT.with(|root| {
+            if let Some(ref r) = *root.borrow() {
+                find_element_by_id(r, target_id).map(register_node)
+            } else { None }
+        });
+
+        if let Some(nid) = native_id {
+            let code = format!("document.__trigger_event({}, '{}', {{ bubbles: true }})", nid, event_type);
+            let _ = self.context.eval(Source::from_bytes(code.as_bytes()));
         }
     }
 
@@ -230,9 +271,25 @@ fn find_element_by_id(root: &Handle, id: &str) -> Option<Handle> {
     None
 }
 
+fn find_element_by_tag(root: &Handle, tag: &str) -> Option<Handle> {
+    if let NodeData::Element { ref name, .. } = root.data {
+        if name.local.to_string() == tag {
+            return Some(root.clone());
+        }
+    }
+    for child in root.children.borrow().iter() {
+        if let Some(found) = find_element_by_tag(child, tag) { return Some(found); }
+    }
+    None
+}
+
 fn register_node(handle: Handle) -> u32 {
     NODE_REGISTRY.with(|reg| {
         let mut reg = reg.borrow_mut();
+        // Check if already registered
+        for (id, h) in reg.iter() {
+            if std::rc::Rc::ptr_eq(h, &handle) { return *id; }
+        }
         let id = NEXT_NODE_ID.with(|id_cell| {
             let id = *id_cell.borrow();
             *id_cell.borrow_mut() += 1;

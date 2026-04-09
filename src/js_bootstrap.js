@@ -8,19 +8,79 @@ var __aura_inner_html_log = [];
 function __aura_set_style(id, prop, value) {
     __aura_style_log.push(id + '||||' + prop + '||||' + value);
 }
-function __aura_set_inner_html(id, html) {
-    __aura_inner_html_log.push(id + '||||' + html);
+
+// -- Node Registry (Ensures stable objects for events) -----------------------
+var __node_registry = new Map();
+
+function __get_or_create_node(id, tag) {
+    if (!id) return null;
+    if (__node_registry.has(id)) return __node_registry.get(id);
+    let node = tag ? new Element(id, tag) : new Node(id);
+    __node_registry.set(id, node);
+    return node;
 }
 
-// -- Basic globals ------------------------------------------------------------
-var window = globalThis;
-var console = { log: log, warn: log, error: log, info: log, debug: log };
-var navigator = { userAgent: 'Browser/2.0', language: 'en-US', languages: ['en-US'] };
+// -- Event System ------------------------------------------------------------
+class Event {
+    constructor(type, options = {}) {
+        this.type = type;
+        this.bubbles = options.bubbles || false;
+        this.cancelable = options.cancelable || false;
+        this.target = null;
+        this.currentTarget = null;
+        this.defaultPrevented = false;
+    }
+    preventDefault() { this.defaultPrevented = true; }
+}
+
+class MouseEvent extends Event {
+    constructor(type, options = {}) {
+        super(type, options);
+        this.clientX = options.clientX || 0;
+        this.clientY = options.clientY || 0;
+    }
+}
+
+class EventTarget {
+    constructor() {
+        this._listeners = new Map();
+    }
+    addEventListener(type, callback) {
+        if (!this._listeners.has(type)) this._listeners.set(type, []);
+        this._listeners.get(type).push(callback);
+    }
+    removeEventListener(type, callback) {
+        if (!this._listeners.has(type)) return;
+        this._listeners.set(type, this._listeners.get(type).filter(l => l !== callback));
+    }
+    dispatchEvent(event) {
+        event.target = this;
+        let current = this;
+        // Simple bubbling (if supported by event)
+        while (current) {
+            event.currentTarget = current;
+            let list = current._listeners.get(event.type);
+            if (list) {
+                for (let listener of list) {
+                    try { listener.call(current, event); } catch(e) { console.log("Event Error: " + e); }
+                }
+            }
+            if (!event.bubbles) break;
+            current = current.parentNode;
+        }
+        return !event.defaultPrevented;
+    }
+}
 
 // -- Node & Element Classes ---------------------------------------------------
-class Node {
+class Node extends EventTarget {
     constructor(id) {
+        super();
         this._id = id;
+    }
+    get parentNode() {
+        let pid = __aura_get_parent_id(this._id);
+        return pid ? __get_or_create_node(pid) : null;
     }
     appendChild(child) {
         if (child instanceof Node) {
@@ -31,8 +91,9 @@ class Node {
 }
 
 class Element extends Node {
-    constructor(id) {
+    constructor(id, tag) {
         super(id);
+        this.tagName = (tag || '').toUpperCase();
         this.style = new Proxy({ _id: id }, {
             set: (target, prop, value) => {
                 let kebab = prop.replace(/([A-Z])/g, "-$1").toLowerCase();
@@ -51,62 +112,50 @@ class Element extends Node {
 var document = {
     getElementById: function(id) {
         let nativeId = __aura_get_element_by_id(id);
-        return nativeId ? new Element(nativeId) : null;
+        return nativeId ? __get_or_create_node(nativeId) : null;
     },
     createElement: function(tag) {
         let nativeId = __aura_create_element(tag);
-        return new Element(nativeId);
-    },
-    createTextNode: function(text) {
-        let nativeId = __aura_create_text_node(text);
-        return new Node(nativeId);
+        return __get_or_create_node(nativeId, tag);
     },
     get body() {
         let nativeId = __aura_get_body();
-        return nativeId ? new Element(nativeId) : null;
+        return nativeId ? __get_or_create_node(nativeId, 'body') : null;
     },
+    activeElement: null,
     location: { href: '', hostname: '', pathname: '/', search: '', hash: '' },
     title: '',
-    readyState: 'complete'
+    readyState: 'complete',
+    
+    // Internal bridge for Rust to trigger events
+    __trigger_event: function(id, type, data) {
+        let target = __get_or_create_node(id);
+        if (target) {
+            let ev = type.startsWith('mouse') ? new MouseEvent(type, data) : new Event(type, data);
+            target.dispatchEvent(ev);
+        }
+    }
 };
 
+var window = globalThis;
+window.document = document;
+var console = { log: log, warn: log, error: log, info: log, debug: log };
+var navigator = { userAgent: 'Browser/2.0', language: 'en-US' };
 var location = document.location;
 
 // -- Timers ------------------------------------------------------------------
-var __timer_id = 0;
 window.setTimeout = function(fn, delay) {
-    __timer_id++;
     if (typeof fn === 'function') {
         __aura_queue_task(fn);
     } else if (typeof fn === 'string') {
         __aura_queue_task(() => eval(fn));
     }
-    return __timer_id;
+    return 1;
 };
 
 // -- fetch() -----------------------------------------------------------------
-class Response {
-    constructor(data) {
-        this.status = data.status;
-        this.ok = data.ok;
-        this._body = data._body;
-    }
-    text() { return Promise.resolve(this._body); }
-    json() { return Promise.resolve(JSON.parse(this._body)); }
-}
-
 window.fetch = function(url) {
     return new Promise((resolve, reject) => {
         __aura_fetch(url, resolve, reject);
     });
 };
-
-// -- Storage stubs -----------------------------------------------------------
-window.localStorage = {
-    _data: {},
-    getItem: (k) => this._data[k] || null,
-    setItem: (k, v) => { this._data[k] = String(v); },
-    removeItem: (k) => { delete this._data[k]; },
-    clear: () => { this._data = {}; }
-};
-window.sessionStorage = window.localStorage;
