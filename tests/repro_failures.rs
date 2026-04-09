@@ -1,4 +1,4 @@
-use browser::layout::{build_layout_tree, DisplayType, LayoutBox};
+use browser::layout::build_layout_tree;
 use browser::dom;
 use browser::css;
 use browser::style;
@@ -16,7 +16,7 @@ fn test_interleaved_block_inline_stacking() {
     "#;
     let dom = dom::parse_html(html);
     let stylesheet = css::parse_css("");
-    let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new());
+    let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None);
 
     // Find the outer div
     let outer_div = style_tree.children.iter()

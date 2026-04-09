@@ -543,7 +543,7 @@ mod tests {
         let html = r#"<button onclick="alert(1)" style="width: 100px; height: 50px; margin: 10px;">Click me</button>"#;
         let dom = dom::parse_html(html);
         let stylesheet = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new());
+        let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None);
         
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 1024.0, 1024.0, 768.0);
         let layout = layout_opt.unwrap();
@@ -564,7 +564,7 @@ mod tests {
         let html = r#"<div style="display: block; width: 500px; margin: auto;">Content</div>"#;
         let dom = dom::parse_html(html);
         let stylesheet = css::parse_css("");
-        let mut style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new());
+        let mut style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None);
         
         // Ensure the style is manually set if parser was ambiguous
         if let NodeData::Element { .. } = style_tree.children[0].node.data {
@@ -585,7 +585,7 @@ mod tests {
         let html = r#"<div style="margin-left: 48px; margin-top: 24px;">Hello world</div>"#;
         let dom = dom::parse_html(html);
         let stylesheet = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new());
+        let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None);
 
         let div_node = style_tree
             .children
@@ -645,7 +645,7 @@ mod tests {
         let html = r#"<span>Hi</span>"#;
         let dom = dom::parse_html(html);
         let stylesheet = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new());
+        let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None);
 
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 768.0);
         let layout = layout_opt.unwrap();

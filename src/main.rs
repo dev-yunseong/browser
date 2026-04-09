@@ -83,7 +83,7 @@ impl BrowserApp {
             image_promises: HashMap::new(),
             last_body: String::new(),
             last_base_url: None,
-            js_runtime: js::JsRuntime::new(),
+            js_runtime: js::JsRuntime::new(None),
             js_style_overrides: HashMap::new(),
             is_loading: false,
         }
@@ -119,7 +119,7 @@ impl BrowserApp {
         self.error = None;
         self.image_promises.clear();
         self.js_style_overrides.clear();
-        self.js_runtime = js::JsRuntime::new();
+        self.js_runtime = js::JsRuntime::new(None);
         self.is_loading = true;
         self.hovered_id = None;
         self.content_promise = Some(Promise::spawn_thread("fetcher", move || {
@@ -466,8 +466,9 @@ impl eframe::App for BrowserApp {
                             }
 
                             // Execute page scripts and apply any JS-driven style changes
-                            let scripts = js::extract_scripts_from_dom(&dom::parse_html(&body).document);
-                            self.js_runtime = js::JsRuntime::new();
+                            let dom = dom::parse_html(&body);
+                            self.js_runtime = js::JsRuntime::new(Some(dom.document.clone()));
+                            let scripts = js::extract_scripts_from_dom(&dom.document);
                             for script in scripts {
                                 self.js_runtime.execute(&script);
                             }
