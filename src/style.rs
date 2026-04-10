@@ -1,6 +1,7 @@
 use crate::css::{Stylesheet, Value, Selector, parse_value, parse_color, Combinator};
 use markup5ever_rcdom::{Handle, NodeData};
 use std::collections::HashMap;
+use rayon::prelude::*;
 
 pub type PropertyMap = HashMap<String, Value>;
 
@@ -11,10 +12,162 @@ pub struct StyledNode {
     pub children: Vec<StyledNode>,
 }
 
+pub struct NodeDataSend {
+    pub tag: String,
+    pub id: Option<String>,
+    pub classes: Vec<String>,
+    pub attrs: Vec<(String, String)>,
+    pub is_element: bool,
+    pub parent_idx: Option<usize>,
+    pub children_idx: Vec<usize>,
+}
+
+// Flatten RcDom into a Vec for parallel processing
+fn flatten_dom(handle: &Handle, arena: &mut Vec<NodeDataSend>, parent_idx: Option<usize>) -> usize {
+    let idx = arena.len();
+    
+    let mut tag = String::new();
+    let mut id = None;
+    let mut classes = Vec::new();
+    let mut attrs_vec = Vec::new();
+    let mut is_element = false;
+
+    if let NodeData::Element { ref name, ref attrs, .. } = handle.data {
+        is_element = true;
+        tag = name.local.to_string();
+        for attr in attrs.borrow().iter() {
+            let k = attr.name.local.to_string();
+            let v = attr.value.to_string();
+            if k == "id" { id = Some(v.clone()); }
+            if k == "class" { classes = v.split_whitespace().map(|s| s.to_string()).collect(); }
+            attrs_vec.push((k, v));
+        }
+    }
+
+    arena.push(NodeDataSend {
+        tag, id, classes, attrs: attrs_vec, is_element, parent_idx, children_idx: Vec::new()
+    });
+
+    let mut children_idx = Vec::new();
+    for child in handle.children.borrow().iter() {
+        let child_idx = flatten_dom(child, arena, Some(idx));
+        children_idx.push(child_idx);
+    }
+    
+    arena[idx].children_idx = children_idx;
+    idx
+}
+
+fn matches_selector_arena(selector: &Selector, idx: usize, arena: &[NodeDataSend], hovered_id: Option<&str>) -> bool {
+    let node = &arena[idx];
+    
+    let has_constraint = selector.tag.is_some() || selector.id.is_some() || !selector.class.is_empty() || !selector.attributes.is_empty() || selector.pseudo_class.is_some();
+    if !has_constraint { return false; }
+
+    if let Some(ref s_tag) = selector.tag {
+        if s_tag != &node.tag && s_tag != "*" { return false; }
+    }
+    if let Some(ref s_id) = selector.id {
+        if Some(s_id.as_str()) != node.id.as_deref() { return false; }
+    }
+    for s_class in &selector.class {
+        if !node.classes.contains(s_class) { return false; }
+    }
+    if let Some(ref pseudo) = selector.pseudo_class {
+        if pseudo == "hover" {
+            if Some(node.id.as_deref()) != Some(hovered_id) || node.id.is_none() { return false; }
+        } else { return false; }
+    }
+    for attr_sel in &selector.attributes {
+        let mut matched = false;
+        for (k, v) in &node.attrs {
+            if k == &attr_sel.name {
+                match &attr_sel.value {
+                    crate::css::AttributeMatch::Exists => { matched = true; break; }
+                    crate::css::AttributeMatch::Equals(val) => { if v == val { matched = true; break; } }
+                }
+            }
+        }
+        if !matched { return false; }
+    }
+
+    if let Some(ref ancestor_sel) = selector.ancestor {
+        let combinator = selector.combinator.as_ref().unwrap_or(&Combinator::Descendant);
+        match combinator {
+            Combinator::Descendant => {
+                let mut current = node.parent_idx;
+                let mut matched = false;
+                while let Some(p_idx) = current {
+                    if matches_selector_arena(ancestor_sel, p_idx, arena, hovered_id) {
+                        matched = true; break;
+                    }
+                    current = arena[p_idx].parent_idx;
+                }
+                if !matched { return false; }
+            }
+            Combinator::Child => {
+                if let Some(p_idx) = node.parent_idx {
+                    if !matches_selector_arena(ancestor_sel, p_idx, arena, hovered_id) { return false; }
+                } else { return false; }
+            }
+            Combinator::NextSibling => {
+                if let Some(p_idx) = node.parent_idx {
+                    let p_node = &arena[p_idx];
+                    let mut found = false;
+                    for &sib_idx in p_node.children_idx.iter().rev() {
+                        if sib_idx >= idx { continue; }
+                        if arena[sib_idx].is_element {
+                            if matches_selector_arena(ancestor_sel, sib_idx, arena, hovered_id) { found = true; }
+                            break;
+                        }
+                    }
+                    if !found { return false; }
+                } else { return false; }
+            }
+            Combinator::SubsequentSibling => {
+                if let Some(p_idx) = node.parent_idx {
+                    let p_node = &arena[p_idx];
+                    let mut matched = false;
+                    for &sib_idx in &p_node.children_idx {
+                        if sib_idx >= idx { break; }
+                        if arena[sib_idx].is_element {
+                            if matches_selector_arena(ancestor_sel, sib_idx, arena, hovered_id) {
+                                matched = true; break;
+                            }
+                        }
+                    }
+                    if !matched { return false; }
+                } else { return false; }
+            }
+        }
+    }
+    true
+}
+
+fn apply_attribute_styles_arena(node: &NodeDataSend, map: &mut PropertyMap) {
+    match node.tag.as_str() {
+        "img" => {
+            for (k, v) in &node.attrs {
+                if k == "width" { if let Ok(val) = v.trim_end_matches("px").parse::<f32>() { map.insert("width".to_string(), Value::Length(val, crate::css::Unit::Px)); } }
+                if k == "height" { if let Ok(val) = v.trim_end_matches("px").parse::<f32>() { map.insert("height".to_string(), Value::Length(val, crate::css::Unit::Px)); } }
+            }
+        }
+        "font" => {
+            for (k, v) in &node.attrs {
+                if k == "color" { if let Some(c) = parse_color(v) { map.insert("color".to_string(), Value::Color(c)); } }
+                if k == "size" {
+                    let size_map = [("1", 10.0f32), ("2", 13.0), ("3", 16.0), ("4", 18.0), ("5", 24.0), ("6", 32.0), ("7", 48.0)];
+                    for (s, px) in &size_map {
+                        if s == v { map.insert("font-size".to_string(), Value::Length(*px, crate::css::Unit::Px)); }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Build a style tree, applying CSS rules, inline styles, and JS overrides.
-///
-/// `js_overrides` maps element id → property → value string.
-/// These are applied last (highest priority), overriding CSS and inline styles.
 pub fn build_style_tree(
     root: &Handle,
     stylesheet: &Stylesheet,
@@ -22,169 +175,129 @@ pub fn build_style_tree(
     js_overrides: &HashMap<String, HashMap<String, String>>,
     hovered_id: Option<&str>,
 ) -> StyledNode {
-    let mut specified_values = HashMap::new();
+    let mut arena = Vec::new();
+    flatten_dom(root, &mut arena, None);
 
-    // 1. Set initial defaults for root (or inherit from parent)
-    if parent_style.is_none() {
-        // Default color for the very first node (usually <html>)
-        specified_values.insert("color".to_string(), Value::Color(crate::css::Color { r: 0, g: 0, b: 0, a: 255 }));
-        specified_values.insert("font-size".to_string(), Value::Length(16.0, crate::css::Unit::Px));
-    }
-
-    // 2. Inherit properties from parent
-    if let Some(parent) = parent_style {
-        let inheritable = [
-            "color", "font-size", "font-family", "font-weight",
-            "line-height", "text-align", "list-style-type",
-        ];
-        for prop in inheritable {
-            if let Some(val) = parent.get(prop) {
-                specified_values.insert(prop.to_string(), val.clone());
-            }
-        }
-    }
-
-    if let NodeData::Element { ref name, ref attrs, .. } = root.data {
-        let tag_name = name.local.to_string();
-        let mut id: Option<String> = None;
-
-        for attr in attrs.borrow().iter() {
-            let attr_name = attr.name.local.to_string();
-            match attr_name.as_str() {
-                "id" => id = Some(attr.value.to_string()),
-                _ => {}
-            }
-        }
-
-        // 2. Apply default browser styles (UA origin)
-        apply_default_styles(&tag_name, &mut specified_values);
-
-        // 3. Match CSS rules and collect declarations
+    // Phase 1: Parallel CSS Matching
+    let mut pre_styles: Vec<PropertyMap> = arena.par_iter().enumerate().map(|(idx, node)| {
+        if !node.is_element { return HashMap::new(); }
+        let mut map = HashMap::new();
+        apply_default_styles(&node.tag, &mut map);
+        
         let mut matches = Vec::new();
         for rule in stylesheet.all_rules() {
-            let mut highest_match: Option<(usize, usize, usize)> = None;
-            for selector in &rule.selectors {
-                if matches_selector(selector, root, hovered_id) {
-                    let spec = selector.specificity();
-                    if highest_match.is_none() || spec > highest_match.unwrap() {
-                        highest_match = Some(spec);
-                    }
+            let mut highest = None;
+            for sel in &rule.selectors {
+                if matches_selector_arena(sel, idx, &arena, hovered_id) {
+                    let spec = sel.specificity();
+                    if highest.is_none() || spec > highest.unwrap() { highest = Some(spec); }
                 }
             }
-            if let Some(spec) = highest_match {
-                matches.push((spec, rule));
+            if let Some(s) = highest { matches.push((s, rule)); }
+        }
+        matches.sort_by(|a, b| a.0.cmp(&b.0));
+        
+        let mut important = HashMap::new();
+        for (_, rule) in &matches {
+            for decl in &rule.declarations {
+                if !decl.important { map.insert(decl.name.clone(), decl.value.clone()); }
+                else { important.insert(decl.name.clone(), decl.value.clone()); }
             }
         }
         
-        // Sort by specificity and source order
-        matches.sort_by(|a, b| a.0.cmp(&b.0));
-
-        // Track importance to allow !important to override
-        let mut important_properties = HashMap::new();
-
-        // Apply normal declarations from rules
-        for (_, rule) in &matches {
-            for decl in &rule.declarations {
-                if !decl.important {
-                    specified_values.insert(decl.name.clone(), decl.value.clone());
-                } else {
-                    important_properties.insert(decl.name.clone(), decl.value.clone());
-                }
-            }
-        }
-
-        // 4. Apply element-specific attribute styles (normal priority)
-        apply_attribute_styles(&tag_name, &attrs.borrow(), &mut specified_values);
-
-        // 5. Apply inline style attribute (normal priority)
+        apply_attribute_styles_arena(node, &mut map);
+        
         let mut inline_important = HashMap::new();
-        for attr in attrs.borrow().iter() {
-            if attr.name.local.to_string() == "style" {
-                let mut inline_map = Vec::new();
-                parse_inline_style_into_vec(&attr.value.to_string(), &mut inline_map);
-                for decl in inline_map {
-                    if !decl.important {
-                        specified_values.insert(decl.name, decl.value);
-                    } else {
-                        inline_important.insert(decl.name, decl.value);
-                    }
-                }
+        if let Some(v) = node.attrs.iter().find(|(k, _)| k == "style").map(|(_, v)| v) {
+            let mut inline_map = Vec::new();
+            parse_inline_style_into_vec(v, &mut inline_map);
+            for decl in inline_map {
+                if !decl.important { map.insert(decl.name, decl.value); }
+                else { inline_important.insert(decl.name, decl.value); }
             }
         }
-
-        // Apply Author !important declarations (rules then inline)
-        for (k, v) in important_properties {
-            specified_values.insert(k, v);
-        }
-        for (k, v) in inline_important {
-            specified_values.insert(k, v);
-        }
-
-        // --- Issue #10: Computed Value Resolution ---
-        // Resolve 'font-size' first because other 'em' units depend on it.
-        let mut resolved_fs = 16.0f32;
-        if let Some(val) = specified_values.get("font-size") {
-            match val {
-                Value::Length(v, crate::css::Unit::Px) => resolved_fs = *v,
-                Value::Length(v, crate::css::Unit::Percent) => {
-                    let parent_fs = match parent_style {
-                        Some(parent) => match parent.get("font-size") {
-                            Some(Value::Length(pv, crate::css::Unit::Px)) => *pv,
-                            _ => 16.0,
-                        },
-                        _ => 16.0,
-                    };
-                    resolved_fs = parent_fs * (v / 100.0);
-                }
-                Value::Length(v, crate::css::Unit::Em) => {
-                    let parent_fs = match parent_style {
-                        Some(parent) => match parent.get("font-size") {
-                            Some(Value::Length(pv, crate::css::Unit::Px)) => *pv,
-                            _ => 16.0,
-                        },
-                        _ => 16.0,
-                    };
-                    resolved_fs = parent_fs * v;
-                }
-                _ => {}
+        
+        for (k, v) in important { map.insert(k, v); }
+        for (k, v) in inline_important { map.insert(k, v); }
+        
+        if let Some(ref id) = node.id {
+            if let Some(overrides) = js_overrides.get(id) {
+                for (k, v) in overrides { map.insert(k.clone(), parse_value(v)); }
             }
         }
-        // Force font-size to be absolute pixels
-        specified_values.insert("font-size".to_string(), Value::Length(resolved_fs, crate::css::Unit::Px));
+        map
+    }).collect();
 
-        // Resolve all other 'em' units to absolute 'px'
-        let keys: Vec<String> = specified_values.keys().cloned().collect();
-        for k in keys {
-            if k == "font-size" { continue; }
-            if let Some(Value::Length(v, crate::css::Unit::Em)) = specified_values.get(&k) {
-                specified_values.insert(k, Value::Length(v * resolved_fs, crate::css::Unit::Px));
-            }
-        }
+    // Phase 2: Sequential Inheritance
+    let mut arena_idx = 0;
+    build_final_tree(root, &mut arena_idx, &mut pre_styles, parent_style)
+}
 
-        // 6. Apply JS overrides (highest priority)
-        if let Some(ref element_id) = id {
-            if let Some(overrides) = js_overrides.get(element_id) {
-                for (k, v) in overrides {
-                    specified_values.insert(k.clone(), parse_value(v));
-                }
+fn build_final_tree(
+    handle: &Handle,
+    arena_idx: &mut usize,
+    pre_styles: &mut [PropertyMap],
+    parent_style: Option<&PropertyMap>
+) -> StyledNode {
+    let current_idx = *arena_idx;
+    *arena_idx += 1;
+    
+    let mut specified_values = std::mem::take(&mut pre_styles[current_idx]);
+    
+    if parent_style.is_none() && current_idx == 0 {
+        specified_values.insert("color".to_string(), Value::Color(crate::css::Color { r: 0, g: 0, b: 0, a: 255 }));
+        specified_values.insert("font-size".to_string(), Value::Length(16.0, crate::css::Unit::Px));
+    }
+    
+    if let Some(p) = parent_style {
+        let inheritable = ["color", "font-size", "font-family", "font-weight", "line-height", "text-align", "list-style-type"];
+        for prop in inheritable {
+            if let Some(v) = p.get(prop) {
+                specified_values.entry(prop.to_string()).or_insert_with(|| v.clone());
             }
         }
     }
+    
+    let mut resolved_fs = 16.0f32;
+    if let Some(val) = specified_values.get("font-size") {
+        match val {
+            Value::Length(v, crate::css::Unit::Px) => resolved_fs = *v,
+            Value::Length(v, crate::css::Unit::Percent) => {
+                let parent_fs = match parent_style {
+                    Some(p) => match p.get("font-size") { Some(Value::Length(pv, crate::css::Unit::Px)) => *pv, _ => 16.0 }, _ => 16.0
+                };
+                resolved_fs = parent_fs * (v / 100.0);
+            }
+            Value::Length(v, crate::css::Unit::Em) => {
+                let parent_fs = match parent_style {
+                    Some(p) => match p.get("font-size") { Some(Value::Length(pv, crate::css::Unit::Px)) => *pv, _ => 16.0 }, _ => 16.0
+                };
+                resolved_fs = parent_fs * v;
+            }
+            _ => {}
+        }
+    }
+    specified_values.insert("font-size".to_string(), Value::Length(resolved_fs, crate::css::Unit::Px));
 
-    let children = root.children
-        .borrow()
-        .iter()
-        .map(|child| build_style_tree(child, stylesheet, Some(&specified_values), js_overrides, hovered_id))
-        .collect();
-
+    let keys: Vec<String> = specified_values.keys().cloned().collect();
+    for k in keys {
+        if k == "font-size" { continue; }
+        if let Some(Value::Length(v, crate::css::Unit::Em)) = specified_values.get(&k) {
+            specified_values.insert(k, Value::Length(v * resolved_fs, crate::css::Unit::Px));
+        }
+    }
+    
+    let children = handle.children.borrow().iter().map(|child| {
+        build_final_tree(child, arena_idx, pre_styles, Some(&specified_values))
+    }).collect();
+    
     StyledNode {
-        node: root.clone(),
+        node: handle.clone(),
         specified_values,
-        children,
+        children
     }
 }
 
-/// Parse `style="..."` attribute content and return a list of declarations.
 pub fn parse_inline_style_into_vec(style_str: &str, list: &mut Vec<crate::css::Declaration>) {
     for decl in style_str.split(';') {
         let decl = decl.trim();
@@ -240,7 +353,6 @@ pub fn parse_inline_style(style_str: &str, map: &mut PropertyMap) {
     }
 }
 
-/// Apply default browser-like styles for known HTML tags.
 fn apply_default_styles(tag: &str, map: &mut PropertyMap) {
     match tag {
         "h1" => {
@@ -290,195 +402,6 @@ fn apply_default_styles(tag: &str, map: &mut PropertyMap) {
             map.entry("margin-bottom".to_string()).or_insert(Value::Length(8.0, crate::css::Unit::Px));
         }
         _ => {}
-    }
-}
-
-/// Apply styles derived from HTML attributes (e.g., width/height on img, color on font).
-/// Called with the borrowed attrs from NodeData::Element.
-fn apply_attribute_styles(tag: &str, attrs_borrow: &std::cell::Ref<Vec<html5ever::Attribute>>, map: &mut PropertyMap) {
-    match tag {
-        "img" => {
-            for attr in attrs_borrow.iter() {
-                match attr.name.local.as_ref() {
-                    "width" => {
-                        if let Ok(v) = attr.value.trim_end_matches("px").parse::<f32>() {
-                            map.insert("width".to_string(), Value::Length(v, crate::css::Unit::Px));
-                        }
-                    }
-                    "height" => {
-                        if let Ok(v) = attr.value.trim_end_matches("px").parse::<f32>() {
-                            map.insert("height".to_string(), Value::Length(v, crate::css::Unit::Px));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        "font" => {
-            for attr in attrs_borrow.iter() {
-                match attr.name.local.as_ref() {
-                    "color" => {
-                        if let Some(c) = parse_color(&attr.value) {
-                            map.insert("color".to_string(), Value::Color(c));
-                        }
-                    }
-                    "size" => {
-                        let size_map = [("1", 10.0f32), ("2", 13.0), ("3", 16.0), ("4", 18.0), ("5", 24.0), ("6", 32.0), ("7", 48.0)];
-                        let v = attr.value.as_ref();
-                        for (s, px) in &size_map {
-                            if *s == v {
-                                map.insert("font-size".to_string(), Value::Length(*px, crate::css::Unit::Px));
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn get_parent(handle: &Handle) -> Option<Handle> {
-    let p = handle.parent.take();
-    let res = p.as_ref().and_then(|p| p.upgrade());
-    handle.parent.set(p);
-    res
-}
-
-fn matches_selector(selector: &Selector, handle: &Handle, hovered_id: Option<&str>) -> bool {
-    // Check current node matches primary part of selector
-    if let NodeData::Element { ref name, ref attrs, .. } = handle.data {
-        let tag = name.local.to_string();
-        let mut id = None;
-        let mut classes = Vec::new();
-        for attr in attrs.borrow().iter() {
-            match attr.name.local.as_ref() {
-                "id" => id = Some(attr.value.to_string()),
-                "class" => classes = attr.value.to_string().split_whitespace().map(|s| s.to_string()).collect(),
-                _ => {}
-            }
-        }
-
-        // Base match
-        let has_constraint = selector.tag.is_some() || selector.id.is_some() || !selector.class.is_empty() || !selector.attributes.is_empty() || selector.pseudo_class.is_some();
-        if !has_constraint { return false; }
-
-        if let Some(ref s_tag) = selector.tag {
-            if s_tag != &tag && s_tag != "*" { return false; }
-        }
-        if let Some(ref s_id) = selector.id {
-            if Some(s_id.as_str()) != id.as_deref() { return false; }
-        }
-        for s_class in &selector.class {
-            if !classes.contains(s_class) { return false; }
-        }
-
-        // Pseudo-class match
-        if let Some(ref pseudo) = selector.pseudo_class {
-            if pseudo == "hover" {
-                if Some(id.as_deref()) != Some(hovered_id) || id.is_none() {
-                    return false;
-                }
-            } else {
-                return false;
-            }
-        }
-
-        // Attribute match
-        for attr_sel in &selector.attributes {
-            let mut matched = false;
-            for attr in attrs.borrow().iter() {
-                if attr.name.local.as_ref() == attr_sel.name {
-                    match &attr_sel.value {
-                        crate::css::AttributeMatch::Exists => { matched = true; break; }
-                        crate::css::AttributeMatch::Equals(v) => {
-                            if attr.value.as_ref() == v { matched = true; break; }
-                        }
-                    }
-                }
-            }
-            if !matched { return false; }
-        }
-
-        // If there's an ancestor requirement, check it
-        if let Some(ref ancestor_sel) = selector.ancestor {
-            let combinator = selector.combinator.as_ref().unwrap_or(&Combinator::Descendant);
-            
-            match combinator {
-                Combinator::Descendant => {
-                    let mut current = get_parent(handle);
-                    let mut matched = false;
-                    while let Some(parent_handle) = current {
-                        if matches_selector(ancestor_sel, &parent_handle, hovered_id) {
-                            matched = true;
-                            break;
-                        }
-                        current = get_parent(&parent_handle);
-                    }
-                    if !matched { return false; }
-                }
-                Combinator::Child => {
-                    if let Some(p) = get_parent(handle) {
-                        if !matches_selector(ancestor_sel, &p, hovered_id) {
-                            return false;
-                        }
-                    } else {
-                        return false;
-                    }
-                }
-                Combinator::NextSibling => {
-                    if let Some(p) = get_parent(handle) {
-                        let children = p.children.borrow();
-                        let index = children.iter().position(|child| std::ptr::eq(child, handle));
-                        if let Some(idx) = index {
-                            let mut found = false;
-                            for prev_idx in (0..idx).rev() {
-                                let sib = &children[prev_idx];
-                                if let NodeData::Element { .. } = sib.data {
-                                    if matches_selector(ancestor_sel, sib, hovered_id) {
-                                        found = true;
-                                    }
-                                    break;
-                                }
-                            }
-                            if !found { return false; }
-                        } else {
-                            return false;
-                        }
-                    } else {
-                        return false;
-                    }
-                }
-                Combinator::SubsequentSibling => {
-                    if let Some(p) = get_parent(handle) {
-                        let children = p.children.borrow();
-                        let index = children.iter().position(|child| std::ptr::eq(child, handle));
-                        if let Some(idx) = index {
-                            let mut matched = false;
-                            for prev_idx in 0..idx {
-                                let sib = &children[prev_idx];
-                                if let NodeData::Element { .. } = sib.data {
-                                    if matches_selector(ancestor_sel, sib, hovered_id) {
-                                        matched = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if !matched { return false; }
-                        } else {
-                            return false;
-                        }
-                    } else {
-                        return false;
-                    }
-                }
-            }
-        }
-
-        true
-    } else {
-        false
     }
 }
 
