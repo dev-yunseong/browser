@@ -4,6 +4,57 @@ use std::collections::HashMap;
 use markup5ever_rcdom::NodeData;
 use ab_glyph::{Font, FontRef, PxScale};
 
+// ── Float layout types ────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum FloatSide { Left, Right }
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ClearValue { Left, Right, Both }
+
+#[derive(Clone, Debug)]
+struct FloatArea { y: f32, height: f32, width: f32, side: FloatSide }
+
+struct FloatContext { areas: Vec<FloatArea>, container_width: f32 }
+
+impl FloatContext {
+    fn new(container_width: f32) -> Self {
+        FloatContext { areas: vec![], container_width }
+    }
+    /// Returns (avail_width, left_indent) for a horizontal band at y..y+max(h,1).
+    fn available_at(&self, y: f32, h: f32) -> (f32, f32) {
+        let band = h.max(1.0);
+        let mut left_w = 0.0f32;
+        let mut right_w = 0.0f32;
+        for fa in &self.areas {
+            if fa.y < y + band && fa.y + fa.height > y {
+                match fa.side {
+                    FloatSide::Left  => left_w  += fa.width,
+                    FloatSide::Right => right_w += fa.width,
+                }
+            }
+        }
+        let avail = (self.container_width - left_w - right_w).max(0.0);
+        (avail, left_w)
+    }
+    /// Minimum y to be completely clear of floats on the given side.
+    fn clear_y(&self, cv: ClearValue) -> f32 {
+        self.areas.iter()
+            .filter(|fa| match cv {
+                ClearValue::Left  => fa.side == FloatSide::Left,
+                ClearValue::Right => fa.side == FloatSide::Right,
+                ClearValue::Both  => true,
+            })
+            .map(|fa| fa.y + fa.height)
+            .fold(0.0f32, f32::max)
+    }
+    /// Bottom edge of the lowest registered float.
+    fn bottom(&self) -> f32 {
+        self.areas.iter().map(|fa| fa.y + fa.height).fold(0.0f32, f32::max)
+    }
+    fn add(&mut self, area: FloatArea) { self.areas.push(area); }
+}
+
 const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/NanumGothic.ttf");
 
 #[derive(Default, Debug, Clone, Copy, PartialEq)]
@@ -289,96 +340,165 @@ impl<'a> LayoutBox<'a> {
             return (Some(self.clone()), final_x, final_y);
         }
 
-        // --- NEW UNIFIED LINE-BOX MODEL ---
-        struct Line<'a> {
-            members: Vec<LayoutBox<'a>>,
-            width: f32,
-            height: f32,
-            ascent: f32,
-            descent: f32,
+        // --- FLOAT-AWARE SINGLE-PASS LAYOUT ---
+        //
+        // Pass 1 (classify): iterate self.style_node.children (immutable borrow of self)
+        //   and classify each child as Float / Block / Inline.
+        // Pass 2 (build+position): build LayoutBoxes and push to a local `result` Vec.
+        //   After the loop the immutable borrow on self.style_node ends, so we can
+        //   assign `self.children = result` safely.
+        //
+        // This two-step split is necessary to satisfy Rust's borrow checker:
+        // we cannot call self.children.push() while borrowing self.style_node.children.
+
+        enum ChildKind { Float(FloatSide), Block, Inline }
+        struct ChildEntry<'entry> {
+            node: &'entry StyledNode,
+            kind: ChildKind,
+            clear: Option<ClearValue>,
         }
 
-        enum LayoutItem<'a> {
-            Line(Line<'a>),
-            Block(LayoutBox<'a>),
-        }
-
-        let mut items: Vec<LayoutItem> = Vec::new();
-        let mut current_line = Line { members: Vec::new(), width: 0.0, height: 0.0, ascent: 0.0, descent: 0.0 };
-
+        let mut entries: Vec<ChildEntry<'a>> = Vec::new();
         for child_node in &self.style_node.children {
             if should_skip(child_node) { continue; }
-            let child_display = get_display_type(child_node);
-            let child_is_block = is_block_level(child_display);
-
-            if child_is_block {
-                if !current_line.members.is_empty() {
-                    let old_line = std::mem::replace(&mut current_line, Line { members: Vec::new(), width: 0.0, height: 0.0, ascent: 0.0, descent: 0.0 });
-                    items.push(LayoutItem::Line(old_line));
-                }
-                let (cb_opt, _, _) = build_layout_tree(child_node, self.dimensions.x + self.padding.left + self.border.left, self.dimensions.x + self.padding.left + self.border.left, 0.0, inner_width, vw, vh);
-                if let Some(cb) = cb_opt {
-                    items.push(LayoutItem::Block(cb));
-                }
+            let float_side = get_float(child_node);
+            let clear_val  = get_clear(child_node);
+            let child_disp = get_display_type(child_node);
+            let kind = if let Some(side) = float_side {
+                ChildKind::Float(side)
+            } else if is_block_level(child_disp) {
+                ChildKind::Block
             } else {
-                let (cb_opt, _next_x, _) = build_layout_tree(child_node, self.dimensions.x + self.padding.left + self.border.left, self.dimensions.x + self.padding.left + self.border.left + current_line.width, 0.0, inner_width, vw, vh);
-                if let Some(cb) = cb_opt {
-                    let item_w = cb.dimensions.width + cb.margin.left + cb.margin.right;
-                    if current_line.width + item_w > inner_width && !current_line.members.is_empty() {
-                        let old_line = std::mem::replace(&mut current_line, Line { members: Vec::new(), width: 0.0, height: 0.0, ascent: 0.0, descent: 0.0 });
-                        items.push(LayoutItem::Line(old_line));
-                        let (new_cb_opt, _, _) = build_layout_tree(child_node, self.dimensions.x + self.padding.left + self.border.left, self.dimensions.x + self.padding.left + self.border.left, 0.0, inner_width, vw, vh);
-                        if let Some(new_cb) = new_cb_opt {
-                            let new_item_w = new_cb.dimensions.width + new_cb.margin.left + new_cb.margin.right;
-                            current_line.width = new_item_w;
-                            current_line.height = new_cb.dimensions.height + new_cb.margin.top + new_cb.margin.bottom;
-                            current_line.members.push(new_cb);
-                        }
-                    } else {
-                        current_line.width += item_w;
-                        current_line.height = current_line.height.max(cb.dimensions.height + cb.margin.top + cb.margin.bottom);
-                        current_line.members.push(cb);
-                    }
-                }
-            }
+                ChildKind::Inline
+            };
+            entries.push(ChildEntry { node: child_node, kind, clear: clear_val });
         }
-        if !current_line.members.is_empty() { items.push(LayoutItem::Line(current_line)); }
+        // Immutable borrow of self.style_node.children is now released.
 
-        // Position Pass: Stack items vertically
+        let container_x = self.dimensions.x + self.padding.left + self.border.left;
+        let mut float_ctx = FloatContext::new(inner_width);
         let mut cursor_y = self.dimensions.y + self.padding.top + self.border.top;
         let mut prev_margin_bottom = 0.0f32;
+        let mut result: Vec<LayoutBox<'a>> = Vec::new();
 
-        for item in items {
-            match item {
-                LayoutItem::Line(line) => {
-                    // Lines don't collapse margins in the same way blocks do, 
-                    // but we ensure they start after the previous block's collapsed margin.
-                    let mut cursor_x = self.dimensions.x + self.padding.left + self.border.left;
-                    for mut member in line.members {
-                        let dx = cursor_x - (member.dimensions.x - member.margin.left);
-                        let dy = cursor_y - (member.dimensions.y - member.margin.top);
-                        offset_layout_box(&mut member, dx, dy);
-                        max_child_x = max_child_x.max(member.dimensions.x + member.dimensions.width + member.margin.right);
-                        cursor_x += member.dimensions.width + member.margin.left + member.margin.right;
-                        self.children.push(member);
+        // Inline line accumulator
+        struct InlineLine<'a> { members: Vec<LayoutBox<'a>>, width: f32, height: f32 }
+        let mut cur_line = InlineLine::<'a> { members: vec![], width: 0.0, height: 0.0 };
+        let mut line_start_y = cursor_y;
+
+        // Flush the current inline line into `result`, advancing cursor_y.
+        macro_rules! flush_line {
+            () => {
+                if !cur_line.members.is_empty() {
+                    let (_, left_indent) = float_ctx.available_at(line_start_y, cur_line.height.max(1.0));
+                    let mut lx = container_x + left_indent;
+                    for mut m in cur_line.members.drain(..) {
+                        let dx = lx - (m.dimensions.x - m.margin.left);
+                        let dy = cursor_y - (m.dimensions.y - m.margin.top);
+                        offset_layout_box(&mut m, dx, dy);
+                        max_child_x = max_child_x.max(m.dimensions.x + m.dimensions.width + m.margin.right);
+                        lx += m.dimensions.width + m.margin.left + m.margin.right;
+                        result.push(m);
                     }
-                    cursor_y += line.height;
-                    prev_margin_bottom = 0.0; // Reset after line
-                }
-                LayoutItem::Block(mut block) => {
-                    // Simple vertical margin collapsing: max(prev_bottom, current_top)
-                    let collapsed_margin = prev_margin_bottom.max(block.margin.top);
-                    let dy = (cursor_y + collapsed_margin) - (block.dimensions.y + block.margin.top);
-                    offset_layout_box(&mut block, 0.0, dy);
-                    
-                    max_child_x = max_child_x.max(block.dimensions.x + block.dimensions.width + block.margin.right);
-                    cursor_y = block.dimensions.y + block.dimensions.height;
-                    prev_margin_bottom = block.margin.bottom;
-                    self.children.push(block);
+                    cursor_y += cur_line.height;
+                    cur_line.width = 0.0;
+                    cur_line.height = 0.0;
+                    line_start_y = cursor_y;
                 }
             }
         }
+
+        for entry in entries {
+            match entry.kind {
+                // ── Float child ───────────────────────────────────────────────
+                ChildKind::Float(side) => {
+                    flush_line!();
+                    // Build with origin (0,0); offset_layout_box will reposition.
+                    // Use inner_width so explicit CSS widths resolve correctly.
+                    let (cb_opt, _, _) = build_layout_tree(entry.node, 0.0, 0.0, 0.0, inner_width, vw, vh);
+                    if let Some(mut cb) = cb_opt {
+                        let float_w = cb.dimensions.width + cb.margin.left + cb.margin.right;
+                        let float_h = cb.dimensions.height + cb.margin.top + cb.margin.bottom;
+                        let (avail_w, left_indent) = float_ctx.available_at(cursor_y, float_h);
+                        let fx = match side {
+                            FloatSide::Left  => container_x + left_indent,
+                            FloatSide::Right => container_x + left_indent + avail_w - float_w,
+                        };
+                        let dx = fx - (cb.dimensions.x - cb.margin.left);
+                        let dy = cursor_y - (cb.dimensions.y - cb.margin.top);
+                        offset_layout_box(&mut cb, dx, dy);
+                        float_ctx.add(FloatArea { y: cursor_y, height: float_h, width: float_w, side });
+                        max_child_x = max_child_x.max(cb.dimensions.x + cb.dimensions.width + cb.margin.right);
+                        result.push(cb);
+                    }
+                    // cursor_y does NOT advance for floats
+                }
+
+                // ── Block child ───────────────────────────────────────────────
+                ChildKind::Block => {
+                    flush_line!();
+                    if let Some(cv) = entry.clear {
+                        cursor_y = float_ctx.clear_y(cv).max(cursor_y);
+                    }
+                    let (avail_w, left_indent) = float_ctx.available_at(cursor_y, 0.0);
+                    let block_x = container_x + left_indent;
+                    let (cb_opt, _, _) = build_layout_tree(entry.node, block_x, block_x, 0.0, avail_w, vw, vh);
+                    if let Some(mut cb) = cb_opt {
+                        let collapsed = prev_margin_bottom.max(cb.margin.top);
+                        let dy = (cursor_y + collapsed) - (cb.dimensions.y + cb.margin.top);
+                        offset_layout_box(&mut cb, 0.0, dy);
+                        cursor_y = cb.dimensions.y + cb.dimensions.height;
+                        prev_margin_bottom = cb.margin.bottom;
+                        max_child_x = max_child_x.max(cb.dimensions.x + cb.dimensions.width + cb.margin.right);
+                        result.push(cb);
+                    }
+                    line_start_y = cursor_y; // keep line_start_y in sync after block advances cursor_y
+                }
+
+                // ── Inline child ──────────────────────────────────────────────
+                ChildKind::Inline => {
+                    prev_margin_bottom = 0.0;
+                    let (avail_w, left_indent) = float_ctx.available_at(line_start_y, cur_line.height.max(16.0));
+                    let (cb_opt, _, _) = build_layout_tree(
+                        entry.node,
+                        container_x + left_indent,
+                        container_x + left_indent + cur_line.width,
+                        0.0, avail_w, vw, vh,
+                    );
+                    if let Some(cb) = cb_opt {
+                        let item_w = cb.dimensions.width + cb.margin.left + cb.margin.right;
+                        if cur_line.width + item_w > avail_w && !cur_line.members.is_empty() {
+                            flush_line!();
+                            // Re-lay out for new line with updated float-aware width
+                            let (aw2, li2) = float_ctx.available_at(line_start_y, 16.0);
+                            let (cb2_opt, _, _) = build_layout_tree(
+                                entry.node,
+                                container_x + li2, container_x + li2,
+                                0.0, aw2, vw, vh,
+                            );
+                            if let Some(cb2) = cb2_opt {
+                                cur_line.width  = cb2.dimensions.width  + cb2.margin.left + cb2.margin.right;
+                                cur_line.height = cb2.dimensions.height + cb2.margin.top  + cb2.margin.bottom;
+                                cur_line.members.push(cb2);
+                            }
+                        } else {
+                            cur_line.width  += item_w;
+                            cur_line.height  = cur_line.height.max(
+                                cb.dimensions.height + cb.margin.top + cb.margin.bottom);
+                            cur_line.members.push(cb);
+                        }
+                    }
+                }
+            }
+        }
+
+        flush_line!();
         cursor_y += prev_margin_bottom;
+        // Clearfix: ensure the container is tall enough to cover all floated children.
+        cursor_y = cursor_y.max(float_ctx.bottom());
+
+        // Now safe to mutably assign self.children (immutable borrow of self.style_node ended above).
+        self.children = result;
 
         if self.dimensions.width <= 0.0 {
             let derived = max_child_x - self.dimensions.x + self.padding.right + self.border.right;
@@ -451,6 +571,29 @@ impl<'a> LayoutBox<'a> {
         let final_x = self.dimensions.x + self.dimensions.width + self.margin.right;
         let final_y = self.dimensions.y + self.dimensions.height + self.margin.bottom;
         (Some(self.clone()), final_x, final_y)
+    }
+}
+
+fn get_float(sn: &StyledNode) -> Option<FloatSide> {
+    match sn.specified_values.get("float") {
+        Some(Value::Keyword(k)) => match k.as_str() {
+            "left"  => Some(FloatSide::Left),
+            "right" => Some(FloatSide::Right),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn get_clear(sn: &StyledNode) -> Option<ClearValue> {
+    match sn.specified_values.get("clear") {
+        Some(Value::Keyword(k)) => match k.as_str() {
+            "left"  => Some(ClearValue::Left),
+            "right" => Some(ClearValue::Right),
+            "both"  => Some(ClearValue::Both),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -737,5 +880,117 @@ mod tests {
         assert!(span.dimensions.width < 800.0,
             "span width {} must be < container_width 800 (should shrink to content)",
             span.dimensions.width);
+    }
+
+    // ── Float layout tests ────────────────────────────────────────────────────
+
+    /// Deep-search the layout tree for the first child that has `float: left` or `float: right`.
+    fn find_float_child_deep<'a>(layout: &'a LayoutBox<'a>) -> Option<&'a LayoutBox<'a>> {
+        for child in &layout.children {
+            match child.style_node.specified_values.get("float") {
+                Some(Value::Keyword(k)) if k == "left" || k == "right" => return Some(child),
+                _ => {}
+            }
+            if let Some(f) = find_float_child_deep(child) { return Some(f); }
+        }
+        None
+    }
+
+    /// Among the DIRECT children of `layout`, return the first Block-display child
+    /// that does NOT have a `float` CSS property set.
+    fn find_direct_non_float_block<'a>(layout: &'a LayoutBox<'a>) -> Option<&'a LayoutBox<'a>> {
+        for child in &layout.children {
+            if child.display == DisplayType::Block
+                && !child.style_node.specified_values.contains_key("float")
+            {
+                return Some(child);
+            }
+        }
+        None
+    }
+
+    /// Navigate html > body > first-div and return that div's layout box.
+    fn find_outer_div<'a>(root: &'a LayoutBox<'a>) -> Option<&'a LayoutBox<'a>> {
+        for child in &root.children {
+            if let NodeData::Element { ref name, .. } = child.style_node.node.data {
+                if name.local.to_string() == "html" {
+                    for body in &child.children {
+                        if let NodeData::Element { ref name, .. } = body.style_node.node.data {
+                            if name.local.to_string() == "body" {
+                                for div in &body.children {
+                                    if let NodeData::Element { ref name, .. } = div.style_node.node.data {
+                                        if name.local.to_string() == "div" {
+                                            return Some(div);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn test_float_left_x() {
+        let html = r#"<div style="width:800px;"><div style="float:left;width:100px;height:50px;">F</div></div>"#;
+        let dom_tree = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None);
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.unwrap();
+        let float_child = find_float_child_deep(&layout).expect("float child not found");
+        assert_eq!(float_child.dimensions.x, 0.0,
+            "float:left child should have x=0.0, got {}", float_child.dimensions.x);
+    }
+
+    #[test]
+    fn test_float_right_x() {
+        let html = r#"<div style="width:800px;"><div style="float:right;width:100px;height:50px;">F</div></div>"#;
+        let dom_tree = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None);
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.unwrap();
+        let float_child = find_float_child_deep(&layout).expect("float child not found");
+        assert_eq!(float_child.dimensions.x, 700.0,
+            "float:right child (width 100px) in 800px container should have x=700.0, got {}",
+            float_child.dimensions.x);
+    }
+
+    #[test]
+    fn test_clear_left_advances_cursor() {
+        let html = r#"<div style="width:800px;"><div style="float:left;width:100px;height:50px;">F</div><div style="clear:left;">C</div></div>"#;
+        let dom_tree = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None);
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.unwrap();
+        // Navigate to the outer div (width:800px) then look at its direct children.
+        let outer_div = find_outer_div(&layout).expect("outer div not found");
+        let clear_block = find_direct_non_float_block(outer_div)
+            .expect("clear:left block not found among outer div's children");
+        assert!(clear_block.dimensions.y >= 50.0,
+            "clear:left block must start at or below float bottom (50px), got y={}",
+            clear_block.dimensions.y);
+    }
+
+    #[test]
+    fn test_float_intrusion_narrows_sibling_block() {
+        // float:left 100px wide → sibling block in the same container gets avail_w = 700px
+        let html = r#"<div style="width:800px;"><div style="float:left;width:100px;height:50px;">F</div><div style="display:block;">S</div></div>"#;
+        let dom_tree = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None);
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.unwrap();
+        let outer_div = find_outer_div(&layout).expect("outer div not found");
+        let sibling = find_direct_non_float_block(outer_div)
+            .expect("non-float sibling block not found");
+        assert_eq!(sibling.dimensions.width, 700.0,
+            "sibling block should be narrowed to 700px by the 100px left float, got {}",
+            sibling.dimensions.width);
     }
 }
