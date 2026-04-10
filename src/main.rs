@@ -15,7 +15,8 @@ struct BrowserApp {
     url: String,
     history: Vec<String>,
     history_index: usize,
-    content_promise: Option<Promise<Result<StaticPageData, String>>>,
+    content_promise: Option<Promise<Result<(StaticPageData, css::Stylesheet), String>>>,
+    re_render_promise: Option<Promise<Result<(StaticPageData, css::Stylesheet), String>>>,
     texture: Option<egui::TextureHandle>,
     error: Option<String>,
     current_links: Vec<(layout::Rect, String)>,
@@ -25,6 +26,8 @@ struct BrowserApp {
     hovered_id: Option<String>,
     form_values: HashMap<usize, String>,
     image_cache: HashMap<String, Vec<u8>>,
+    css_cache: HashMap<String, String>,
+    last_stylesheet: Option<css::Stylesheet>,
     image_promises: HashMap<String, Promise<Result<(String, Vec<u8>), String>>>,
     last_body: String,
     last_base_url: Option<Url>,
@@ -71,6 +74,7 @@ impl BrowserApp {
             history: vec![],
             history_index: 0,
             content_promise: None,
+            re_render_promise: None,
             texture: None,
             error: None,
             current_links: vec![],
@@ -80,6 +84,8 @@ impl BrowserApp {
             hovered_id: None,
             form_values: HashMap::new(),
             image_cache: HashMap::new(),
+            css_cache: HashMap::new(),
+            last_stylesheet: None,
             image_promises: HashMap::new(),
             last_body: String::new(),
             last_base_url: None,
@@ -122,8 +128,12 @@ impl BrowserApp {
         self.js_runtime = js::JsRuntime::new(None);
         self.is_loading = true;
         self.hovered_id = None;
+        self.last_stylesheet = None; // Reset stylesheet on new URL
+        self.css_cache.clear();      // Optional: clear cache or keep it? Let's clear for now to be safe.
+        
+        let mut cache = self.css_cache.clone();
         self.content_promise = Some(Promise::spawn_thread("fetcher", move || {
-            fetch_and_process(&url, &HashMap::new(), &HashMap::new(), None, width)
+            fetch_and_process(&url, &mut cache, &HashMap::new(), None, width)
                 .map_err(|e| e.to_string())
         }));
     }
@@ -133,24 +143,19 @@ impl BrowserApp {
         if let Some(base_url) = self.last_base_url.clone() {
             let body = self.last_body.clone();
             let cache = self.image_cache.clone();
+            let mut css_cache = self.css_cache.clone();
+            let stylesheet = self.last_stylesheet.clone();
             let overrides = self.js_style_overrides.clone();
             let hovered_id = self.hovered_id.clone();
 
-            let join_handle = std::thread::spawn(move || {
-                process_html_with_cache(&body, &base_url, &cache, &overrides, hovered_id.as_deref(), width)
-            });
-
-            match join_handle.join() {
-                Ok(Ok(page_data)) => {
-                    self.apply_page_data(page_data, ctx);
-                }
-                Ok(Err(e)) => {
-                    self.error = Some(format!("Re-render error: {}", e));
-                }
-                Err(_) => {
-                    self.error = Some("Render thread panicked".to_string());
-                }
-            }
+            // Use re_render_promise instead of join() to avoid UI blocking
+            self.re_render_promise = Some(Promise::spawn_thread("re_render", move || {
+                process_html_with_cache(&body, &base_url, &cache, &mut css_cache, stylesheet, &overrides, hovered_id.as_deref(), width)
+                    .map_err(|e| e.to_string())
+            }));
+            
+            // Request repaint to check promise
+            ctx.request_repaint();
         }
     }
 
@@ -167,7 +172,9 @@ impl BrowserApp {
     }
 }
 
-fn collect_css_in_order(handle: &markup5ever_rcdom::Handle, base_url: &Url, css_source: &mut String) {
+use std::time::Instant;
+
+fn collect_css_in_order(handle: &markup5ever_rcdom::Handle, base_url: &Url, css_source: &mut String, cache: &mut HashMap<String, String>) {
     if let markup5ever_rcdom::NodeData::Element { ref name, ref attrs, .. } = handle.data {
         let tag = name.local.to_string();
         if tag == "style" {
@@ -189,9 +196,20 @@ fn collect_css_in_order(handle: &markup5ever_rcdom::Handle, base_url: &Url, css_
             if is_stylesheet {
                 if let Some(h) = href {
                     let abs_url = base_url.join(&h).map(|u| u.to_string()).unwrap_or(h);
-                    if let Ok(resp) = reqwest::blocking::get(&abs_url) {
-                        if let Ok(text) = resp.text() {
-                            css_source.push_str(&text);
+                    
+                    if let Some(cached) = cache.get(&abs_url) {
+                        css_source.push_str(cached);
+                    } else {
+                        let start = Instant::now();
+                        if let Ok(resp) = reqwest::blocking::get(&abs_url) {
+                            let elapsed = start.elapsed();
+                            println!("[Perf] Network Fetch (CSS): {} in {:?}", abs_url, elapsed);
+                            if let Ok(text) = resp.text() {
+                                cache.insert(abs_url, text.clone());
+                                css_source.push_str(&text);
+                            }
+                        } else {
+                            println!("[Error] Failed to fetch CSS: {}", abs_url);
                         }
                     }
                 }
@@ -199,46 +217,70 @@ fn collect_css_in_order(handle: &markup5ever_rcdom::Handle, base_url: &Url, css_
         }
     }
     for child in handle.children.borrow().iter() {
-        collect_css_in_order(child, base_url, css_source);
+        collect_css_in_order(child, base_url, css_source, cache);
     }
 }
 
 fn fetch_and_process(
     url_str: &str,
-    image_cache: &HashMap<String, Vec<u8>>,
+    css_cache: &mut HashMap<String, String>,
     js_overrides: &HashMap<String, HashMap<String, String>>,
     hovered_id: Option<&str>,
     width: f32,
-) -> Result<StaticPageData, Box<dyn Error + Send + Sync>> {
+) -> Result<(StaticPageData, css::Stylesheet), Box<dyn Error + Send + Sync>> {
     let response = reqwest::blocking::get(url_str)?;
     let body = response.text()?;
     let base_url = Url::parse(url_str)?;
-    process_html_with_cache(&body, &base_url, image_cache, js_overrides, hovered_id, width)
+    process_html_with_cache(&body, &base_url, &HashMap::new(), css_cache, None, js_overrides, hovered_id, width)
 }
 
 fn process_html_with_cache(
     body: &str,
     base_url: &Url,
     image_cache: &HashMap<String, Vec<u8>>,
+    css_cache: &mut HashMap<String, String>,
+    cached_stylesheet: Option<css::Stylesheet>,
     js_overrides: &HashMap<String, HashMap<String, String>>,
     hovered_id: Option<&str>,
     width: f32,
-) -> Result<StaticPageData, Box<dyn Error + Send + Sync>> {
+) -> Result<(StaticPageData, css::Stylesheet), Box<dyn Error + Send + Sync>> {
+    let start_total = Instant::now();
     let width = width.max(1.0);
+    
+    let start = Instant::now();
     let dom_tree = dom::parse_html(body);
+    let dom_elapsed = start.elapsed();
 
-    // Collect inline + external CSS in order (C6)
-    let mut css_source = String::new();
-    collect_css_in_order(&dom_tree.document, base_url, &mut css_source);
+    let stylesheet = if let Some(s) = cached_stylesheet {
+        s
+    } else {
+        // Collect inline + external CSS in order (C6)
+        let start = Instant::now();
+        let mut css_source = String::new();
+        collect_css_in_order(&dom_tree.document, base_url, &mut css_source, css_cache);
+        let css_collect_elapsed = start.elapsed();
+        println!("  - CSS collect: {:?}", css_collect_elapsed);
 
-    let stylesheet = css::parse_css(&css_source);
+        let start = Instant::now();
+        let s = css::parse_css(&css_source);
+        let css_parse_elapsed = start.elapsed();
+        println!("  - CSS parse: {:?}", css_parse_elapsed);
+        s
+    };
+
+    let start = Instant::now();
     let style_tree = style::build_style_tree(&dom_tree.document, &stylesheet, None, js_overrides, hovered_id);
+    let style_elapsed = start.elapsed();
 
+    let start = Instant::now();
     let (layout_tree, _, final_y) =
         layout::build_layout_tree(&style_tree, 0.0, 0.0, 0.0, width, width, 768.0);
+    let layout_elapsed = start.elapsed();
 
     let height = (final_y.ceil() as u32).clamp(600, 16384);
     let w_u32 = width as u32;
+    
+    let start = Instant::now();
     let mut pixmap = tiny_skia::Pixmap::new(w_u32, height)
         .ok_or_else(|| format!("Failed to create pixmap with size {}x{}", w_u32, height))?;
 
@@ -280,14 +322,28 @@ fn process_html_with_cache(
             form_controls.push((rect, val));
         }
     }
+    let render_elapsed = start.elapsed();
 
+    let start = Instant::now();
     let absolute_links = links.into_iter().map(|(rect, link)| {
         let abs = base_url.join(&link).map(|u| u.to_string()).unwrap_or(link);
         (rect, abs)
     }).collect();
 
-    Ok(StaticPageData {
-        pixmap_bytes: pixmap.data().to_vec(),
+    let pixmap_bytes = pixmap.data().to_vec();
+    let data_copy_elapsed = start.elapsed();
+
+    let total_elapsed = start_total.elapsed();
+    
+    println!("[Perf] process_html_with_cache total: {:?}", total_elapsed);
+    println!("  - DOM parse: {:?}", dom_elapsed);
+    println!("  - Style build: {:?}", style_elapsed);
+    println!("  - Layout build: {:?}", layout_elapsed);
+    println!("  - Render: {:?}", render_elapsed);
+    println!("  - Data copy & Links: {:?}", data_copy_elapsed);
+
+    Ok((StaticPageData {
+        pixmap_bytes,
         width: width as u32,
         height,
         links: absolute_links,
@@ -297,7 +353,7 @@ fn process_html_with_cache(
         image_urls,
         body: body.to_string(),
         base_url: base_url.clone(),
-    })
+    }, stylesheet))
 }
 
 impl eframe::App for BrowserApp {
@@ -404,6 +460,36 @@ impl eframe::App for BrowserApp {
                     self.trigger_re_render(ctx, ui.available_width());
                 }
 
+                // Handle pending re-render promise
+                if let Some(promise) = &self.re_render_promise {
+                    match promise.ready() {
+                        None => {
+                            ctx.request_repaint();
+                        }
+                        Some(Err(e)) => {
+                            self.error = Some(format!("Re-render error: {}", e));
+                            self.re_render_promise = None;
+                        }
+                        Some(Ok((page_data, stylesheet))) => {
+                            self.last_stylesheet = Some(stylesheet.clone());
+                            let page = StaticPageData {
+                                pixmap_bytes: page_data.pixmap_bytes.clone(),
+                                width: page_data.width,
+                                height: page_data.height,
+                                links: page_data.links.clone(),
+                                form_controls: page_data.form_controls.clone(),
+                                event_handlers: page_data.event_handlers.clone(),
+                                element_ids: page_data.element_ids.clone(),
+                                image_urls: page_data.image_urls.clone(),
+                                body: page_data.body.clone(),
+                                base_url: page_data.base_url.clone(),
+                            };
+                            self.apply_page_data(page, ctx);
+                            self.re_render_promise = None;
+                        }
+                    }
+                }
+
                 // Handle pending page-load promise
                 if let Some(promise) = &self.content_promise {
                     match promise.ready() {
@@ -418,11 +504,13 @@ impl eframe::App for BrowserApp {
                             self.content_promise = None;
                             self.is_loading = false;
                         }
-                        Some(Ok(page_data)) => {
+                        Some(Ok((page_data, stylesheet))) => {
                             // Clone what we need before releasing the borrow
                             let body = page_data.body.clone();
                             let base_url = page_data.base_url.clone();
                             let image_urls = page_data.image_urls.clone();
+                            self.last_stylesheet = Some(stylesheet.clone());
+                            
                             let page = StaticPageData {
                                 pixmap_bytes: page_data.pixmap_bytes.clone(),
                                 width: page_data.width,

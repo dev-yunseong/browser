@@ -70,7 +70,10 @@ impl Compositor {
     }
 }
 
+use std::time::Instant;
+
 pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap, image_cache: &HashMap<String, Vec<u8>>) {
+    let start = Instant::now();
     let mut compositor = Compositor::new();
     let mut root_layer = Layer::new(0, 1.0);
     
@@ -84,8 +87,13 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap, image_cache: 
 
     generate_layers(layout, &mut compositor, &mut root_layer, initial_clip);
     compositor.add_layer(root_layer);
+    let layer_gen_elapsed = start.elapsed();
 
+    let start_render = Instant::now();
     compositor.render(pixmap, image_cache);
+    let render_elapsed = start_render.elapsed();
+    
+    println!("[Perf] render_layout_tree: Layer gen: {:?}, Actual render: {:?}", layer_gen_elapsed, render_elapsed);
 }
 
 fn generate_layers(layout: &LayoutBox, compositor: &mut Compositor, current_layer: &mut Layer, clip: LayoutRect) {
@@ -256,11 +264,17 @@ fn create_rounded_rect_path(r: LayoutRect, radius: f32) -> Option<tiny_skia::Pat
     pb.finish()
 }
 
+use std::sync::OnceLock;
+
+static FONT: OnceLock<FontRef<'static>> = OnceLock::new();
+
 fn render_text_raw(text: String, rect: LayoutRect, font_size: f32, color: &Color, clip: LayoutRect, pixmap: &mut Pixmap) {
     let trimmed = text.trim();
     if trimmed.is_empty() { return; }
 
-    let font = FontRef::try_from_slice(FONT_DATA).unwrap();
+    let font = FONT.get_or_init(|| {
+        FontRef::try_from_slice(FONT_DATA).expect("Failed to parse embedded font")
+    });
     let scale = PxScale::from(font_size);
     let units = font.units_per_em().unwrap_or(1000.0) as f32;
 
