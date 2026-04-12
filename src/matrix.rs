@@ -99,6 +99,15 @@ impl Matrix4x4 {
             0.0, 0.0, 0.0, 1.0,
         ])
     }
+
+    /// Convert to tiny_skia::Transform (2D projection).
+    /// Assumes standard 2D view if 3D components are present.
+    /// Mapping: 0=a, 4=b, 1=c, 5=d, 3=tx, 7=ty
+    pub fn to_skia(&self) -> tiny_skia::Transform {
+        tiny_skia::Transform::from_row(
+            self.0[0], self.0[4], self.0[1], self.0[5], self.0[3], self.0[7]
+        )
+    }
 }
 
 #[cfg(test)]
