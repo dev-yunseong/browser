@@ -16,6 +16,7 @@ eframe = "0.29"
 egui = "0.29"
 html5ever = "0.38.0"
 image = { version = "0.25.10", features = ["png", "jpeg", "webp"] }
+lazy_static = "1.5.0"
 markup5ever_rcdom = "0.38.0"
 poll-promise = "0.3.0"
 rayon = "1.11.0"

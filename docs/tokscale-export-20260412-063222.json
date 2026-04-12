@@ -1,0 +1,186 @@
+{
+  "agents": [],
+  "daily": [
+    {
+      "cost": 7.744585150000001,
+      "date": "2026-04-12",
+      "tokens": {
+        "cacheRead": 11140936,
+        "cacheWrite": 539855,
+        "input": 3204477,
+        "output": 124042,
+        "total": 15022681
+      }
+    },
+    {
+      "cost": 9.000795899999998,
+      "date": "2026-04-10",
+      "tokens": {
+        "cacheRead": 10584987,
+        "cacheWrite": 628560,
+        "input": 2244346,
+        "output": 149749,
+        "total": 13626241
+      }
+    },
+    {
+      "cost": 2.781893550000001,
+      "date": "2026-04-09",
+      "tokens": {
+        "cacheRead": 3290093,
+        "cacheWrite": 286335,
+        "input": 25743,
+        "output": 46338,
+        "total": 3649289
+      }
+    },
+    {
+      "cost": 21.06967899999999,
+      "date": "2026-04-08",
+      "tokens": {
+        "cacheRead": 33252578,
+        "cacheWrite": 214892,
+        "input": 2417653,
+        "output": 308718,
+        "total": 36282613
+      }
+    },
+    {
+      "cost": 29.674543200000013,
+      "date": "2026-04-07",
+      "tokens": {
+        "cacheRead": 43789900,
+        "cacheWrite": 340150,
+        "input": 47979468,
+        "output": 358024,
+        "total": 92540697
+      }
+    },
+    {
+      "cost": 45.19073115000003,
+      "date": "2026-04-06",
+      "tokens": {
+        "cacheRead": 78605911,
+        "cacheWrite": 2480305,
+        "input": 13442,
+        "output": 488958,
+        "total": 81588616
+      }
+    },
+    {
+      "cost": 8.057543749999999,
+      "date": "2026-04-05",
+      "tokens": {
+        "cacheRead": 22632718,
+        "cacheWrite": 317589,
+        "input": 987,
+        "output": 95449,
+        "total": 23046743
+      }
+    }
+  ],
+  "models": [
+    {
+      "client": "claude",
+      "cost": 46.85141879999999,
+      "model": "claude-sonnet-4-6",
+      "provider": "anthropic",
+      "sessionCount": 53,
+      "tokens": {
+        "cacheRead": 82822811,
+        "cacheWrite": 2853410,
+        "input": 24191,
+        "output": 748781,
+        "total": 86449193
+      }
+    },
+    {
+      "client": "gemini",
+      "cost": 27.321473500000007,
+      "model": "gemini-3-flash-preview",
+      "provider": "google",
+      "sessionCount": 6,
+      "tokens": {
+        "cacheRead": 44328756,
+        "cacheWrite": 0,
+        "input": 52475873,
+        "output": 279394,
+        "total": 97165808
+      }
+    },
+    {
+      "client": "claude",
+      "cost": 25.910770499999998,
+      "model": "claude-opus-4-6",
+      "provider": "anthropic",
+      "sessionCount": 3,
+      "tokens": {
+        "cacheRead": 33940216,
+        "cacheWrite": 840614,
+        "input": 3580,
+        "output": 146757,
+        "total": 34931167
+      }
+    },
+    {
+      "client": "codex",
+      "cost": 17.09513499999999,
+      "model": "gpt-5.4",
+      "provider": "openai",
+      "sessionCount": 21,
+      "tokens": {
+        "cacheRead": 27310720,
+        "cacheWrite": 0,
+        "input": 2269848,
+        "output": 219230,
+        "total": 29886757
+      }
+    },
+    {
+      "client": "claude",
+      "cost": 3.6170419000000007,
+      "model": "claude-haiku-4-5",
+      "provider": "anthropic",
+      "sessionCount": 21,
+      "tokens": {
+        "cacheRead": 14149994,
+        "cacheWrite": 1113662,
+        "input": 15030,
+        "output": 158987,
+        "total": 15437673
+      }
+    },
+    {
+      "client": "gemini",
+      "cost": 2.723932,
+      "model": "gemini-3.1-pro-preview",
+      "provider": "google",
+      "sessionCount": 2,
+      "tokens": {
+        "cacheRead": 744626,
+        "cacheWrite": 0,
+        "input": 1097594,
+        "output": 18129,
+        "total": 1886282
+      }
+    },
+    {
+      "client": "claude",
+      "cost": 0.0,
+      "model": "<synthetic>",
+      "provider": "anthropic",
+      "sessionCount": 12,
+      "tokens": {
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "input": 0,
+        "output": 0,
+        "total": 0
+      }
+    }
+  ],
+  "totals": {
+    "cost": 123.51977169999999,
+    "tokens": 265756880
+  }
+}

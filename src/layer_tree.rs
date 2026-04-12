@@ -58,6 +58,23 @@ pub enum CompositingTrigger {
 
 // ── Layer ─────────────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone)]
+pub struct Tile {
+    pub rect: LayoutRect,
+    pub paint_commands: Vec<PaintCommand>,
+    pub dirty: bool,
+}
+
+impl Tile {
+    pub fn new(rect: LayoutRect) -> Self {
+        Self {
+            rect,
+            paint_commands: Vec::new(),
+            dirty: true,
+        }
+    }
+}
+
 /// A single compositing layer. Contains the paint commands for all boxes that
 /// belong to this layer's stacking context.
 #[derive(Debug, Clone)]
@@ -74,6 +91,8 @@ pub struct Layer {
     pub triggers: Vec<CompositingTrigger>,
     /// Transformation matrix for this layer.
     pub transform: Matrix4x4,
+    /// Ordered list of tiles for this layer (256x256 each).
+    pub tiles: Vec<Tile>,
     /// Ordered list of drawing operations for this layer.
     pub paint_commands: Vec<PaintCommand>,
     /// IDs of layers created as direct children of this layer during tree build.
@@ -84,6 +103,27 @@ pub struct Layer {
 
 impl Layer {
     fn new(id: usize, z_index: i32, opacity: f32, bounds: LayoutRect, triggers: Vec<CompositingTrigger>, transform: Matrix4x4) -> Self {
+        let mut tiles = Vec::new();
+        let tile_size = 256.0;
+        
+        // Only subdivide the root layer or large layers. 
+        // Small layers (most divs) get 1 tile.
+        let mut y = bounds.y;
+        while y < (bounds.y + bounds.height).max(y + 1.0) {
+            let mut x = bounds.x;
+            while x < (bounds.x + bounds.width).max(x + 1.0) {
+                let w = (bounds.x + bounds.width - x).max(0.0).min(tile_size);
+                let h = (bounds.y + bounds.height - y).max(0.0).min(tile_size);
+                tiles.push(Tile::new(LayoutRect { x, y, width: w.max(1.0), height: h.max(1.0) }));
+                x += tile_size;
+                if x >= bounds.x + bounds.width && bounds.width > 0.0 { break; }
+                if bounds.width <= 0.0 { break; }
+            }
+            y += tile_size;
+            if y >= bounds.y + bounds.height && bounds.height > 0.0 { break; }
+            if bounds.height <= 0.0 { break; }
+        }
+
         Self {
             id,
             z_index,
@@ -91,6 +131,7 @@ impl Layer {
             bounds,
             triggers,
             transform,
+            tiles,
             paint_commands: Vec::new(),
             child_layer_ids: Vec::new(),
         }
@@ -259,10 +300,12 @@ impl LayerTreeBuilder {
             _ => 0.0,
         };
 
+        let mut commands = Vec::new();
+
         // Box shadow (outer only)
         if let Some(Value::BoxShadow(shadow)) = sv.get("box-shadow") {
             if !shadow.inset {
-                layer.paint_commands.push(PaintCommand::Shadow(d, shadow.clone()));
+                commands.push(PaintCommand::Shadow(d, shadow.clone()));
             }
         }
 
@@ -270,7 +313,7 @@ impl LayerTreeBuilder {
         let bg = sv.get("background-color").or_else(|| sv.get("background"));
         if let Some(Value::Color(c)) = bg {
             if c.a > 0 {
-                layer.paint_commands.push(PaintCommand::Rect(d, c.clone(), radius));
+                commands.push(PaintCommand::Rect(d, c.clone(), radius));
             }
         }
 
@@ -280,13 +323,13 @@ impl LayerTreeBuilder {
                 Some(Value::Color(c)) => c.clone(),
                 _ => Color { r: 180, g: 180, b: 180, a: 255 },
             };
-            layer.paint_commands.push(PaintCommand::Border(d, layout.border.left, color, radius));
+            commands.push(PaintCommand::Border(d, layout.border.left, color, radius));
         }
 
         // Image
         if layout.display == DisplayType::Image {
             if let Some(ref url) = layout.image_url {
-                layer.paint_commands.push(PaintCommand::Image(d, url.clone()));
+                commands.push(PaintCommand::Image(d, url.clone()));
             }
         }
 
@@ -300,13 +343,34 @@ impl LayerTreeBuilder {
                 Some(Value::Color(c)) => c.clone(),
                 _ => Color { r: 0, g: 0, b: 0, a: 255 },
             };
-            layer.paint_commands.push(PaintCommand::Text {
+            commands.push(PaintCommand::Text {
                 rect: d,
                 text: contents.borrow().to_string(),
                 font_size,
                 color,
                 clip,
             });
+        }
+
+        // Distribute commands to overlapping tiles
+        for cmd in commands {
+            // Add to layer-level list for compatibility/compositor
+            layer.paint_commands.push(cmd.clone());
+
+            let cmd_rect = match &cmd {
+                PaintCommand::Rect(r, ..) => *r,
+                PaintCommand::Border(r, ..) => *r,
+                PaintCommand::Image(r, ..) => *r,
+                PaintCommand::Text { rect, .. } => *rect,
+                PaintCommand::Shadow(r, ..) => *r,
+            };
+
+            for tile in &mut layer.tiles {
+                if tile.rect.intersects(&cmd_rect) {
+                    tile.paint_commands.push(cmd.clone());
+                    tile.dirty = true;
+                }
+            }
         }
     }
 }
