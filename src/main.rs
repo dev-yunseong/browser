@@ -360,6 +360,11 @@ fn process_html_with_cache(
 
 impl eframe::App for BrowserApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Poll JS event loop tasks
+        if self.js_runtime.poll_tasks() {
+            self.trigger_re_render(ctx, 800.0); // Using standard width
+        }
+
         // ── Browser chrome ──────────────────────────────────────────────────
         let toolbar_fill = egui::Color32::from_rgb(50, 50, 55);
         let url_bar_fill = egui::Color32::from_rgb(72, 72, 78);
@@ -452,8 +457,6 @@ impl eframe::App for BrowserApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(egui::Color32::WHITE))
             .show(ctx, |ui| {
-                // Periodically run any queued JS macro-tasks (setTimeout, etc.)
-                self.js_runtime.run_queued_tasks();
                 let overrides = self.js_runtime.get_style_overrides();
                 if !overrides.is_empty() {
                     for (id, props) in overrides {
