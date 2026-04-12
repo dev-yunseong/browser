@@ -30,8 +30,27 @@ fn test_macro_micro_task_order() {
     
     // Poll again to run the macro task
     js.poll_tasks();
+}
 
-    // Verify order via internal state if we had access, 
-    // or just check if it doesn't panic for now.
-    // In a real browser test, we'd check `order` array.
+#[test]
+fn test_raf_timestamp() {
+    let mut js = JsRuntime::new(None);
+
+    js.execute(r#"
+        var ts = 0;
+        requestAnimationFrame((t) => {
+            ts = t;
+            log("rAF called with: " + t);
+        });
+    "#);
+
+    // Initial execute should NOT have run rAF
+    js.poll_tasks(); // Runs microtasks
+
+    // Explicitly poll rAF
+    js.poll_raf_tasks(1234.5);
+
+    // Check ts via eval
+    let val = js.context.eval(boa_engine::Source::from_bytes(b"ts")).unwrap();
+    assert_eq!(val.as_number().unwrap(), 1234.5);
 }

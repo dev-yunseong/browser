@@ -8,6 +8,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 thread_local! {
     static MACRO_TASKS: RefCell<VecDeque<Box<dyn FnOnce(&mut Context)>>> = RefCell::new(VecDeque::new());
     static MICRO_TASKS: RefCell<VecDeque<Box<dyn FnOnce(&mut Context)>>> = RefCell::new(VecDeque::new());
+    static RAF_TASKS: RefCell<VecDeque<Box<dyn FnOnce(&mut Context, f64)>>> = RefCell::new(VecDeque::new());
     static DOM_ROOT: RefCell<Option<Handle>> = RefCell::new(None);
     static NODE_REGISTRY: RefCell<HashMap<u32, Handle>> = RefCell::new(HashMap::new());
     static NEXT_NODE_ID: RefCell<u32> = RefCell::new(1);
@@ -62,6 +63,23 @@ impl JsRuntime {
             Ok(JsValue::undefined())
         });
         context.register_global_callable(js_string!("setTimeout"), 2, set_timeout).unwrap();
+
+        // Register native requestAnimationFrame
+        let raf = NativeFunction::from_copy_closure(|_this, args, _context| {
+            if let Some(callback) = args.get(0).cloned() {
+                if let Some(obj) = callback.as_object() {
+                    if obj.is_callable() {
+                        RAF_TASKS.with(|tasks| {
+                            tasks.borrow_mut().push_back(Box::new(move |ctx, timestamp| {
+                                let _ = callback.as_object().unwrap().call(&JsValue::undefined(), &[JsValue::from(timestamp)], ctx);
+                            }));
+                        });
+                    }
+                }
+            }
+            Ok(JsValue::undefined())
+        });
+        context.register_global_callable(js_string!("requestAnimationFrame"), 1, raf).unwrap();
 
         // Register native __aura_queue_task
         let queue_task = NativeFunction::from_copy_closure(|_this, args, _context| {
@@ -276,6 +294,25 @@ impl JsRuntime {
             // Microtask checkpoint after event execution
             self.run_microtasks();
         }
+    }
+
+    pub fn poll_raf_tasks(&mut self, timestamp: f64) -> bool {
+        let mut did_work = false;
+
+        // Take a snapshot of current tasks to avoid infinite recursion in same frame
+        let mut tasks = VecDeque::new();
+        RAF_TASKS.with(|t| tasks = t.borrow_mut().drain(..).collect());
+
+        if !tasks.is_empty() {
+            did_work = true;
+            for task in tasks {
+                task(&mut self.context, timestamp);
+                // Microtask checkpoint after each rAF callback
+                self.run_microtasks();
+            }
+        }
+
+        did_work
     }
 
     pub fn execute(&mut self, source: &str) {

@@ -37,6 +37,7 @@ struct BrowserApp {
     /// Accumulated JS style overrides (element id → property → value).
     js_style_overrides: HashMap<String, HashMap<String, String>>,
     is_loading: bool,
+    start_time: std::time::Instant,
 }
 
 struct StaticPageData {
@@ -94,6 +95,7 @@ impl BrowserApp {
             js_runtime: js::JsRuntime::new(None),
             js_style_overrides: HashMap::new(),
             is_loading: false,
+            start_time: std::time::Instant::now(),
         }
     }
 
@@ -361,7 +363,15 @@ fn process_html_with_cache(
 impl eframe::App for BrowserApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Poll JS event loop tasks
-        if self.js_runtime.poll_tasks() {
+        let mut needs_re_render = self.js_runtime.poll_tasks();
+
+        // Run animation frames
+        let timestamp = self.start_time.elapsed().as_secs_f64() * 1000.0;
+        if self.js_runtime.poll_raf_tasks(timestamp) {
+            needs_re_render = true;
+        }
+
+        if needs_re_render {
             self.trigger_re_render(ctx, 800.0); // Using standard width
         }
 
