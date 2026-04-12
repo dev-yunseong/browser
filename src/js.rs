@@ -48,6 +48,60 @@ thread_local! {
     static TASK_SENDER: RefCell<Option<Sender<Box<dyn FnOnce(&mut Context) + Send>>>> = RefCell::new(None);
     static FOCUSED_NODE: RefCell<Option<String>> = RefCell::new(None);
     static CURRENT_ORIGIN: RefCell<Option<Url>> = RefCell::new(None);
+    static CSP_POLICY: RefCell<Option<CspPolicy>> = RefCell::new(None);
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CspPolicy {
+    pub connect_src: Vec<String>,
+    pub script_src: Vec<String>,
+}
+
+impl CspPolicy {
+    pub fn parse(header: &str) -> Self {
+        let mut policy = Self::default();
+        for directive in header.split(';') {
+            let parts: Vec<&str> = directive.trim().split_whitespace().collect();
+            if parts.is_empty() { continue; }
+            let name = parts[0].to_lowercase();
+            let sources: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+            
+            match name.as_str() {
+                "connect-src" => policy.connect_src = sources,
+                "script-src" => policy.script_src = sources,
+                _ => {}
+            }
+        }
+        policy
+    }
+
+    pub fn is_allowed(&self, directive: &str, url: &Url, current_origin: Option<&Url>) -> bool {
+        let sources = match directive {
+            "connect-src" => &self.connect_src,
+            "script-src" => &self.script_src,
+            _ => return true,
+        };
+
+        if sources.is_empty() { return true; }
+
+        for source in sources {
+            if source == "*" { return true; }
+            if source == "'self'" {
+                if let Some(origin) = current_origin {
+                    if origin.origin() == url.origin() { return true; }
+                }
+                continue;
+            }
+            // Simple string prefix/origin match
+            if url.to_string().starts_with(source) { return true; }
+        }
+        false
+    }
+
+    pub fn allows_inline_script(&self) -> bool {
+        if self.script_src.is_empty() { return true; }
+        self.script_src.iter().any(|s| s == "'unsafe-inline'")
+    }
 }
 
 pub struct JsRuntime {
@@ -56,9 +110,10 @@ pub struct JsRuntime {
 }
 
 impl JsRuntime {
-    pub fn new(dom: Option<Handle>, base_url: Option<Url>) -> Self {
+    pub fn new(dom: Option<Handle>, base_url: Option<Url>, policy: Option<CspPolicy>) -> Self {
         DOM_ROOT.with(|root| *root.borrow_mut() = dom);
         CURRENT_ORIGIN.with(|origin| *origin.borrow_mut() = base_url);
+        CSP_POLICY.with(|p| *p.borrow_mut() = policy);
         let mut context = Context::default();
         let (task_sender, task_receiver) = channel();
         TASK_SENDER.with(|s| *s.borrow_mut() = Some(task_sender));
@@ -250,6 +305,22 @@ impl JsRuntime {
             } else {
                 Url::parse(&url_str).unwrap_or_else(|_| Url::parse("about:blank").unwrap())
             };
+
+            // CSP Check
+            let allowed = CSP_POLICY.with(|p| {
+                if let Some(ref policy) = *p.borrow() {
+                    policy.is_allowed("connect-src", &target_url, base_url.as_ref())
+                } else {
+                    true
+                }
+            });
+
+            if !allowed {
+                if let Some(obj) = reject.as_object() {
+                    let _ = obj.call(&JsValue::undefined(), &[JsValue::from(js_string!("CSP Error: connect-src directive blocked this request"))], _context);
+                }
+                return Ok(JsValue::undefined());
+            }
 
             let fetch_id = NEXT_FETCH_ID.with(|id_cell| {
                 let id = *id_cell.borrow();

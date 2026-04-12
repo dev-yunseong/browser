@@ -37,6 +37,7 @@ struct BrowserApp {
     last_body: String,
     last_base_url: Option<Url>,
     js_runtime: js::JsRuntime,
+    current_csp_policy: Option<js::CspPolicy>,
     /// Accumulated JS style overrides (element id → property → value).
     js_style_overrides: HashMap<String, HashMap<String, String>>,
     is_loading: bool,
@@ -55,6 +56,7 @@ struct StaticPageData {
     image_urls: Vec<String>,
     body: String,
     base_url: Url,
+    csp_policy: Option<js::CspPolicy>,
 }
 
 impl BrowserApp {
@@ -98,7 +100,8 @@ impl BrowserApp {
             image_promises: HashMap::new(),
             last_body: String::new(),
             last_base_url: None,
-            js_runtime: js::JsRuntime::new(None, None),
+            js_runtime: js::JsRuntime::new(None, None, None),
+            current_csp_policy: None,
             js_style_overrides: HashMap::new(),
             is_loading: false,
             start_time: std::time::Instant::now(),
@@ -136,7 +139,8 @@ impl BrowserApp {
         self.image_promises.clear();
         self.js_style_overrides.clear();
         let base_url = Url::parse(&url).ok();
-        self.js_runtime = js::JsRuntime::new(None, base_url);
+        self.js_runtime = js::JsRuntime::new(None, base_url, None);
+        self.current_csp_policy = None;
         self.is_loading = true;
         self.hovered_id = None;
         self.last_stylesheet = None; // Reset stylesheet on new URL
@@ -159,10 +163,11 @@ impl BrowserApp {
             let overrides = self.js_style_overrides.clone();
             let hovered_id = self.hovered_id.clone();
             let focused_id = self.focused_id.clone();
+            let csp_policy = self.current_csp_policy.clone();
 
             // Use re_render_promise instead of join() to avoid UI blocking
             self.re_render_promise = Some(Promise::spawn_thread("re_render", move || {
-                process_html_with_cache(&body, &base_url, &cache, &mut css_cache, stylesheet, &overrides, hovered_id.as_deref(), focused_id.as_deref(), width)
+                process_html_with_cache(&body, &base_url, &cache, &mut css_cache, stylesheet, &overrides, hovered_id.as_deref(), focused_id.as_deref(), csp_policy, width)
                     .map_err(|e| e.to_string())
             }));
             
@@ -182,6 +187,7 @@ impl BrowserApp {
         self.current_event_handlers = page_data.event_handlers;
         self.current_element_ids = page_data.element_ids;
         self.current_focusable_elements = page_data.focusable_elements;
+        self.current_csp_policy = page_data.csp_policy;
     }
 }
 
@@ -243,9 +249,13 @@ fn fetch_and_process(
     width: f32,
 ) -> Result<(StaticPageData, css::Stylesheet), Box<dyn Error + Send + Sync>> {
     let response = reqwest::blocking::get(url_str)?;
+    let csp_header = response.headers().get("content-security-policy")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| js::CspPolicy::parse(s));
+    
     let body = response.text()?;
     let base_url = Url::parse(url_str)?;
-    process_html_with_cache(&body, &base_url, &HashMap::new(), css_cache, None, js_overrides, hovered_id, focused_id, width)
+    process_html_with_cache(&body, &base_url, &HashMap::new(), css_cache, None, js_overrides, hovered_id, focused_id, csp_header, width)
 }
 
 fn process_html_with_cache(
@@ -257,6 +267,7 @@ fn process_html_with_cache(
     js_overrides: &HashMap<String, HashMap<String, String>>,
     hovered_id: Option<&str>,
     focused_id: Option<&str>,
+    csp_policy: Option<js::CspPolicy>,
     width: f32,
 ) -> Result<(StaticPageData, css::Stylesheet), Box<dyn Error + Send + Sync>> {
     let start_total = Instant::now();
@@ -284,7 +295,7 @@ fn process_html_with_cache(
     };
 
     let start = Instant::now();
-    let style_tree = style::build_style_tree(&dom_tree.document, &stylesheet, None, js_overrides, hovered_id, focused_id);
+    let style_tree = style::build_style_tree(&dom_tree.document, &stylesheet, None, js_overrides, hovered_id, focused_id, csp_policy.as_ref());
     let style_elapsed = start.elapsed();
 
     let start = Instant::now();
@@ -369,6 +380,7 @@ fn process_html_with_cache(
         image_urls,
         body: body.to_string(),
         base_url: base_url.clone(),
+        csp_policy,
     }, stylesheet))
 }
 
@@ -553,6 +565,7 @@ impl eframe::App for BrowserApp {
                                 image_urls: page_data.image_urls.clone(),
                                 body: page_data.body.clone(),
                                 base_url: page_data.base_url.clone(),
+                                csp_policy: page_data.csp_policy.clone(),
                             };
                             self.apply_page_data(page, ctx);
                             self.re_render_promise = None;
@@ -593,6 +606,7 @@ impl eframe::App for BrowserApp {
                                 image_urls: image_urls.clone(),
                                 body: body.clone(),
                                 base_url: base_url.clone(),
+                                csp_policy: page_data.csp_policy.clone(),
                             };
 
                             // Release the borrow on content_promise
@@ -626,10 +640,16 @@ impl eframe::App for BrowserApp {
 
                             // Execute page scripts and apply any JS-driven style changes
                             let dom = dom::parse_html(&body);
-                            self.js_runtime = js::JsRuntime::new(Some(dom.document.clone()), self.last_base_url.clone());
+                            self.js_runtime = js::JsRuntime::new(Some(dom.document.clone()), self.last_base_url.clone(), self.current_csp_policy.clone());
                             let scripts = js::extract_scripts_from_dom(&dom.document);
-                            for script in scripts {
-                                self.js_runtime.execute(&script);
+                            
+                            let allowed = self.current_csp_policy.as_ref().map(|p| p.allows_inline_script()).unwrap_or(true);
+                            if allowed {
+                                for script in scripts {
+                                    self.js_runtime.execute(&script);
+                                }
+                            } else {
+                                println!("[CSP] Blocked inline script execution");
                             }
                             let overrides = self.js_runtime.get_style_overrides();
                             if !overrides.is_empty() {

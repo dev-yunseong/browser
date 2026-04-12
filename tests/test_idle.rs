@@ -7,7 +7,7 @@ use std::cell::RefCell;
 
 #[test]
 fn test_request_idle_callback_registration() {
-    let mut runtime = browser::js::JsRuntime::new(None, None);
+    let mut runtime = browser::js::JsRuntime::new(None, None, None);
     
     // Test if requestIdleCallback is available in the global scope
     let code = r#"
@@ -35,7 +35,7 @@ fn test_request_idle_callback_registration() {
 
 #[test]
 fn test_cancel_idle_callback() {
-    let mut runtime = browser::js::JsRuntime::new(None, None);
+    let mut runtime = browser::js::JsRuntime::new(None, None, None);
     
     let code = r#"
         let idleCalled = false;
