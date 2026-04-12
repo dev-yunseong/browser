@@ -61,6 +61,19 @@ All three are independent of each other. Closes domain issue #7.
 
 ---
 
+## Priority 6 — HTML & CSS Engine Perfection (Performance & Stability)
+
+Addresses severe crashes (OOM/Stack overflow) and massive rendering latency (>1.5s) on real-world pages.
+
+| # | Issue | Why this order |
+|---|---|---|
+| #60 | Parallel Async CSS Fetching & Processing | Blocking the main thread for 1.3s during CSS parsing makes the browser unusable. Fix network first. |
+| #61 | Style Tree Memory Optimization (OOM) | Creating HashMaps for every DOM node causes massive OOM on large sites. |
+| #62 | CSS Parser & Selector Matching Opt | O(N*M) selector matching is painfully slow. We need Right-to-Left matching and caches. |
+| #63 | Layout Engine Recursion & Scalability | Deeply nested DOMs crash the layout engine with stack overflows. Convert to iterative trees. |
+
+---
+
 ## Dependency graph
 
 ```
@@ -73,6 +86,7 @@ All three are independent of each other. Closes domain issue #7.
 #28
 #29
 #19
+#60 → #61 → #62 → #63
 ```
 
 ## Domain closure
@@ -84,4 +98,5 @@ All three are independent of each other. Closes domain issue #7.
 | #6 Runtime & Interactivity | #22 #25 #38 #40 done |
 | #7 Resource Loading & Security | #27 #28 #29 done |
 | #2 Standard HTML5 & CSS Parsing | #19 done |
+| Perfecting Engine (Performance) | #60 #61 #62 #63 done |
 | #1 Vision | all domains done |
