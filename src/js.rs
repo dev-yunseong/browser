@@ -42,6 +42,27 @@ impl JsRuntime {
         });
         context.register_global_callable(js_string!("log"), 1, log).unwrap();
 
+        // Register native setTimeout
+        let set_timeout = NativeFunction::from_copy_closure(|_this, args, _context| {
+            if let Some(callback) = args.get(0).cloned() {
+                if let Some(obj) = callback.as_object() {
+                    if obj.is_callable() {
+                        let ms = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0);
+                        
+                        // For now, immediate execution in next macro-task queue
+                        // Proper timer management requires JsRuntime to track deadlines.
+                        MACRO_TASKS.with(|tasks| {
+                            tasks.borrow_mut().push_back(Box::new(move |ctx| {
+                                let _ = callback.as_object().unwrap().call(&JsValue::undefined(), &[], ctx);
+                            }));
+                        });
+                    }
+                }
+            }
+            Ok(JsValue::undefined())
+        });
+        context.register_global_callable(js_string!("setTimeout"), 2, set_timeout).unwrap();
+
         // Register native __aura_queue_task
         let queue_task = NativeFunction::from_copy_closure(|_this, args, _context| {
             if let Some(callback) = args.get(0).cloned() {
@@ -201,24 +222,42 @@ impl JsRuntime {
         Self { context, task_receiver }
     }
 
-    pub fn run_queued_tasks(&mut self) {
-        while let Ok(task) = self.task_receiver.try_recv() { task(&mut self.context); }
-        loop {
-            let task = MACRO_TASKS.with(|tasks| tasks.borrow_mut().pop_front());
-            if let Some(task) = task {
-                task(&mut self.context);
-                self.run_microtasks();
-            } else {
-                break;
-            }
+    pub fn poll_tasks(&mut self) -> bool {
+        let mut did_work = false;
+
+        // 1. Check for tasks from other threads (fetch, etc.)
+        while let Ok(task) = self.task_receiver.try_recv() {
+            MACRO_TASKS.with(|tasks| tasks.borrow_mut().push_back(task));
         }
-        let _ = self.context.run_jobs();
+
+        // 2. Execute ONE macro-task
+        let macro_task = MACRO_TASKS.with(|tasks| tasks.borrow_mut().pop_front());
+        if let Some(task) = macro_task {
+            task(&mut self.context);
+            did_work = true;
+            
+            // 3. Microtask checkpoint after task execution
+            self.run_microtasks();
+        }
+
+        did_work
     }
 
-    pub fn run_microtasks(&mut self) {
+    /// Run all pending micro-tasks and Boa jobs.
+    fn run_microtasks(&mut self) {
         loop {
-            let micro = MICRO_TASKS.with(|tasks| tasks.borrow_mut().pop_front());
-            if let Some(m) = micro { m(&mut self.context); } else { break; }
+            let mut micro_work_done = false;
+
+            // Execute all micro-tasks in our queue
+            while let Some(task) = MICRO_TASKS.with(|tasks| tasks.borrow_mut().pop_front()) {
+                task(&mut self.context);
+                micro_work_done = true;
+            }
+
+            // Execute Boa jobs (Promises)
+            let _ = self.context.run_jobs();
+
+            if !micro_work_done { break; }
         }
     }
 
@@ -233,12 +272,18 @@ impl JsRuntime {
         if let Some(nid) = native_id {
             let code = format!("document.__trigger_event({}, '{}', {{ bubbles: true }})", nid, event_type);
             let _ = self.context.eval(Source::from_bytes(code.as_bytes()));
+            
+            // Microtask checkpoint after event execution
+            self.run_microtasks();
         }
     }
 
-    pub fn execute(&mut self, code: &str) {
-        if code.contains("import.meta") || (code.contains("import ") && code.contains(" from ")) { return; }
-        let _ = self.context.eval(Source::from_bytes(code.as_bytes()));
+    pub fn execute(&mut self, source: &str) {
+        if source.contains("import.meta") || (source.contains("import ") && source.contains(" from ")) { return; }
+        let _ = self.context.eval(Source::from_bytes(source.as_bytes()));
+        
+        // Microtask checkpoint after script execution
+        self.run_microtasks();
     }
 
     pub fn get_style_overrides(&mut self) -> HashMap<String, HashMap<String, String>> {
