@@ -93,8 +93,10 @@ pub struct Layer {
     pub transform: Matrix4x4,
     /// Ordered list of tiles for this layer (256x256 each).
     pub tiles: Vec<Tile>,
-    /// Ordered list of drawing operations for this layer.
-    pub paint_commands: Vec<PaintCommand>,
+    /// Background and borders of the element that established this layer.
+    pub background_commands: Vec<PaintCommand>,
+    /// In-flow content commands (descendants that don't create layers).
+    pub content_commands: Vec<PaintCommand>,
     /// IDs of layers created as direct children of this layer during tree build.
     /// Retained for use by the future compositor (issue #33); not used during
     /// the flat z-index sorted rendering pass implemented in this issue.
@@ -132,7 +134,8 @@ impl Layer {
             triggers,
             transform,
             tiles,
-            paint_commands: Vec::new(),
+            background_commands: Vec::new(),
+            content_commands: Vec::new(),
             child_layer_ids: Vec::new(),
         }
     }
@@ -167,6 +170,31 @@ impl LayerTree {
         let mut refs: Vec<&Layer> = self.layers.iter().collect();
         refs.sort_by_key(|l| l.z_index);
         refs
+    }
+
+    /// Categorize child layers of a parent into negative, zero, and positive z-indices.
+    pub fn categorize_children(&self, parent_id: usize) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+        let parent = &self.layers[parent_id];
+        let mut negative = Vec::new();
+        let mut zero = Vec::new();
+        let mut positive = Vec::new();
+
+        for &child_id in &parent.child_layer_ids {
+            let child = &self.layers[child_id];
+            if child.z_index < 0 {
+                negative.push(child_id);
+            } else if child.z_index == 0 {
+                zero.push(child_id);
+            } else {
+                positive.push(child_id);
+            }
+        }
+
+        // Sort negative and positive by z_index
+        negative.sort_by_key(|&id| self.layers[id].z_index);
+        positive.sort_by_key(|&id| self.layers[id].z_index);
+
+        (negative, zero, positive)
     }
 }
 
@@ -216,8 +244,8 @@ impl LayerTreeBuilder {
             // Record parent → child relationship for future compositor use.
             tree.layers[current_layer_id].child_layer_ids.push(new_id);
 
-            // Collect this box's own paint commands into the new layer.
-            Self::collect_paint_commands(layout, &mut tree.layers[new_id], clip);
+            // Collect this box's own paint commands into the new layer as BACKGROUND.
+            Self::collect_paint_commands(layout, &mut tree.layers[new_id], clip, true);
 
             // All children of this box belong to the new layer's stacking context.
             let next_clip = clip.intersect(&layout.get_content_rect());
@@ -225,8 +253,8 @@ impl LayerTreeBuilder {
                 Self::traverse(child, tree, new_id, next_clip);
             }
         } else {
-            // No trigger — paint into the current ancestor layer.
-            Self::collect_paint_commands(layout, &mut tree.layers[current_layer_id], clip);
+            // No trigger — paint into the current ancestor layer as CONTENT.
+            Self::collect_paint_commands(layout, &mut tree.layers[current_layer_id], clip, false);
 
             let next_clip = clip.intersect(&layout.get_content_rect());
             for child in &layout.children {
@@ -291,7 +319,7 @@ impl LayerTreeBuilder {
     /// Emit paint commands for a single `LayoutBox` (not its children) into `layer`.
     ///
     /// Covers: box-shadow, background, border, images, and text.
-    fn collect_paint_commands(layout: &LayoutBox, layer: &mut Layer, clip: LayoutRect) {
+    fn collect_paint_commands(layout: &LayoutBox, layer: &mut Layer, clip: LayoutRect, is_root_of_layer: bool) {
         let d = layout.dimensions;
         let sv = &layout.style_node.specified_values;
 
@@ -352,11 +380,15 @@ impl LayerTreeBuilder {
             });
         }
 
-        // Distribute commands to overlapping tiles
-        for cmd in commands {
-            // Add to layer-level list for compatibility/compositor
-            layer.paint_commands.push(cmd.clone());
+        // Distribute commands to correct list
+        if is_root_of_layer {
+            layer.background_commands.extend(commands.clone());
+        } else {
+            layer.content_commands.extend(commands.clone());
+        }
 
+        // Also distribute to overlapping tiles
+        for cmd in commands {
             let cmd_rect = match &cmd {
                 PaintCommand::Rect(r, ..) => *r,
                 PaintCommand::Border(r, ..) => *r,
