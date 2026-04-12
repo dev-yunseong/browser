@@ -371,6 +371,14 @@ impl eframe::App for BrowserApp {
             needs_re_render = true;
         }
 
+        // Run idle tasks if no work was done and no long-running promises are active
+        if !needs_re_render && self.content_promise.is_none() && self.re_render_promise.is_none() {
+            let deadline = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as f64 + 50.0;
+            if self.js_runtime.poll_idle_tasks(deadline) {
+                needs_re_render = true;
+            }
+        }
+
         if needs_re_render {
             self.trigger_re_render(ctx, 800.0); // Using standard width
         }

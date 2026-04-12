@@ -9,6 +9,8 @@ thread_local! {
     static MACRO_TASKS: RefCell<VecDeque<Box<dyn FnOnce(&mut Context)>>> = RefCell::new(VecDeque::new());
     static MICRO_TASKS: RefCell<VecDeque<Box<dyn FnOnce(&mut Context)>>> = RefCell::new(VecDeque::new());
     static RAF_TASKS: RefCell<VecDeque<Box<dyn FnOnce(&mut Context, f64)>>> = RefCell::new(VecDeque::new());
+    static IDLE_TASKS: RefCell<VecDeque<(u32, Box<dyn FnOnce(&mut Context, f64)>)>> = RefCell::new(VecDeque::new());
+    static NEXT_IDLE_ID: RefCell<u32> = RefCell::new(1);
     static DOM_ROOT: RefCell<Option<Handle>> = RefCell::new(None);
     static NODE_REGISTRY: RefCell<HashMap<u32, Handle>> = RefCell::new(HashMap::new());
     static NEXT_NODE_ID: RefCell<u32> = RefCell::new(1);
@@ -80,6 +82,58 @@ impl JsRuntime {
             Ok(JsValue::undefined())
         });
         context.register_global_callable(js_string!("requestAnimationFrame"), 1, raf).unwrap();
+
+        // Register native requestIdleCallback
+        let ric = NativeFunction::from_copy_closure(|_this, args, _context| {
+            if let Some(callback) = args.get(0).cloned() {
+                if let Some(obj) = callback.as_object() {
+                    if obj.is_callable() {
+                        let id = NEXT_IDLE_ID.with(|id_cell| {
+                            let id = *id_cell.borrow();
+                            *id_cell.borrow_mut() += 1;
+                            id
+                        });
+                        IDLE_TASKS.with(|tasks| {
+                            tasks.borrow_mut().push_back((id, Box::new(move |ctx, deadline| {
+                                // Create IdleDeadline object
+                                let deadline_obj_val = ctx.eval(Source::from_bytes(b"({})")).unwrap();
+                                let deadline_obj = deadline_obj_val.as_object().unwrap();
+                                
+                                let time_rem = NativeFunction::from_copy_closure(move |_this, _args, _context| {
+                                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as f64;
+                                    Ok(JsValue::from((deadline - now).max(0.0)))
+                                });
+                                
+                                // Workaround to create a JS function value from NativeFunction in Boa 0.21.1
+                                ctx.register_global_callable(js_string!("__aura_temp_time_rem"), 0, time_rem).unwrap();
+                                let time_rem_fn = ctx.eval(Source::from_bytes(b"__aura_temp_time_rem")).unwrap();
+                                
+                                deadline_obj.set(js_string!("timeRemaining"), time_rem_fn, false, ctx).unwrap();
+                                deadline_obj.set(js_string!("didTimeout"), JsValue::from(false), false, ctx).unwrap();
+                                
+                                // Clean up the temporary global
+                                let _ = ctx.eval(Source::from_bytes(b"delete globalThis.__aura_temp_time_rem"));
+                                
+                                let _ = obj.call(&JsValue::undefined(), &[deadline_obj_val], ctx);
+                            })));
+                        });
+                        return Ok(JsValue::from(id));
+                    }
+                }
+            }
+            Ok(JsValue::undefined())
+        });
+        context.register_global_callable(js_string!("requestIdleCallback"), 1, ric).unwrap();
+
+        // Register native cancelIdleCallback
+        let cic = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let id = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
+            IDLE_TASKS.with(|tasks| {
+                tasks.borrow_mut().retain(|(tid, _)| *tid != id);
+            });
+            Ok(JsValue::undefined())
+        });
+        context.register_global_callable(js_string!("cancelIdleCallback"), 1, cic).unwrap();
 
         // Register native __aura_queue_task
         let queue_task = NativeFunction::from_copy_closure(|_this, args, _context| {
@@ -309,6 +363,24 @@ impl JsRuntime {
                 task(&mut self.context, timestamp);
                 // Microtask checkpoint after each rAF callback
                 self.run_microtasks();
+            }
+        }
+
+        did_work
+    }
+
+    pub fn poll_idle_tasks(&mut self, deadline_ms: f64) -> bool {
+        let mut did_work = false;
+
+        while let Some((_, task)) = IDLE_TASKS.with(|tasks| tasks.borrow_mut().pop_front()) {
+            did_work = true;
+            task(&mut self.context, deadline_ms);
+            self.run_microtasks();
+
+            // Check if we still have time
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as f64;
+            if now >= deadline_ms {
+                break;
             }
         }
 
