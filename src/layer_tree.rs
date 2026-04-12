@@ -1,0 +1,398 @@
+use crate::layout::{LayoutBox, DisplayType, Rect as LayoutRect};
+use crate::css::{Value, Color, BoxShadow};
+use markup5ever_rcdom::NodeData;
+
+// ── Paint Commands ────────────────────────────────────────────────────────────
+
+/// A single atomic drawing operation. Moved from render.rs so that layer_tree.rs
+/// owns the data pipeline (layout → layer tree → paint commands) while render.rs
+/// owns the pixel execution (paint commands → Pixmap).
+#[derive(Debug, Clone)]
+pub enum PaintCommand {
+    /// Filled rectangle: (bounds, color, corner-radius)
+    Rect(LayoutRect, Color, f32),
+    /// Stroked rectangle border: (bounds, stroke-width, color, corner-radius)
+    Border(LayoutRect, f32, Color, f32),
+    /// Image placeholder: (bounds, url)
+    Image(LayoutRect, String),
+    /// Text run with clipping rect
+    Text {
+        rect: LayoutRect,
+        text: String,
+        font_size: f32,
+        color: Color,
+        clip: LayoutRect,
+    },
+    /// Outer box-shadow
+    Shadow(LayoutRect, BoxShadow),
+}
+
+// ── Compositing Triggers ──────────────────────────────────────────────────────
+
+/// CSS properties that cause a `LayoutBox` to establish a compositing layer.
+///
+/// See: https://developer.mozilla.org/en-US/docs/Web/CSS/CSS_positioned_layout/Understanding_z-index/Stacking_context
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompositingTrigger {
+    /// Non-zero `z-index` (only meaningful on positioned elements in practice).
+    ZIndex(i32),
+    /// `opacity` < 1.0
+    Opacity(f32),
+    /// `transform` property with a value other than `none`
+    Transform(String),
+    /// `position: fixed`
+    ///
+    /// NOTE: The layout engine does not produce viewport-relative positions for
+    /// fixed elements. These coordinates are document-flow positions. Correct
+    /// fixed-position layout is deferred to a future layout issue.
+    PositionFixed,
+    /// `position: sticky`
+    ///
+    /// Same limitation as `PositionFixed` — scroll-relative positioning is not
+    /// yet implemented in the layout engine.
+    PositionSticky,
+    /// `will-change` with a value other than `auto`
+    WillChange(String),
+}
+
+// ── Layer ─────────────────────────────────────────────────────────────────────
+
+/// A single compositing layer. Contains the paint commands for all boxes that
+/// belong to this layer's stacking context.
+#[derive(Debug, Clone)]
+pub struct Layer {
+    /// Stable identifier — equal to the layer's index in `LayerTree::layers`.
+    pub id: usize,
+    /// CSS `z-index` of the element that established this layer.
+    pub z_index: i32,
+    /// CSS `opacity` of the element that established this layer (1.0 = fully opaque).
+    pub opacity: f32,
+    /// Bounding box of the element that established this layer.
+    pub bounds: LayoutRect,
+    /// CSS properties that caused this layer to be created.
+    pub triggers: Vec<CompositingTrigger>,
+    /// Ordered list of drawing operations for this layer.
+    pub paint_commands: Vec<PaintCommand>,
+    /// IDs of layers created as direct children of this layer during tree build.
+    /// Retained for use by the future compositor (issue #33); not used during
+    /// the flat z-index sorted rendering pass implemented in this issue.
+    pub child_layer_ids: Vec<usize>,
+}
+
+impl Layer {
+    fn new(id: usize, z_index: i32, opacity: f32, bounds: LayoutRect, triggers: Vec<CompositingTrigger>) -> Self {
+        Self {
+            id,
+            z_index,
+            opacity,
+            bounds,
+            triggers,
+            paint_commands: Vec::new(),
+            child_layer_ids: Vec::new(),
+        }
+    }
+}
+
+// ── LayerTree ─────────────────────────────────────────────────────────────────
+
+/// A flat collection of compositing layers built from a `LayoutBox` tree.
+///
+/// `layers[0]` is always the root layer (z_index = 0, opacity = 1.0).
+pub struct LayerTree {
+    /// All layers in creation order. Index == `Layer::id`.
+    pub layers: Vec<Layer>,
+}
+
+impl LayerTree {
+    fn new() -> Self {
+        Self { layers: Vec::new() }
+    }
+
+    /// Append a layer and return its assigned id.
+    fn add_layer(&mut self, layer: Layer) -> usize {
+        let id = layer.id;
+        self.layers.push(layer);
+        id
+    }
+
+    /// Returns references to all layers sorted by `z_index` (ascending).
+    /// This is the order in which layers must be composited to produce correct
+    /// painter's-algorithm rendering.
+    pub fn sorted_layers(&self) -> Vec<&Layer> {
+        let mut refs: Vec<&Layer> = self.layers.iter().collect();
+        refs.sort_by_key(|l| l.z_index);
+        refs
+    }
+}
+
+// ── LayerTreeBuilder ──────────────────────────────────────────────────────────
+
+/// Traverses a `LayoutBox` tree and produces a `LayerTree`.
+///
+/// Each box that carries a compositing trigger establishes a new `Layer`;
+/// all other boxes paint into the current ancestor layer.
+pub struct LayerTreeBuilder;
+
+impl LayerTreeBuilder {
+    /// Build a `LayerTree` from the given layout root.
+    ///
+    /// `viewport` is the full drawable area and becomes the bounds of the root layer.
+    pub fn build(layout: &LayoutBox, viewport: LayoutRect) -> LayerTree {
+        let mut tree = LayerTree::new();
+        let root = Layer::new(0, 0, 1.0, viewport, vec![]);
+        tree.add_layer(root);
+        Self::traverse(layout, &mut tree, 0, viewport);
+        tree
+    }
+
+    /// Recursive traversal. Assigns each `LayoutBox` to either a new layer
+    /// (if it has compositing triggers) or the current ancestor layer.
+    fn traverse(layout: &LayoutBox, tree: &mut LayerTree, current_layer_id: usize, clip: LayoutRect) {
+        let d = layout.dimensions;
+
+        // Skip zero-sized boxes but still recurse children — they may be visible
+        // (e.g. overflow: visible children of a collapsed parent).
+        if d.width < 0.1 || d.height < 0.1 {
+            for child in &layout.children {
+                Self::traverse(child, tree, current_layer_id, clip);
+            }
+            return;
+        }
+
+        let triggers = Self::detect_triggers(layout);
+
+        if !triggers.is_empty() {
+            // This box establishes a new compositing layer.
+            let new_id = tree.layers.len();
+            let opacity = layout.get_opacity();
+            let new_layer = Layer::new(new_id, layout.z_index, opacity, d, triggers);
+            tree.add_layer(new_layer);
+
+            // Record parent → child relationship for future compositor use.
+            tree.layers[current_layer_id].child_layer_ids.push(new_id);
+
+            // Collect this box's own paint commands into the new layer.
+            Self::collect_paint_commands(layout, &mut tree.layers[new_id], clip);
+
+            // All children of this box belong to the new layer's stacking context.
+            let next_clip = clip.intersect(&layout.get_content_rect());
+            for child in &layout.children {
+                Self::traverse(child, tree, new_id, next_clip);
+            }
+        } else {
+            // No trigger — paint into the current ancestor layer.
+            Self::collect_paint_commands(layout, &mut tree.layers[current_layer_id], clip);
+
+            let next_clip = clip.intersect(&layout.get_content_rect());
+            for child in &layout.children {
+                Self::traverse(child, tree, current_layer_id, next_clip);
+            }
+        }
+    }
+
+    /// Inspect a `LayoutBox`'s CSS properties and return the list of
+    /// compositing triggers it carries.
+    ///
+    /// BFC-establishing properties (InlineBlock, Flex, TableCell, overflow:hidden)
+    /// are intentionally excluded — BFC != compositing layer per the CSS spec.
+    fn detect_triggers(layout: &LayoutBox) -> Vec<CompositingTrigger> {
+        let mut triggers = Vec::new();
+        let sv = &layout.style_node.specified_values;
+
+        if layout.z_index != 0 {
+            triggers.push(CompositingTrigger::ZIndex(layout.z_index));
+        }
+
+        let opacity = layout.get_opacity();
+        if opacity < 1.0 {
+            triggers.push(CompositingTrigger::Opacity(opacity));
+        }
+
+        if let Some(Value::Keyword(k)) = sv.get("transform") {
+            if k != "none" {
+                triggers.push(CompositingTrigger::Transform(k.clone()));
+            }
+        }
+
+        match sv.get("position") {
+            Some(Value::Keyword(k)) if k == "fixed" => triggers.push(CompositingTrigger::PositionFixed),
+            Some(Value::Keyword(k)) if k == "sticky" => triggers.push(CompositingTrigger::PositionSticky),
+            _ => {}
+        }
+
+        if let Some(Value::Keyword(k)) = sv.get("will-change") {
+            if k != "auto" {
+                triggers.push(CompositingTrigger::WillChange(k.clone()));
+            }
+        }
+
+        triggers
+    }
+
+    /// Emit paint commands for a single `LayoutBox` (not its children) into `layer`.
+    ///
+    /// Covers: box-shadow, background, border, images, and text.
+    fn collect_paint_commands(layout: &LayoutBox, layer: &mut Layer, clip: LayoutRect) {
+        let d = layout.dimensions;
+        let sv = &layout.style_node.specified_values;
+
+        let radius = match sv.get("border-radius") {
+            Some(Value::Length(v, _)) => *v,
+            _ => 0.0,
+        };
+
+        // Box shadow (outer only)
+        if let Some(Value::BoxShadow(shadow)) = sv.get("box-shadow") {
+            if !shadow.inset {
+                layer.paint_commands.push(PaintCommand::Shadow(d, shadow.clone()));
+            }
+        }
+
+        // Background
+        let bg = sv.get("background-color").or_else(|| sv.get("background"));
+        if let Some(Value::Color(c)) = bg {
+            if c.a > 0 {
+                layer.paint_commands.push(PaintCommand::Rect(d, c.clone(), radius));
+            }
+        }
+
+        // Border
+        if layout.border.left > 0.0 {
+            let color = match sv.get("border-color") {
+                Some(Value::Color(c)) => c.clone(),
+                _ => Color { r: 180, g: 180, b: 180, a: 255 },
+            };
+            layer.paint_commands.push(PaintCommand::Border(d, layout.border.left, color, radius));
+        }
+
+        // Image
+        if layout.display == DisplayType::Image {
+            if let Some(ref url) = layout.image_url {
+                layer.paint_commands.push(PaintCommand::Image(d, url.clone()));
+            }
+        }
+
+        // Text
+        if let NodeData::Text { ref contents } = layout.style_node.node.data {
+            let font_size = match sv.get("font-size") {
+                Some(Value::Length(v, _)) => *v,
+                _ => 16.0,
+            };
+            let color = match sv.get("color") {
+                Some(Value::Color(c)) => c.clone(),
+                _ => Color { r: 0, g: 0, b: 0, a: 255 },
+            };
+            layer.paint_commands.push(PaintCommand::Text {
+                rect: d,
+                text: contents.borrow().to_string(),
+                font_size,
+                color,
+                clip,
+            });
+        }
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dom;
+    use crate::css;
+    use crate::style;
+    use crate::layout::{build_layout_tree, Rect};
+    use std::collections::HashMap;
+
+    fn viewport() -> LayoutRect {
+        Rect { x: 0.0, y: 0.0, width: 800.0, height: 600.0 }
+    }
+
+    fn build_tree_from_html(html: &str, extra_css: &str) -> LayerTree {
+        let dom = dom::parse_html(html);
+        let stylesheet = css::parse_css(extra_css);
+        let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None);
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout tree should be built");
+        LayerTreeBuilder::build(&layout, viewport())
+    }
+
+    #[test]
+    fn test_root_layer_always_created() {
+        let tree = build_tree_from_html("<div>Hello</div>", "");
+        assert!(!tree.layers.is_empty(), "at least one layer must exist");
+        assert_eq!(tree.layers[0].id, 0, "root layer id must be 0");
+        assert_eq!(tree.layers[0].z_index, 0, "root layer z_index must be 0");
+        assert!((tree.layers[0].opacity - 1.0).abs() < f32::EPSILON, "root opacity must be 1.0");
+    }
+
+    #[test]
+    fn test_no_trigger_plain_div() {
+        // A plain div with no compositing properties should not create extra layers.
+        let tree = build_tree_from_html(
+            r#"<div style="width:100px; height:50px; background-color:red;">Content</div>"#,
+            "",
+        );
+        assert_eq!(tree.layers.len(), 1, "plain div should not create extra layers");
+    }
+
+    #[test]
+    fn test_opacity_trigger_creates_new_layer() {
+        let tree = build_tree_from_html(
+            r#"<div style="width:100px; height:50px; opacity:0.5;">Content</div>"#,
+            "",
+        );
+        // Root layer + at least one layer for the opacity element
+        assert!(tree.layers.len() >= 2, "opacity element should create a new layer");
+        let opacity_layer = tree.layers.iter().find(|l| l.id != 0).expect("should have child layer");
+        assert!(
+            opacity_layer.triggers.iter().any(|t| matches!(t, CompositingTrigger::Opacity(_))),
+            "layer should have Opacity trigger"
+        );
+    }
+
+    #[test]
+    fn test_z_index_trigger_creates_new_layer() {
+        let tree = build_tree_from_html(
+            r#"<div style="width:100px; height:50px; z-index:5;">Content</div>"#,
+            "",
+        );
+        assert!(tree.layers.len() >= 2, "z-index element should create a new layer");
+        let z_layer = tree.layers.iter().find(|l| l.id != 0).expect("should have child layer");
+        assert!(
+            z_layer.triggers.iter().any(|t| *t == CompositingTrigger::ZIndex(5)),
+            "layer should have ZIndex(5) trigger"
+        );
+    }
+
+    #[test]
+    fn test_sorted_layers_by_z_index() {
+        // Create a tree with known z-index values via nested elements
+        let tree = build_tree_from_html(
+            r#"<div>
+                <div style="width:50px;height:50px;z-index:3;">A</div>
+                <div style="width:50px;height:50px;z-index:1;">B</div>
+                <div style="width:50px;height:50px;z-index:2;">C</div>
+            </div>"#,
+            "",
+        );
+        let sorted = tree.sorted_layers();
+        for pair in sorted.windows(2) {
+            assert!(pair[0].z_index <= pair[1].z_index, "layers must be in ascending z-index order");
+        }
+    }
+
+    #[test]
+    fn test_will_change_trigger_creates_new_layer() {
+        let tree = build_tree_from_html(
+            r#"<div style="width:100px;height:50px;will-change:transform;">Content</div>"#,
+            "",
+        );
+        assert!(tree.layers.len() >= 2, "will-change element should create a new layer");
+        let wc_layer = tree.layers.iter().find(|l| l.id != 0).expect("should have child layer");
+        assert!(
+            wc_layer.triggers.iter().any(|t| matches!(t, CompositingTrigger::WillChange(_))),
+            "layer should have WillChange trigger"
+        );
+    }
+}
