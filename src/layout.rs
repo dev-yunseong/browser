@@ -932,6 +932,15 @@ impl<'a> LayoutBox<'a> {
             height: (self.dimensions.height - self.border.top - self.border.bottom - self.padding.top - self.padding.bottom).max(0.0),
         }
     }
+
+    /// Returns the CSS `opacity` value for this box, clamped to [0.0, 1.0].
+    /// Defaults to 1.0 (fully opaque) if the property is absent or unparseable.
+    pub fn get_opacity(&self) -> f32 {
+        match self.style_node.specified_values.get("opacity") {
+            Some(Value::Number(n)) => n.clamp(0.0, 1.0),
+            _ => 1.0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1305,5 +1314,33 @@ mod tests {
         let div = find_element_by_tag(&layout, "div").expect("div not found");
         assert!(div.dimensions.width > 0.0, "fit-content width must be > 0");
         assert!(div.dimensions.width <= 800.0, "fit-content width must be <= container (800px)");
+    }
+
+    // ── get_opacity tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_get_opacity_default() {
+        // An element with no opacity style should return 1.0
+        let html = r#"<div style="width:100px;height:50px;">Content</div>"#;
+        let dom = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None);
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.unwrap();
+        let div = find_element_by_tag(&layout, "div").expect("div not found");
+        assert!((div.get_opacity() - 1.0).abs() < f32::EPSILON, "default opacity must be 1.0");
+    }
+
+    #[test]
+    fn test_get_opacity_value() {
+        // An element with opacity:0.5 should return 0.5
+        let html = r#"<div style="width:100px;height:50px;opacity:0.5;">Content</div>"#;
+        let dom = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None);
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.unwrap();
+        let div = find_element_by_tag(&layout, "div").expect("div not found");
+        assert!((div.get_opacity() - 0.5).abs() < 0.01, "opacity must be 0.5, got {}", div.get_opacity());
     }
 }
