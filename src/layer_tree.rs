@@ -1,5 +1,6 @@
 use crate::layout::{LayoutBox, DisplayType, Rect as LayoutRect};
-use crate::css::{Value, Color, BoxShadow};
+use crate::css::{Value, Color, BoxShadow, TransformOp};
+use crate::matrix::{Matrix3x3, Matrix4x4};
 use markup5ever_rcdom::NodeData;
 
 // ── Paint Commands ────────────────────────────────────────────────────────────
@@ -38,8 +39,8 @@ pub enum CompositingTrigger {
     ZIndex(i32),
     /// `opacity` < 1.0
     Opacity(f32),
-    /// `transform` property with a value other than `none`
-    Transform(String),
+    /// `transform` property with a resolved matrix
+    Transform(Matrix4x4),
     /// `position: fixed`
     ///
     /// NOTE: The layout engine does not produce viewport-relative positions for
@@ -71,6 +72,8 @@ pub struct Layer {
     pub bounds: LayoutRect,
     /// CSS properties that caused this layer to be created.
     pub triggers: Vec<CompositingTrigger>,
+    /// Transformation matrix for this layer.
+    pub transform: Matrix4x4,
     /// Ordered list of drawing operations for this layer.
     pub paint_commands: Vec<PaintCommand>,
     /// IDs of layers created as direct children of this layer during tree build.
@@ -80,13 +83,14 @@ pub struct Layer {
 }
 
 impl Layer {
-    fn new(id: usize, z_index: i32, opacity: f32, bounds: LayoutRect, triggers: Vec<CompositingTrigger>) -> Self {
+    fn new(id: usize, z_index: i32, opacity: f32, bounds: LayoutRect, triggers: Vec<CompositingTrigger>, transform: Matrix4x4) -> Self {
         Self {
             id,
             z_index,
             opacity,
             bounds,
             triggers,
+            transform,
             paint_commands: Vec::new(),
             child_layer_ids: Vec::new(),
         }
@@ -139,7 +143,7 @@ impl LayerTreeBuilder {
     /// `viewport` is the full drawable area and becomes the bounds of the root layer.
     pub fn build(layout: &LayoutBox, viewport: LayoutRect) -> LayerTree {
         let mut tree = LayerTree::new();
-        let root = Layer::new(0, 0, 1.0, viewport, vec![]);
+        let root = Layer::new(0, 0, 1.0, viewport, vec![], Matrix4x4::identity());
         tree.add_layer(root);
         Self::traverse(layout, &mut tree, 0, viewport);
         tree
@@ -159,13 +163,13 @@ impl LayerTreeBuilder {
             return;
         }
 
-        let triggers = Self::detect_triggers(layout);
+        let (triggers, matrix) = Self::detect_triggers(layout);
 
         if !triggers.is_empty() {
             // This box establishes a new compositing layer.
             let new_id = tree.layers.len();
             let opacity = layout.get_opacity();
-            let new_layer = Layer::new(new_id, layout.z_index, opacity, d, triggers);
+            let new_layer = Layer::new(new_id, layout.z_index, opacity, d, triggers, matrix);
             tree.add_layer(new_layer);
 
             // Record parent → child relationship for future compositor use.
@@ -195,9 +199,10 @@ impl LayerTreeBuilder {
     ///
     /// BFC-establishing properties (InlineBlock, Flex, TableCell, overflow:hidden)
     /// are intentionally excluded — BFC != compositing layer per the CSS spec.
-    fn detect_triggers(layout: &LayoutBox) -> Vec<CompositingTrigger> {
+    fn detect_triggers(layout: &LayoutBox) -> (Vec<CompositingTrigger>, Matrix4x4) {
         let mut triggers = Vec::new();
         let sv = &layout.style_node.specified_values;
+        let mut matrix = Matrix4x4::identity();
 
         if layout.z_index != 0 {
             triggers.push(CompositingTrigger::ZIndex(layout.z_index));
@@ -208,10 +213,9 @@ impl LayerTreeBuilder {
             triggers.push(CompositingTrigger::Opacity(opacity));
         }
 
-        if let Some(Value::Keyword(k)) = sv.get("transform") {
-            if k != "none" {
-                triggers.push(CompositingTrigger::Transform(k.clone()));
-            }
+        if let Some(Value::Transform(ops)) = sv.get("transform") {
+            matrix = Self::compute_transform_matrix(ops);
+            triggers.push(CompositingTrigger::Transform(matrix));
         }
 
         match sv.get("position") {
@@ -226,7 +230,21 @@ impl LayerTreeBuilder {
             }
         }
 
-        triggers
+        (triggers, matrix)
+    }
+
+    fn compute_transform_matrix(ops: &[TransformOp]) -> Matrix4x4 {
+        let mut result = Matrix4x4::identity();
+        for op in ops {
+            let m = match op {
+                TransformOp::Translate(x, y) => Matrix4x4::translate(*x, *y, 0.0),
+                TransformOp::Scale(x, y) => Matrix4x4::from_2d(Matrix3x3::scale(*x, *y)),
+                TransformOp::Rotate(rad) => Matrix4x4::from_2d(Matrix3x3::rotate(*rad)),
+                TransformOp::Matrix(a, b, c, d, e, f) => Matrix4x4::from_2d(Matrix3x3([*a, *c, *e, *b, *d, *f, 0.0, 0.0, 1.0])),
+            };
+            result = result.multiply(&m);
+        }
+        result
     }
 
     /// Emit paint commands for a single `LayoutBox` (not its children) into `layer`.
@@ -394,5 +412,28 @@ mod tests {
             wc_layer.triggers.iter().any(|t| matches!(t, CompositingTrigger::WillChange(_))),
             "layer should have WillChange trigger"
         );
+    }
+
+    #[test]
+    fn test_transform_trigger_creates_layer_with_matrix() {
+        let tree = build_tree_from_html(
+            r#"<div style="width:100px; height:50px; transform:translate(50px, 100px);">Content</div>"#,
+            "",
+        );
+        assert!(tree.layers.len() >= 2);
+        let t_layer = tree.layers.iter().find(|l| l.id != 0).expect("child layer");
+        
+        let mut found_transform = false;
+        for trigger in &t_layer.triggers {
+            if let CompositingTrigger::Transform(m) = trigger {
+                found_transform = true;
+                // Matrix translation part should match 50, 100
+                assert_eq!(m.0[3], 50.0);
+                assert_eq!(m.0[7], 100.0);
+            }
+        }
+        assert!(found_transform, "layer must have Transform trigger with matrix");
+        assert_eq!(t_layer.transform.0[3], 50.0);
+        assert_eq!(t_layer.transform.0[7], 100.0);
     }
 }

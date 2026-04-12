@@ -10,6 +10,15 @@ pub enum Value {
     /// Represents `fit-content(N px)` — uses available space up to N px,
     /// but no more than max-content and no less than min-content.
     FitContent(f32),
+    Transform(Vec<TransformOp>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TransformOp {
+    Translate(f32, f32), // px
+    Scale(f32, f32),     // factor
+    Rotate(f32),         // radians
+    Matrix(f32, f32, f32, f32, f32, f32), // matrix(a, b, c, d, e, f)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -438,6 +447,14 @@ pub fn parse_value(val: &str) -> Value {
     if val == "min-content" || val == "max-content" || val == "fit-content" {
         return Value::Keyword(val.to_string());
     }
+
+    // transform: translate(...) rotate(...)
+    if val.contains('(') && (val.starts_with("translate") || val.starts_with("scale") || val.starts_with("rotate") || val.starts_with("matrix")) {
+        let ops = parse_transform_list(val);
+        if !ops.is_empty() {
+            return Value::Transform(ops);
+        }
+    }
     // fit-content(<length>) — e.g. fit-content(300px)
     if val.starts_with("fit-content(") && val.ends_with(')') {
         let inner = &val["fit-content(".len()..val.len() - 1];
@@ -625,4 +642,62 @@ mod tests {
         assert!(parse_color("navy").is_some());
         assert!(parse_color("transparent").is_some());
     }
+}
+
+fn parse_transform_list(val: &str) -> Vec<TransformOp> {
+    let mut ops = Vec::new();
+    let parts = split_respecting_parens(val);
+    for part in parts {
+        let part = part.trim();
+        if part.is_empty() { continue; }
+        
+        if let Some(open) = part.find('(') {
+            let name = &part[..open].to_lowercase();
+            let args_str = &part[open + 1..part.len() - 1];
+            let args: Vec<&str> = args_str.split(',').map(|s| s.trim()).collect();
+            
+            match name.as_str() {
+                "translate" => {
+                    let x = parse_px_or_zero(args.get(0).copied().unwrap_or("0"));
+                    let y = parse_px_or_zero(args.get(1).copied().unwrap_or("0"));
+                    ops.push(TransformOp::Translate(x, y));
+                }
+                "scale" => {
+                    let x = args.get(0).and_then(|s| s.parse::<f32>().ok()).unwrap_or(1.0);
+                    let y = args.get(1).and_then(|s| s.parse::<f32>().ok()).unwrap_or(x);
+                    ops.push(TransformOp::Scale(x, y));
+                }
+                "rotate" => {
+                    let mut rad = 0.0;
+                    if let Some(arg) = args.get(0) {
+                        let arg = arg.trim();
+                        if arg.ends_with("deg") {
+                            let deg = arg.trim_end_matches("deg").parse::<f32>().unwrap_or(0.0);
+                            rad = deg.to_radians();
+                        } else {
+                            rad = arg.parse::<f32>().unwrap_or(0.0);
+                        }
+                    }
+                    ops.push(TransformOp::Rotate(rad));
+                }
+                "matrix" => {
+                    if args.len() == 6 {
+                        let a = args[0].parse().unwrap_or(1.0);
+                        let b = args[1].parse().unwrap_or(0.0);
+                        let c = args[2].parse().unwrap_or(0.0);
+                        let d = args[3].parse().unwrap_or(1.0);
+                        let e = args[4].parse().unwrap_or(0.0);
+                        let f = args[5].parse().unwrap_or(0.0);
+                        ops.push(TransformOp::Matrix(a, b, c, d, e, f));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    ops
+}
+
+fn parse_px_or_zero(s: &str) -> f32 {
+    s.trim_end_matches("px").parse::<f32>().unwrap_or(0.0)
 }
