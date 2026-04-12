@@ -193,14 +193,24 @@ impl BrowserApp {
 
 use std::time::Instant;
 
-fn collect_css_in_order(handle: &markup5ever_rcdom::Handle, base_url: &Url, css_source: &mut String, cache: &mut HashMap<String, String>) {
+#[derive(Clone, Debug)]
+enum CssSource {
+    Inline(String),
+    Remote(String), // URL
+}
+
+fn collect_css_in_order(handle: &markup5ever_rcdom::Handle, base_url: &Url, cache: &HashMap<String, String>, sources: &mut Vec<CssSource>) {
     if let markup5ever_rcdom::NodeData::Element { ref name, ref attrs, .. } = handle.data {
         let tag = name.local.to_string();
         if tag == "style" {
+            let mut inline = String::new();
             for child in handle.children.borrow().iter() {
                 if let markup5ever_rcdom::NodeData::Text { ref contents } = child.data {
-                    css_source.push_str(&contents.borrow());
+                    inline.push_str(&contents.borrow());
                 }
+            }
+            if !inline.is_empty() {
+                sources.push(CssSource::Inline(inline));
             }
         } else if tag == "link" {
             let mut is_stylesheet = false;
@@ -215,28 +225,17 @@ fn collect_css_in_order(handle: &markup5ever_rcdom::Handle, base_url: &Url, css_
             if is_stylesheet {
                 if let Some(h) = href {
                     let abs_url = base_url.join(&h).map(|u| u.to_string()).unwrap_or(h);
-                    
                     if let Some(cached) = cache.get(&abs_url) {
-                        css_source.push_str(cached);
+                        sources.push(CssSource::Inline(cached.clone()));
                     } else {
-                        let start = Instant::now();
-                        if let Ok(resp) = reqwest::blocking::get(&abs_url) {
-                            let elapsed = start.elapsed();
-                            println!("[Perf] Network Fetch (CSS): {} in {:?}", abs_url, elapsed);
-                            if let Ok(text) = resp.text() {
-                                cache.insert(abs_url, text.clone());
-                                css_source.push_str(&text);
-                            }
-                        } else {
-                            println!("[Error] Failed to fetch CSS: {}", abs_url);
-                        }
+                        sources.push(CssSource::Remote(abs_url));
                     }
                 }
             }
         }
     }
     for child in handle.children.borrow().iter() {
-        collect_css_in_order(child, base_url, css_source, cache);
+        collect_css_in_order(child, base_url, cache, sources);
     }
 }
 
@@ -280,17 +279,45 @@ fn process_html_with_cache(
     let stylesheet = if let Some(s) = cached_stylesheet {
         s
     } else {
-        // Collect inline + external CSS in order (C6)
-        let start = Instant::now();
-        let mut css_source = String::new();
-        collect_css_in_order(&dom_tree.document, base_url, &mut css_source, css_cache);
-        let css_collect_elapsed = start.elapsed();
-        println!("  - CSS collect: {:?}", css_collect_elapsed);
+        // 1. Collect all CSS sources (sequential DOM walk)
+        let start_collect = Instant::now();
+        let mut sources = Vec::new();
+        collect_css_in_order(&dom_tree.document, base_url, css_cache, &mut sources);
+        println!("  - CSS collect metadata: {:?}", start_collect.elapsed());
 
-        let start = Instant::now();
-        let s = css::parse_css(&css_source);
-        let css_parse_elapsed = start.elapsed();
-        println!("  - CSS parse: {:?}", css_parse_elapsed);
+        // 2. Fetch all remote sources in parallel
+        use rayon::prelude::*;
+        let fetched_contents: Vec<(String, Option<String>)> = sources.into_par_iter().map(|src| {
+            match src {
+                CssSource::Inline(text) => (text, None),
+                CssSource::Remote(url) => {
+                    let start_fetch = Instant::now();
+                    match reqwest::blocking::get(&url).and_then(|resp| resp.text()) {
+                        Ok(text) => {
+                            println!("[Perf] Parallel Fetch (CSS): {} in {:?}", url, start_fetch.elapsed());
+                            (text, Some(url))
+                        }
+                        Err(e) => {
+                            println!("[Error] Parallel Fetch (CSS): {} failed: {}", url, e);
+                            (String::new(), None)
+                        }
+                    }
+                }
+            }
+        }).collect();
+
+        // 3. Assemble and update cache
+        let mut final_css = String::new();
+        for (content, url_opt) in fetched_contents {
+            final_css.push_str(&content);
+            if let Some(url) = url_opt {
+                css_cache.insert(url, content);
+            }
+        }
+
+        let start_parse = Instant::now();
+        let s = css::parse_css(&final_css);
+        println!("  - CSS parse: {:?}", start_parse.elapsed());
         s
     };
 
@@ -826,4 +853,36 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(BrowserApp::new(cc)))),
     )
+}
+
+#[cfg(test)]
+mod main_tests {
+    use super::*;
+
+    #[test]
+    fn test_collect_css_in_order() {
+        let html = r#"
+            <html>
+                <head>
+                    <style>body { color: red; }</style>
+                    <link rel="stylesheet" href="style.css">
+                </head>
+            </html>
+        "#;
+        let dom = dom::parse_html(html);
+        let base_url = Url::parse("https://example.com").unwrap();
+        let cache = HashMap::new();
+        let mut sources = Vec::new();
+        collect_css_in_order(&dom.document, &base_url, &cache, &mut sources);
+
+        assert_eq!(sources.len(), 2);
+        match &sources[0] {
+            CssSource::Inline(text) => assert!(text.contains("red")),
+            _ => panic!("Expected inline style"),
+        }
+        match &sources[1] {
+            CssSource::Remote(url) => assert_eq!(url, "https://example.com/style.css"),
+            _ => panic!("Expected remote style"),
+        }
+    }
 }
