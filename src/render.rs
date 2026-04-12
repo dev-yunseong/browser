@@ -4,8 +4,42 @@ use crate::layout::{LayoutBox, Rect as LayoutRect};
 use crate::css::Color;
 use crate::layer_tree::{LayerTree, LayerTreeBuilder, PaintCommand, Layer};
 use std::collections::HashMap;
+use std::sync::Mutex;
+use lazy_static::lazy_static;
 
 const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/NanumGothic.ttf");
+
+lazy_static! {
+    static ref TEXTURE_POOL: Mutex<TexturePool> = Mutex::new(TexturePool::new());
+}
+
+/// A pool of reusable `Pixmap` buffers to avoid frequent allocations.
+pub struct TexturePool {
+    pool: HashMap<(u32, u32), Vec<Pixmap>>,
+}
+
+impl TexturePool {
+    pub fn new() -> Self {
+        Self { pool: HashMap::new() }
+    }
+
+    /// Acquire a `Pixmap` of the given size. Returns a new one if none available in pool.
+    pub fn acquire(&mut self, width: u32, height: u32) -> Pixmap {
+        if let Some(list) = self.pool.get_mut(&(width, height)) {
+            if let Some(mut pixmap) = list.pop() {
+                pixmap.fill(tiny_skia::Color::TRANSPARENT);
+                return pixmap;
+            }
+        }
+        Pixmap::new(width, height).expect("Failed to allocate Pixmap")
+    }
+
+    /// Release a `Pixmap` back into the pool for future reuse.
+    pub fn release(&mut self, pixmap: Pixmap) {
+        let size = (pixmap.width(), pixmap.height());
+        self.pool.entry(size).or_insert_with(Vec::new).push(pixmap);
+    }
+}
 
 use std::time::Instant;
 
@@ -29,25 +63,53 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap, image_cache: 
         if layer.opacity <= 0.0 {
             continue;
         }
-        execute_layer(layer, pixmap, image_cache);
+
+        // Use tiles for rendering if available.
+        // For now, we still composite directly to the main pixmap,
+        // but using the pool for intermediate tile rendering is the goal.
+        for tile in &layer.tiles {
+            if tile.paint_commands.is_empty() { continue; }
+            
+            let mut pool = TEXTURE_POOL.lock().unwrap();
+            let mut tile_pixmap = pool.acquire(tile.rect.width as u32, tile.rect.height as u32);
+            
+            // Render tile commands relative to tile origin
+            execute_tile(tile, &mut tile_pixmap, image_cache);
+            
+            // Composite tile to main pixmap
+            pixmap.draw_pixmap(
+                tile.rect.x as i32, 
+                tile.rect.y as i32, 
+                tile_pixmap.as_ref(), 
+                &PixmapPaint::default(), 
+                Transform::identity(), 
+                None
+            );
+            
+            pool.release(tile_pixmap);
+        }
     }
     let render_elapsed = start_render.elapsed();
 
     println!("[Perf] render_layout_tree: Layer gen: {:?}, Actual render: {:?}", layer_gen_elapsed, render_elapsed);
 }
 
-fn execute_layer(layer: &Layer, pixmap: &mut Pixmap, image_cache: &HashMap<String, Vec<u8>>) {
-    for cmd in &layer.paint_commands {
+fn execute_tile(tile: &crate::layer_tree::Tile, pixmap: &mut Pixmap, image_cache: &HashMap<String, Vec<u8>>) {
+    let tx = -tile.rect.x;
+    let ty = -tile.rect.y;
+    let transform = Transform::from_translate(tx, ty);
+
+    for cmd in &tile.paint_commands {
         match cmd {
             PaintCommand::Rect(r, c, radius) => {
                 let mut paint = Paint::default();
                 paint.set_color_rgba8(c.r, c.g, c.b, c.a);
                 if *radius > 0.0 {
                     if let Some(path) = create_rounded_rect_path(*r, *radius) {
-                        pixmap.fill_path(&path, &paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
+                        pixmap.fill_path(&path, &paint, tiny_skia::FillRule::Winding, transform, None);
                     }
                 } else if let Some(tr) = tiny_skia::Rect::from_xywh(r.x, r.y, r.width, r.height) {
-                    pixmap.fill_rect(tr, &paint, Transform::identity(), None);
+                    pixmap.fill_rect(tr, &paint, transform, None);
                 }
             }
             PaintCommand::Border(r, w, c, radius) => {
@@ -57,13 +119,13 @@ fn execute_layer(layer: &Layer, pixmap: &mut Pixmap, image_cache: &HashMap<Strin
                 stroke.width = *w;
                 if *radius > 0.0 {
                     if let Some(path) = create_rounded_rect_path(*r, *radius) {
-                        pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+                        pixmap.stroke_path(&path, &paint, &stroke, transform, None);
                     }
                 } else if let Some(tr) = tiny_skia::Rect::from_xywh(r.x + w/2.0, r.y + w/2.0, (r.width - w).max(0.0), (r.height - w).max(0.0)) {
                     let mut pb = PathBuilder::new();
                     pb.push_rect(tr);
                     if let Some(path) = pb.finish() {
-                        pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+                        pixmap.stroke_path(&path, &paint, &stroke, transform, None);
                     }
                 }
             }
@@ -74,13 +136,20 @@ fn execute_layer(layer: &Layer, pixmap: &mut Pixmap, image_cache: &HashMap<Strin
                         if let Some(mut img_pixmap) = Pixmap::new(rgba.width(), rgba.height()) {
                             img_pixmap.data_mut().copy_from_slice(&rgba);
                             pixmap.draw_pixmap(r.x as i32, r.y as i32, img_pixmap.as_ref(), &PixmapPaint::default(),
-                                Transform::from_scale(r.width / rgba.width() as f32, r.height / rgba.height() as f32), None);
+                                transform.post_scale(r.width / rgba.width() as f32, r.height / rgba.height() as f32), None);
                         }
                     }
                 }
             }
             PaintCommand::Text { rect, text, font_size, color, clip } => {
-                render_text_raw(text.clone(), *rect, *font_size, color, *clip, pixmap);
+                // Adjust text rendering for tile offset
+                let mut adjusted_rect = *rect;
+                adjusted_rect.x += tx;
+                adjusted_rect.y += ty;
+                let mut adjusted_clip = *clip;
+                adjusted_clip.x += tx;
+                adjusted_clip.y += ty;
+                render_text_raw(text.clone(), adjusted_rect, *font_size, color, adjusted_clip, pixmap);
             }
             PaintCommand::Shadow(r, s) => {
                 let mut paint = Paint::default();
@@ -90,7 +159,7 @@ fn execute_layer(layer: &Layer, pixmap: &mut Pixmap, image_cache: &HashMap<Strin
                 let sw = r.width + (s.spread * 2.0);
                 let sh = r.height + (s.spread * 2.0);
                 if let Some(tr) = tiny_skia::Rect::from_xywh(sx, sy, sw, sh) {
-                    pixmap.fill_rect(tr, &paint, Transform::identity(), None);
+                    pixmap.fill_rect(tr, &paint, transform, None);
                 }
             }
         }

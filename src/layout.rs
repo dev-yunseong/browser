@@ -237,6 +237,12 @@ impl Rect {
             height: (y2 - y).max(0.0),
         }
     }
+
+    pub fn intersects(&self, other: &Rect) -> bool {
+        let x_overlap = self.x < other.x + other.width && self.x + self.width > other.x;
+        let y_overlap = self.y < other.y + other.height && self.y + self.height > other.y;
+        x_overlap && y_overlap
+    }
 }
 
 #[derive(Default, Debug, Clone, Copy)]
