@@ -11,6 +11,7 @@ pub mod layout;
 pub mod render;
 pub mod layer_tree;
 pub mod js;
+pub mod matrix;
 
 struct BrowserApp {
     url: String,
