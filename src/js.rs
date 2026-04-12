@@ -3,6 +3,7 @@ use std::collections::{HashMap, VecDeque};
 use markup5ever_rcdom::{NodeData, Handle};
 use std::cell::RefCell;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use url::Url;
 
 thread_local! {
     static MACRO_TASKS: RefCell<VecDeque<Box<dyn FnOnce(&mut Context)>>> = RefCell::new(VecDeque::new());
@@ -18,6 +19,7 @@ thread_local! {
     static NEXT_FETCH_ID: RefCell<u32> = RefCell::new(1);
     static TASK_SENDER: RefCell<Option<Sender<Box<dyn FnOnce(&mut Context) + Send>>>> = RefCell::new(None);
     static FOCUSED_NODE: RefCell<Option<String>> = RefCell::new(None);
+    static CURRENT_ORIGIN: RefCell<Option<Url>> = RefCell::new(None);
 }
 
 pub struct JsRuntime {
@@ -26,8 +28,9 @@ pub struct JsRuntime {
 }
 
 impl JsRuntime {
-    pub fn new(dom: Option<Handle>) -> Self {
+    pub fn new(dom: Option<Handle>, base_url: Option<Url>) -> Self {
         DOM_ROOT.with(|root| *root.borrow_mut() = dom);
+        CURRENT_ORIGIN.with(|origin| *origin.borrow_mut() = base_url);
         let mut context = Context::default();
         let (task_sender, task_receiver) = channel();
         TASK_SENDER.with(|s| *s.borrow_mut() = Some(task_sender));
@@ -157,10 +160,17 @@ impl JsRuntime {
         context.register_global_callable(js_string!("__aura_queue_task"), 1, queue_task).unwrap();
 
         // Register native __aura_fetch
-        let aura_fetch = NativeFunction::from_copy_closure(|_this, args, _context| {
-            let url = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
+        let aura_fetch = NativeFunction::from_copy_closure(|_this, args, context| {
+            let url_str = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
             let resolve = args.get(1).cloned().unwrap_or(JsValue::undefined());
             let reject = args.get(2).cloned().unwrap_or(JsValue::undefined());
+
+            let base_url = CURRENT_ORIGIN.with(|o| (*o.borrow()).clone());
+            let target_url = if let Some(base) = base_url.as_ref() {
+                base.join(&url_str).unwrap_or_else(|_| Url::parse(&url_str).unwrap_or(base.clone()))
+            } else {
+                Url::parse(&url_str).unwrap_or_else(|_| Url::parse("about:blank").unwrap())
+            };
 
             let fetch_id = NEXT_FETCH_ID.with(|id_cell| {
                 let id = *id_cell.borrow();
@@ -173,10 +183,41 @@ impl JsRuntime {
             TASK_SENDER.with(|s_cell| {
                 if let Some(ref sender) = *s_cell.borrow() {
                     let sender_clone = sender.clone();
+                    let origin_str = base_url.as_ref().map(|u| u.origin().unicode_serialization()).unwrap_or_else(|| "null".to_string());
+                    let is_cross_origin = base_url.as_ref().map(|u| u.origin() != target_url.origin()).unwrap_or(false);
+
                     std::thread::spawn(move || {
-                        let res = reqwest::blocking::get(&url);
+                        let client = reqwest::blocking::Client::new();
+                        let mut req = client.get(target_url.clone());
+                        if is_cross_origin {
+                            req = req.header("Origin", origin_str.clone());
+                        }
+
+                        let res = req.send();
                         match res {
                             Ok(response) => {
+                                // CORS Check
+                                if is_cross_origin {
+                                    let acao = response.headers().get("access-control-allow-origin")
+                                        .and_then(|h| h.to_str().ok());
+                                    
+                                    let allowed = match acao {
+                                        Some("*") => true,
+                                        Some(val) if val == origin_str => true,
+                                        _ => false,
+                                    };
+
+                                    if !allowed {
+                                        let _ = sender_clone.send(Box::new(move |ctx| {
+                                            let (_, reject) = FETCH_REGISTRY.with(|reg| reg.borrow_mut().remove(&fetch_id).unwrap());
+                                            if let Some(obj) = reject.as_object() {
+                                                let _ = obj.call(&JsValue::undefined(), &[JsValue::from(js_string!("CORS Error: Origin not allowed"))], ctx);
+                                            }
+                                        }));
+                                        return;
+                                    }
+                                }
+
                                 let body = response.text().unwrap_or_default();
                                 let _ = sender_clone.send(Box::new(move |ctx| {
                                     let (resolve, _) = FETCH_REGISTRY.with(|reg| reg.borrow_mut().remove(&fetch_id).unwrap());

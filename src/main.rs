@@ -98,7 +98,7 @@ impl BrowserApp {
             image_promises: HashMap::new(),
             last_body: String::new(),
             last_base_url: None,
-            js_runtime: js::JsRuntime::new(None),
+            js_runtime: js::JsRuntime::new(None, None),
             js_style_overrides: HashMap::new(),
             is_loading: false,
             start_time: std::time::Instant::now(),
@@ -135,7 +135,8 @@ impl BrowserApp {
         self.error = None;
         self.image_promises.clear();
         self.js_style_overrides.clear();
-        self.js_runtime = js::JsRuntime::new(None);
+        let base_url = Url::parse(&url).ok();
+        self.js_runtime = js::JsRuntime::new(None, base_url);
         self.is_loading = true;
         self.hovered_id = None;
         self.last_stylesheet = None; // Reset stylesheet on new URL
@@ -625,7 +626,7 @@ impl eframe::App for BrowserApp {
 
                             // Execute page scripts and apply any JS-driven style changes
                             let dom = dom::parse_html(&body);
-                            self.js_runtime = js::JsRuntime::new(Some(dom.document.clone()));
+                            self.js_runtime = js::JsRuntime::new(Some(dom.document.clone()), self.last_base_url.clone());
                             let scripts = js::extract_scripts_from_dom(&dom.document);
                             for script in scripts {
                                 self.js_runtime.execute(&script);
