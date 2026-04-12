@@ -58,7 +58,7 @@ fn flatten_dom(handle: &Handle, arena: &mut Vec<NodeDataSend>, parent_idx: Optio
     idx
 }
 
-fn matches_selector_arena(selector: &Selector, idx: usize, arena: &[NodeDataSend], hovered_id: Option<&str>) -> bool {
+fn matches_selector_arena(selector: &Selector, idx: usize, arena: &[NodeDataSend], hovered_id: Option<&str>, focused_id: Option<&str>) -> bool {
     let node = &arena[idx];
     
     let has_constraint = selector.tag.is_some() || selector.id.is_some() || !selector.class.is_empty() || !selector.attributes.is_empty() || selector.pseudo_class.is_some();
@@ -76,6 +76,8 @@ fn matches_selector_arena(selector: &Selector, idx: usize, arena: &[NodeDataSend
     if let Some(ref pseudo) = selector.pseudo_class {
         if pseudo == "hover" {
             if Some(node.id.as_deref()) != Some(hovered_id) || node.id.is_none() { return false; }
+        } else if pseudo == "focus" {
+            if Some(node.id.as_deref()) != Some(focused_id) || node.id.is_none() { return false; }
         } else { return false; }
     }
     for attr_sel in &selector.attributes {
@@ -98,7 +100,7 @@ fn matches_selector_arena(selector: &Selector, idx: usize, arena: &[NodeDataSend
                 let mut current = node.parent_idx;
                 let mut matched = false;
                 while let Some(p_idx) = current {
-                    if matches_selector_arena(ancestor_sel, p_idx, arena, hovered_id) {
+                    if matches_selector_arena(ancestor_sel, p_idx, arena, hovered_id, focused_id) {
                         matched = true; break;
                     }
                     current = arena[p_idx].parent_idx;
@@ -107,7 +109,7 @@ fn matches_selector_arena(selector: &Selector, idx: usize, arena: &[NodeDataSend
             }
             Combinator::Child => {
                 if let Some(p_idx) = node.parent_idx {
-                    if !matches_selector_arena(ancestor_sel, p_idx, arena, hovered_id) { return false; }
+                    if !matches_selector_arena(ancestor_sel, p_idx, arena, hovered_id, focused_id) { return false; }
                 } else { return false; }
             }
             Combinator::NextSibling => {
@@ -117,7 +119,7 @@ fn matches_selector_arena(selector: &Selector, idx: usize, arena: &[NodeDataSend
                     for &sib_idx in p_node.children_idx.iter().rev() {
                         if sib_idx >= idx { continue; }
                         if arena[sib_idx].is_element {
-                            if matches_selector_arena(ancestor_sel, sib_idx, arena, hovered_id) { found = true; }
+                            if matches_selector_arena(ancestor_sel, sib_idx, arena, hovered_id, focused_id) { found = true; }
                             break;
                         }
                     }
@@ -131,7 +133,7 @@ fn matches_selector_arena(selector: &Selector, idx: usize, arena: &[NodeDataSend
                     for &sib_idx in &p_node.children_idx {
                         if sib_idx >= idx { break; }
                         if arena[sib_idx].is_element {
-                            if matches_selector_arena(ancestor_sel, sib_idx, arena, hovered_id) {
+                            if matches_selector_arena(ancestor_sel, sib_idx, arena, hovered_id, focused_id) {
                                 matched = true; break;
                             }
                         }
@@ -174,6 +176,7 @@ pub fn build_style_tree(
     parent_style: Option<&PropertyMap>,
     js_overrides: &HashMap<String, HashMap<String, String>>,
     hovered_id: Option<&str>,
+    focused_id: Option<&str>,
 ) -> StyledNode {
     let mut arena = Vec::new();
     flatten_dom(root, &mut arena, None);
@@ -188,7 +191,7 @@ pub fn build_style_tree(
         for rule in stylesheet.all_rules() {
             let mut highest = None;
             for sel in &rule.selectors {
-                if matches_selector_arena(sel, idx, &arena, hovered_id) {
+                if matches_selector_arena(sel, idx, &arena, hovered_id, focused_id) {
                     let spec = sel.specificity();
                     if highest.is_none() || spec > highest.unwrap() { highest = Some(spec); }
                 }
@@ -457,5 +460,25 @@ mod tests {
         assert!(map.contains_key("color"));
         assert!(map.contains_key("font-size"));
         assert!(map.contains_key("background-color"));
+    }
+
+    #[test]
+    fn test_focus_pseudo_class_matching() {
+        let mut arena = Vec::new();
+        arena.push(NodeDataSend {
+            tag: "div".to_string(),
+            id: Some("target".to_string()),
+            classes: Vec::new(),
+            attrs: Vec::new(),
+            is_element: true,
+            parent_idx: None,
+            children_idx: Vec::new(),
+        });
+
+        let mut selector = crate::css::Selector::default();
+        selector.pseudo_class = Some("focus".to_string());
+
+        assert!(!matches_selector_arena(&selector, 0, &arena, None, None));
+        assert!(matches_selector_arena(&selector, 0, &arena, None, Some("target")));
     }
 }

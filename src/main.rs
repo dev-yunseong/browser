@@ -25,8 +25,11 @@ struct BrowserApp {
     current_form_controls: Vec<(layout::Rect, String)>,
     current_event_handlers: Vec<(layout::Rect, String)>,
     current_element_ids: Vec<(layout::Rect, String)>,
+    current_focusable_elements: Vec<(layout::Rect, String)>,
     hovered_id: Option<String>,
-    form_values: HashMap<usize, String>,
+    focused_id: Option<String>,
+    form_values: HashMap<String, String>,
+
     image_cache: HashMap<String, Vec<u8>>,
     css_cache: HashMap<String, String>,
     last_stylesheet: Option<css::Stylesheet>,
@@ -48,6 +51,7 @@ struct StaticPageData {
     form_controls: Vec<(layout::Rect, String)>,
     event_handlers: Vec<(layout::Rect, String)>,
     element_ids: Vec<(layout::Rect, String)>,
+    focusable_elements: Vec<(layout::Rect, String)>,
     image_urls: Vec<String>,
     body: String,
     base_url: Url,
@@ -84,7 +88,9 @@ impl BrowserApp {
             current_form_controls: vec![],
             current_event_handlers: vec![],
             current_element_ids: vec![],
+            current_focusable_elements: vec![],
             hovered_id: None,
+            focused_id: None,
             form_values: HashMap::new(),
             image_cache: HashMap::new(),
             css_cache: HashMap::new(),
@@ -137,7 +143,7 @@ impl BrowserApp {
         
         let mut cache = self.css_cache.clone();
         self.content_promise = Some(Promise::spawn_thread("fetcher", move || {
-            fetch_and_process(&url, &mut cache, &HashMap::new(), None, width)
+            fetch_and_process(&url, &mut cache, &HashMap::new(), None, None, width)
                 .map_err(|e| e.to_string())
         }));
     }
@@ -151,10 +157,11 @@ impl BrowserApp {
             let stylesheet = self.last_stylesheet.clone();
             let overrides = self.js_style_overrides.clone();
             let hovered_id = self.hovered_id.clone();
+            let focused_id = self.focused_id.clone();
 
             // Use re_render_promise instead of join() to avoid UI blocking
             self.re_render_promise = Some(Promise::spawn_thread("re_render", move || {
-                process_html_with_cache(&body, &base_url, &cache, &mut css_cache, stylesheet, &overrides, hovered_id.as_deref(), width)
+                process_html_with_cache(&body, &base_url, &cache, &mut css_cache, stylesheet, &overrides, hovered_id.as_deref(), focused_id.as_deref(), width)
                     .map_err(|e| e.to_string())
             }));
             
@@ -173,6 +180,7 @@ impl BrowserApp {
         self.current_form_controls = page_data.form_controls;
         self.current_event_handlers = page_data.event_handlers;
         self.current_element_ids = page_data.element_ids;
+        self.current_focusable_elements = page_data.focusable_elements;
     }
 }
 
@@ -230,12 +238,13 @@ fn fetch_and_process(
     css_cache: &mut HashMap<String, String>,
     js_overrides: &HashMap<String, HashMap<String, String>>,
     hovered_id: Option<&str>,
+    focused_id: Option<&str>,
     width: f32,
 ) -> Result<(StaticPageData, css::Stylesheet), Box<dyn Error + Send + Sync>> {
     let response = reqwest::blocking::get(url_str)?;
     let body = response.text()?;
     let base_url = Url::parse(url_str)?;
-    process_html_with_cache(&body, &base_url, &HashMap::new(), css_cache, None, js_overrides, hovered_id, width)
+    process_html_with_cache(&body, &base_url, &HashMap::new(), css_cache, None, js_overrides, hovered_id, focused_id, width)
 }
 
 fn process_html_with_cache(
@@ -246,6 +255,7 @@ fn process_html_with_cache(
     cached_stylesheet: Option<css::Stylesheet>,
     js_overrides: &HashMap<String, HashMap<String, String>>,
     hovered_id: Option<&str>,
+    focused_id: Option<&str>,
     width: f32,
 ) -> Result<(StaticPageData, css::Stylesheet), Box<dyn Error + Send + Sync>> {
     let start_total = Instant::now();
@@ -273,12 +283,13 @@ fn process_html_with_cache(
     };
 
     let start = Instant::now();
-    let style_tree = style::build_style_tree(&dom_tree.document, &stylesheet, None, js_overrides, hovered_id);
+    let style_tree = style::build_style_tree(&dom_tree.document, &stylesheet, None, js_overrides, hovered_id, focused_id);
     let style_elapsed = start.elapsed();
 
     let start = Instant::now();
-    let (layout_tree, _, final_y) =
+    let (layout_tree_opt, _, final_y) =
         layout::build_layout_tree(&style_tree, 0.0, 0.0, 0.0, width, width, 768.0);
+    let layout_tree = layout_tree_opt.ok_or("Failed to build layout tree")?;
     let layout_elapsed = start.elapsed();
 
     let height = (final_y.ceil() as u32).clamp(600, 16384);
@@ -294,38 +305,37 @@ fn process_html_with_cache(
     let mut form_controls = Vec::new();
     let mut event_handlers = Vec::new();
     let mut element_ids = Vec::new();
-    let mut image_urls = Vec::new();
+    let mut focusable_elements = Vec::new();
+    let image_urls: Vec<String>;
 
-    if let Some(ref root) = layout_tree {
-        render::render_layout_tree(root, &mut pixmap, image_cache);
+    render::render_layout_tree(&layout_tree, &mut pixmap, image_cache);
 
-        root.collect_links(&mut links);
-        
-        root.collect_event_handlers(&mut event_handlers);
+    layout_tree.collect_links(&mut links);
+    layout_tree.collect_event_handlers(&mut event_handlers);
+    layout_tree.collect_element_ids(&mut element_ids);
+    layout_tree.collect_focusable_elements(&mut focusable_elements);
+    
+    let mut controls_with_nodes = Vec::new();
+    layout_tree.collect_form_controls(&mut controls_with_nodes);
+    
+    let mut image_urls_raw = Vec::new();
+    layout_tree.collect_images(&mut image_urls_raw);
+    image_urls = image_urls_raw.into_iter().map(|(_, url)| {
+        base_url.join(&url).map(|u| u.to_string()).unwrap_or(url)
+    }).collect();
 
-        root.collect_element_ids(&mut element_ids);
-        
-        let mut controls_with_nodes = Vec::new();
-        root.collect_form_controls(&mut controls_with_nodes);
-        
-        let mut image_urls_raw = Vec::new();
-        root.collect_images(&mut image_urls_raw);
-        image_urls = image_urls_raw.into_iter().map(|(_, url)| {
-            base_url.join(&url).map(|u| u.to_string()).unwrap_or(url)
-        }).collect();
-
-        for (rect, node) in controls_with_nodes {
-            let mut val = String::new();
-            if let markup5ever_rcdom::NodeData::Element { ref attrs, .. } = node.node.data {
-                for attr in attrs.borrow().iter() {
-                    if attr.name.local.to_string() == "value" {
-                        val = attr.value.to_string();
-                    }
+    for (rect, node) in controls_with_nodes {
+        let mut val = String::new();
+        if let markup5ever_rcdom::NodeData::Element { ref attrs, .. } = node.node.data {
+            for attr in attrs.borrow().iter() {
+                if attr.name.local.to_string() == "value" {
+                    val = attr.value.to_string();
                 }
             }
-            form_controls.push((rect, val));
         }
+        form_controls.push((rect, val));
     }
+
     let render_elapsed = start.elapsed();
 
     let start = Instant::now();
@@ -354,6 +364,7 @@ fn process_html_with_cache(
         form_controls,
         event_handlers,
         element_ids,
+        focusable_elements,
         image_urls,
         body: body.to_string(),
         base_url: base_url.clone(),
@@ -362,8 +373,42 @@ fn process_html_with_cache(
 
 impl eframe::App for BrowserApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Handle Tab navigation
+        if ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
+            let focusables = &self.current_focusable_elements;
+            if !focusables.is_empty() {
+                let current_index = self.focused_id.as_ref()
+                    .and_then(|id| focusables.iter().position(|(_, fid)| fid == id));
+                
+                let next_index = if ctx.input(|i| i.modifiers.shift) {
+                    // Shift+Tab: Backward
+                    match current_index {
+                        Some(i) if i > 0 => i - 1,
+                        _ => focusables.len() - 1,
+                    }
+                } else {
+                    // Tab: Forward
+                    match current_index {
+                        Some(i) if i + 1 < focusables.len() => i + 1,
+                        _ => 0,
+                    }
+                };
+                
+                self.focused_id = Some(focusables[next_index].1.clone());
+                self.trigger_re_render(ctx, 800.0);
+            }
+        }
+
         // Poll JS event loop tasks
         let mut needs_re_render = self.js_runtime.poll_tasks();
+
+        // Sync focus from JS
+        if let Some(js_focused_id) = self.js_runtime.get_focused_node_id() {
+            if self.focused_id.as_deref() != Some(&js_focused_id) {
+                self.focused_id = Some(js_focused_id);
+                needs_re_render = true;
+            }
+        }
 
         // Run animation frames
         let timestamp = self.start_time.elapsed().as_secs_f64() * 1000.0;
@@ -503,6 +548,7 @@ impl eframe::App for BrowserApp {
                                 form_controls: page_data.form_controls.clone(),
                                 event_handlers: page_data.event_handlers.clone(),
                                 element_ids: page_data.element_ids.clone(),
+                                focusable_elements: page_data.focusable_elements.clone(),
                                 image_urls: page_data.image_urls.clone(),
                                 body: page_data.body.clone(),
                                 base_url: page_data.base_url.clone(),
@@ -542,6 +588,7 @@ impl eframe::App for BrowserApp {
                                 form_controls: page_data.form_controls.clone(),
                                 event_handlers: page_data.event_handlers.clone(),
                                 element_ids: page_data.element_ids.clone(),
+                                focusable_elements: page_data.focusable_elements.clone(),
                                 image_urls: image_urls.clone(),
                                 body: body.clone(),
                                 base_url: base_url.clone(),
@@ -556,7 +603,7 @@ impl eframe::App for BrowserApp {
                             self.last_base_url = Some(base_url.clone());
                             self.form_values.clear();
                             for (i, (_, val)) in page.form_controls.iter().enumerate() {
-                                self.form_values.insert(i, val.clone());
+                                self.form_values.insert(i.to_string(), val.clone());
                             }
                             self.apply_page_data(page, ctx);
 
@@ -640,7 +687,7 @@ impl eframe::App for BrowserApp {
 
                         // Overlay interactive form controls
                         for (i, (l_rect, _)) in self.current_form_controls.iter().enumerate() {
-                            let val = self.form_values.entry(i).or_default();
+                            let val = self.form_values.entry(i.to_string()).or_default();
                             let screen_rect = egui::Rect::from_min_size(
                                 rect.min + egui::vec2(l_rect.x, l_rect.y),
                                 egui::vec2(l_rect.width, l_rect.height),
@@ -658,6 +705,18 @@ impl eframe::App for BrowserApp {
                                     if hit(rel, l_rect) {
                                         self.js_runtime.trigger_event(id, "click");
                                     }
+                                }
+
+                                // Update focused_id on click
+                                let mut new_focus = None;
+                                for (l_rect, id) in &self.current_focusable_elements {
+                                    if hit(rel, l_rect) {
+                                        new_focus = Some(id.clone());
+                                    }
+                                }
+                                if new_focus != self.focused_id {
+                                    self.focused_id = new_focus;
+                                    self.trigger_re_render(ctx, ui.available_width());
                                 }
 
                                 for (l_rect, script) in &self.current_event_handlers {

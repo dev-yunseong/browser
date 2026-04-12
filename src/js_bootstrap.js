@@ -12,10 +12,10 @@ function __aura_set_style(id, prop, value) {
 // -- Node Registry (Ensures stable objects for events) -----------------------
 var __node_registry = new Map();
 
-function __get_or_create_node(id, tag) {
+function __get_or_create_node(id, tag, string_id) {
     if (!id) return null;
     if (__node_registry.has(id)) return __node_registry.get(id);
-    let node = tag ? new Element(id, tag) : new Node(id);
+    let node = tag ? new Element(id, tag, string_id) : new Node(id);
     __node_registry.set(id, node);
     return node;
 }
@@ -91,9 +91,10 @@ class Node extends EventTarget {
 }
 
 class Element extends Node {
-    constructor(id, tag) {
+    constructor(id, tag, string_id) {
         super(id);
         this.tagName = (tag || '').toUpperCase();
+        this.id = string_id || '';
         this.style = new Proxy({ _id: id }, {
             set: (target, prop, value) => {
                 let kebab = prop.replace(/([A-Z])/g, "-$1").toLowerCase();
@@ -106,13 +107,17 @@ class Element extends Node {
     setAttribute(name, value) {
         __aura_set_attribute(this._id, name, String(value));
     }
+    focus() {
+        document.activeElement = this;
+        __aura_set_focus(this.id);
+    }
 }
 
 // -- document -----------------------------------------------------------------
 var document = {
     getElementById: function(id) {
         let nativeId = __aura_get_element_by_id(id);
-        return nativeId ? __get_or_create_node(nativeId) : null;
+        return nativeId ? __get_or_create_node(nativeId, null, id) : null;
     },
     createElement: function(tag) {
         let nativeId = __aura_create_element(tag);
