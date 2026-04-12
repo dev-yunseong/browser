@@ -4,6 +4,165 @@ use std::collections::HashMap;
 use markup5ever_rcdom::NodeData;
 use ab_glyph::{Font, FontRef, PxScale};
 
+// ── Intrinsic sizing helpers ──────────────────────────────────────────────────
+
+/// Measure the width of `text` rendered at `font_size` px.
+/// When `wrap_width` is `f32::INFINITY`, no wrapping occurs (max-content).
+/// When finite, line-breaks at word boundaries (min-content: longest word).
+fn measure_text_width(text: &str, font_size: f32, wrap_width: f32) -> f32 {
+    let trimmed = text.trim();
+    if trimmed.is_empty() { return 0.0; }
+    let font = FontRef::try_from_slice(FONT_DATA).unwrap();
+    let scale = PxScale::from(font_size.max(1.0));
+    let units = font.units_per_em().unwrap_or(1000.0) as f32;
+    let space_w = font.h_advance_unscaled(font.glyph_id(' ')) * (scale.x / units);
+
+    let mut max_w: f32 = 0.0;
+    let mut line_w: f32 = 0.0;
+
+    for word in trimmed.split_whitespace() {
+        let mut word_w = 0.0f32;
+        for c in word.chars() {
+            word_w += font.h_advance_unscaled(font.glyph_id(c)) * (scale.x / units);
+        }
+        if wrap_width.is_finite() && line_w + word_w > wrap_width && line_w > 0.0 {
+            max_w = max_w.max(line_w);
+            line_w = 0.0;
+        }
+        if line_w > 0.0 { line_w += space_w; }
+        line_w += word_w;
+    }
+    max_w.max(line_w)
+}
+
+/// Read a raw `px` value from `specified_values` for a single property.
+/// Returns 0.0 for anything that isn't an explicit pixel length.
+fn read_px_direct(sn: &StyledNode, prop: &str) -> f32 {
+    match sn.specified_values.get(prop) {
+        Some(Value::Length(v, Unit::Px)) => *v,
+        _ => 0.0,
+    }
+}
+
+/// Horizontal padding + border contribution for intrinsic sizing (px only).
+fn horiz_padding_border(sn: &StyledNode) -> f32 {
+    read_px_direct(sn, "padding-left")
+        + read_px_direct(sn, "padding-right")
+        + read_px_direct(sn, "border-width") * 2.0
+}
+
+/// Compute the **max-content** width of a `StyledNode` subtree.
+///
+/// - Text nodes: total width with no line wrapping.
+/// - Images: explicit `width` attribute/style, or 100 px default.
+/// - `display: none`: 0.
+/// - Block elements: max over children's max-content widths.
+/// - Inline/inline-block elements: sum of children's max-content widths on one line.
+pub fn compute_max_content_width(sn: &StyledNode, vw: f32, vh: f32) -> f32 {
+    // display: none → 0
+    if is_none_display(sn) { return 0.0; }
+
+    // Text node
+    if let NodeData::Text { ref contents } = sn.node.data {
+        let font_size = match sn.specified_values.get("font-size") {
+            Some(Value::Length(v, Unit::Px)) => *v,
+            _ => 16.0,
+        };
+        return measure_text_width(&contents.borrow(), font_size, f32::INFINITY);
+    }
+
+    let disp = get_display_type(sn);
+
+    // Replaced element (image): use explicit size or 100 px
+    if disp == DisplayType::Image {
+        let w = read_px_direct(sn, "width");
+        return if w > 0.0 { w } else { 100.0 };
+    }
+
+    if should_skip(sn) { return 0.0; }
+
+    let pad_border = horiz_padding_border(sn);
+
+    // Check if an explicit pixel width was set — honour it directly.
+    if let Some(Value::Length(v, Unit::Px)) = sn.specified_values.get("width") {
+        return *v;
+    }
+    // Percentage / vw / vh widths cannot be resolved without a container; fall through
+    // to content-based sizing (same as the default case below).
+
+    // Walk children
+    let mut inline_run_width: f32 = 0.0;
+    let mut max_w: f32 = 0.0;
+
+    for child in &sn.children {
+        if should_skip(child) { continue; }
+        let child_disp = get_display_type(child);
+        let child_max = compute_max_content_width(child, vw, vh);
+
+        if is_block_level(child_disp) {
+            // Flush inline run
+            max_w = max_w.max(inline_run_width);
+            inline_run_width = 0.0;
+            // Block children are independent
+            max_w = max_w.max(child_max);
+        } else {
+            // Inline children accumulate on the same "line"
+            inline_run_width += child_max;
+        }
+    }
+    max_w = max_w.max(inline_run_width);
+
+    max_w + pad_border
+}
+
+/// Compute the **min-content** width of a `StyledNode` subtree.
+///
+/// - Text nodes: width of the longest single unbreakable word.
+/// - Images: explicit `width` attribute/style, or 100 px default.
+/// - `display: none`: 0.
+/// - All elements: max over children's min-content widths (wrapping can isolate any child).
+pub fn compute_min_content_width(sn: &StyledNode, vw: f32, vh: f32) -> f32 {
+    if is_none_display(sn) { return 0.0; }
+
+    if let NodeData::Text { ref contents } = sn.node.data {
+        let font_size = match sn.specified_values.get("font-size") {
+            Some(Value::Length(v, Unit::Px)) => *v,
+            _ => 16.0,
+        };
+        // min-content = longest word: measure each word individually
+        let text = contents.borrow();
+        let trimmed = text.trim();
+        if trimmed.is_empty() { return 0.0; }
+        return trimmed.split_whitespace()
+            .map(|word| measure_text_width(word, font_size, f32::INFINITY))
+            .fold(0.0f32, f32::max);
+    }
+
+    let disp = get_display_type(sn);
+
+    if disp == DisplayType::Image {
+        let w = read_px_direct(sn, "width");
+        return if w > 0.0 { w } else { 100.0 };
+    }
+
+    if should_skip(sn) { return 0.0; }
+
+    let pad_border = horiz_padding_border(sn);
+
+    // Honour explicit pixel widths
+    if let Some(Value::Length(v, Unit::Px)) = sn.specified_values.get("width") {
+        return *v;
+    }
+
+    // min-content = max over all descendants' min-content (any child can be its own line)
+    let child_min = sn.children.iter()
+        .filter(|c| !should_skip(c))
+        .map(|c| compute_min_content_width(c, vw, vh))
+        .fold(0.0f32, f32::max);
+
+    child_min + pad_border
+}
+
 // ── Float layout types ────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -210,6 +369,27 @@ impl<'a> LayoutBox<'a> {
             Some(Value::Length(v, Unit::Percent)) => container_width * (v / 100.0),
             Some(Value::Length(v, Unit::Vw)) => vw * (v / 100.0),
             Some(Value::Length(v, Unit::Vh)) => vh * (v / 100.0),
+            // CSS Intrinsic & Extrinsic Sizing Level 3
+            Some(Value::Keyword(k)) if k == "min-content" => {
+                compute_min_content_width(self.style_node, vw, vh)
+            }
+            Some(Value::Keyword(k)) if k == "max-content" => {
+                compute_max_content_width(self.style_node, vw, vh)
+            }
+            Some(Value::Keyword(k)) if k == "fit-content" => {
+                let max_c = compute_max_content_width(self.style_node, vw, vh);
+                let min_c = compute_min_content_width(self.style_node, vw, vh);
+                // fit-content without argument: min(max-content, max(min-content, available))
+                max_c.min(container_width).max(min_c)
+            }
+            Some(Value::FitContent(limit)) => {
+                let limit = *limit;
+                let max_c = compute_max_content_width(self.style_node, vw, vh);
+                let min_c = compute_min_content_width(self.style_node, vw, vh);
+                // fit-content(N): min(max-content, max(min-content, min(available, N)))
+                let available = container_width.min(limit);
+                max_c.min(available).max(min_c)
+            }
             _ => if is_block { (container_width - self.margin.left - self.margin.right).max(0.0) } else { 0.0 },
         };
 
@@ -246,6 +426,12 @@ impl<'a> LayoutBox<'a> {
             Some(Value::Length(v, Unit::Px)) => *v,
             Some(Value::Length(v, Unit::Vw)) => vw * (v / 100.0),
             Some(Value::Length(v, Unit::Vh)) => vh * (v / 100.0),
+            // CSS Intrinsic & Extrinsic Sizing Level 3 — height axis
+            // For block containers, min-content and max-content height are both
+            // equivalent to the natural auto height (content-derived). Return 0.0
+            // so the existing content-height calculation takes over.
+            Some(Value::Keyword(k)) if k == "min-content" || k == "max-content" || k == "fit-content" => 0.0,
+            Some(Value::FitContent(_)) => 0.0,
             _ => 0.0,
         };
 
@@ -992,5 +1178,132 @@ mod tests {
         assert_eq!(sibling.dimensions.width, 700.0,
             "sibling block should be narrowed to 700px by the 100px left float, got {}",
             sibling.dimensions.width);
+    }
+
+    // ── Intrinsic sizing tests ────────────────────────────────────────────────
+
+    /// Helper: navigate into the layout tree and find the first element whose
+    /// local tag name matches `tag`.
+    fn find_element_by_tag<'a>(b: &'a LayoutBox<'a>, tag: &str) -> Option<&'a LayoutBox<'a>> {
+        if let NodeData::Element { ref name, .. } = b.style_node.node.data {
+            if name.local.to_string() == tag { return Some(b); }
+        }
+        for c in &b.children {
+            if let Some(found) = find_element_by_tag(c, tag) { return Some(found); }
+        }
+        None
+    }
+
+    /// `parse_value("fit-content(200px)")` must return `Value::FitContent(200.0)`.
+    #[test]
+    fn test_css_fit_content_parse() {
+        let v = css::parse_value("fit-content(200px)");
+        assert_eq!(v, css::Value::FitContent(200.0));
+    }
+
+    /// `parse_value("min-content")` must return a Keyword.
+    #[test]
+    fn test_css_min_max_content_parse() {
+        assert_eq!(css::parse_value("min-content"), css::Value::Keyword("min-content".to_string()));
+        assert_eq!(css::parse_value("max-content"), css::Value::Keyword("max-content".to_string()));
+    }
+
+    /// `compute_max_content_width` on "Hello World" must be wider than `compute_min_content_width`.
+    #[test]
+    fn test_intrinsic_width_ordering() {
+        let html = r#"<span>Hello World</span>"#;
+        let dom_tree = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None);
+
+        // Locate the <span> StyledNode
+        fn find_span_node<'a>(sn: &'a crate::style::StyledNode) -> Option<&'a crate::style::StyledNode> {
+            if let NodeData::Element { ref name, .. } = sn.node.data {
+                if name.local.to_string() == "span" { return Some(sn); }
+            }
+            for c in &sn.children { if let Some(f) = find_span_node(c) { return Some(f); } }
+            None
+        }
+        let span_node = find_span_node(&style_tree).expect("span not found");
+
+        let min_c = compute_min_content_width(span_node, 800.0, 600.0);
+        let max_c = compute_max_content_width(span_node, 800.0, 600.0);
+
+        assert!(min_c > 0.0, "min-content must be > 0, got {min_c}");
+        assert!(max_c > min_c,
+            "max-content ({max_c}) must be wider than min-content ({min_c}) for multi-word text");
+    }
+
+    /// `width: min-content` — the div must not span the full 800 px container.
+    #[test]
+    fn test_width_min_content_layout() {
+        let html = r#"<div style="width: min-content;">Hello World</div>"#;
+        let dom_tree = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None);
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.unwrap();
+
+        let div = find_element_by_tag(&layout, "div").expect("div not found");
+        assert!(div.dimensions.width > 0.0, "div width must be > 0");
+        assert!(div.dimensions.width < 800.0,
+            "div with width:min-content must be < 800px (container), got {}",
+            div.dimensions.width);
+    }
+
+    /// `width: max-content` — the div must be wider than a min-content div.
+    #[test]
+    fn test_width_max_content_layout() {
+        // min-content case
+        let dom_min = dom::parse_html(r#"<div style="width: min-content;">Hello World</div>"#);
+        let ss_min = css::parse_css("");
+        let st_min = style::build_style_tree(&dom_min.document, &ss_min, None, &HashMap::new(), None);
+        let (lo_min, _, _) = build_layout_tree(&st_min, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout_min = lo_min.unwrap();
+        let div_min_w = find_element_by_tag(&layout_min, "div").unwrap().dimensions.width;
+
+        // max-content case
+        let dom_max = dom::parse_html(r#"<div style="width: max-content;">Hello World</div>"#);
+        let ss_max = css::parse_css("");
+        let st_max = style::build_style_tree(&dom_max.document, &ss_max, None, &HashMap::new(), None);
+        let (lo_max, _, _) = build_layout_tree(&st_max, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout_max = lo_max.unwrap();
+        let div_max_w = find_element_by_tag(&layout_max, "div").unwrap().dimensions.width;
+
+        assert!(div_max_w >= div_min_w,
+            "max-content width ({div_max_w}) must be >= min-content width ({div_min_w})");
+        assert!(div_max_w < 800.0,
+            "max-content width ({div_max_w}) must be < container (800px) for short text");
+    }
+
+    /// `width: fit-content(150px)` — clamps to at most 150 px.
+    #[test]
+    fn test_fit_content_with_limit() {
+        // "Hello World" max-content is well under 800px but we clamp to 150px
+        let html = r#"<div style="width: fit-content(150px);">Hello World this is some longer text for the test</div>"#;
+        let dom_tree = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None);
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.unwrap();
+        let div = find_element_by_tag(&layout, "div").expect("div not found");
+        assert!(div.dimensions.width <= 150.0,
+            "fit-content(150px) must be <= 150px, got {}", div.dimensions.width);
+        assert!(div.dimensions.width > 0.0,
+            "fit-content(150px) must be > 0, got {}", div.dimensions.width);
+    }
+
+    /// `width: fit-content` (no argument) — shrinks to content but stays <= container.
+    #[test]
+    fn test_fit_content_no_arg() {
+        let html = r#"<div style="width: fit-content;">Hello</div>"#;
+        let dom_tree = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None);
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.unwrap();
+        let div = find_element_by_tag(&layout, "div").expect("div not found");
+        assert!(div.dimensions.width > 0.0, "fit-content width must be > 0");
+        assert!(div.dimensions.width <= 800.0, "fit-content width must be <= container (800px)");
     }
 }

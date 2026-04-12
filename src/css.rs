@@ -7,6 +7,9 @@ pub enum Value {
     Color(Color),
     BoxShadow(BoxShadow),
     Number(f32),
+    /// Represents `fit-content(N px)` — uses available space up to N px,
+    /// but no more than max-content and no less than min-content.
+    FitContent(f32),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -430,6 +433,17 @@ pub fn parse_value(val: &str) -> Value {
     let val = val.trim();
     // Strip !important
     let val = val.trim_end_matches("!important").trim();
+
+    // Intrinsic sizing keywords (CSS Sizing Level 3)
+    if val == "min-content" || val == "max-content" || val == "fit-content" {
+        return Value::Keyword(val.to_string());
+    }
+    // fit-content(<length>) — e.g. fit-content(300px)
+    if val.starts_with("fit-content(") && val.ends_with(')') {
+        let inner = &val["fit-content(".len()..val.len() - 1];
+        let px_val = inner.trim_end_matches("px").parse::<f32>().unwrap_or(0.0);
+        return Value::FitContent(px_val);
+    }
 
     if val.ends_with("px") {
         Value::Length(val.trim_end_matches("px").parse().unwrap_or(0.0), Unit::Px)
