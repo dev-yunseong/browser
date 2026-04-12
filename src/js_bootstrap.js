@@ -113,6 +113,22 @@ class Element extends Node {
     }
 }
 
+// -- Storage -----------------------------------------------------------------
+var localStorage = {
+    getItem: function(key) {
+        return __aura_storage_get(String(key));
+    },
+    setItem: function(key, value) {
+        __aura_storage_set(String(key), String(value));
+    },
+    removeItem: function(key) {
+        __aura_storage_remove(String(key));
+    },
+    clear: function() {
+        __aura_storage_clear();
+    }
+};
+
 // -- document -----------------------------------------------------------------
 var document = {
     getElementById: function(id) {
@@ -144,6 +160,7 @@ var document = {
 
 var window = globalThis;
 window.document = document;
+window.localStorage = localStorage;
 var console = { log: log, warn: log, error: log, info: log, debug: log };
 var navigator = { userAgent: 'Browser/2.0', language: 'en-US' };
 var location = document.location;
