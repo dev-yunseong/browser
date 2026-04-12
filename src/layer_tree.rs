@@ -425,7 +425,7 @@ mod tests {
     fn build_tree_from_html(html: &str, extra_css: &str) -> LayerTree {
         let dom = dom::parse_html(html);
         let stylesheet = css::parse_css(extra_css);
-        let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None, None);
+        let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None, None, None);
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.expect("layout tree should be built");
         LayerTreeBuilder::build(&layout, viewport())

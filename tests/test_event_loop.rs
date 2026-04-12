@@ -2,7 +2,7 @@ use browser::js::JsRuntime;
 
 #[test]
 fn test_macro_micro_task_order() {
-    let mut js = JsRuntime::new(None, None);
+    let mut js = JsRuntime::new(None, None, None);
     
     // This script uses standard Promise (micro) and our setTimeout (macro)
     js.execute(r#"
@@ -34,7 +34,7 @@ fn test_macro_micro_task_order() {
 
 #[test]
 fn test_raf_timestamp() {
-    let mut js = JsRuntime::new(None, None);
+    let mut js = JsRuntime::new(None, None, None);
 
     js.execute(r#"
         var ts = 0;

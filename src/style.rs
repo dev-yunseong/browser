@@ -177,6 +177,7 @@ pub fn build_style_tree(
     js_overrides: &HashMap<String, HashMap<String, String>>,
     hovered_id: Option<&str>,
     focused_id: Option<&str>,
+    _csp_policy: Option<&crate::js::CspPolicy>,
 ) -> StyledNode {
     let mut arena = Vec::new();
     flatten_dom(root, &mut arena, None);

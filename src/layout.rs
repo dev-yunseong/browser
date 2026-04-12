@@ -991,7 +991,7 @@ mod tests {
         let html = r#"<button onclick="alert(1)" style="width: 100px; height: 50px; margin: 10px;">Click me</button>"#;
         let dom = dom::parse_html(html);
         let stylesheet = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None, None);
+        let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None, None, None);
         
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 1024.0, 1024.0, 768.0);
         let layout = layout_opt.unwrap();
@@ -1012,7 +1012,7 @@ mod tests {
         let html = r#"<div style="display: block; width: 500px; margin: auto;">Content</div>"#;
         let dom = dom::parse_html(html);
         let stylesheet = css::parse_css("");
-        let mut style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None, None);
+        let mut style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None, None, None);
         
         // Ensure the style is manually set if parser was ambiguous
         if let NodeData::Element { .. } = style_tree.children[0].node.data {
@@ -1033,7 +1033,7 @@ mod tests {
         let html = r#"<div style="margin-left: 48px; margin-top: 24px;">Hello world</div>"#;
         let dom = dom::parse_html(html);
         let stylesheet = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None, None);
+        let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None, None, None);
 
         let div_node = style_tree
             .children
@@ -1093,7 +1093,7 @@ mod tests {
         let html = r#"<span>Hi</span>"#;
         let dom = dom::parse_html(html);
         let stylesheet = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None, None);
+        let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None, None, None);
 
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 768.0);
         let layout = layout_opt.unwrap();
@@ -1169,7 +1169,7 @@ mod tests {
         let html = r#"<div style="width:800px;"><div style="float:left;width:100px;height:50px;">F</div></div>"#;
         let dom_tree = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None);
+        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None, None);
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.unwrap();
         let float_child = find_float_child_deep(&layout).expect("float child not found");
@@ -1182,7 +1182,7 @@ mod tests {
         let html = r#"<div style="width:800px;"><div style="float:right;width:100px;height:50px;">F</div></div>"#;
         let dom_tree = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None);
+        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None, None);
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.unwrap();
         let float_child = find_float_child_deep(&layout).expect("float child not found");
@@ -1196,7 +1196,7 @@ mod tests {
         let html = r#"<div style="width:800px;"><div style="float:left;width:100px;height:50px;">F</div><div style="clear:left;">C</div></div>"#;
         let dom_tree = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None);
+        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None, None);
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.unwrap();
         // Navigate to the outer div (width:800px) then look at its direct children.
@@ -1214,7 +1214,7 @@ mod tests {
         let html = r#"<div style="width:800px;"><div style="float:left;width:100px;height:50px;">F</div><div style="display:block;">S</div></div>"#;
         let dom_tree = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None);
+        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None, None);
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.unwrap();
         let outer_div = find_outer_div(&layout).expect("outer div not found");
@@ -1259,7 +1259,7 @@ mod tests {
         let html = r#"<span>Hello World</span>"#;
         let dom_tree = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None);
+        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None, None);
 
         // Locate the <span> StyledNode
         fn find_span_node<'a>(sn: &'a crate::style::StyledNode) -> Option<&'a crate::style::StyledNode> {
@@ -1285,7 +1285,7 @@ mod tests {
         let html = r#"<div style="width: min-content;">Hello World</div>"#;
         let dom_tree = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None);
+        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None, None);
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.unwrap();
 
@@ -1302,7 +1302,7 @@ mod tests {
         // min-content case
         let dom_min = dom::parse_html(r#"<div style="width: min-content;">Hello World</div>"#);
         let ss_min = css::parse_css("");
-        let st_min = style::build_style_tree(&dom_min.document, &ss_min, None, &HashMap::new(), None, None);
+        let st_min = style::build_style_tree(&dom_min.document, &ss_min, None, &HashMap::new(), None, None, None);
         let (lo_min, _, _) = build_layout_tree(&st_min, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout_min = lo_min.unwrap();
         let div_min_w = find_element_by_tag(&layout_min, "div").unwrap().dimensions.width;
@@ -1310,7 +1310,7 @@ mod tests {
         // max-content case
         let dom_max = dom::parse_html(r#"<div style="width: max-content;">Hello World</div>"#);
         let ss_max = css::parse_css("");
-        let st_max = style::build_style_tree(&dom_max.document, &ss_max, None, &HashMap::new(), None, None);
+        let st_max = style::build_style_tree(&dom_max.document, &ss_max, None, &HashMap::new(), None, None, None);
         let (lo_max, _, _) = build_layout_tree(&st_max, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout_max = lo_max.unwrap();
         let div_max_w = find_element_by_tag(&layout_max, "div").unwrap().dimensions.width;
@@ -1328,7 +1328,7 @@ mod tests {
         let html = r#"<div style="width: fit-content(150px);">Hello World this is some longer text for the test</div>"#;
         let dom_tree = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None);
+        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None, None);
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.unwrap();
         let div = find_element_by_tag(&layout, "div").expect("div not found");
@@ -1344,7 +1344,7 @@ mod tests {
         let html = r#"<div style="width: fit-content;">Hello</div>"#;
         let dom_tree = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None);
+        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None, None);
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.unwrap();
         let div = find_element_by_tag(&layout, "div").expect("div not found");
@@ -1360,7 +1360,7 @@ mod tests {
         let html = r#"<div style="width:100px;height:50px;">Content</div>"#;
         let dom = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None);
+        let style_tree = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.unwrap();
         let div = find_element_by_tag(&layout, "div").expect("div not found");
@@ -1373,7 +1373,7 @@ mod tests {
         let html = r#"<div style="width:100px;height:50px;opacity:0.5;">Content</div>"#;
         let dom = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None);
+        let style_tree = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.unwrap();
         let div = find_element_by_tag(&layout, "div").expect("div not found");

@@ -16,7 +16,7 @@ fn test_interleaved_block_inline_stacking() {
     "#;
     let dom = dom::parse_html(html);
     let stylesheet = css::parse_css("");
-    let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None, None);
+    let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None, None, None);
 
     // Find the outer div
     let outer_div = style_tree.children.iter()
