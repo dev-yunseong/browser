@@ -770,6 +770,7 @@ dependencies = [
  "image",
  "markup5ever_rcdom",
  "poll-promise",
+ "rayon",
  "reqwest",
  "tiny-skia 0.12.0",
  "tokio",
