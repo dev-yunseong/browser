@@ -4,6 +4,34 @@ use markup5ever_rcdom::{NodeData, Handle};
 use std::cell::RefCell;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use url::Url;
+use serde::{Serialize, Deserialize};
+use std::sync::Mutex;
+use lazy_static::lazy_static;
+
+lazy_static! {
+    static ref GLOBAL_STORAGE: Mutex<OriginStorage> = Mutex::new(OriginStorage::load());
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct OriginStorage {
+    // origin_string -> { key -> value }
+    data: HashMap<String, HashMap<String, String>>,
+}
+
+impl OriginStorage {
+    fn load() -> Self {
+        std::fs::read_to_string("storage.json")
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self) {
+        if let Ok(s) = serde_json::to_string(self) {
+            let _ = std::fs::write("storage.json", s);
+        }
+    }
+}
 
 thread_local! {
     static MACRO_TASKS: RefCell<VecDeque<Box<dyn FnOnce(&mut Context)>>> = RefCell::new(VecDeque::new());
@@ -142,6 +170,57 @@ impl JsRuntime {
         });
         context.register_global_callable(js_string!("__aura_set_focus"), 1, set_focus).unwrap();
 
+        // Register native __aura_storage_get
+        let storage_get = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let key = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            let origin = CURRENT_ORIGIN.with(|o| o.borrow().as_ref().map(|u| u.origin().unicode_serialization()).unwrap_or_else(|| "null".to_string()));
+            let store = GLOBAL_STORAGE.lock().unwrap();
+            let val = store.data.get(&origin).and_then(|m| m.get(&key)).cloned().unwrap_or_else(|| "null".to_string());
+            if val == "null" {
+                Ok(JsValue::null())
+            } else {
+                Ok(JsValue::from(js_string!(val)))
+            }
+        });
+        context.register_global_callable(js_string!("__aura_storage_get"), 1, storage_get).unwrap();
+
+        // Register native __aura_storage_set
+        let storage_set = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let key = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            let value = args.get(1).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            let origin = CURRENT_ORIGIN.with(|o| o.borrow().as_ref().map(|u| u.origin().unicode_serialization()).unwrap_or_else(|| "null".to_string()));
+            let mut store = GLOBAL_STORAGE.lock().unwrap();
+            store.data.entry(origin).or_insert_with(HashMap::new).insert(key, value);
+            store.save();
+            Ok(JsValue::undefined())
+        });
+        context.register_global_callable(js_string!("__aura_storage_set"), 2, storage_set).unwrap();
+
+        // Register native __aura_storage_remove
+        let storage_remove = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let key = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            let origin = CURRENT_ORIGIN.with(|o| o.borrow().as_ref().map(|u| u.origin().unicode_serialization()).unwrap_or_else(|| "null".to_string()));
+            let mut store = GLOBAL_STORAGE.lock().unwrap();
+            if let Some(m) = store.data.get_mut(&origin) {
+                m.remove(&key);
+                store.save();
+            }
+            Ok(JsValue::undefined())
+        });
+        context.register_global_callable(js_string!("__aura_storage_remove"), 1, storage_remove).unwrap();
+
+        // Register native __aura_storage_clear
+        let storage_clear = NativeFunction::from_copy_closure(|_this, _args, _context| {
+            let origin = CURRENT_ORIGIN.with(|o| o.borrow().as_ref().map(|u| u.origin().unicode_serialization()).unwrap_or_else(|| "null".to_string()));
+            let mut store = GLOBAL_STORAGE.lock().unwrap();
+            if let Some(m) = store.data.get_mut(&origin) {
+                m.clear();
+                store.save();
+            }
+            Ok(JsValue::undefined())
+        });
+        context.register_global_callable(js_string!("__aura_storage_clear"), 0, storage_clear).unwrap();
+
         // Register native __aura_queue_task
         let queue_task = NativeFunction::from_copy_closure(|_this, args, _context| {
             if let Some(callback) = args.get(0).cloned() {
@@ -160,7 +239,7 @@ impl JsRuntime {
         context.register_global_callable(js_string!("__aura_queue_task"), 1, queue_task).unwrap();
 
         // Register native __aura_fetch
-        let aura_fetch = NativeFunction::from_copy_closure(|_this, args, context| {
+        let aura_fetch = NativeFunction::from_copy_closure(|_this, args, _context| {
             let url_str = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
             let resolve = args.get(1).cloned().unwrap_or(JsValue::undefined());
             let reject = args.get(2).cloned().unwrap_or(JsValue::undefined());

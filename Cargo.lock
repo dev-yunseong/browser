@@ -773,6 +773,8 @@ dependencies = [
  "poll-promise",
  "rayon",
  "reqwest",
+ "serde",
+ "serde_json",
  "tiny-skia 0.12.0",
  "tokio",
  "url",
