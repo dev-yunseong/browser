@@ -326,6 +326,16 @@ pub struct Selector {
     pub ancestor: Option<Box<Selector>>,
 }
 
+/// The most-specific "key" feature of the rightmost part of a selector.
+/// Used to bucket selectors into an index for O(1) candidate lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SelectorKey {
+    Id(String),
+    Class(String),
+    Tag(String),
+    Universal,
+}
+
 impl Selector {
     pub fn new() -> Self {
         Self::default()
@@ -338,12 +348,27 @@ impl Selector {
         b += self.attributes.len();
         if self.pseudo_class.is_some() { b += 1; }
         if self.tag.is_some() { c += 1; }
-        
+
         if let Some(ref d) = self.ancestor {
             let (da, db, dc) = d.specificity();
             a += da; b += db; c += dc;
         }
         (a, b, c)
+    }
+
+    /// Returns the most specific "key" feature of this selector's subject (rightmost) part.
+    /// Used to bucket selectors for fast candidate lookup (ID > first class > tag > universal).
+    pub fn key_feature(&self) -> SelectorKey {
+        if let Some(ref id) = self.id {
+            return SelectorKey::Id(id.clone());
+        }
+        if let Some(cls) = self.class.first() {
+            return SelectorKey::Class(cls.clone());
+        }
+        if let Some(ref tag) = self.tag {
+            return SelectorKey::Tag(tag.clone());
+        }
+        SelectorKey::Universal
     }
 }
 
@@ -705,6 +730,47 @@ mod tests {
     fn test_named_color() {
         assert!(parse_color("navy").is_some());
         assert!(parse_color("transparent").is_some());
+    }
+
+    #[test]
+    fn test_key_feature_id() {
+        let s = parse_selector("#foo");
+        assert_eq!(s.key_feature(), SelectorKey::Id("foo".to_string()));
+    }
+
+    #[test]
+    fn test_key_feature_id_priority_over_class() {
+        // ID is more specific than class; id should be returned even when class is present
+        let s = parse_selector("div#main.header");
+        assert_eq!(s.key_feature(), SelectorKey::Id("main".to_string()));
+    }
+
+    #[test]
+    fn test_key_feature_class() {
+        let s = parse_selector(".bar");
+        assert_eq!(s.key_feature(), SelectorKey::Class("bar".to_string()));
+    }
+
+    #[test]
+    fn test_key_feature_tag() {
+        let s = parse_selector("div");
+        assert_eq!(s.key_feature(), SelectorKey::Tag("div".to_string()));
+    }
+
+    #[test]
+    fn test_key_feature_universal() {
+        // A selector with only pseudo-class or empty falls through to Universal
+        let mut s = Selector::new();
+        s.pseudo_class = Some("hover".to_string());
+        assert_eq!(s.key_feature(), SelectorKey::Universal);
+    }
+
+    #[test]
+    fn test_key_feature_complex_selector_rightmost() {
+        // For "div .bar", the rightmost part (.bar) should be the key
+        let s = parse_selector("div .bar");
+        // The rightmost selector part is .bar, so key should be Class("bar")
+        assert_eq!(s.key_feature(), SelectorKey::Class("bar".to_string()));
     }
 }
 
