@@ -61,7 +61,8 @@ pub enum CompositingTrigger {
 #[derive(Debug, Clone)]
 pub struct Tile {
     pub rect: LayoutRect,
-    pub paint_commands: Vec<PaintCommand>,
+    pub background_commands: Vec<PaintCommand>,
+    pub content_commands: Vec<PaintCommand>,
     pub dirty: bool,
 }
 
@@ -69,7 +70,8 @@ impl Tile {
     pub fn new(rect: LayoutRect) -> Self {
         Self {
             rect,
-            paint_commands: Vec::new(),
+            background_commands: Vec::new(),
+            content_commands: Vec::new(),
             dirty: true,
         }
     }
@@ -399,7 +401,11 @@ impl LayerTreeBuilder {
 
             for tile in &mut layer.tiles {
                 if tile.rect.intersects(&cmd_rect) {
-                    tile.paint_commands.push(cmd.clone());
+                    if is_root_of_layer {
+                        tile.background_commands.push(cmd.clone());
+                    } else {
+                        tile.content_commands.push(cmd.clone());
+                    }
                     tile.dirty = true;
                 }
             }
