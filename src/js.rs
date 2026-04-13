@@ -415,18 +415,52 @@ impl JsRuntime {
         Self { context, task_receiver }
     }
 
-    pub fn poll_tasks(&mut self) -> bool {
+    pub fn tick(&mut self, timestamp: Option<f64>, deadline_ms: Option<f64>) -> bool {
         let mut did_work = false;
 
+        // 1. Drain task_receiver into MACRO_TASKS
         while let Ok(task) = self.task_receiver.try_recv() {
             MACRO_TASKS.with(|tasks| tasks.borrow_mut().push_back(task));
         }
 
+        // 2. Process ONE macro task
         let macro_task = MACRO_TASKS.with(|tasks| tasks.borrow_mut().pop_front());
         if let Some(task) = macro_task {
             task(&mut self.context);
             did_work = true;
-            self.run_microtasks();
+        }
+
+        // 3. Microtask checkpoint
+        self.run_microtasks();
+
+        // 4. Rendering step (rAF)
+        if let Some(ts) = timestamp {
+            let mut tasks = VecDeque::new();
+            RAF_TASKS.with(|t| tasks = t.borrow_mut().drain(..).collect());
+
+            if !tasks.is_empty() {
+                did_work = true;
+                for task in tasks {
+                    task(&mut self.context, ts);
+                    self.run_microtasks();
+                }
+            }
+        }
+
+        // 5. Idle tasks
+        if let Some(deadline) = deadline_ms {
+            loop {
+                let task_opt = IDLE_TASKS.with(|tasks| tasks.borrow_mut().pop_front());
+                if let Some((_, task)) = task_opt {
+                    did_work = true;
+                    task(&mut self.context, deadline);
+                    self.run_microtasks();
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as f64;
+                    if now >= deadline { break; }
+                } else {
+                    break;
+                }
+            }
         }
 
         did_work
@@ -452,37 +486,14 @@ impl JsRuntime {
         });
 
         if let Some(nid) = native_id {
-            let code = format!("document.__trigger_event({}, '{}', {{ bubbles: true }})", nid, event_type);
-            let _ = self.context.eval(Source::from_bytes(code.as_bytes()));
-            self.run_microtasks();
+            let event_type = event_type.to_string();
+            MACRO_TASKS.with(|tasks| {
+                tasks.borrow_mut().push_back(Box::new(move |ctx| {
+                    let code = format!("document.__trigger_event({}, '{}', {{ bubbles: true }})", nid, event_type);
+                    let _ = ctx.eval(Source::from_bytes(code.as_bytes()));
+                }));
+            });
         }
-    }
-
-    pub fn poll_raf_tasks(&mut self, timestamp: f64) -> bool {
-        let mut did_work = false;
-        let mut tasks = VecDeque::new();
-        RAF_TASKS.with(|t| tasks = t.borrow_mut().drain(..).collect());
-
-        if !tasks.is_empty() {
-            did_work = true;
-            for task in tasks {
-                task(&mut self.context, timestamp);
-                self.run_microtasks();
-            }
-        }
-        did_work
-    }
-
-    pub fn poll_idle_tasks(&mut self, deadline_ms: f64) -> bool {
-        let mut did_work = false;
-        while let Some((_, task)) = IDLE_TASKS.with(|tasks| tasks.borrow_mut().pop_front()) {
-            did_work = true;
-            task(&mut self.context, deadline_ms);
-            self.run_microtasks();
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as f64;
-            if now >= deadline_ms { break; }
-        }
-        did_work
     }
 
     pub fn execute(&mut self, source: &str) {

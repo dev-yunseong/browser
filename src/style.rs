@@ -153,38 +153,63 @@ pub struct NodeDataSend {
 }
 
 // Flatten RcDom into a Vec for parallel processing
-fn flatten_dom(handle: &Handle, arena: &mut Vec<NodeDataSend>, parent_idx: Option<usize>) -> usize {
-    let idx = arena.len();
-    
-    let mut tag = String::new();
-    let mut id = None;
-    let mut classes = Vec::new();
-    let mut attrs_vec = Vec::new();
-    let mut is_element = false;
+fn flatten_dom(root: &Handle, arena: &mut Vec<NodeDataSend>, root_parent_idx: Option<usize>) -> usize {
+    // Iterative replacement for the formerly recursive flatten_dom.
+    // Uses an explicit heap stack to avoid stack overflows on deeply nested DOMs.
+    //
+    // Strategy:
+    //   1. Push (handle, parent_idx) pairs onto the stack, children in reverse
+    //      order so the first child is popped (and inserted into the arena) first.
+    //   2. After the traversal, reconstruct children_idx by scanning the arena —
+    //      every node already knows its parent_idx.
+    let start_idx = arena.len();
+    let mut stack: Vec<(Handle, Option<usize>)> = vec![(root.clone(), root_parent_idx)];
 
-    if let NodeData::Element { ref name, ref attrs, .. } = handle.data {
-        is_element = true;
-        tag = name.local.to_string();
-        for attr in attrs.borrow().iter() {
-            let k = attr.name.local.to_string();
-            let v = attr.value.to_string();
-            if k == "id" { id = Some(v.clone()); }
-            if k == "class" { classes = v.split_whitespace().map(|s| s.to_string()).collect(); }
-            attrs_vec.push((k, v));
+    while let Some((handle, parent_idx)) = stack.pop() {
+        let idx = arena.len();
+
+        let mut tag = String::new();
+        let mut id = None;
+        let mut classes = Vec::new();
+        let mut attrs_vec = Vec::new();
+        let mut is_element = false;
+
+        if let NodeData::Element { ref name, ref attrs, .. } = handle.data {
+            is_element = true;
+            tag = name.local.to_string();
+            for attr in attrs.borrow().iter() {
+                let k = attr.name.local.to_string();
+                let v = attr.value.to_string();
+                if k == "id" { id = Some(v.clone()); }
+                if k == "class" { classes = v.split_whitespace().map(|s| s.to_string()).collect(); }
+                attrs_vec.push((k, v));
+            }
+        }
+
+        arena.push(NodeDataSend {
+            tag, id, classes, attrs: attrs_vec, is_element, parent_idx, children_idx: Vec::new()
+        });
+
+        // Push children in REVERSE order so the first child is popped first,
+        // preserving the original document (left-to-right) visit order.
+        for child in handle.children.borrow().iter().rev() {
+            stack.push((child.clone(), Some(idx)));
         }
     }
 
-    arena.push(NodeDataSend {
-        tag, id, classes, attrs: attrs_vec, is_element, parent_idx, children_idx: Vec::new()
-    });
-
-    let mut children_idx = Vec::new();
-    for child in handle.children.borrow().iter() {
-        children_idx.push(flatten_dom(child, arena, Some(idx)));
+    // Reconstruct children_idx: every node knows its parent, so walk forward
+    // and append each node's index to its parent's children list.
+    for i in start_idx..arena.len() {
+        if let Some(p) = arena[i].parent_idx {
+            // Only link nodes that were created in this call (root_parent_idx
+            // nodes belong to a different sub-tree inserted earlier).
+            if p >= start_idx || root_parent_idx.map_or(true, |rp| p != rp) {
+                arena[p].children_idx.push(i);
+            }
+        }
     }
-    
-    arena[idx].children_idx = children_idx;
-    idx
+
+    start_idx
 }
 
 fn matches_selector_arena(selector: &Selector, idx: usize, arena: &[NodeDataSend], hovered_id: Option<&str>, focused_id: Option<&str>) -> bool {
@@ -419,69 +444,133 @@ pub fn build_style_tree(
 }
 
 fn build_final_tree(
-    handle: &Handle,
+    root: &Handle,
     arena_idx: &mut usize,
     raw_styles: &mut [HashMap<Arc<str>, Value>],
-    parent_style: Option<&PropertyMap>,
+    initial_parent_style: Option<&PropertyMap>,
     store: &mut StyleStore
 ) -> StyledNode {
-    let current_idx = *arena_idx;
-    *arena_idx += 1;
-    
-    let mut specified_values = std::mem::take(&mut raw_styles[current_idx]);
-    
-    if parent_style.is_none() && current_idx == 0 {
-        specified_values.insert(intern("color"), Value::Color(crate::css::Color { r: 0, g: 0, b: 0, a: 255 }));
-        specified_values.insert(intern("font-size"), Value::Length(16.0, crate::css::Unit::Px));
+    // Iterative replacement for the formerly recursive build_final_tree.
+    //
+    // The original function performs two interleaved operations:
+    //   1. Pre-order (top-down): compute specified_values using the parent's PropertyMap.
+    //   2. Post-order (bottom-up): assemble StyledNode once all children are known.
+    //
+    // Key insight for arena_idx: Pre frames must NOT store the arena index at push time,
+    // because sibling subtrees haven't been processed yet.  Instead, each Pre frame reads
+    // `*arena_idx` LIVE when it is popped — by that point all preceding Pre frames have
+    // already incremented the counter, so `*arena_idx` is the correct sequential index for
+    // the current node, matching exactly how `flatten_dom` assigned indices in pre-order.
+    //
+    // Stack discipline (LIFO):
+    //   - Push children in REVERSE so the first child is at the top (popped first).
+    //   - Push Post BEFORE children so Post is processed AFTER all descendants finish.
+
+    enum Frame {
+        Pre {
+            handle: Handle,
+            parent_pm: Option<PropertyMap>,
+        },
+        Post {
+            handle: Handle,
+            specified_values: PropertyMap,
+            num_children: usize,
+        },
     }
-    
-    if let Some(p) = parent_style {
-        let inheritable = ["color", "font-size", "font-family", "font-weight", "line-height", "text-align", "list-style-type"];
-        for prop in inheritable {
-            let prop_arc = intern(prop);
-            if let Some(v) = p.get(&prop_arc) {
-                specified_values.entry(prop_arc).or_insert_with(|| v.clone());
+
+    let mut work: Vec<Frame> = vec![Frame::Pre {
+        handle: root.clone(),
+        parent_pm: initial_parent_style.cloned(),
+    }];
+    let mut results: Vec<StyledNode> = Vec::new();
+
+    while let Some(frame) = work.pop() {
+        match frame {
+            Frame::Pre { handle, parent_pm } => {
+                // Read the current sequential index BEFORE incrementing.
+                let current_idx = *arena_idx;
+                *arena_idx += 1;
+
+                // Compute specified_values: apply inheritance, defaults, em/% resolution.
+                let mut specified_values = std::mem::take(&mut raw_styles[current_idx]);
+
+                if parent_pm.is_none() && current_idx == 0 {
+                    specified_values.insert(intern("color"), Value::Color(crate::css::Color { r: 0, g: 0, b: 0, a: 255 }));
+                    specified_values.insert(intern("font-size"), Value::Length(16.0, crate::css::Unit::Px));
+                }
+
+                if let Some(ref p) = parent_pm {
+                    let inheritable = ["color", "font-size", "font-family", "font-weight", "line-height", "text-align", "list-style-type"];
+                    for prop in inheritable {
+                        let prop_arc = intern(prop);
+                        if let Some(v) = p.get(&prop_arc) {
+                            specified_values.entry(prop_arc).or_insert_with(|| v.clone());
+                        }
+                    }
+                }
+
+                // Em/Percent resolution for font-size
+                let fs_key = intern("font-size");
+                let mut resolved_fs = 16.0f32;
+                if let Some(val) = specified_values.get(&fs_key) {
+                    match val {
+                        Value::Length(v, crate::css::Unit::Px) => resolved_fs = *v,
+                        Value::Length(v, crate::css::Unit::Percent) => {
+                            let parent_fs = match parent_pm.as_ref() {
+                                Some(p) => match p.get(&fs_key) { Some(Value::Length(pv, crate::css::Unit::Px)) => *pv, _ => 16.0 }, _ => 16.0
+                            };
+                            resolved_fs = parent_fs * (v / 100.0);
+                        }
+                        Value::Length(v, crate::css::Unit::Em) => {
+                            let parent_fs = match parent_pm.as_ref() {
+                                Some(p) => match p.get(&fs_key) { Some(Value::Length(pv, crate::css::Unit::Px)) => *pv, _ => 16.0 }, _ => 16.0
+                            };
+                            resolved_fs = parent_fs * v;
+                        }
+                        _ => {}
+                    }
+                }
+                if resolved_fs != 16.0 {
+                    specified_values.insert(fs_key, Value::Length(resolved_fs, crate::css::Unit::Px));
+                }
+
+                let interned_map = store.intern(specified_values);
+
+                let children_handles: Vec<Handle> = handle.children.borrow().iter().cloned().collect();
+                let num_children = children_handles.len();
+
+                // Push Post FIRST — it will be processed only after ALL descendants finish.
+                work.push(Frame::Post {
+                    handle,
+                    specified_values: interned_map.clone(),
+                    num_children,
+                });
+
+                // Push Pre frames for children in REVERSE order so the first child
+                // is at the top of the stack and popped first (forward document order).
+                for child_handle in children_handles.into_iter().rev() {
+                    work.push(Frame::Pre {
+                        handle: child_handle,
+                        parent_pm: Some(interned_map.clone()),
+                    });
+                }
+            }
+            Frame::Post { handle, specified_values, num_children } => {
+                // Children have all been processed and pushed onto `results`.
+                // Drain the last num_children entries — they are in forward order
+                // because children were pushed in reverse (LIFO gives forward order).
+                let start = results.len().saturating_sub(num_children);
+                let children: Vec<StyledNode> = results.drain(start..).collect();
+                results.push(StyledNode {
+                    node: handle,
+                    specified_values,
+                    children,
+                });
             }
         }
     }
-    
-    // Simple Em/Percent resolution for font-size
-    let mut resolved_fs = 16.0f32;
-    let fs_key = intern("font-size");
-    if let Some(val) = specified_values.get(&fs_key) {
-        match val {
-            Value::Length(v, crate::css::Unit::Px) => resolved_fs = *v,
-            Value::Length(v, crate::css::Unit::Percent) => {
-                let parent_fs = match parent_style {
-                    Some(p) => match p.get(&fs_key) { Some(Value::Length(pv, crate::css::Unit::Px)) => *pv, _ => 16.0 }, _ => 16.0
-                };
-                resolved_fs = parent_fs * (v / 100.0);
-            }
-            Value::Length(v, crate::css::Unit::Em) => {
-                let parent_fs = match parent_style {
-                    Some(p) => match p.get(&fs_key) { Some(Value::Length(pv, crate::css::Unit::Px)) => *pv, _ => 16.0 }, _ => 16.0
-                };
-                resolved_fs = parent_fs * v;
-            }
-            _ => {}
-        }
-    }
-    if resolved_fs != 16.0 {
-        specified_values.insert(fs_key, Value::Length(resolved_fs, crate::css::Unit::Px));
-    }
 
-    // Intern the final map
-    let interned_map = store.intern(specified_values);
-    
-    let children = handle.children.borrow().iter().map(|child| {
-        build_final_tree(child, arena_idx, raw_styles, Some(&interned_map), store)
-    }).collect();
-
-    StyledNode {
-        node: handle.clone(),
-        specified_values: interned_map,
-        children,
-    }
+    results.pop().expect("build_final_tree: results stack should have exactly one element")
 }
 
 fn apply_default_styles(tag: &str, map: &mut HashMap<Arc<str>, Value>) {

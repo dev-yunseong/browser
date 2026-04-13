@@ -23,13 +23,13 @@ fn test_macro_micro_task_order() {
     // Standard order: Sync -> Micro -> Macro
     
     // Poll to run microtasks (checkpoint after script)
-    js.poll_tasks(); 
+    js.tick(None, None); 
     
     // Wait for the thread-spawned setTimeout to send its task
     std::thread::sleep(std::time::Duration::from_millis(50));
     
     // Poll again to run the macro task
-    js.poll_tasks();
+    js.tick(None, None);
 }
 
 #[test]
@@ -45,10 +45,10 @@ fn test_raf_timestamp() {
     "#);
 
     // Initial execute should NOT have run rAF
-    js.poll_tasks(); // Runs microtasks
+    js.tick(None, None); // Runs microtasks
 
     // Explicitly poll rAF
-    js.poll_raf_tasks(1234.5);
+    js.tick(Some(1234.5), None);
 
     // Check ts via eval
     let val = js.context.eval(boa_engine::Source::from_bytes(b"ts")).unwrap();

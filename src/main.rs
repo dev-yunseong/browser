@@ -439,27 +439,19 @@ impl eframe::App for BrowserApp {
             }
         }
 
-        // Poll JS event loop tasks
-        let mut needs_re_render = self.js_runtime.poll_tasks();
+        // Poll JS event loop tasks (Macro, Micro, rAF, Idle)
+        let timestamp = self.start_time.elapsed().as_secs_f64() * 1000.0;
+        let mut deadline = None;
+        if self.content_promise.is_none() && self.re_render_promise.is_none() {
+            deadline = Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as f64 + 16.0);
+        }
+        
+        let mut needs_re_render = self.js_runtime.tick(Some(timestamp), deadline);
 
         // Sync focus from JS
         if let Some(js_focused_id) = self.js_runtime.get_focused_node_id() {
             if self.focused_id.as_deref() != Some(&js_focused_id) {
                 self.focused_id = Some(js_focused_id);
-                needs_re_render = true;
-            }
-        }
-
-        // Run animation frames
-        let timestamp = self.start_time.elapsed().as_secs_f64() * 1000.0;
-        if self.js_runtime.poll_raf_tasks(timestamp) {
-            needs_re_render = true;
-        }
-
-        // Run idle tasks if no work was done and no long-running promises are active
-        if !needs_re_render && self.content_promise.is_none() && self.re_render_promise.is_none() {
-            let deadline = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as f64 + 50.0;
-            if self.js_runtime.poll_idle_tasks(deadline) {
                 needs_re_render = true;
             }
         }
