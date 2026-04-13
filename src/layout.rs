@@ -59,60 +59,98 @@ fn horiz_padding_border(sn: &StyledNode) -> f32 {
 /// - Block elements: max over children's max-content widths.
 /// - Inline/inline-block elements: sum of children's max-content widths on one line.
 pub fn compute_max_content_width(sn: &StyledNode, vw: f32, vh: f32) -> f32 {
-    // display: none → 0
-    if is_none_display(sn) { return 0.0; }
+    // Iterative post-order traversal to avoid stack overflows on deep DOM trees.
+    //
+    // Frame::Pre  — process the node's early-return cases or push children + Post.
+    // Frame::Post — reconstruct the parent's inline-run / block logic from child values.
+    //
+    // `val_stack` holds computed widths; Post frames pop their children's widths and push
+    // the aggregated result.  The final answer is `val_stack[0]`.
 
-    // Text node
-    if let NodeData::Text { ref contents } = sn.node.data {
-        let font_size = match sn.specified_values.get(&crate::css::intern("font-size")) {
-            Some(Value::Length(v, Unit::Px)) => *v,
-            _ => 16.0,
-        };
-        return measure_text_width(&contents.borrow(), font_size, f32::INFINITY);
+    enum Frame<'a> {
+        Pre(&'a StyledNode),
+        /// Carries metadata needed to reconstruct the inline-run accumulation:
+        ///   - node pointer for re-deriving child display types
+        ///   - number of non-skipped children whose values are on `val_stack`
+        ///   - pad_border offset for the parent
+        Post {
+            node: *const StyledNode,
+            num_children: usize,
+            pad_border: f32,
+        },
     }
 
-    let disp = get_display_type(sn);
+    let mut work: Vec<Frame> = vec![Frame::Pre(sn)];
+    let mut val_stack: Vec<f32> = Vec::new();
 
-    // Replaced element (image): use explicit size or 100 px
-    if disp == DisplayType::Image {
-        let w = read_px_direct(sn, "width");
-        return if w > 0.0 { w } else { 100.0 };
-    }
+    while let Some(frame) = work.pop() {
+        match frame {
+            Frame::Pre(node) => {
+                if is_none_display(node) { val_stack.push(0.0); continue; }
 
-    if should_skip(sn) { return 0.0; }
+                if let NodeData::Text { ref contents } = node.node.data {
+                    let font_size = match node.specified_values.get(&crate::css::intern("font-size")) {
+                        Some(Value::Length(v, Unit::Px)) => *v,
+                        _ => 16.0,
+                    };
+                    val_stack.push(measure_text_width(&contents.borrow(), font_size, f32::INFINITY));
+                    continue;
+                }
 
-    let pad_border = horiz_padding_border(sn);
+                let disp = get_display_type(node);
+                if disp == DisplayType::Image {
+                    let w = read_px_direct(node, "width");
+                    val_stack.push(if w > 0.0 { w } else { 100.0 });
+                    continue;
+                }
+                if should_skip(node) { val_stack.push(0.0); continue; }
+                if let Some(Value::Length(v, Unit::Px)) = node.specified_values.get(&crate::css::intern("width")) {
+                    val_stack.push(*v);
+                    continue;
+                }
 
-    // Check if an explicit pixel width was set — honour it directly.
-    if let Some(Value::Length(v, Unit::Px)) = sn.specified_values.get(&crate::css::intern("width")) {
-        return *v;
-    }
-    // Percentage / vw / vh widths cannot be resolved without a container; fall through
-    // to content-based sizing (same as the default case below).
+                let pad_border = horiz_padding_border(node);
+                let non_skip: Vec<&StyledNode> = node.children.iter().filter(|c| !should_skip(c)).collect();
+                let num_children = non_skip.len();
 
-    // Walk children
-    let mut inline_run_width: f32 = 0.0;
-    let mut max_w: f32 = 0.0;
+                // Push Post before children so it processes AFTER all children are done.
+                work.push(Frame::Post { node: node as *const StyledNode, num_children, pad_border });
+                for child in non_skip.into_iter().rev() {
+                    work.push(Frame::Pre(child));
+                }
+            }
+            Frame::Post { node, num_children, pad_border } => {
+                // Re-derive children display types from the stored node pointer.
+                // SAFETY: `node` was derived from a reference that outlives this call,
+                // and we only read it (no mutation), so this is safe.
+                let node_ref = unsafe { &*node };
+                let non_skip_children: Vec<&StyledNode> = node_ref.children.iter()
+                    .filter(|c| !should_skip(c))
+                    .collect();
 
-    for child in &sn.children {
-        if should_skip(child) { continue; }
-        let child_disp = get_display_type(child);
-        let child_max = compute_max_content_width(child, vw, vh);
+                // Pop child values in forward order (they were pushed in reverse → LIFO gives forward).
+                let start = val_stack.len().saturating_sub(num_children);
+                let child_vals: Vec<f32> = val_stack.drain(start..).collect();
 
-        if is_block_level(child_disp) {
-            // Flush inline run
-            max_w = max_w.max(inline_run_width);
-            inline_run_width = 0.0;
-            // Block children are independent
-            max_w = max_w.max(child_max);
-        } else {
-            // Inline children accumulate on the same "line"
-            inline_run_width += child_max;
+                let mut inline_run_width: f32 = 0.0;
+                let mut max_w: f32 = 0.0;
+                for (child_val, child) in child_vals.into_iter().zip(non_skip_children.iter()) {
+                    let child_disp = get_display_type(child);
+                    if is_block_level(child_disp) {
+                        max_w = max_w.max(inline_run_width);
+                        inline_run_width = 0.0;
+                        max_w = max_w.max(child_val);
+                    } else {
+                        inline_run_width += child_val;
+                    }
+                }
+                max_w = max_w.max(inline_run_width);
+                val_stack.push(max_w + pad_border);
+            }
         }
     }
-    max_w = max_w.max(inline_run_width);
 
-    max_w + pad_border
+    val_stack.pop().unwrap_or(0.0)
 }
 
 /// Compute the **min-content** width of a `StyledNode` subtree.
@@ -122,45 +160,73 @@ pub fn compute_max_content_width(sn: &StyledNode, vw: f32, vh: f32) -> f32 {
 /// - `display: none`: 0.
 /// - All elements: max over children's min-content widths (wrapping can isolate any child).
 pub fn compute_min_content_width(sn: &StyledNode, vw: f32, vh: f32) -> f32 {
-    if is_none_display(sn) { return 0.0; }
-
-    if let NodeData::Text { ref contents } = sn.node.data {
-        let font_size = match sn.specified_values.get(&crate::css::intern("font-size")) {
-            Some(Value::Length(v, Unit::Px)) => *v,
-            _ => 16.0,
-        };
-        // min-content = longest word: measure each word individually
-        let text = contents.borrow();
-        let trimmed = text.trim();
-        if trimmed.is_empty() { return 0.0; }
-        return trimmed.split_whitespace()
-            .map(|word| measure_text_width(word, font_size, f32::INFINITY))
-            .fold(0.0f32, f32::max);
+    // Iterative approach to avoid stack overflows.
+    enum Frame<'a> {
+        Pre(&'a StyledNode),
+        Post { num_children: usize, pad_border: f32 },
     }
 
-    let disp = get_display_type(sn);
+    let mut work: Vec<Frame> = vec![Frame::Pre(sn)];
+    let mut val_stack: Vec<f32> = Vec::new();
 
-    if disp == DisplayType::Image {
-        let w = read_px_direct(sn, "width");
-        return if w > 0.0 { w } else { 100.0 };
+    while let Some(frame) = work.pop() {
+        match frame {
+            Frame::Pre(node) => {
+                if is_none_display(node) { val_stack.push(0.0); continue; }
+
+                if let NodeData::Text { ref contents } = node.node.data {
+                    let font_size = match node.specified_values.get(&crate::css::intern("font-size")) {
+                        Some(Value::Length(v, Unit::Px)) => *v,
+                        _ => 16.0,
+                    };
+                    let text = contents.borrow();
+                    let trimmed = text.trim();
+                    if trimmed.is_empty() {
+                        val_stack.push(0.0);
+                    } else {
+                        let min_w = trimmed.split_whitespace()
+                            .map(|word| measure_text_width(word, font_size, f32::INFINITY))
+                            .fold(0.0f32, f32::max);
+                        val_stack.push(min_w);
+                    }
+                    continue;
+                }
+
+                let disp = get_display_type(node);
+                if disp == DisplayType::Image {
+                    let w = read_px_direct(node, "width");
+                    val_stack.push(if w > 0.0 { w } else { 100.0 });
+                    continue;
+                }
+                if should_skip(node) { val_stack.push(0.0); continue; }
+                if let Some(Value::Length(v, Unit::Px)) = node.specified_values.get(&crate::css::intern("width")) {
+                    val_stack.push(*v);
+                    continue;
+                }
+
+                let pad_border = horiz_padding_border(node);
+                let non_skip: Vec<&StyledNode> = node.children.iter().filter(|c| !should_skip(c)).collect();
+                let num_children = non_skip.len();
+
+                work.push(Frame::Post { num_children, pad_border });
+                for child in non_skip.into_iter().rev() {
+                    work.push(Frame::Pre(child));
+                }
+            }
+            Frame::Post { num_children, pad_border } => {
+                let start = val_stack.len().saturating_sub(num_children);
+                let child_vals = val_stack.drain(start..);
+                let max_child = child_vals.fold(0.0f32, f32::max);
+                val_stack.push(max_child + pad_border);
+            }
+        }
     }
 
-    if should_skip(sn) { return 0.0; }
+    val_stack.pop().unwrap_or(0.0)
+}
 
-    let pad_border = horiz_padding_border(sn);
-
-    // Honour explicit pixel widths
-    if let Some(Value::Length(v, Unit::Px)) = sn.specified_values.get(&crate::css::intern("width")) {
-        return *v;
-    }
-
-    // min-content = max over all descendants' min-content (any child can be its own line)
-    let child_min = sn.children.iter()
-        .filter(|c| !should_skip(c))
-        .map(|c| compute_min_content_width(c, vw, vh))
-        .fold(0.0f32, f32::max);
-
-    child_min + pad_border
+fn is_shrink_wrap(d: DisplayType) -> bool {
+    matches!(d, DisplayType::InlineBlock | DisplayType::Table | DisplayType::TableCell | DisplayType::Image)
 }
 
 // ── Float layout types ────────────────────────────────────────────────────────
@@ -396,7 +462,18 @@ impl<'a> LayoutBox<'a> {
                 let available = container_width.min(limit);
                 max_c.min(available).max(min_c)
             }
-            _ => if is_block { (container_width - self.margin.left - self.margin.right).max(0.0) } else { 0.0 },
+            _ => {
+                if is_shrink_wrap(self.display) {
+                    let max_c = compute_max_content_width(self.style_node, vw, vh);
+                    let min_c = compute_min_content_width(self.style_node, vw, vh);
+                    // Shrink-wrap: min(max-content, max(min-content, available))
+                    max_c.min(container_width).max(min_c)
+                } else if is_block {
+                    (container_width - self.margin.left - self.margin.right).max(0.0)
+                } else {
+                    0.0
+                }
+            }
         };
 
         let box_sizing = self.style_node.specified_values.get(&crate::css::intern("box-sizing"))
