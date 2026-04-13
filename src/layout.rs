@@ -38,7 +38,7 @@ fn measure_text_width(text: &str, font_size: f32, wrap_width: f32) -> f32 {
 /// Read a raw `px` value from `specified_values` for a single property.
 /// Returns 0.0 for anything that isn't an explicit pixel length.
 fn read_px_direct(sn: &StyledNode, prop: &str) -> f32 {
-    match sn.specified_values.get(prop) {
+    match sn.specified_values.get(&crate::css::intern(prop)) {
         Some(Value::Length(v, Unit::Px)) => *v,
         _ => 0.0,
     }
@@ -64,7 +64,7 @@ pub fn compute_max_content_width(sn: &StyledNode, vw: f32, vh: f32) -> f32 {
 
     // Text node
     if let NodeData::Text { ref contents } = sn.node.data {
-        let font_size = match sn.specified_values.get("font-size") {
+        let font_size = match sn.specified_values.get(&crate::css::intern("font-size")) {
             Some(Value::Length(v, Unit::Px)) => *v,
             _ => 16.0,
         };
@@ -84,7 +84,7 @@ pub fn compute_max_content_width(sn: &StyledNode, vw: f32, vh: f32) -> f32 {
     let pad_border = horiz_padding_border(sn);
 
     // Check if an explicit pixel width was set — honour it directly.
-    if let Some(Value::Length(v, Unit::Px)) = sn.specified_values.get("width") {
+    if let Some(Value::Length(v, Unit::Px)) = sn.specified_values.get(&crate::css::intern("width")) {
         return *v;
     }
     // Percentage / vw / vh widths cannot be resolved without a container; fall through
@@ -125,7 +125,7 @@ pub fn compute_min_content_width(sn: &StyledNode, vw: f32, vh: f32) -> f32 {
     if is_none_display(sn) { return 0.0; }
 
     if let NodeData::Text { ref contents } = sn.node.data {
-        let font_size = match sn.specified_values.get("font-size") {
+        let font_size = match sn.specified_values.get(&crate::css::intern("font-size")) {
             Some(Value::Length(v, Unit::Px)) => *v,
             _ => 16.0,
         };
@@ -150,7 +150,7 @@ pub fn compute_min_content_width(sn: &StyledNode, vw: f32, vh: f32) -> f32 {
     let pad_border = horiz_padding_border(sn);
 
     // Honour explicit pixel widths
-    if let Some(Value::Length(v, Unit::Px)) = sn.specified_values.get("width") {
+    if let Some(Value::Length(v, Unit::Px)) = sn.specified_values.get(&crate::css::intern("width")) {
         return *v;
     }
 
@@ -302,7 +302,7 @@ pub fn build_layout_tree<'a>(
 impl<'a> LayoutBox<'a> {
     fn new(style_node: &'a StyledNode) -> Self {
         let display = get_display_type(style_node);
-        let z_index = match style_node.specified_values.get("z-index") {
+        let z_index = match style_node.specified_values.get(&crate::css::intern("z-index")) {
             Some(Value::Number(n)) => *n as i32,
             _ => 0,
         };
@@ -347,7 +347,7 @@ impl<'a> LayoutBox<'a> {
         self.padding.left = get_prop(sn, "padding-left", "padding", container_width, vw, vh);
         self.padding.right = get_prop(sn, "padding-right", "padding", container_width, vw, vh);
 
-        let b_width = match sn.specified_values.get("border-width") {
+        let b_width = match sn.specified_values.get(&crate::css::intern("border-width")) {
             Some(Value::Length(v, Unit::Px)) => *v,
             _ => if self.display == DisplayType::Input { 1.0 } else { 0.0 },
         };
@@ -370,19 +370,19 @@ impl<'a> LayoutBox<'a> {
             current_y += 5.0; // Break line before block
         }
 
-        let mut width = match self.style_node.specified_values.get("width") {
+        let mut width = match self.style_node.specified_values.get(&crate::css::intern("width")) {
             Some(Value::Length(v, Unit::Px)) => *v,
             Some(Value::Length(v, Unit::Percent)) => container_width * (v / 100.0),
             Some(Value::Length(v, Unit::Vw)) => vw * (v / 100.0),
             Some(Value::Length(v, Unit::Vh)) => vh * (v / 100.0),
             // CSS Intrinsic & Extrinsic Sizing Level 3
-            Some(Value::Keyword(k)) if k == "min-content" => {
+            Some(Value::Keyword(k)) if **k == *"min-content" => {
                 compute_min_content_width(self.style_node, vw, vh)
             }
-            Some(Value::Keyword(k)) if k == "max-content" => {
+            Some(Value::Keyword(k)) if **k == *"max-content" => {
                 compute_max_content_width(self.style_node, vw, vh)
             }
-            Some(Value::Keyword(k)) if k == "fit-content" => {
+            Some(Value::Keyword(k)) if **k == *"fit-content" => {
                 let max_c = compute_max_content_width(self.style_node, vw, vh);
                 let min_c = compute_min_content_width(self.style_node, vw, vh);
                 // fit-content without argument: min(max-content, max(min-content, available))
@@ -399,21 +399,21 @@ impl<'a> LayoutBox<'a> {
             _ => if is_block { (container_width - self.margin.left - self.margin.right).max(0.0) } else { 0.0 },
         };
 
-        let box_sizing = self.style_node.specified_values.get("box-sizing")
-            .and_then(|v| if let Value::Keyword(k) = v { Some(k.as_str()) } else { None })
+        let box_sizing = self.style_node.specified_values.get(&crate::css::intern("box-sizing"))
+            .and_then(|v| if let Value::Keyword(k) = v { Some(&**k) } else { None })
             .unwrap_or("content-box");
 
         if box_sizing == "border-box" && width > 0.0 {
             width = (width - self.padding.left - self.padding.right - self.border.left - self.border.right).max(0.0);
         }
 
-        if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get("max-width") { width = width.min(*v); }
-        if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get("min-width") { width = width.max(*v); }
+        if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get(&crate::css::intern("max-width")) { width = width.min(*v); }
+        if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get(&crate::css::intern("min-width")) { width = width.max(*v); }
 
         if is_block && width < container_width {
             let mut is_auto = false;
             for prop in ["margin", "margin-left", "margin-right"] {
-                if let Some(Value::Keyword(s)) = self.style_node.specified_values.get(prop) {
+                if let Some(Value::Keyword(s)) = self.style_node.specified_values.get(&crate::css::intern(prop)) {
                     if s.contains("auto") { is_auto = true; break; }
                 }
             }
@@ -428,7 +428,7 @@ impl<'a> LayoutBox<'a> {
         self.dimensions.y = current_y + self.margin.top;
         self.dimensions.width = width;
 
-        let height = match self.style_node.specified_values.get("height") {
+        let height = match self.style_node.specified_values.get(&crate::css::intern("height")) {
             Some(Value::Length(v, Unit::Px)) => *v,
             Some(Value::Length(v, Unit::Vw)) => vw * (v / 100.0),
             Some(Value::Length(v, Unit::Vh)) => vh * (v / 100.0),
@@ -436,7 +436,7 @@ impl<'a> LayoutBox<'a> {
             // For block containers, min-content and max-content height are both
             // equivalent to the natural auto height (content-derived). Return 0.0
             // so the existing content-height calculation takes over.
-            Some(Value::Keyword(k)) if k == "min-content" || k == "max-content" || k == "fit-content" => 0.0,
+            Some(Value::Keyword(k)) if **k == *"min-content" || **k == *"max-content" || **k == *"fit-content" => 0.0,
             Some(Value::FitContent(_)) => 0.0,
             _ => 0.0,
         };
@@ -450,11 +450,11 @@ impl<'a> LayoutBox<'a> {
         let mut max_child_x = self.dimensions.x;
 
         if self.display == DisplayType::Flex {
-            let flex_direction = self.style_node.specified_values.get("flex-direction")
-                .and_then(|v| if let Value::Keyword(k) = v { Some(k.as_str()) } else { None })
+            let flex_direction = self.style_node.specified_values.get(&crate::css::intern("flex-direction"))
+                .and_then(|v| if let Value::Keyword(k) = v { Some(&**k) } else { None })
                 .unwrap_or("row");
-            let justify = self.style_node.specified_values.get("justify-content")
-                .and_then(|v| if let Value::Keyword(k) = v { Some(k.as_str()) } else { None })
+            let justify = self.style_node.specified_values.get(&crate::css::intern("justify-content"))
+                .and_then(|v| if let Value::Keyword(k) = v { Some(&**k) } else { None })
                 .unwrap_or("flex-start");
 
             let mut flex_children = Vec::new();
@@ -699,8 +699,8 @@ impl<'a> LayoutBox<'a> {
 
         let content_height = (cursor_y - self.dimensions.y + self.padding.bottom + self.border.bottom).max(0.0);
         let mut final_h = if height > 0.0 { height } else { content_height };
-        if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get("max-height") { final_h = final_h.min(*v); }
-        if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get("min-height") { final_h = final_h.max(*v); }
+        if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get(&crate::css::intern("max-height")) { final_h = final_h.min(*v); }
+        if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get(&crate::css::intern("min-height")) { final_h = final_h.max(*v); }
         self.dimensions.height = final_h;
 
         let final_x = if is_block { container_start_x } else { self.dimensions.x + self.dimensions.width + self.margin.right };
@@ -711,7 +711,7 @@ impl<'a> LayoutBox<'a> {
     fn layout_text(&mut self, text: String, current_x: f32, current_y: f32, container_width: f32) -> (Option<LayoutBox<'a>>, f32, f32) {
         let trimmed = text.trim();
         if trimmed.is_empty() { return (None, current_x, current_y); }
-        let font_size = match self.style_node.specified_values.get("font-size") {
+        let font_size = match self.style_node.specified_values.get(&crate::css::intern("font-size")) {
             Some(Value::Length(v, Unit::Px)) => v.max(1.0),
             _ => 16.0,
         };
@@ -767,8 +767,8 @@ impl<'a> LayoutBox<'a> {
 }
 
 fn get_float(sn: &StyledNode) -> Option<FloatSide> {
-    match sn.specified_values.get("float") {
-        Some(Value::Keyword(k)) => match k.as_str() {
+    match sn.specified_values.get(&crate::css::intern("float")) {
+        Some(Value::Keyword(k)) => match &**k {
             "left"  => Some(FloatSide::Left),
             "right" => Some(FloatSide::Right),
             _ => None,
@@ -778,8 +778,8 @@ fn get_float(sn: &StyledNode) -> Option<FloatSide> {
 }
 
 fn get_clear(sn: &StyledNode) -> Option<ClearValue> {
-    match sn.specified_values.get("clear") {
-        Some(Value::Keyword(k)) => match k.as_str() {
+    match sn.specified_values.get(&crate::css::intern("clear")) {
+        Some(Value::Keyword(k)) => match &**k {
             "left"  => Some(ClearValue::Left),
             "right" => Some(ClearValue::Right),
             "both"  => Some(ClearValue::Both),
@@ -790,7 +790,7 @@ fn get_clear(sn: &StyledNode) -> Option<ClearValue> {
 }
 
 fn get_prop(sn: &StyledNode, p1: &str, p2: &str, cw: f32, vw: f32, vh: f32) -> f32 {
-    match sn.specified_values.get(p1).or(sn.specified_values.get(p2)) {
+    match sn.specified_values.get(&crate::css::intern(p1)).or(sn.specified_values.get(&crate::css::intern(p2))) {
         Some(Value::Length(v, Unit::Px)) => *v,
         Some(Value::Length(v, Unit::Percent)) => cw * (v / 100.0),
         Some(Value::Length(v, Unit::Vw)) => vw * (v / 100.0),
@@ -801,8 +801,8 @@ fn get_prop(sn: &StyledNode, p1: &str, p2: &str, cw: f32, vw: f32, vh: f32) -> f
 
 fn get_display_type(sn: &StyledNode) -> DisplayType {
     if let NodeData::Text { .. } = sn.node.data { return DisplayType::Inline; }
-    if let Some(Value::Keyword(d)) = sn.specified_values.get("display") {
-        match d.as_str() {
+    if let Some(Value::Keyword(d)) = sn.specified_values.get(&crate::css::intern("display")) {
+        match &**d {
             "block" => return DisplayType::Block,
             "inline-block" => return DisplayType::InlineBlock,
             "flex" => return DisplayType::Flex,
@@ -840,7 +840,7 @@ fn is_block_level(d: DisplayType) -> bool {
 }
 
 fn is_none_display(sn: &StyledNode) -> bool {
-    if let Some(Value::Keyword(d)) = sn.specified_values.get("display") { d == "none" } else { false }
+    if let Some(Value::Keyword(d)) = sn.specified_values.get(&crate::css::intern("display")) { **d == *"none" } else { false }
 }
 
 fn should_skip(child: &StyledNode) -> bool {
@@ -943,8 +943,8 @@ impl<'a> LayoutBox<'a> {
             DisplayType::InlineBlock | DisplayType::Flex | DisplayType::TableCell => true,
             _ => {
                 // overflow != visible also establishes BFC
-                if let Some(Value::Keyword(v)) = self.style_node.specified_values.get("overflow") {
-                    v != "visible"
+                if let Some(Value::Keyword(v)) = self.style_node.specified_values.get(&crate::css::intern("overflow")) {
+                    **v != *"visible"
                 } else {
                     false
                 }
@@ -972,7 +972,7 @@ impl<'a> LayoutBox<'a> {
     /// Returns the CSS `opacity` value for this box, clamped to [0.0, 1.0].
     /// Defaults to 1.0 (fully opaque) if the property is absent or unparseable.
     pub fn get_opacity(&self) -> f32 {
-        match self.style_node.specified_values.get("opacity") {
+        match self.style_node.specified_values.get(&crate::css::intern("opacity")) {
             Some(Value::Number(n)) => n.clamp(0.0, 1.0),
             _ => 1.0,
         }
@@ -981,6 +981,7 @@ impl<'a> LayoutBox<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use super::*;
     use crate::dom;
     use crate::css;
@@ -1016,9 +1017,12 @@ mod tests {
         
         // Ensure the style is manually set if parser was ambiguous
         if let NodeData::Element { .. } = style_tree.children[0].node.data {
-            style_tree.children[0].specified_values.insert("display".to_string(), css::Value::Keyword("block".to_string()));
-            style_tree.children[0].specified_values.insert("width".to_string(), css::Value::Length(500.0, css::Unit::Px));
-            style_tree.children[0].specified_values.insert("margin".to_string(), css::Value::Keyword("auto".to_string()));
+            let mut map = (*style_tree.children[0].specified_values.0).clone();
+            map.insert(crate::css::intern("display"), css::Value::Keyword(crate::css::intern("block")));
+            map.insert(crate::css::intern("width"), css::Value::Length(500.0, css::Unit::Px));
+            map.insert(crate::css::intern("margin-left"), css::Value::Keyword(crate::css::intern("auto")));
+            map.insert(crate::css::intern("margin-right"), css::Value::Keyword(crate::css::intern("auto")));
+            style_tree.children[0].specified_values = style::PropertyMap(Arc::new(map));
         }
 
         let (layout_opt, _, _) = build_layout_tree(&style_tree.children[0], 0.0, 0.0, 0.0, 1000.0, 1000.0, 768.0);
@@ -1118,8 +1122,8 @@ mod tests {
     /// Deep-search the layout tree for the first child that has `float: left` or `float: right`.
     fn find_float_child_deep<'a>(layout: &'a LayoutBox<'a>) -> Option<&'a LayoutBox<'a>> {
         for child in &layout.children {
-            match child.style_node.specified_values.get("float") {
-                Some(Value::Keyword(k)) if k == "left" || k == "right" => return Some(child),
+            match child.style_node.specified_values.get(&crate::css::intern("float")) {
+                Some(Value::Keyword(k)) if &**k == "left" || &**k == "right" => return Some(child),
                 _ => {}
             }
             if let Some(f) = find_float_child_deep(child) { return Some(f); }
@@ -1249,8 +1253,8 @@ mod tests {
     /// `parse_value("min-content")` must return a Keyword.
     #[test]
     fn test_css_min_max_content_parse() {
-        assert_eq!(css::parse_value("min-content"), css::Value::Keyword("min-content".to_string()));
-        assert_eq!(css::parse_value("max-content"), css::Value::Keyword("max-content".to_string()));
+        assert_eq!(css::parse_value("min-content"), css::Value::Keyword(crate::css::intern("min-content")));
+        assert_eq!(css::parse_value("max-content"), css::Value::Keyword(crate::css::intern("max-content")));
     }
 
     /// `compute_max_content_width` on "Hello World" must be wider than `compute_min_content_width`.
