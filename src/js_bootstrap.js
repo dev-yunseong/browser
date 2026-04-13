@@ -59,12 +59,21 @@ class EventTarget {
         // Simple bubbling (if supported by event)
         while (current) {
             event.currentTarget = current;
+            
+            // 1. Check addEventListener listeners
             let list = current._listeners.get(event.type);
             if (list) {
                 for (let listener of list) {
                     try { listener.call(current, event); } catch(e) { console.log("Event Error: " + e); }
                 }
             }
+            
+            // 2. Check onEVENT property
+            let onHandler = current['on' + event.type];
+            if (typeof onHandler === 'function') {
+                try { onHandler.call(current, event); } catch(e) { console.log("Event Error: " + e); }
+            }
+
             if (!event.bubbles) break;
             current = current.parentNode;
         }
@@ -108,7 +117,6 @@ class Element extends Node {
         __aura_set_attribute(this._id, name, String(value));
     }
     focus() {
-        document.activeElement = this;
         __aura_set_focus(this.id);
     }
 }
@@ -132,8 +140,8 @@ var localStorage = {
 // -- document -----------------------------------------------------------------
 var document = {
     getElementById: function(id) {
-        let nativeId = __aura_get_element_by_id(id);
-        return nativeId ? __get_or_create_node(nativeId, null, id) : null;
+        let res = __aura_get_element_by_id(id);
+        return res ? __get_or_create_node(res.nid, res.tag, id) : null;
     },
     createElement: function(tag) {
         let nativeId = __aura_create_element(tag);

@@ -41,12 +41,14 @@ thread_local! {
     static NEXT_IDLE_ID: RefCell<u32> = RefCell::new(1);
     static DOM_ROOT: RefCell<Option<Handle>> = RefCell::new(None);
     static NODE_REGISTRY: RefCell<HashMap<u32, Handle>> = RefCell::new(HashMap::new());
+    static REVERSE_NODE_REGISTRY: RefCell<HashMap<usize, u32>> = RefCell::new(HashMap::new());
     static NEXT_NODE_ID: RefCell<u32> = RefCell::new(1);
     static FETCH_REGISTRY: RefCell<HashMap<u32, (JsValue, JsValue)>> = RefCell::new(HashMap::new());
     static FETCH_BODY_REGISTRY: RefCell<HashMap<u32, String>> = RefCell::new(HashMap::new());
     static NEXT_FETCH_ID: RefCell<u32> = RefCell::new(1);
     static TASK_SENDER: RefCell<Option<Sender<Box<dyn FnOnce(&mut Context) + Send>>>> = RefCell::new(None);
     static FOCUSED_NODE: RefCell<Option<String>> = RefCell::new(None);
+    static PREVIOUS_FOCUSED_NODE: RefCell<Option<String>> = RefCell::new(None);
     static CURRENT_ORIGIN: RefCell<Option<Url>> = RefCell::new(None);
     static CSP_POLICY: RefCell<Option<CspPolicy>> = RefCell::new(None);
 }
@@ -224,6 +226,87 @@ impl JsRuntime {
             Ok(JsValue::undefined())
         });
         context.register_global_callable(js_string!("__aura_set_focus"), 1, set_focus).unwrap();
+
+        // Register native __aura_get_element_by_id
+        let get_element_by_id = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let id = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            let res = DOM_ROOT.with(|root| {
+                if let Some(ref r) = *root.borrow() {
+                    find_element_by_id(r, &id).map(|h| {
+                        let tag = if let NodeData::Element { ref name, .. } = h.data {
+                            name.local.to_string()
+                        } else { "".to_string() };
+                        (register_node(h), tag)
+                    })
+                } else { None }
+            });
+            
+            if let Some((nid, tag)) = res {
+                use boa_engine::object::ObjectInitializer;
+                let mut obj = ObjectInitializer::new(_context);
+                obj.property(js_string!("nid"), JsValue::from(nid), boa_engine::property::Attribute::all());
+                obj.property(js_string!("tag"), JsValue::from(js_string!(tag)), boa_engine::property::Attribute::all());
+                Ok(obj.build().into())
+            } else {
+                Ok(JsValue::null())
+            }
+        });
+        context.register_global_callable(js_string!("__aura_get_element_by_id"), 1, get_element_by_id).unwrap();
+
+        // Register native __aura_get_parent_id
+        let get_parent_id = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let child_nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let parent_nid = DOM_ROOT.with(|root| {
+                if let Some(ref r) = *root.borrow() {
+                    find_parent_of_node(r, child_nid).map(register_node)
+                } else { None }
+            });
+            Ok(parent_nid.map(JsValue::from).unwrap_or(JsValue::null()))
+        });
+        context.register_global_callable(js_string!("__aura_get_parent_id"), 1, get_parent_id).unwrap();
+
+        // Register native __aura_get_body
+        let get_body = NativeFunction::from_copy_closure(|_this, _args, _context| {
+            let body_nid = DOM_ROOT.with(|root| {
+                if let Some(ref r) = *root.borrow() {
+                    find_element_by_tag(r, "body").map(register_node)
+                } else { None }
+            });
+            Ok(body_nid.map(JsValue::from).unwrap_or(JsValue::null()))
+        });
+        context.register_global_callable(js_string!("__aura_get_body"), 0, get_body).unwrap();
+
+        // Register native __aura_set_attribute
+        let set_attr = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let name = args.get(1).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            let value = args.get(2).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            
+            NODE_REGISTRY.with(|reg| {
+                if let Some(node) = reg.borrow().get(&nid) {
+                    if let NodeData::Element { ref attrs, .. } = node.data {
+                        let mut attrs = attrs.borrow_mut();
+                        let mut found = false;
+                        for attr in attrs.iter_mut() {
+                            if attr.name.local.to_string() == name {
+                                attr.value = value.clone().into();
+                                found = true;
+                                break;
+                            }
+                        }
+                        if !found {
+                            use html5ever::{QualName, LocalName, ns, Attribute};
+                            attrs.push(Attribute {
+                                name: QualName::new(None, ns!(html), LocalName::from(name)),
+                                value: value.into(),
+                            });
+                        }
+                    }
+                }
+            });
+            Ok(JsValue::undefined())
+        });
+        context.register_global_callable(js_string!("__aura_set_attribute"), 3, set_attr).unwrap();
 
         // Register native __aura_storage_get
         let storage_get = NativeFunction::from_copy_closure(|_this, args, _context| {
@@ -418,6 +501,11 @@ impl JsRuntime {
     pub fn tick(&mut self, timestamp: Option<f64>, deadline_ms: Option<f64>) -> bool {
         let mut did_work = false;
 
+        // 0. Synchronize focus and dispatch events
+        if self.sync_focus() {
+            did_work = true;
+        }
+
         // 1. Drain task_receiver into MACRO_TASKS
         while let Ok(task) = self.task_receiver.try_recv() {
             MACRO_TASKS.with(|tasks| tasks.borrow_mut().push_back(task));
@@ -498,7 +586,9 @@ impl JsRuntime {
 
     pub fn execute(&mut self, source: &str) {
         if source.contains("import.meta") || (source.contains("import ") && source.contains(" from ")) { return; }
-        let _ = self.context.eval(Source::from_bytes(source.as_bytes()));
+        if let Err(e) = self.context.eval(Source::from_bytes(source.as_bytes())) {
+            println!("[JS Error] execute: {:?}", e);
+        }
         self.run_microtasks();
     }
 
@@ -523,6 +613,71 @@ impl JsRuntime {
     pub fn get_focused_node_id(&self) -> Option<String> {
         FOCUSED_NODE.with(|f| (*f.borrow()).clone())
     }
+
+    pub fn set_focused_node_id(&mut self, id: Option<String>) {
+        FOCUSED_NODE.with(|f| *f.borrow_mut() = id);
+    }
+
+    pub fn sync_focus(&mut self) -> bool {
+        let (old, new) = (
+            PREVIOUS_FOCUSED_NODE.with(|f| (*f.borrow()).clone()),
+            FOCUSED_NODE.with(|f| (*f.borrow()).clone())
+        );
+
+        if old == new { return false; }
+
+        PREVIOUS_FOCUSED_NODE.with(|f| *f.borrow_mut() = new.clone());
+
+        // Blur old element
+        if let Some(id) = old {
+            let native_id = DOM_ROOT.with(|root| {
+                if let Some(ref r) = *root.borrow() {
+                    find_element_by_id(r, &id).map(register_node)
+                } else { None }
+            });
+            if let Some(nid) = native_id {
+                let code = format!("
+                    (function() {{
+                        let el = document.getElementById('{}') || __get_or_create_node({});
+                        if (el) {{
+                            el.dispatchEvent(new Event('blur', {{ bubbles: false }}));
+                            el.dispatchEvent(new Event('focusout', {{ bubbles: true }}));
+                        }}
+                    }})();
+                ", id, nid);
+                let _ = self.context.eval(Source::from_bytes(code.as_bytes()));
+                self.run_microtasks();
+            }
+        }
+
+        // Focus new element
+        if let Some(id) = new {
+            let native_id = DOM_ROOT.with(|root| {
+                if let Some(ref r) = *root.borrow() {
+                    find_element_by_id(r, &id).map(register_node)
+                } else { None }
+            });
+            if let Some(nid) = native_id {
+                let code = format!("
+                    (function() {{
+                        let el = document.getElementById('{}') || __get_or_create_node({});
+                        if (el) {{
+                            document.activeElement = el;
+                            el.dispatchEvent(new Event('focus', {{ bubbles: false }}));
+                            el.dispatchEvent(new Event('focusin', {{ bubbles: true }}));
+                        }}
+                    }})();
+                ", id, nid);
+                let _ = self.context.eval(Source::from_bytes(code.as_bytes()));
+                self.run_microtasks();
+            }
+        } else {
+            let _ = self.context.eval(Source::from_bytes(b"document.activeElement = document.body;"));
+            self.run_microtasks();
+        }
+
+        true
+    }
 }
 
 pub fn extract_scripts_from_dom(handle: &Handle) -> Vec<String> {
@@ -546,6 +701,18 @@ pub fn extract_scripts_from_dom(handle: &Handle) -> Vec<String> {
     scripts
 }
 
+fn find_element_by_tag(root: &Handle, tag: &str) -> Option<Handle> {
+    if let NodeData::Element { ref name, .. } = root.data {
+        if name.local.to_string() == tag {
+            return Some(root.clone());
+        }
+    }
+    for child in root.children.borrow().iter() {
+        if let Some(found) = find_element_by_tag(child, tag) { return Some(found); }
+    }
+    None
+}
+
 fn find_element_by_id(root: &Handle, id: &str) -> Option<Handle> {
     if let NodeData::Element { ref attrs, .. } = root.data {
         for attr in attrs.borrow().iter() {
@@ -560,12 +727,43 @@ fn find_element_by_id(root: &Handle, id: &str) -> Option<Handle> {
     None
 }
 
+fn find_parent_of_node(root: &Handle, target_nid: u32) -> Option<Handle> {
+    for child in root.children.borrow().iter() {
+        // Check if any child matches the target_nid (needs to be registered first to check nid)
+        // Wait, checking by NID is tricky because we might not have it registered.
+        // Actually, we can check by pointer equality if we had the handle.
+        // But the JS side only gives us NID.
+        
+        let child_nid = NODE_REGISTRY.with(|reg| {
+            for (nid, handle) in reg.borrow().iter() {
+                if Rc::ptr_eq(handle, child) { return Some(*nid); }
+            }
+            None
+        });
+        
+        if let Some(nid) = child_nid {
+            if nid == target_nid { return Some(root.clone()); }
+        }
+        
+        if let Some(found) = find_parent_of_node(child, target_nid) { return Some(found); }
+    }
+    None
+}
+
+use std::rc::Rc;
+
 fn register_node(handle: Handle) -> u32 {
+    let ptr = Rc::as_ptr(&handle) as usize;
+    if let Some(id) = REVERSE_NODE_REGISTRY.with(|reg| reg.borrow().get(&ptr).cloned()) {
+        return id;
+    }
+
     let id = NEXT_NODE_ID.with(|id_cell| {
         let id = *id_cell.borrow();
         *id_cell.borrow_mut() += 1;
         id
     });
     NODE_REGISTRY.with(|reg| reg.borrow_mut().insert(id, handle));
+    REVERSE_NODE_REGISTRY.with(|reg| reg.borrow_mut().insert(ptr, id));
     id
 }

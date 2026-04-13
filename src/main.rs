@@ -446,9 +446,12 @@ impl eframe::App for BrowserApp {
             deadline = Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as f64 + 16.0);
         }
         
+        // Sync focus to JS
+        self.js_runtime.set_focused_node_id(self.focused_id.clone());
+
         let mut needs_re_render = self.js_runtime.tick(Some(timestamp), deadline);
 
-        // Sync focus from JS
+        // Sync focus FROM JS (if changed via element.focus())
         if let Some(js_focused_id) = self.js_runtime.get_focused_node_id() {
             if self.focused_id.as_deref() != Some(&js_focused_id) {
                 self.focused_id = Some(js_focused_id);
