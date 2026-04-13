@@ -282,20 +282,20 @@ impl LayerTreeBuilder {
             triggers.push(CompositingTrigger::Opacity(opacity));
         }
 
-        if let Some(Value::Transform(ops)) = sv.get("transform") {
+        if let Some(Value::Transform(ops)) = sv.get(&crate::css::intern("transform")) {
             matrix = Self::compute_transform_matrix(ops);
             triggers.push(CompositingTrigger::Transform(matrix));
         }
 
-        match sv.get("position") {
-            Some(Value::Keyword(k)) if k == "fixed" => triggers.push(CompositingTrigger::PositionFixed),
-            Some(Value::Keyword(k)) if k == "sticky" => triggers.push(CompositingTrigger::PositionSticky),
+        match sv.get(&crate::css::intern("position")) {
+            Some(Value::Keyword(k)) if **k == *"fixed" => triggers.push(CompositingTrigger::PositionFixed),
+            Some(Value::Keyword(k)) if **k == *"sticky" => triggers.push(CompositingTrigger::PositionSticky),
             _ => {}
         }
 
-        if let Some(Value::Keyword(k)) = sv.get("will-change") {
-            if k != "auto" {
-                triggers.push(CompositingTrigger::WillChange(k.clone()));
+        if let Some(Value::Keyword(k)) = sv.get(&crate::css::intern("will-change")) {
+            if **k != *"auto" {
+                triggers.push(CompositingTrigger::WillChange(k.to_string()));
             }
         }
 
@@ -306,10 +306,10 @@ impl LayerTreeBuilder {
         let mut result = Matrix4x4::identity();
         for op in ops {
             let m = match op {
-                TransformOp::Translate(x, y) => Matrix4x4::translate(*x, *y, 0.0),
-                TransformOp::Scale(x, y) => Matrix4x4::from_2d(Matrix3x3::scale(*x, *y)),
-                TransformOp::Rotate(rad) => Matrix4x4::from_2d(Matrix3x3::rotate(*rad)),
-                TransformOp::Matrix(a, b, c, d, e, f) => Matrix4x4::from_2d(Matrix3x3([*a, *c, *e, *b, *d, *f, 0.0, 0.0, 1.0])),
+                TransformOp::Translate(x, y) => Matrix4x4::translate(x.0, y.0, 0.0),
+                TransformOp::Scale(x, y) => Matrix4x4::from_2d(Matrix3x3::scale(x.0, y.0)),
+                TransformOp::Rotate(rad) => Matrix4x4::from_2d(Matrix3x3::rotate(rad.0)),
+                TransformOp::Matrix(a, b, c, d, e, f) => Matrix4x4::from_2d(Matrix3x3([a.0, c.0, e.0, b.0, d.0, f.0, 0.0, 0.0, 1.0])),
             };
             result = result.multiply(&m);
         }
@@ -323,7 +323,7 @@ impl LayerTreeBuilder {
         let d = layout.dimensions;
         let sv = &layout.style_node.specified_values;
 
-        let radius = match sv.get("border-radius") {
+        let radius = match sv.get(&crate::css::intern("border-radius")) {
             Some(Value::Length(v, _)) => *v,
             _ => 0.0,
         };
@@ -331,14 +331,14 @@ impl LayerTreeBuilder {
         let mut commands = Vec::new();
 
         // Box shadow (outer only)
-        if let Some(Value::BoxShadow(shadow)) = sv.get("box-shadow") {
+        if let Some(Value::BoxShadow(shadow)) = sv.get(&crate::css::intern("box-shadow")) {
             if !shadow.inset {
                 commands.push(PaintCommand::Shadow(d, shadow.clone()));
             }
         }
 
         // Background
-        let bg = sv.get("background-color").or_else(|| sv.get("background"));
+        let bg = sv.get(&crate::css::intern("background-color")).or_else(|| sv.get(&crate::css::intern("background")));
         if let Some(Value::Color(c)) = bg {
             if c.a > 0 {
                 commands.push(PaintCommand::Rect(d, c.clone(), radius));
@@ -347,7 +347,7 @@ impl LayerTreeBuilder {
 
         // Border
         if layout.border.left > 0.0 {
-            let color = match sv.get("border-color") {
+            let color = match sv.get(&crate::css::intern("border-color")) {
                 Some(Value::Color(c)) => c.clone(),
                 _ => Color { r: 180, g: 180, b: 180, a: 255 },
             };
@@ -363,11 +363,11 @@ impl LayerTreeBuilder {
 
         // Text
         if let NodeData::Text { ref contents } = layout.style_node.node.data {
-            let font_size = match sv.get("font-size") {
+            let font_size = match sv.get(&crate::css::intern("font-size")) {
                 Some(Value::Length(v, _)) => *v,
                 _ => 16.0,
             };
-            let color = match sv.get("color") {
+            let color = match sv.get(&crate::css::intern("color")) {
                 Some(Value::Color(c)) => c.clone(),
                 _ => Color { r: 0, g: 0, b: 0, a: 255 },
             };

@@ -1,8 +1,25 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::hash::{Hash, Hasher};
+use lazy_static::lazy_static;
+
+lazy_static! {
+    static ref STRING_INTERNER: Mutex<HashSet<Arc<str>>> = Mutex::new(HashSet::new());
+}
+
+pub fn intern(s: &str) -> Arc<str> {
+    let mut interner = STRING_INTERNER.lock().unwrap();
+    if let Some(arc) = interner.get(s) {
+        return arc.clone();
+    }
+    let arc: Arc<str> = Arc::from(s);
+    interner.insert(arc.clone());
+    arc
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
-    Keyword(String),
+    Keyword(Arc<str>),
     Length(f32, Unit),
     Color(Color),
     BoxShadow(BoxShadow),
@@ -13,25 +30,72 @@ pub enum Value {
     Transform(Vec<TransformOp>),
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum TransformOp {
-    Translate(f32, f32), // px
-    Scale(f32, f32),     // factor
-    Rotate(f32),         // radians
-    Matrix(f32, f32, f32, f32, f32, f32), // matrix(a, b, c, d, e, f)
+impl Eq for Value {}
+
+impl Hash for Value {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Value::Keyword(s) => s.hash(state),
+            Value::Length(f, u) => {
+                f.to_bits().hash(state);
+                u.hash(state);
+            }
+            Value::Color(c) => c.hash(state),
+            Value::BoxShadow(s) => s.hash(state),
+            Value::Number(f) => f.to_bits().hash(state),
+            Value::FitContent(f) => f.to_bits().hash(state),
+            Value::Transform(ops) => ops.hash(state),
+        }
+    }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash, Eq)]
+pub enum TransformOp {
+    Translate(OrderedFloat, OrderedFloat), // px
+    Scale(OrderedFloat, OrderedFloat),     // factor
+    Rotate(OrderedFloat),                  // radians
+    Matrix(OrderedFloat, OrderedFloat, OrderedFloat, OrderedFloat, OrderedFloat, OrderedFloat),
+}
+
+use std::ops::Deref;
+
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct OrderedFloat(pub f32);
+
+impl Deref for OrderedFloat {
+    type Target = f32;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Hash for OrderedFloat {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.to_bits().hash(state);
+    }
+}
+
+impl Eq for OrderedFloat {}
+
+impl std::ops::Mul<f32> for OrderedFloat {
+    type Output = f32;
+    fn mul(self, rhs: f32) -> Self::Output {
+        self.0 * rhs
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Hash, Eq)]
 pub struct BoxShadow {
-    pub offset_x: f32,
-    pub offset_y: f32,
-    pub blur: f32,
-    pub spread: f32,
+    pub offset_x: OrderedFloat,
+    pub offset_y: OrderedFloat,
+    pub blur: OrderedFloat,
+    pub spread: OrderedFloat,
     pub color: Color,
     pub inset: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash, Eq)]
 pub struct Color {
     pub r: u8,
     pub g: u8,
@@ -39,7 +103,7 @@ pub struct Color {
     pub a: u8,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash, Eq)]
 pub enum Unit {
     Px,
     Vw,
@@ -50,7 +114,7 @@ pub enum Unit {
 
 #[derive(Debug, Clone)]
 pub struct Declaration {
-    pub name: String,
+    pub name: Arc<str>,
     pub value: Value,
     pub important: bool,
 }
@@ -133,7 +197,7 @@ pub fn parse_css(source: &str) -> Stylesheet {
             if decl.is_empty() { continue; }
             
             let mut kv = decl.splitn(2, ':');
-            let key = kv.next().unwrap_or("").trim().to_lowercase();
+            let key = intern(&kv.next().unwrap_or("").trim().to_lowercase());
             let mut val_raw = kv.next().unwrap_or("").trim().to_string();
             if key.is_empty() || val_raw.is_empty() { continue; }
 
@@ -142,26 +206,26 @@ pub fn parse_css(source: &str) -> Stylesheet {
                 val_raw = val_raw.trim_end_matches("!important").trim().to_string();
             }
 
-            match key.as_str() {
+            match &*key {
                 "border" => {
                     let mut temp_map = HashMap::new();
                     parse_border_shorthand(&val_raw, &mut temp_map);
                     for (k, v) in temp_map {
-                        declarations.push(Declaration { name: k, value: v, important });
+                        declarations.push(Declaration { name: intern(&k), value: v, important });
                     }
                 }
                 "padding" => {
                     let mut temp_map = HashMap::new();
                     parse_quad_shorthand("padding", &val_raw, &mut temp_map);
                     for (k, v) in temp_map {
-                        declarations.push(Declaration { name: k, value: v, important });
+                        declarations.push(Declaration { name: intern(&k), value: v, important });
                     }
                 }
                 "margin" => {
                     let mut temp_map = HashMap::new();
                     parse_quad_shorthand("margin", &val_raw, &mut temp_map);
                     for (k, v) in temp_map {
-                        declarations.push(Declaration { name: k, value: v, important });
+                        declarations.push(Declaration { name: intern(&k), value: v, important });
                     }
                 }
                 "box-shadow" => {
@@ -378,7 +442,7 @@ fn parse_border_shorthand(val: &str, declarations: &mut HashMap<String, Value>) 
         } else if let Some(color) = parse_color(part) {
             declarations.insert("border-color".to_string(), Value::Color(color));
         } else if matches!(part, "solid" | "dashed" | "dotted" | "none") {
-            declarations.insert("border-style".to_string(), Value::Keyword(part.to_string()));
+            declarations.insert("border-style".to_string(), Value::Keyword(intern(part)));
         }
     }
 }
@@ -429,10 +493,10 @@ pub fn parse_box_shadow(s: &str) -> Option<BoxShadow> {
     if values.is_empty() { return None; }
 
     Some(BoxShadow {
-        offset_x: values.get(0).copied().unwrap_or(0.0),
-        offset_y: values.get(1).copied().unwrap_or(0.0),
-        blur: values.get(2).copied().unwrap_or(0.0),
-        spread: values.get(3).copied().unwrap_or(0.0),
+        offset_x: OrderedFloat(values.get(0).copied().unwrap_or(0.0)),
+        offset_y: OrderedFloat(values.get(1).copied().unwrap_or(0.0)),
+        blur: OrderedFloat(values.get(2).copied().unwrap_or(0.0)),
+        spread: OrderedFloat(values.get(3).copied().unwrap_or(0.0)),
         color,
         inset,
     })
@@ -445,7 +509,7 @@ pub fn parse_value(val: &str) -> Value {
 
     // Intrinsic sizing keywords (CSS Sizing Level 3)
     if val == "min-content" || val == "max-content" || val == "fit-content" {
-        return Value::Keyword(val.to_string());
+        return Value::Keyword(intern(val));
     }
 
     // transform: translate(...) rotate(...)
@@ -478,7 +542,7 @@ pub fn parse_value(val: &str) -> Value {
     } else if let Ok(num) = val.parse::<f32>() {
         Value::Number(num)
     } else {
-        Value::Keyword(val.to_string())
+        Value::Keyword(intern(val))
     }
 }
 
@@ -626,9 +690,9 @@ mod tests {
         let s = parse_box_shadow("0px 2px 8px rgba(0, 0, 0, 0.15)");
         assert!(s.is_some());
         let s = s.unwrap();
-        assert_eq!(s.offset_x, 0.0);
-        assert_eq!(s.offset_y, 2.0);
-        assert_eq!(s.blur, 8.0);
+        assert_eq!(s.offset_x, OrderedFloat(0.0));
+        assert_eq!(s.offset_y, OrderedFloat(2.0));
+        assert_eq!(s.blur, OrderedFloat(8.0));
     }
 
     #[test]
@@ -660,12 +724,12 @@ fn parse_transform_list(val: &str) -> Vec<TransformOp> {
                 "translate" => {
                     let x = parse_px_or_zero(args.get(0).copied().unwrap_or("0"));
                     let y = parse_px_or_zero(args.get(1).copied().unwrap_or("0"));
-                    ops.push(TransformOp::Translate(x, y));
+                    ops.push(TransformOp::Translate(OrderedFloat(x), OrderedFloat(y)));
                 }
                 "scale" => {
                     let x = args.get(0).and_then(|s| s.parse::<f32>().ok()).unwrap_or(1.0);
                     let y = args.get(1).and_then(|s| s.parse::<f32>().ok()).unwrap_or(x);
-                    ops.push(TransformOp::Scale(x, y));
+                    ops.push(TransformOp::Scale(OrderedFloat(x), OrderedFloat(y)));
                 }
                 "rotate" => {
                     let mut rad = 0.0;
@@ -678,7 +742,7 @@ fn parse_transform_list(val: &str) -> Vec<TransformOp> {
                             rad = arg.parse::<f32>().unwrap_or(0.0);
                         }
                     }
-                    ops.push(TransformOp::Rotate(rad));
+                    ops.push(TransformOp::Rotate(OrderedFloat(rad)));
                 }
                 "matrix" => {
                     if args.len() == 6 {
@@ -688,7 +752,7 @@ fn parse_transform_list(val: &str) -> Vec<TransformOp> {
                         let d = args[3].parse().unwrap_or(1.0);
                         let e = args[4].parse().unwrap_or(0.0);
                         let f = args[5].parse().unwrap_or(0.0);
-                        ops.push(TransformOp::Matrix(a, b, c, d, e, f));
+                        ops.push(TransformOp::Matrix(OrderedFloat(a), OrderedFloat(b), OrderedFloat(c), OrderedFloat(d), OrderedFloat(e), OrderedFloat(f)));
                     }
                 }
                 _ => {}

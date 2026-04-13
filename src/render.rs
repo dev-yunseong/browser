@@ -2,7 +2,7 @@ use tiny_skia::{Pixmap, Paint, Transform, Stroke, PathBuilder, PixmapPaint};
 use ab_glyph::{Font, FontRef, PxScale, point};
 use crate::layout::{LayoutBox, Rect as LayoutRect};
 use crate::css::Color;
-use crate::layer_tree::{LayerTree, LayerTreeBuilder, PaintCommand, Layer};
+use crate::layer_tree::{LayerTree, LayerTreeBuilder, PaintCommand};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use lazy_static::lazy_static;
@@ -182,10 +182,10 @@ fn execute_commands(commands: &[PaintCommand], pixmap: &mut Pixmap, layer_bounds
             PaintCommand::Shadow(r, s) => {
                 let mut paint = Paint::default();
                 paint.set_color_rgba8(s.color.r, s.color.g, s.color.b, s.color.a / 2);
-                let sx = r.x + s.offset_x - s.spread;
-                let sy = r.y + s.offset_y - s.spread;
-                let sw = r.width + (s.spread * 2.0);
-                let sh = r.height + (s.spread * 2.0);
+                let sx = r.x + *s.offset_x - *s.spread;
+                let sy = r.y + *s.offset_y - *s.spread;
+                let sw = r.width + (*s.spread * 2.0);
+                let sh = r.height + (*s.spread * 2.0);
                 if let Some(tr) = tiny_skia::Rect::from_xywh(sx, sy, sw, sh) {
                     pixmap.fill_rect(tr, &paint, transform, None);
                 }
@@ -254,10 +254,10 @@ fn execute_tile(tile: &crate::layer_tree::Tile, pixmap: &mut Pixmap, image_cache
             PaintCommand::Shadow(r, s) => {
                 let mut paint = Paint::default();
                 paint.set_color_rgba8(s.color.r, s.color.g, s.color.b, s.color.a / 2);
-                let sx = r.x + s.offset_x - s.spread;
-                let sy = r.y + s.offset_y - s.spread;
-                let sw = r.width + (s.spread * 2.0);
-                let sh = r.height + (s.spread * 2.0);
+                let sx = r.x + *s.offset_x - *s.spread;
+                let sy = r.y + *s.offset_y - *s.spread;
+                let sw = r.width + (*s.spread * 2.0);
+                let sh = r.height + (*s.spread * 2.0);
                 if let Some(tr) = tiny_skia::Rect::from_xywh(sx, sy, sw, sh) {
                     pixmap.fill_rect(tr, &paint, transform, None);
                 }
