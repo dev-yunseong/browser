@@ -1,4 +1,4 @@
-use crate::css::{Stylesheet, Value, Selector, parse_value, parse_color, Combinator, intern};
+use crate::css::{Stylesheet, Value, Selector, parse_value, parse_color, Combinator, intern, SelectorKey};
 
 use markup5ever_rcdom::{Handle, NodeData};
 use std::collections::{HashMap, HashSet};
@@ -42,6 +42,96 @@ impl StyleStore {
             self.cache.insert(wrapper.clone());
             wrapper
         }
+    }
+}
+
+/// An entry in the selector index pointing to a specific selector within a rule.
+#[derive(Clone)]
+struct IndexEntry {
+    specificity: (usize, usize, usize),
+    rule_idx: usize,
+    sel_idx: usize,
+    /// True when the selector has an ancestor part (needs DOM context for full match).
+    is_complex: bool,
+}
+
+/// Pre-built index that buckets selectors by their key feature for O(1) candidate lookup.
+/// Built once per stylesheet before the parallel matching phase.
+struct SelectorIndex {
+    by_id:    HashMap<String, Vec<IndexEntry>>,
+    by_class: HashMap<String, Vec<IndexEntry>>,
+    by_tag:   HashMap<String, Vec<IndexEntry>>,
+    universal: Vec<IndexEntry>,
+}
+
+impl SelectorIndex {
+    fn build(stylesheet: &Stylesheet) -> Self {
+        let mut by_id: HashMap<String, Vec<IndexEntry>> = HashMap::new();
+        let mut by_class: HashMap<String, Vec<IndexEntry>> = HashMap::new();
+        let mut by_tag: HashMap<String, Vec<IndexEntry>> = HashMap::new();
+        let mut universal: Vec<IndexEntry> = Vec::new();
+
+        for (rule_idx, rule) in stylesheet.all_rules().iter().enumerate() {
+            for (sel_idx, sel) in rule.selectors.iter().enumerate() {
+                let entry = IndexEntry {
+                    specificity: sel.specificity(),
+                    rule_idx,
+                    sel_idx,
+                    // Mark as complex if it has an ancestor combinator OR attribute constraints.
+                    // Attribute selectors depend on per-node attribute values, which are not
+                    // captured in the ElementSignature, so they must bypass the signature cache.
+                    is_complex: sel.ancestor.is_some() || !sel.attributes.is_empty(),
+                };
+                match sel.key_feature() {
+                    SelectorKey::Id(id)    => by_id.entry(id).or_default().push(entry),
+                    SelectorKey::Class(cls) => by_class.entry(cls).or_default().push(entry),
+                    SelectorKey::Tag(tag)  => by_tag.entry(tag).or_default().push(entry),
+                    SelectorKey::Universal => universal.push(entry),
+                }
+            }
+        }
+        SelectorIndex { by_id, by_class, by_tag, universal }
+    }
+
+    /// Collect candidate entries for a given element node.
+    /// Returns entries that *might* match the node (false positives possible for complex selectors;
+    /// full `matches_selector_arena` call is still required to confirm).
+    fn candidates<'a>(&'a self, node: &NodeDataSend) -> Vec<&'a IndexEntry> {
+        let mut out: Vec<&IndexEntry> = Vec::new();
+        out.extend(self.universal.iter());
+        if !node.tag.is_empty() {
+            if let Some(entries) = self.by_tag.get(&node.tag) {
+                out.extend(entries.iter());
+            }
+        }
+        for cls in &node.classes {
+            if let Some(entries) = self.by_class.get(cls) {
+                out.extend(entries.iter());
+            }
+        }
+        if let Some(ref id) = node.id {
+            if let Some(entries) = self.by_id.get(id) {
+                out.extend(entries.iter());
+            }
+        }
+        out
+    }
+}
+
+/// Signature of an element for cache lookup. Classes are sorted so identical
+/// sets of classes map to the same signature regardless of DOM order.
+#[derive(Hash, Eq, PartialEq)]
+struct ElementSignature {
+    tag: String,
+    id: Option<String>,
+    classes: Vec<String>, // sorted
+}
+
+impl ElementSignature {
+    fn from_node(node: &NodeDataSend) -> Self {
+        let mut classes = node.classes.clone();
+        classes.sort_unstable();
+        ElementSignature { tag: node.tag.clone(), id: node.id.clone(), classes }
     }
 }
 
@@ -227,35 +317,80 @@ pub fn build_style_tree(
     let mut arena = Vec::new();
     flatten_dom(root, &mut arena, None);
 
-    // Phase 1: Parallel CSS Matching
+    // Pre-build selector index: O(M) — done once before the parallel phase.
+    let sel_index = SelectorIndex::build(stylesheet);
+    // Snapshot all_rules into a Vec so we can index into it by rule_idx.
+    let all_rules: Vec<&crate::css::Rule> = stylesheet.all_rules();
+
+    // Pre-build element signature cache for simple (no-combinator) selectors.
+    // Maps ElementSignature -> Vec<(specificity, rule_idx)>.
+    // Computed sequentially once; read-only inside par_iter (HashMap is Sync when V is Sync).
+    let mut sig_cache: HashMap<ElementSignature, Vec<(( usize, usize, usize), usize)>> = HashMap::new();
+    for (idx, node) in arena.iter().enumerate() {
+        if !node.is_element { continue; }
+        let sig = ElementSignature::from_node(node);
+        if sig_cache.contains_key(&sig) { continue; }
+        // Gather simple-selector matches for this signature.
+        // "Simple" means no ancestor combinator — result is position-independent.
+        let candidates = sel_index.candidates(node);
+        let mut rule_best: HashMap<usize, (usize, usize, usize)> = HashMap::new();
+        for entry in &candidates {
+            if entry.is_complex { continue; } // skip; needs full DOM context
+            let sel = &all_rules[entry.rule_idx].selectors[entry.sel_idx];
+            if matches_selector_arena(sel, idx, &arena, hovered_id, focused_id) {
+                let e = rule_best.entry(entry.rule_idx).or_insert((0, 0, 0));
+                if entry.specificity > *e { *e = entry.specificity; }
+            }
+        }
+        let mut matched: Vec<((usize, usize, usize), usize)> = rule_best.into_iter().map(|(ridx, spec)| (spec, ridx)).collect();
+        matched.sort_by_key(|&(spec, _)| spec);
+        sig_cache.insert(sig, matched);
+    }
+
+    // Phase 1: Parallel CSS Matching (index-accelerated, O(N × bucket_size))
     let mut raw_styles: Vec<HashMap<Arc<str>, Value>> = arena.par_iter().enumerate().map(|(idx, node)| {
         if !node.is_element { return HashMap::new(); }
         let mut map = HashMap::new();
         apply_default_styles(&node.tag, &mut map);
-        
-        let mut matches = Vec::new();
-        for rule in stylesheet.all_rules() {
-            let mut highest = None;
-            for sel in &rule.selectors {
-                if matches_selector_arena(sel, idx, &arena, hovered_id, focused_id) {
-                    let spec = sel.specificity();
-                    if highest.is_none() || spec > highest.unwrap() { highest = Some(spec); }
-                }
+
+        // --- Collect matching rules ---
+        // rule_best maps rule_idx -> highest specificity seen for that rule
+        let mut rule_best: HashMap<usize, (usize, usize, usize)> = HashMap::new();
+
+        // 1. Simple-selector matches via the signature cache (no DOM traversal needed)
+        let sig = ElementSignature::from_node(node);
+        if let Some(simple_matches) = sig_cache.get(&sig) {
+            for &(spec, rule_idx) in simple_matches {
+                let e = rule_best.entry(rule_idx).or_insert((0, 0, 0));
+                if spec > *e { *e = spec; }
             }
-            if let Some(s) = highest { matches.push((s, rule)); }
         }
-        matches.sort_by(|a, b| a.0.cmp(&b.0));
-        
-        let mut important = HashMap::new();
-        for (_, rule) in &matches {
-            for decl in &rule.declarations {
+
+        // 2. Complex-selector matches via the index (need full DOM context for ancestor checks)
+        let candidates = sel_index.candidates(node);
+        for entry in &candidates {
+            if !entry.is_complex { continue; }
+            let sel = &all_rules[entry.rule_idx].selectors[entry.sel_idx];
+            if matches_selector_arena(sel, idx, &arena, hovered_id, focused_id) {
+                let e = rule_best.entry(entry.rule_idx).or_insert((0, 0, 0));
+                if entry.specificity > *e { *e = entry.specificity; }
+            }
+        }
+
+        // Sort by specificity (ascending) so higher specificity overwrites lower
+        let mut matches: Vec<((usize, usize, usize), usize)> = rule_best.into_iter().map(|(ridx, spec)| (spec, ridx)).collect();
+        matches.sort_by_key(|&(spec, _)| spec);
+
+        let mut important: HashMap<Arc<str>, Value> = HashMap::new();
+        for (_, rule_idx) in &matches {
+            for decl in &all_rules[*rule_idx].declarations {
                 if !decl.important { map.insert(decl.name.clone(), decl.value.clone()); }
                 else { important.insert(decl.name.clone(), decl.value.clone()); }
             }
         }
-        
+
         apply_attribute_styles_arena(node, &mut map);
-        
+
         let mut inline_important = HashMap::new();
         if let Some(v) = node.attrs.iter().find(|(k, _)| k == "style").map(|(_, v)| v) {
             let mut inline_map = Vec::new();
@@ -265,10 +400,10 @@ pub fn build_style_tree(
                 else { inline_important.insert(decl.name, decl.value); }
             }
         }
-        
+
         for (k, v) in important { map.insert(k, v); }
         for (k, v) in inline_important { map.insert(k, v); }
-        
+
         if let Some(ref id) = node.id {
             if let Some(overrides) = js_overrides.get(id) {
                 for (k, v) in overrides { map.insert(intern(k), parse_value(v)); }
