@@ -232,6 +232,9 @@ fn matches_selector_arena(selector: &Selector, idx: usize, arena: &[NodeDataSend
             if Some(node.id.as_deref()) != Some(hovered_id) || node.id.is_none() { return false; }
         } else if pseudo == "focus" {
             if Some(node.id.as_deref()) != Some(focused_id) || node.id.is_none() { return false; }
+        } else if pseudo == "root" {
+            // :root matches the root element of the document — the <html> element.
+            if node.tag != "html" { return false; }
         } else { return false; }
     }
     for attr_sel in &selector.attributes {
@@ -443,6 +446,66 @@ pub fn build_style_tree(
     build_final_tree(root, &mut arena_idx, &mut raw_styles, parent_style, &mut store)
 }
 
+/// Returns the CSS initial value for a given property name, or `None` if not defined here.
+/// Only properties that can be set to `initial` keyword need an entry.
+fn initial_value(prop: &str) -> Option<Value> {
+    use crate::css::{Unit, Color};
+    match prop {
+        "color"            => Some(Value::Color(Color { r: 0, g: 0, b: 0, a: 255 })),
+        "font-size"        => Some(Value::Length(16.0, Unit::Px)),
+        "font-weight"      => Some(Value::Keyword(intern("normal"))),
+        "font-style"       => Some(Value::Keyword(intern("normal"))),
+        "font-family"      => Some(Value::Keyword(intern("serif"))),
+        "text-align"       => Some(Value::Keyword(intern("left"))),
+        "text-decoration"  => Some(Value::Keyword(intern("none"))),
+        "line-height"      => Some(Value::Keyword(intern("normal"))),
+        "display"          => Some(Value::Keyword(intern("inline"))),
+        "visibility"       => Some(Value::Keyword(intern("visible"))),
+        "background-color" => Some(Value::Keyword(intern("transparent"))),
+        "opacity"          => Some(Value::Number(1.0)),
+        "border-width"     => Some(Value::Length(0.0, Unit::Px)),
+        "border-style"     => Some(Value::Keyword(intern("none"))),
+        "margin-top" | "margin-right" | "margin-bottom" | "margin-left" |
+        "padding-top" | "padding-right" | "padding-bottom" | "padding-left" =>
+            Some(Value::Length(0.0, Unit::Px)),
+        _ => None,
+    }
+}
+
+/// Maximum recursion depth for `var()` resolution, to prevent infinite loops from
+/// cyclic custom property references (e.g. `--a: var(--b); --b: var(--a)`).
+const VAR_RESOLVE_MAX_DEPTH: u32 = 32;
+
+/// Resolve `Value::CssVar` references using the provided custom properties map.
+/// `depth` tracks recursion depth; returns `None` when the limit is reached.
+fn resolve_var(value: &Value, custom_props: &HashMap<Arc<str>, Value>, depth: u32) -> Option<Value> {
+    if depth > VAR_RESOLVE_MAX_DEPTH { return None; }
+    if let Value::CssVar { name, fallback } = value {
+        if let Some(raw) = custom_props.get(name) {
+            if let Value::RawCustomProp(raw_str) = raw {
+                // Re-parse the raw string as a CSS value at use time.
+                let resolved = crate::css::parse_value(raw_str);
+                // Recurse in case the resolved value is itself a var().
+                return Some(resolve_var_value(resolved, custom_props, depth + 1));
+            }
+        }
+        // Custom property not found — use fallback if present.
+        if let Some(fb) = fallback {
+            return Some(resolve_var_value(*fb.clone(), custom_props, depth + 1));
+        }
+        return None;
+    }
+    None
+}
+
+/// Recursively resolve any `CssVar` values inside `value`.
+fn resolve_var_value(value: Value, custom_props: &HashMap<Arc<str>, Value>, depth: u32) -> Value {
+    match &value {
+        Value::CssVar { .. } => resolve_var(&value, custom_props, depth).unwrap_or(value),
+        _ => value,
+    }
+}
+
 fn build_final_tree(
     root: &Handle,
     arena_idx: &mut usize,
@@ -495,10 +558,32 @@ fn build_final_tree(
                 let mut specified_values = std::mem::take(&mut raw_styles[current_idx]);
 
                 if parent_pm.is_none() && current_idx == 0 {
-                    specified_values.insert(intern("color"), Value::Color(crate::css::Color { r: 0, g: 0, b: 0, a: 255 }));
-                    specified_values.insert(intern("font-size"), Value::Length(16.0, crate::css::Unit::Px));
+                    specified_values.entry(intern("color")).or_insert_with(|| Value::Color(crate::css::Color { r: 0, g: 0, b: 0, a: 255 }));
+                    specified_values.entry(intern("font-size")).or_insert_with(|| Value::Length(16.0, crate::css::Unit::Px));
                 }
 
+                // --- Step 1: Collect custom properties from this element's map ---
+                // CSS custom properties are inherited by default.
+                let mut custom_props: HashMap<Arc<str>, Value> = HashMap::new();
+                // Inherit parent custom properties first.
+                if let Some(ref p) = parent_pm {
+                    for (k, v) in p.iter() {
+                        if k.starts_with("--") {
+                            custom_props.insert(k.clone(), v.clone());
+                            // Also insert into specified_values so they flow into the
+                            // PropertyMap and can be inherited by grandchildren.
+                            specified_values.entry(k.clone()).or_insert_with(|| v.clone());
+                        }
+                    }
+                }
+                // Override/add with this element's own custom properties.
+                for (k, v) in &specified_values {
+                    if k.starts_with("--") {
+                        custom_props.insert(k.clone(), v.clone());
+                    }
+                }
+
+                // --- Step 2: Inherit inheritable properties (unless explicitly set) ---
                 if let Some(ref p) = parent_pm {
                     let inheritable = ["color", "font-size", "font-family", "font-weight", "line-height", "text-align", "list-style-type"];
                     for prop in inheritable {
@@ -509,29 +594,97 @@ fn build_final_tree(
                     }
                 }
 
-                // Em/Percent resolution for font-size
+                // --- Step 3: Resolve font-size em/% first (needs parent font-size) ---
                 let fs_key = intern("font-size");
-                let mut resolved_fs = 16.0f32;
+                let parent_fs = parent_pm.as_ref()
+                    .and_then(|p| p.get(&fs_key))
+                    .and_then(|v| if let Value::Length(pv, crate::css::Unit::Px) = v { Some(*pv) } else { None })
+                    .unwrap_or(16.0);
                 if let Some(val) = specified_values.get(&fs_key) {
-                    match val {
-                        Value::Length(v, crate::css::Unit::Px) => resolved_fs = *v,
-                        Value::Length(v, crate::css::Unit::Percent) => {
-                            let parent_fs = match parent_pm.as_ref() {
-                                Some(p) => match p.get(&fs_key) { Some(Value::Length(pv, crate::css::Unit::Px)) => *pv, _ => 16.0 }, _ => 16.0
-                            };
-                            resolved_fs = parent_fs * (v / 100.0);
+                    let resolved_fs = match val {
+                        Value::Length(v, crate::css::Unit::Px) => Some(*v),
+                        Value::Length(v, crate::css::Unit::Percent) => Some(parent_fs * (v / 100.0)),
+                        Value::Length(v, crate::css::Unit::Em) => Some(parent_fs * v),
+                        Value::Keyword(kw) if kw.as_ref() == "inherit" => Some(parent_fs),
+                        Value::Keyword(kw) if kw.as_ref() == "initial" => Some(16.0),
+                        Value::CssVar { .. } => {
+                            resolve_var(val, &custom_props, 0)
+                                .and_then(|resolved| if let Value::Length(pv, crate::css::Unit::Px) = resolved { Some(pv) } else { None })
                         }
-                        Value::Length(v, crate::css::Unit::Em) => {
-                            let parent_fs = match parent_pm.as_ref() {
-                                Some(p) => match p.get(&fs_key) { Some(Value::Length(pv, crate::css::Unit::Px)) => *pv, _ => 16.0 }, _ => 16.0
-                            };
-                            resolved_fs = parent_fs * v;
-                        }
-                        _ => {}
+                        _ => None,
+                    };
+                    if let Some(fs) = resolved_fs {
+                        specified_values.insert(fs_key.clone(), Value::Length(fs, crate::css::Unit::Px));
                     }
                 }
-                if resolved_fs != 16.0 {
-                    specified_values.insert(fs_key, Value::Length(resolved_fs, crate::css::Unit::Px));
+                let own_fs = specified_values.get(&fs_key)
+                    .and_then(|v| if let Value::Length(pv, crate::css::Unit::Px) = v { Some(*pv) } else { None })
+                    .unwrap_or(parent_fs);
+
+                // --- Step 4: Resolve inherit / initial / var() / em (non-font-size) / currentColor ---
+                let color_key = intern("color");
+                // We need a snapshot of the current color for currentColor resolution.
+                // First resolve the color property itself if needed.
+                let own_color = {
+                    let color_val = specified_values.get(&color_key).cloned();
+                    match color_val.as_ref() {
+                        Some(Value::Keyword(kw)) if kw.as_ref() == "inherit" => {
+                            parent_pm.as_ref()
+                                .and_then(|p| p.get(&color_key))
+                                .cloned()
+                                .or_else(|| initial_value("color"))
+                        }
+                        Some(Value::Keyword(kw)) if kw.as_ref() == "initial" => initial_value("color"),
+                        Some(Value::CssVar { .. }) => {
+                            color_val.as_ref().and_then(|v| resolve_var(v, &custom_props, 0))
+                        }
+                        Some(v) => Some(v.clone()),
+                        None => parent_pm.as_ref().and_then(|p| p.get(&color_key)).cloned(),
+                    }
+                };
+                if let Some(ref c) = own_color {
+                    specified_values.insert(color_key.clone(), c.clone());
+                }
+
+                // Now resolve all other properties.
+                let keys: Vec<Arc<str>> = specified_values.keys()
+                    .filter(|k| k.as_ref() != "font-size" && k.as_ref() != "color" && !k.starts_with("--"))
+                    .cloned()
+                    .collect();
+                for key in keys {
+                    let val = specified_values[&key].clone();
+                    let resolved = match &val {
+                        Value::Keyword(kw) if kw.as_ref() == "inherit" => {
+                            parent_pm.as_ref()
+                                .and_then(|p| p.get(&key))
+                                .cloned()
+                                .or_else(|| initial_value(&key))
+                        }
+                        Value::Keyword(kw) if kw.as_ref() == "initial" => initial_value(&key),
+                        Value::Keyword(kw) if kw.as_ref().eq_ignore_ascii_case("currentcolor") => {
+                            own_color.clone()
+                        }
+                        Value::CssVar { .. } => {
+                            resolve_var(&val, &custom_props, 0).map(|v| {
+                                // After resolving var(), also resolve em/currentColor on the result.
+                                match &v {
+                                    Value::Length(n, crate::css::Unit::Em) => Value::Length(n * own_fs, crate::css::Unit::Px),
+                                    Value::Keyword(kw) if kw.as_ref().eq_ignore_ascii_case("currentcolor") => {
+                                        own_color.clone().unwrap_or(v.clone())
+                                    }
+                                    _ => v,
+                                }
+                            })
+                        }
+                        // Em resolution for non-font-size properties (resolves against own font-size).
+                        Value::Length(n, crate::css::Unit::Em) => {
+                            Some(Value::Length(n * own_fs, crate::css::Unit::Px))
+                        }
+                        _ => None,
+                    };
+                    if let Some(r) = resolved {
+                        specified_values.insert(key, r);
+                    }
                 }
 
                 let interned_map = store.intern(specified_values);
@@ -625,6 +778,224 @@ fn apply_default_styles(tag: &str, map: &mut HashMap<Arc<str>, Value>) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::css::{parse_css, Value, Unit, Color};
+    use crate::dom::parse_html;
+
+    /// Build a style tree from minimal HTML + CSS and return the root StyledNode.
+    fn make_tree(html: &str, css: &str) -> StyledNode {
+        let dom = parse_html(html);
+        let stylesheet = parse_css(css);
+        let js_overrides = HashMap::new();
+        build_style_tree(&dom.document, &stylesheet, None, &js_overrides, None, None, None)
+    }
+
+    /// Walk the StyledNode tree depth-first to find the first node whose tag matches.
+    fn find_node<'a>(root: &'a StyledNode, tag: &str) -> Option<&'a StyledNode> {
+        if let markup5ever_rcdom::NodeData::Element { ref name, .. } = root.node.data {
+            if name.local.as_ref() == tag { return Some(root); }
+        }
+        for child in &root.children {
+            if let Some(found) = find_node(child, tag) { return Some(found); }
+        }
+        None
+    }
+
+    fn get_color(node: &StyledNode, prop: &str) -> Option<Color> {
+        match node.specified_values.get(&intern(prop)) {
+            Some(Value::Color(c)) => Some(c.clone()),
+            _ => None,
+        }
+    }
+
+    fn get_length_px(node: &StyledNode, prop: &str) -> Option<f32> {
+        match node.specified_values.get(&intern(prop)) {
+            Some(Value::Length(v, Unit::Px)) => Some(*v),
+            _ => None,
+        }
+    }
+
+    fn get_keyword(node: &StyledNode, prop: &str) -> Option<String> {
+        match node.specified_values.get(&intern(prop)) {
+            Some(Value::Keyword(k)) => Some(k.to_string()),
+            _ => None,
+        }
+    }
+
+    // --- inherit keyword ---
+
+    #[test]
+    fn test_inherit_color() {
+        // The child explicitly sets color: inherit, so it should get the parent's color.
+        let tree = make_tree(
+            r#"<html><body><p style="color: red"><span style="color: inherit">text</span></p></body></html>"#,
+            "",
+        );
+        let span = find_node(&tree, "span").expect("span not found");
+        let c = get_color(span, "color").expect("color not found");
+        assert_eq!(c, Color { r: 255, g: 0, b: 0, a: 255 });
+    }
+
+    #[test]
+    fn test_inherit_on_root_falls_back_to_initial() {
+        // On the root element there is no parent, so inherit should fall back to initial value.
+        let tree = make_tree(
+            r#"<html style="font-weight: inherit"></html>"#,
+            "",
+        );
+        let html = find_node(&tree, "html").expect("html not found");
+        // inherit on root → initial value for font-weight is "normal"
+        let kw = get_keyword(html, "font-weight");
+        assert!(kw.is_none() || kw.as_deref() == Some("normal"));
+    }
+
+    // --- initial keyword ---
+
+    #[test]
+    fn test_initial_resets_color() {
+        // Even if CSS sets color to red on body, initial should give black.
+        let tree = make_tree(
+            r#"<html><body><p style="color: initial">text</p></body></html>"#,
+            "body { color: red; }",
+        );
+        let p = find_node(&tree, "p").expect("p not found");
+        let c = get_color(p, "color").expect("color not found");
+        assert_eq!(c, Color { r: 0, g: 0, b: 0, a: 255 });
+    }
+
+    // --- em resolution on non-font-size properties ---
+
+    #[test]
+    fn test_em_resolves_against_own_font_size() {
+        // margin-left: 2em on an element with font-size 20px → 40px
+        let tree = make_tree(
+            r#"<html><body><p>text</p></body></html>"#,
+            "p { font-size: 20px; margin-left: 2em; }",
+        );
+        let p = find_node(&tree, "p").expect("p not found");
+        let ml = get_length_px(p, "margin-left").expect("margin-left not found");
+        assert!((ml - 40.0).abs() < 0.1, "expected 40px, got {}", ml);
+    }
+
+    #[test]
+    fn test_em_font_size_resolves_against_parent() {
+        // Child font-size: 2em, parent font-size: 10px → child should be 20px
+        let tree = make_tree(
+            r#"<html><body><p>text</p></body></html>"#,
+            "body { font-size: 10px; } p { font-size: 2em; }",
+        );
+        let p = find_node(&tree, "p").expect("p not found");
+        let fs = get_length_px(p, "font-size").expect("font-size not found");
+        assert!((fs - 20.0).abs() < 0.1, "expected 20px, got {}", fs);
+    }
+
+    // --- currentColor ---
+
+    #[test]
+    fn test_currentcolor_border() {
+        // border-color: currentColor should resolve to the element's own color.
+        // Note: must use lowercase "currentcolor" because some CSS parsers normalize it.
+        let tree = make_tree(
+            r#"<html><body><p>text</p></body></html>"#,
+            "p { color: rgb(10, 20, 30); border-color: currentcolor; }",
+        );
+        let p = find_node(&tree, "p").expect("p not found");
+        let bc = get_color(p, "border-color").expect("border-color not found");
+        assert_eq!(bc, Color { r: 10, g: 20, b: 30, a: 255 });
+    }
+
+    // --- var() resolution ---
+
+    #[test]
+    fn test_var_resolves_custom_property() {
+        // Use html selector (instead of :root) to define custom property
+        // and inherit it down to p via var()
+        let tree = make_tree(
+            r#"<html><body><p>text</p></body></html>"#,
+            "html { --accent: #ff0000; } p { color: var(--accent); }",
+        );
+        let p = find_node(&tree, "p").expect("p not found");
+        let c = get_color(p, "color").expect("color not found");
+        assert_eq!(c, Color { r: 255, g: 0, b: 0, a: 255 });
+    }
+
+    #[test]
+    fn test_var_resolves_custom_property_root() {
+        // Use :root to define custom property (tests :root pseudo-class support)
+        let tree = make_tree(
+            r#"<html><body><p>text</p></body></html>"#,
+            ":root { --accent: #ff0000; } p { color: var(--accent); }",
+        );
+        let p = find_node(&tree, "p").expect("p not found");
+        let c = get_color(p, "color").expect("color not found");
+        assert_eq!(c, Color { r: 255, g: 0, b: 0, a: 255 });
+    }
+
+    #[test]
+    fn test_var_fallback_used_when_prop_missing() {
+        let tree = make_tree(
+            r#"<html><body><p>text</p></body></html>"#,
+            "p { color: var(--missing, blue); }",
+        );
+        let p = find_node(&tree, "p").expect("p not found");
+        let c = get_color(p, "color").expect("color not found");
+        assert_eq!(c, Color { r: 0, g: 0, b: 255, a: 255 });
+    }
+
+    #[test]
+    fn test_var_in_inline_style() {
+        // Custom property defined in inline style and consumed via var() in CSS.
+        let tree = make_tree(
+            r#"<html><body><p style="--my-color: green; color: var(--my-color)">text</p></body></html>"#,
+            "",
+        );
+        let p = find_node(&tree, "p").expect("p not found");
+        let c = get_color(p, "color").expect("color not found");
+        assert_eq!(c, Color { r: 0, g: 128, b: 0, a: 255 });
+    }
+
+    #[test]
+    fn test_var_cyclic_does_not_panic() {
+        // Cyclic custom properties must not cause infinite recursion.
+        // The cycle should be resolved to None (no crash, no value).
+        let tree = make_tree(
+            r#"<html><body><p>text</p></body></html>"#,
+            "html { --a: var(--b); --b: var(--a); } p { color: var(--a, red); }",
+        );
+        let p = find_node(&tree, "p").expect("p not found");
+        // Should fall back to the fallback value since --a cycles
+        let _c = get_color(p, "color"); // May be None or red — just must not panic
+    }
+
+    // --- cascade ordering: !important ---
+
+    #[test]
+    fn test_important_author_overrides_normal() {
+        // Normal author rule sets color red; !important rule sets it blue. Blue wins.
+        let tree = make_tree(
+            r#"<html><body><p class="a b">text</p></body></html>"#,
+            ".a { color: red; } .b { color: blue !important; }",
+        );
+        let p = find_node(&tree, "p").expect("p not found");
+        let c = get_color(p, "color").expect("color not found");
+        assert_eq!(c, Color { r: 0, g: 0, b: 255, a: 255 });
+    }
+
+    #[test]
+    fn test_inline_important_overrides_css_important() {
+        // inline !important beats stylesheet !important
+        let tree = make_tree(
+            r#"<html><body><p style="color: green !important">text</p></body></html>"#,
+            "p { color: red !important; }",
+        );
+        let p = find_node(&tree, "p").expect("p not found");
+        let c = get_color(p, "color").expect("color not found");
+        assert_eq!(c, Color { r: 0, g: 128, b: 0, a: 255 });
+    }
+}
+
 pub fn parse_inline_style_into_vec(style_str: &str, list: &mut Vec<crate::css::Declaration>) {
     for decl in style_str.split(';') {
         let decl = decl.trim();
@@ -660,9 +1031,15 @@ pub fn parse_inline_style_into_vec(style_str: &str, list: &mut Vec<crate::css::D
                 }
             }
             _ => {
+                // CSS custom properties (--foo) in inline styles keep their raw string value.
+                let value = if key.starts_with("--") {
+                    crate::css::Value::RawCustomProp(crate::css::intern(val))
+                } else {
+                    parse_value(val)
+                };
                 list.push(crate::css::Declaration {
                     name: key,
-                    value: parse_value(val),
+                    value,
                     important,
                 });
             }

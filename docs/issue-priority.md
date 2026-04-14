@@ -4,6 +4,20 @@ Priority is ordered by: **foundational value → dependency order → visual imp
 
 ---
 
+## Priority 0 — Daemon / CLI Architecture (Highest)
+
+Must be done in order. Foundational infrastructure — unlocks headless testing, CLI access, and the browser-tester agent.
+
+| # | Issue | Why first |
+|---|---|---|
+| #68 | Extract Headless BrowserEngine | Decouples engine from GUI. All other daemon/CLI work depends on this. |
+| #70 | Browser Daemon (engine + GUI + HTTP server) | Single process: engine + eframe GUI + axum HTTP. CLI and GUI share state. |
+| #72 | Refactor BrowserApp as daemon GUI module | BrowserApp uses `Arc<Mutex<BrowserEngine>>` directly. No engine logic in main.rs. |
+| #69 | CLI HTTP client (Markdown + REPL) | Thin HTTP client to daemon. Markdown renderer + interactive REPL. |
+| #71 | Browser Tester Agent | Project-local skill. Drives CLI to test all browser features. |
+
+---
+
 ## Priority 1 — Layout Correctness
 
 These unblock domain issue #4 (Complete Layout Contexts).
@@ -77,6 +91,8 @@ Addresses severe crashes (OOM/Stack overflow) and massive rendering latency (>1.
 ## Dependency graph
 
 ```
+#68 → #70 → #72
+#68 → #70 → #69 → #71
 #13
 #30 → #32 → #31 → #33
 #22 → #38
@@ -93,6 +109,7 @@ Addresses severe crashes (OOM/Stack overflow) and massive rendering latency (>1.
 
 | Domain issue | Closes when |
 |---|---|
+| Daemon/CLI Infrastructure | #68 #69 #70 #71 #72 done |
 | #4 Complete Layout Contexts | #13 done |
 | #5 High-Fidelity Rendering | #30 #31 #32 #33 done |
 | #6 Runtime & Interactivity | #22 #25 #38 #40 done |

@@ -28,6 +28,12 @@ pub enum Value {
     /// but no more than max-content and no less than min-content.
     FitContent(f32),
     Transform(Vec<TransformOp>),
+    /// Represents a CSS custom property reference: `var(--name)` or `var(--name, fallback)`.
+    CssVar { name: Arc<str>, fallback: Option<Box<Value>> },
+    /// Holds the raw (unparsed) string value of a CSS custom property (`--foo: bar`).
+    /// Used internally so that custom property values can be re-parsed when resolved
+    /// by a `var()` reference on another property.
+    RawCustomProp(Arc<str>),
 }
 
 impl Eq for Value {}
@@ -46,6 +52,11 @@ impl Hash for Value {
             Value::Number(f) => f.to_bits().hash(state),
             Value::FitContent(f) => f.to_bits().hash(state),
             Value::Transform(ops) => ops.hash(state),
+            Value::CssVar { name, fallback } => {
+                name.hash(state);
+                fallback.hash(state);
+            }
+            Value::RawCustomProp(s) => s.hash(state),
         }
     }
 }
@@ -234,7 +245,14 @@ pub fn parse_css(source: &str) -> Stylesheet {
                     }
                 }
                 _ => {
-                    declarations.push(Declaration { name: key, value: parse_value(&val_raw), important });
+                    // CSS custom properties (--foo) store their raw value so that
+                    // var() references can re-parse them at resolution time.
+                    let value = if key.starts_with("--") {
+                        Value::RawCustomProp(intern(&val_raw))
+                    } else {
+                        parse_value(&val_raw)
+                    };
+                    declarations.push(Declaration { name: key, value, important });
                 }
             }
         }
@@ -535,6 +553,34 @@ pub fn parse_value(val: &str) -> Value {
     // Intrinsic sizing keywords (CSS Sizing Level 3)
     if val == "min-content" || val == "max-content" || val == "fit-content" {
         return Value::Keyword(intern(val));
+    }
+
+    // var(--custom-property) or var(--custom-property, fallback)
+    if val.starts_with("var(") && val.ends_with(')') {
+        let inner = &val[4..val.len() - 1]; // strip "var(" and ")"
+        // Split on first comma to separate name from optional fallback.
+        // We must be careful: the fallback itself may contain commas (e.g. rgb(1,2,3)).
+        // A simple approach: find the first top-level comma.
+        let mut depth = 0i32;
+        let mut comma_pos: Option<usize> = None;
+        for (i, c) in inner.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if depth == 0 => { comma_pos = Some(i); break; }
+                _ => {}
+            }
+        }
+        let (name_str, fallback_str) = if let Some(pos) = comma_pos {
+            (&inner[..pos], Some(inner[pos + 1..].trim()))
+        } else {
+            (inner, None)
+        };
+        let name_str = name_str.trim();
+        if name_str.starts_with("--") {
+            let fallback = fallback_str.map(|fb| Box::new(parse_value(fb)));
+            return Value::CssVar { name: intern(name_str), fallback };
+        }
     }
 
     // transform: translate(...) rotate(...)
