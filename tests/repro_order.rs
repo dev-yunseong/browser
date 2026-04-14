@@ -21,13 +21,13 @@ fn test_repro_order() {
 
     println!("--- After execute ---");
     
-    // Poll 1
-    js.poll_tasks();
-    println!("--- After poll 1 ---");
+    // Tick 1: Runs microtasks (checkpoint after execute)
+    js.tick(None, None);
+    println!("--- After tick 1 ---");
 
-    // Poll 2
-    js.poll_tasks();
-    println!("--- After poll 2 ---");
+    // Tick 2: Runs macro task
+    js.tick(None, None);
+    println!("--- After tick 2 ---");
 
     let val = js.context.eval(Source::from_bytes(b"globalThis.order.join(', ')")).unwrap();
     let order_str = val.to_string(&mut js.context).unwrap().to_std_string_escaped();

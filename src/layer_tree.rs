@@ -61,7 +61,8 @@ pub enum CompositingTrigger {
 #[derive(Debug, Clone)]
 pub struct Tile {
     pub rect: LayoutRect,
-    pub paint_commands: Vec<PaintCommand>,
+    pub background_commands: Vec<PaintCommand>,
+    pub content_commands: Vec<PaintCommand>,
     pub dirty: bool,
 }
 
@@ -69,7 +70,8 @@ impl Tile {
     pub fn new(rect: LayoutRect) -> Self {
         Self {
             rect,
-            paint_commands: Vec::new(),
+            background_commands: Vec::new(),
+            content_commands: Vec::new(),
             dirty: true,
         }
     }
@@ -218,47 +220,66 @@ impl LayerTreeBuilder {
         tree
     }
 
-    /// Recursive traversal. Assigns each `LayoutBox` to either a new layer
-    /// (if it has compositing triggers) or the current ancestor layer.
+    /// Iterative traversal (replaces the formerly recursive implementation).
+    ///
+    /// Assigns each `LayoutBox` to either a new layer (if it has compositing
+    /// triggers) or the current ancestor layer.  Uses an explicit stack so that
+    /// deeply nested DOM trees do not cause a stack overflow.
+    ///
+    /// Sequential index-based accesses to `tree.layers` are used deliberately:
+    /// each write touches a single distinct index, so there is no simultaneous
+    /// aliasing of two entries.
     fn traverse(layout: &LayoutBox, tree: &mut LayerTree, current_layer_id: usize, clip: LayoutRect) {
-        let d = layout.dimensions;
-
-        // Skip zero-sized boxes but still recurse children — they may be visible
-        // (e.g. overflow: visible children of a collapsed parent).
-        if d.width < 0.1 || d.height < 0.1 {
-            for child in &layout.children {
-                Self::traverse(child, tree, current_layer_id, clip);
-            }
-            return;
+        struct Frame<'f> {
+            layout: &'f LayoutBox<'f>,
+            layer_id: usize,
+            clip: LayoutRect,
         }
 
-        let (triggers, matrix) = Self::detect_triggers(layout);
+        let mut stack: Vec<Frame> = vec![Frame { layout, layer_id: current_layer_id, clip }];
 
-        if !triggers.is_empty() {
-            // This box establishes a new compositing layer.
-            let new_id = tree.layers.len();
-            let opacity = layout.get_opacity();
-            let new_layer = Layer::new(new_id, layout.z_index, opacity, d, triggers, matrix);
-            tree.add_layer(new_layer);
+        while let Some(frame) = stack.pop() {
+            let d = frame.layout.dimensions;
 
-            // Record parent → child relationship for future compositor use.
-            tree.layers[current_layer_id].child_layer_ids.push(new_id);
-
-            // Collect this box's own paint commands into the new layer as BACKGROUND.
-            Self::collect_paint_commands(layout, &mut tree.layers[new_id], clip, true);
-
-            // All children of this box belong to the new layer's stacking context.
-            let next_clip = clip.intersect(&layout.get_content_rect());
-            for child in &layout.children {
-                Self::traverse(child, tree, new_id, next_clip);
+            // Skip zero-sized boxes but still visit children.
+            if d.width < 0.1 || d.height < 0.1 {
+                let next_clip = frame.clip.intersect(&frame.layout.get_content_rect());
+                // Push children in reverse order so the first child is processed first.
+                for child in frame.layout.children.iter().rev() {
+                    stack.push(Frame { layout: child, layer_id: frame.layer_id, clip: next_clip });
+                }
+                continue;
             }
-        } else {
-            // No trigger — paint into the current ancestor layer as CONTENT.
-            Self::collect_paint_commands(layout, &mut tree.layers[current_layer_id], clip, false);
 
-            let next_clip = clip.intersect(&layout.get_content_rect());
-            for child in &layout.children {
-                Self::traverse(child, tree, current_layer_id, next_clip);
+            let (triggers, matrix) = Self::detect_triggers(frame.layout);
+
+            if !triggers.is_empty() {
+                // This box establishes a new compositing layer.
+                let new_id = tree.layers.len();
+                let opacity = frame.layout.get_opacity();
+                let new_layer = Layer::new(new_id, frame.layout.z_index, opacity, d, triggers, matrix);
+                tree.add_layer(new_layer);
+
+                // Record parent → child relationship: access parent index first,
+                // then new_id — both are distinct indices so no aliasing.
+                tree.layers[frame.layer_id].child_layer_ids.push(new_id);
+
+                // Collect this box's paint commands into the new layer as BACKGROUND.
+                Self::collect_paint_commands(frame.layout, &mut tree.layers[new_id], frame.clip, true);
+
+                // All children belong to the new layer's stacking context.
+                let next_clip = frame.clip.intersect(&frame.layout.get_content_rect());
+                for child in frame.layout.children.iter().rev() {
+                    stack.push(Frame { layout: child, layer_id: new_id, clip: next_clip });
+                }
+            } else {
+                // No trigger — paint into the current ancestor layer as CONTENT.
+                Self::collect_paint_commands(frame.layout, &mut tree.layers[frame.layer_id], frame.clip, false);
+
+                let next_clip = frame.clip.intersect(&frame.layout.get_content_rect());
+                for child in frame.layout.children.iter().rev() {
+                    stack.push(Frame { layout: child, layer_id: frame.layer_id, clip: next_clip });
+                }
             }
         }
     }
@@ -399,7 +420,11 @@ impl LayerTreeBuilder {
 
             for tile in &mut layer.tiles {
                 if tile.rect.intersects(&cmd_rect) {
-                    tile.paint_commands.push(cmd.clone());
+                    if is_root_of_layer {
+                        tile.background_commands.push(cmd.clone());
+                    } else {
+                        tile.content_commands.push(cmd.clone());
+                    }
                     tile.dirty = true;
                 }
             }

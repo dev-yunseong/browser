@@ -25,7 +25,7 @@ fn test_request_idle_callback_registration() {
     
     // Poll idle tasks with a 50ms deadline
     let deadline = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as f64 + 50.0;
-    runtime.poll_idle_tasks(deadline);
+    runtime.tick(None, Some(deadline));
     
     // Should be called now
     let check_code = "typeof called !== 'undefined' && called === true";
@@ -50,7 +50,7 @@ fn test_cancel_idle_callback() {
     
     // Poll idle tasks
     let deadline = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as f64 + 50.0;
-    runtime.poll_idle_tasks(deadline);
+    runtime.tick(None, Some(deadline));
     
     // Should NOT be called because it was canceled
     let result = runtime.context.eval(Source::from_bytes(b"idleCalled")).unwrap();

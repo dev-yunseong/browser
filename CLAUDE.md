@@ -58,6 +58,12 @@ The pipeline runs: **Network → DOM → Style → Layout → Render → GUI**
 
 The render width is hardcoded to **800 px** (`src/main.rs:155`). Height is computed from layout (clamped 600–16384 px).
 
+## Issue Priority
+
+When choosing which issue to work on next, always consult **`docs/issue-priority.md`**.
+It defines the canonical priority order and dependency graph for all open issues.
+Pick the highest-priority open issue that has no unresolved dependencies.
+
 ## Key dependencies
 
 - `eframe`/`egui` — native GUI window and immediate-mode UI

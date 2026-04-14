@@ -76,7 +76,6 @@ All development tasks MUST follow the **Plan-Review-Act-Verify** steps below:
 - `src/js.rs`: Boa engine wrapper and browser API mocking.
 
 ## Roadmap
-- [ ] Advanced Layout (Grid support, etc.)
-- [ ] Expanded JavaScript DOM API (Event listeners, element manipulation, etc.)
-- [ ] Enhanced Form Input and Interactivity
-- [ ] Image Caching Optimizations and Incremental Rendering
+
+To see the canonical priority list and dependency graph, always refer to **`docs/issue-priority.md`**.
+All tasks should follow the order specified there.
