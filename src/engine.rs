@@ -26,7 +26,8 @@ pub struct PageResult {
 }
 
 /// Result of a click action in headless mode.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type")]
 pub enum ClickResult {
     /// A link was clicked; contains the absolute URL.
     Navigate(String),
@@ -36,6 +37,152 @@ pub enum ClickResult {
     FocusChanged(String),
     /// No interactive element at the given position.
     Nothing,
+}
+
+// ── HTTP API response types ───────────────────────────────────────────────────
+
+/// A rectangle suitable for JSON serialization in HTTP API responses.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ApiRect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// A single interactive element returned by GET /elements.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ApiElement {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub element_type: String,
+    pub text: String,
+    pub href: Option<String>,
+    pub rect: ApiRect,
+}
+
+/// The full page response returned by HTTP navigation/page endpoints.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ApiPageResponse {
+    pub url: String,
+    pub title: String,
+    pub markdown: String,
+    pub elements: Vec<ApiElement>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Convert a `PageResult` into an `ApiPageResponse` for HTTP clients.
+/// Title is extracted by scanning the raw HTML for a `<title>` element.
+pub fn page_to_api_response(page: &PageResult, base_url: &Url) -> ApiPageResponse {
+    let title = extract_title_from_html(&page.body);
+    let markdown = markdown_from_html(&page.body);
+    let elements = page
+        .links
+        .iter()
+        .enumerate()
+        .map(|(i, (rect, href))| ApiElement {
+            id: format!("e{}", i),
+            element_type: "link".to_string(),
+            text: String::new(),
+            href: Some(href.clone()),
+            rect: ApiRect {
+                x: rect.x,
+                y: rect.y,
+                w: rect.width,
+                h: rect.height,
+            },
+        })
+        .collect();
+
+    ApiPageResponse {
+        url: base_url.to_string(),
+        title,
+        markdown,
+        elements,
+        width: page.width,
+        height: page.height,
+    }
+}
+
+/// Extract the text content of the `<title>` element from raw HTML.
+/// Returns an empty string if no title is found.
+pub fn extract_title_from_html(html: &str) -> String {
+    let lower = html.to_lowercase();
+    if let Some(start) = lower.find("<title>") {
+        let after = &html[start + 7..];
+        if let Some(end) = after.to_lowercase().find("</title>") {
+            return after[..end].trim().to_string();
+        }
+    }
+    String::new()
+}
+
+/// Naive HTML-to-markdown converter: strips tags, collapses whitespace.
+/// Not a full converter — suitable for CLI display of page content.
+pub fn markdown_from_html(html: &str) -> String {
+    let mut out = String::with_capacity(html.len() / 2);
+    let mut in_tag = false;
+    let mut in_script = false;
+    let mut in_style = false;
+    let mut tag_buf = String::new();
+
+    let mut chars = html.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '<' {
+            in_tag = true;
+            tag_buf.clear();
+        } else if ch == '>' && in_tag {
+            in_tag = false;
+            let tag_lower = tag_buf.to_lowercase();
+            let tag_lower = tag_lower.trim();
+            if tag_lower == "script" || tag_lower.starts_with("script ") {
+                in_script = true;
+            } else if tag_lower == "/script" {
+                in_script = false;
+            } else if tag_lower == "style" || tag_lower.starts_with("style ") {
+                in_style = true;
+            } else if tag_lower == "/style" {
+                in_style = false;
+            } else if !in_script && !in_style {
+                // Insert newline for block-level tags
+                if matches!(tag_lower, "p" | "br" | "/p" | "div" | "/div"
+                    | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+                    | "/h1" | "/h2" | "/h3" | "/h4" | "/h5" | "/h6"
+                    | "li" | "/li" | "tr" | "/tr") {
+                    out.push('\n');
+                }
+            }
+        } else if in_tag {
+            tag_buf.push(ch);
+        } else if !in_script && !in_style {
+            out.push(ch);
+        }
+    }
+
+    // Collapse runs of whitespace (but preserve newlines)
+    let mut result = String::with_capacity(out.len());
+    let mut last_was_space = false;
+    let mut last_was_newline = false;
+    for ch in out.chars() {
+        if ch == '\n' {
+            if !last_was_newline {
+                result.push('\n');
+            }
+            last_was_newline = true;
+            last_was_space = false;
+        } else if ch.is_whitespace() {
+            if !last_was_space && !last_was_newline {
+                result.push(' ');
+            }
+            last_was_space = true;
+        } else {
+            result.push(ch);
+            last_was_space = false;
+            last_was_newline = false;
+        }
+    }
+    result.trim().to_string()
 }
 
 /// Source of a CSS stylesheet, in document order.
