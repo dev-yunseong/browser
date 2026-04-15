@@ -30,11 +30,11 @@ pub struct PageResult {
 #[serde(tag = "type")]
 pub enum ClickResult {
     /// A link was clicked; contains the absolute URL.
-    Navigate(String),
+    Navigate { url: String },
     /// An `onclick` script handler was executed.
     ScriptExecuted,
     /// A focusable element received focus; contains its ID.
-    FocusChanged(String),
+    FocusChanged { id: String },
     /// No interactive element at the given position.
     Nothing,
 }
@@ -61,6 +61,16 @@ pub struct ApiElement {
     pub rect: ApiRect,
 }
 
+/// A form control element included in the page response.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ApiFormControl {
+    /// Value of the HTML `name` attribute, or empty string.
+    pub name: String,
+    /// Tag name: `"input"`, `"textarea"`, or `"select"`.
+    pub element_type: String,
+    pub rect: ApiRect,
+}
+
 /// The full page response returned by HTTP navigation/page endpoints.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ApiPageResponse {
@@ -68,6 +78,9 @@ pub struct ApiPageResponse {
     pub title: String,
     pub markdown: String,
     pub elements: Vec<ApiElement>,
+    /// Form controls present on the page.
+    #[serde(default)]
+    pub forms: Vec<ApiFormControl>,
     pub width: u32,
     pub height: u32,
 }
@@ -77,21 +90,49 @@ pub struct ApiPageResponse {
 pub fn page_to_api_response(page: &PageResult, base_url: &Url) -> ApiPageResponse {
     let title = extract_title_from_html(&page.body);
     let markdown = markdown_from_html(&page.body);
+    let link_texts = extract_link_texts_from_html(&page.body);
     let elements = page
         .links
         .iter()
         .enumerate()
-        .map(|(i, (rect, href))| ApiElement {
-            id: format!("e{}", i),
-            element_type: "link".to_string(),
-            text: String::new(),
-            href: Some(href.clone()),
-            rect: ApiRect {
-                x: rect.x,
-                y: rect.y,
-                w: rect.width,
-                h: rect.height,
-            },
+        .map(|(i, (rect, href))| {
+            // Match link text by index (same DOM traversal order as collect_links).
+            let text = link_texts.get(i).map(|(_, t)| t.clone()).unwrap_or_default();
+            ApiElement {
+                id: format!("e{}", i),
+                element_type: "link".to_string(),
+                text,
+                href: Some(href.clone()),
+                rect: ApiRect {
+                    x: rect.x,
+                    y: rect.y,
+                    w: rect.width,
+                    h: rect.height,
+                },
+            }
+        })
+        .collect();
+
+    let form_meta = extract_form_controls_from_html(&page.body);
+    let forms = page
+        .form_controls
+        .iter()
+        .enumerate()
+        .map(|(i, (rect, _value))| {
+            let (name, element_type) = form_meta
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| (String::new(), "input".to_string()));
+            ApiFormControl {
+                name,
+                element_type,
+                rect: ApiRect {
+                    x: rect.x,
+                    y: rect.y,
+                    w: rect.width,
+                    h: rect.height,
+                },
+            }
         })
         .collect();
 
@@ -100,6 +141,7 @@ pub fn page_to_api_response(page: &PageResult, base_url: &Url) -> ApiPageRespons
         title,
         markdown,
         elements,
+        forms,
         width: page.width,
         height: page.height,
     }
@@ -183,6 +225,137 @@ pub fn markdown_from_html(html: &str) -> String {
         }
     }
     result.trim().to_string()
+}
+
+/// Extract `(href, display_text)` pairs from `<a>` elements in HTML document order.
+///
+/// Uses the same char-by-char scanner style as `markdown_from_html`. Handles nested
+/// inline tags (strips them, keeping inner text) and basic HTML entities.
+pub fn extract_link_texts_from_html(html: &str) -> Vec<(String, String)> {
+    let mut results = Vec::new();
+    let mut chars = html.chars().peekable();
+    let mut in_tag = false;
+    let mut tag_buf = String::new();
+    // State for being inside an <a> element
+    let mut in_anchor = false;
+    let mut anchor_href = String::new();
+    let mut anchor_text = String::new();
+    let mut anchor_depth = 0u32; // nesting depth of tags inside the anchor
+
+    while let Some(ch) = chars.next() {
+        if ch == '<' {
+            in_tag = true;
+            tag_buf.clear();
+        } else if ch == '>' && in_tag {
+            in_tag = false;
+            let tag_str = tag_buf.trim().to_string();
+            let tag_lower = tag_str.to_lowercase();
+            let tag_lower = tag_lower.trim();
+
+            if tag_lower.starts_with("a ") || tag_lower == "a" {
+                // Opening <a> tag — extract href
+                in_anchor = true;
+                anchor_href = extract_attr(&tag_str, "href").unwrap_or_default();
+                anchor_text.clear();
+                anchor_depth = 0;
+            } else if tag_lower == "/a" {
+                if in_anchor {
+                    let text = decode_html_entities(anchor_text.trim());
+                    results.push((anchor_href.clone(), text));
+                    in_anchor = false;
+                    anchor_href.clear();
+                    anchor_text.clear();
+                }
+            } else if in_anchor {
+                // Track nesting depth for inner tags (we don't need to do anything else)
+                if tag_lower.starts_with('/') {
+                    anchor_depth = anchor_depth.saturating_sub(1);
+                } else if !tag_lower.ends_with('/') {
+                    anchor_depth += 1;
+                }
+            }
+        } else if in_tag {
+            tag_buf.push(ch);
+        } else if in_anchor {
+            anchor_text.push(ch);
+        }
+    }
+
+    results
+}
+
+/// Extract `(name_attr, element_type)` pairs for form controls in HTML document order.
+///
+/// Returns one entry per `<input>`, `<textarea>`, or `<select>` tag.
+/// The order matches `collect_form_controls` traversal order (DOM order).
+pub fn extract_form_controls_from_html(html: &str) -> Vec<(String, String)> {
+    let mut results = Vec::new();
+    let mut chars = html.chars().peekable();
+    let mut in_tag = false;
+    let mut tag_buf = String::new();
+    let mut in_script = false;
+
+    while let Some(ch) = chars.next() {
+        if ch == '<' {
+            in_tag = true;
+            tag_buf.clear();
+        } else if ch == '>' && in_tag {
+            in_tag = false;
+            let tag_str = tag_buf.trim().to_string();
+            let tag_lower = tag_str.to_lowercase();
+            let tag_lower_trimmed = tag_lower.trim();
+
+            if tag_lower_trimmed == "script" || tag_lower_trimmed.starts_with("script ") {
+                in_script = true;
+            } else if tag_lower_trimmed == "/script" {
+                in_script = false;
+            } else if !in_script {
+                let (verb, _) = tag_lower_trimmed.split_once(' ').unwrap_or((tag_lower_trimmed, ""));
+                if matches!(verb, "input" | "textarea" | "select") {
+                    let name = extract_attr(&tag_str, "name").unwrap_or_default();
+                    results.push((name, verb.to_string()));
+                }
+            }
+        } else if in_tag {
+            tag_buf.push(ch);
+        }
+    }
+
+    results
+}
+
+/// Extract the value of an attribute from a raw HTML tag string (e.g., `a href="url" class="x"`).
+fn extract_attr(tag: &str, attr_name: &str) -> Option<String> {
+    // Look for `attr_name=` (case-insensitive) in the tag string
+    let lower = tag.to_lowercase();
+    let search = format!("{}=", attr_name.to_lowercase());
+    let pos = lower.find(&search)?;
+    let rest = &tag[pos + search.len()..];
+    let rest = rest.trim_start();
+    if rest.starts_with('"') {
+        // Quoted value
+        let inner = &rest[1..];
+        let end = inner.find('"').unwrap_or(inner.len());
+        Some(inner[..end].to_string())
+    } else if rest.starts_with('\'') {
+        let inner = &rest[1..];
+        let end = inner.find('\'').unwrap_or(inner.len());
+        Some(inner[..end].to_string())
+    } else {
+        // Unquoted value
+        let end = rest.find(|c: char| c.is_whitespace() || c == '>').unwrap_or(rest.len());
+        Some(rest[..end].to_string())
+    }
+}
+
+/// Decode common HTML entities in text content.
+fn decode_html_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
 }
 
 /// Source of a CSS stylesheet, in document order.
@@ -549,7 +722,7 @@ impl BrowserEngine {
         // Focus change
         for (rect, id) in &page.focusable_elements {
             if hit_test(x, y, rect) {
-                results.push(ClickResult::FocusChanged(id.clone()));
+                results.push(ClickResult::FocusChanged { id: id.clone() });
             }
         }
 
@@ -572,7 +745,7 @@ impl BrowserEngine {
         // Links (navigate)
         for (rect, link) in &page.links {
             if hit_test(x, y, rect) {
-                results.push(ClickResult::Navigate(link.clone()));
+                results.push(ClickResult::Navigate { url: link.clone() });
                 break;
             }
         }
@@ -749,5 +922,88 @@ mod tests {
         let engine = BrowserEngine::new();
         let style = engine.computed_style("body");
         assert!(style.is_empty());
+    }
+
+    // ── New tests for link/form extraction and ClickResult serde ────────────────
+
+    #[test]
+    fn test_extract_link_texts_basic() {
+        let html = r#"<a href="https://example.com">Click here</a>"#;
+        let links = extract_link_texts_from_html(html);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].0, "https://example.com");
+        assert_eq!(links[0].1, "Click here");
+    }
+
+    #[test]
+    fn test_extract_link_texts_nested_tags() {
+        let html = r#"<a href="/page"><span>Inner text</span></a>"#;
+        let links = extract_link_texts_from_html(html);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].0, "/page");
+        assert_eq!(links[0].1, "Inner text");
+    }
+
+    #[test]
+    fn test_extract_link_texts_multiple() {
+        let html = r#"<a href="/a">First</a> text <a href="/b">Second</a>"#;
+        let links = extract_link_texts_from_html(html);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].1, "First");
+        assert_eq!(links[1].1, "Second");
+    }
+
+    #[test]
+    fn test_extract_link_texts_html_entities() {
+        let html = r#"<a href="/x">Rock &amp; Roll</a>"#;
+        let links = extract_link_texts_from_html(html);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].1, "Rock & Roll");
+    }
+
+    #[test]
+    fn test_extract_form_controls_basic() {
+        let html = r#"<form><input name="user" type="text"><input name="pass" type="password"></form>"#;
+        let controls = extract_form_controls_from_html(html);
+        assert_eq!(controls.len(), 2);
+        assert_eq!(controls[0].0, "user");
+        assert_eq!(controls[0].1, "input");
+        assert_eq!(controls[1].0, "pass");
+        assert_eq!(controls[1].1, "input");
+    }
+
+    #[test]
+    fn test_extract_form_controls_select() {
+        let html = r#"<select name="role"><option>Admin</option></select>"#;
+        let controls = extract_form_controls_from_html(html);
+        assert_eq!(controls.len(), 1);
+        assert_eq!(controls[0].0, "role");
+        assert_eq!(controls[0].1, "select");
+    }
+
+    #[test]
+    fn test_click_result_serde_navigate() {
+        let r = ClickResult::Navigate { url: "https://example.com".to_string() };
+        let json = serde_json::to_string(&r).expect("serialize");
+        assert!(json.contains("\"type\":\"Navigate\""));
+        assert!(json.contains("\"url\":\"https://example.com\""));
+        let back: ClickResult = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            ClickResult::Navigate { url } => assert_eq!(url, "https://example.com"),
+            _ => panic!("Expected Navigate"),
+        }
+    }
+
+    #[test]
+    fn test_click_result_serde_focus() {
+        let r = ClickResult::FocusChanged { id: "search-input".to_string() };
+        let json = serde_json::to_string(&r).expect("serialize");
+        assert!(json.contains("\"type\":\"FocusChanged\""));
+        assert!(json.contains("\"id\":\"search-input\""));
+        let back: ClickResult = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            ClickResult::FocusChanged { id } => assert_eq!(id, "search-input"),
+            _ => panic!("Expected FocusChanged"),
+        }
     }
 }

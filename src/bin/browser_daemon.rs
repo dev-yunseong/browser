@@ -429,6 +429,16 @@ async fn elements_handler(State(handle): State<EngineHandle>) -> impl IntoRespon
     (StatusCode::OK, Json(elems)).into_response()
 }
 
+/// Submit the first form on the current page by evaluating `document.forms[0].submit()`.
+///
+/// Note: the JS runtime is a mock, so this is a best-effort stub.
+async fn submit_handler(State(handle): State<EngineHandle>) -> impl IntoResponse {
+    blocking!(move || {
+        handle.send_evaluate_js("if(document.forms && document.forms[0]) document.forms[0].submit()".to_string())
+    });
+    (StatusCode::OK, Json(OkResponse { ok: true })).into_response()
+}
+
 /// Build the axum Router — extracted for testability.
 pub fn build_router(handle: EngineHandle) -> Router {
     Router::new()
@@ -443,6 +453,7 @@ pub fn build_router(handle: EngineHandle) -> Router {
         .route("/layout", get(layout_handler))
         .route("/style", get(style_handler))
         .route("/elements", get(elements_handler))
+        .route("/submit", post(submit_handler))
         .with_state(handle)
 }
 
