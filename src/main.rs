@@ -1,6 +1,5 @@
 use eframe::egui;
 use poll_promise::Promise;
-use url::Url;
 use std::collections::HashMap;
 
 pub mod dom;
@@ -17,8 +16,12 @@ struct BrowserApp {
     url: String,
     history: Vec<String>,
     history_index: usize,
-    content_promise: Option<Promise<Result<(StaticPageData, css::Stylesheet), String>>>,
-    re_render_promise: Option<Promise<Result<(StaticPageData, css::Stylesheet), String>>>,
+    content_promise: Option<Promise<Result<engine::PageResult, String>>>,
+    re_render_promise: Option<Promise<Result<engine::PageResult, String>>>,
+    /// Bounded JS tick promise — prevents unbounded thread spawns per frame.
+    tick_promise: Option<Promise<bool>>,
+    /// Pending click result — triggers re-render when a ScriptExecuted click resolves.
+    click_promise: Option<Promise<Vec<engine::ClickResult>>>,
     texture: Option<egui::TextureHandle>,
     error: Option<String>,
     current_links: Vec<(layout::Rect, String)>,
@@ -34,12 +37,9 @@ struct BrowserApp {
     is_loading: bool,
     start_time: std::time::Instant,
 
-    /// Headless browser engine — owns all pipeline state.
-    engine: engine::BrowserEngine,
+    /// Engine actor handle — all pipeline work is delegated through this.
+    engine: engine::EngineHandle,
 }
-
-/// Type alias — the GUI layer calls the pipeline result `StaticPageData` internally.
-type StaticPageData = engine::PageResult;
 
 impl BrowserApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -66,6 +66,8 @@ impl BrowserApp {
             history_index: 0,
             content_promise: None,
             re_render_promise: None,
+            tick_promise: None,
+            click_promise: None,
             texture: None,
             error: None,
             current_links: vec![],
@@ -79,7 +81,7 @@ impl BrowserApp {
             image_promises: HashMap::new(),
             is_loading: false,
             start_time: std::time::Instant::now(),
-            engine: engine::BrowserEngine::new(),
+            engine: engine::EngineHandle::spawn(),
         }
     }
 
@@ -114,43 +116,27 @@ impl BrowserApp {
         self.image_promises.clear();
         self.hovered_id = None;
         self.is_loading = true;
-        self.engine.clear_for_new_url();
 
-        let mut cache = self.engine.css_cache.clone();
+        let handle = self.engine.clone();
         self.content_promise = Some(Promise::spawn_thread("fetcher", move || {
-            engine::fetch_and_process(&url, &mut cache, &HashMap::new(), None, None, width)
-                .map_err(|e| e.to_string())
+            handle.send_navigate(url, width)
         }));
     }
 
-    /// Re-render the current page using `engine.js_style_overrides` and `engine.image_cache`.
+    /// Re-render the current page (e.g. after hover/focus state change).
     fn trigger_re_render(&mut self, ctx: &egui::Context, width: f32) {
-        let (body, base_url) = match self.engine.last_page.as_ref() {
-            Some(p) => (p.body.clone(), p.base_url.clone()),
-            None => return,
-        };
-        let cache = self.engine.image_cache.clone();
-        let mut css_cache = self.engine.css_cache.clone();
-        let stylesheet = self.engine.last_stylesheet.clone();
-        let overrides = self.engine.js_style_overrides.clone();
+        let handle = self.engine.clone();
         let hovered_id = self.hovered_id.clone();
         let focused_id = self.focused_id.clone();
-        let csp_policy = self.engine.current_csp_policy.clone();
 
-        // Use re_render_promise instead of join() to avoid UI blocking
         self.re_render_promise = Some(Promise::spawn_thread("re_render", move || {
-            engine::process_html_with_cache(
-                &body, &base_url, &cache, &mut css_cache, stylesheet, &overrides,
-                hovered_id.as_deref(), focused_id.as_deref(), csp_policy, width,
-            )
-            .map_err(|e| e.to_string())
+            handle.send_re_render(hovered_id, focused_id, width)
         }));
 
-        // Request repaint to check promise
         ctx.request_repaint();
     }
 
-    fn apply_page_data(&mut self, page_data: StaticPageData, ctx: &egui::Context) {
+    fn apply_page_data(&mut self, page_data: engine::PageResult, ctx: &egui::Context) {
         let image = egui::ColorImage::from_rgba_unmultiplied(
             [page_data.width as usize, page_data.height as usize],
             &page_data.pixmap_bytes,
@@ -161,19 +147,38 @@ impl BrowserApp {
         self.current_event_handlers = page_data.event_handlers.clone();
         self.current_element_ids = page_data.element_ids.clone();
         self.current_focusable_elements = page_data.focusable_elements.clone();
-        // csp_policy is stored on engine.current_csp_policy
     }
 }
 
 impl eframe::App for BrowserApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // JS tick — at most one in-flight at a time to prevent unbounded thread spawns.
+        let timestamp = self.start_time.elapsed().as_secs_f64() * 1000.0;
+        if self.tick_promise.is_none()
+            && self.content_promise.is_none()
+            && self.re_render_promise.is_none()
+        {
+            let handle = self.engine.clone();
+            self.tick_promise = Some(Promise::spawn_thread("tick", move || {
+                handle.send_tick(timestamp, None)
+            }));
+        }
+        if let Some(tick_p) = &self.tick_promise {
+            if let Some(needs) = tick_p.ready() {
+                if *needs {
+                    ctx.request_repaint();
+                }
+                self.tick_promise = None;
+            }
+        }
+
         // Handle Tab navigation
         if ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
             let focusables = &self.current_focusable_elements;
             if !focusables.is_empty() {
                 let current_index = self.focused_id.as_ref()
                     .and_then(|id| focusables.iter().position(|(_, fid)| fid == id));
-                
+
                 let next_index = if ctx.input(|i| i.modifiers.shift) {
                     // Shift+Tab: Backward
                     match current_index {
@@ -187,37 +192,13 @@ impl eframe::App for BrowserApp {
                         _ => 0,
                     }
                 };
-                
+
                 self.focused_id = Some(focusables[next_index].1.clone());
                 self.trigger_re_render(ctx, 800.0);
             }
         }
 
-        // Poll JS event loop tasks (Macro, Micro, rAF, Idle)
-        let timestamp = self.start_time.elapsed().as_secs_f64() * 1000.0;
-        let mut deadline = None;
-        if self.content_promise.is_none() && self.re_render_promise.is_none() {
-            deadline = Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as f64 + 16.0);
-        }
-        
-        // Sync focus to JS
-        self.engine.js_runtime.set_focused_node_id(self.focused_id.clone());
-
-        let mut needs_re_render = self.engine.js_runtime.tick(Some(timestamp), deadline);
-
-        // Sync focus FROM JS (if changed via element.focus())
-        if let Some(js_focused_id) = self.engine.js_runtime.get_focused_node_id() {
-            if self.focused_id.as_deref() != Some(&js_focused_id) {
-                self.focused_id = Some(js_focused_id);
-                needs_re_render = true;
-            }
-        }
-
-        if needs_re_render {
-            self.trigger_re_render(ctx, 800.0); // Using standard width
-        }
-
-        // ── Browser chrome ──────────────────────────────────────────────────
+        // ── Browser chrome ──────────────────────────────────────────────────────────
         let toolbar_fill = egui::Color32::from_rgb(50, 50, 55);
         let url_bar_fill = egui::Color32::from_rgb(72, 72, 78);
 
@@ -305,16 +286,19 @@ impl eframe::App for BrowserApp {
                 }
             });
 
-        // ── Content area ────────────────────────────────────────────────────
+        // ── Content area ─────────────────────────────────────────────────────────
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(egui::Color32::WHITE))
             .show(ctx, |ui| {
-                let overrides = self.engine.js_runtime.get_style_overrides();
-                if !overrides.is_empty() {
-                    for (id, props) in overrides {
-                        self.engine.js_style_overrides.entry(id).or_default().extend(props);
+                // Poll click promise — trigger re-render if onclick fired JS style changes
+                if let Some(click_p) = &self.click_promise {
+                    if let Some(results) = click_p.ready() {
+                        let had_script = results.iter().any(|r| matches!(r, engine::ClickResult::ScriptExecuted));
+                        self.click_promise = None;
+                        if had_script {
+                            self.trigger_re_render(ctx, 800.0);
+                        }
                     }
-                    self.trigger_re_render(ctx, ui.available_width());
                 }
 
                 // Handle pending re-render promise
@@ -327,9 +311,7 @@ impl eframe::App for BrowserApp {
                             self.error = Some(format!("Re-render error: {}", e));
                             self.re_render_promise = None;
                         }
-                        Some(Ok((page_data, stylesheet))) => {
-                            self.engine.last_stylesheet = Some(stylesheet.clone());
-                            self.engine.last_page = Some(page_data.clone());
+                        Some(Ok(page_data)) => {
                             self.apply_page_data(page_data.clone(), ctx);
                             self.re_render_promise = None;
                         }
@@ -350,29 +332,24 @@ impl eframe::App for BrowserApp {
                             self.content_promise = None;
                             self.is_loading = false;
                         }
-                        Some(Ok((page_data, stylesheet))) => {
+                        Some(Ok(page_data)) => {
                             // Clone everything we need before releasing the borrow on content_promise
                             let page_data = page_data.clone();
                             let image_urls = page_data.image_urls.clone();
-                            let body = page_data.body.clone();
-                            self.engine.last_stylesheet = Some(stylesheet.clone());
-                            self.engine.current_csp_policy = page_data.csp_policy.clone();
-                            self.engine.last_page = Some(page_data.clone());
 
-                            // Release the borrow on content_promise
-                            self.content_promise = None;
                             self.is_loading = false;
+                            self.content_promise = None;
 
                             // Update stored GUI state
                             self.form_values.clear();
                             for (i, (_, val)) in page_data.form_controls.iter().enumerate() {
                                 self.form_values.insert(i.to_string(), val.clone());
                             }
-                            self.apply_page_data(page_data.clone(), ctx);
+                            self.apply_page_data(page_data, ctx);
 
                             // Start async image fetches
                             for url in &image_urls {
-                                if !self.engine.image_cache.contains_key(url) && !self.image_promises.contains_key(url) {
+                                if !self.image_promises.contains_key(url) {
                                     let url_clone = url.clone();
                                     self.image_promises.insert(url.clone(), Promise::spawn_thread("img_fetcher", move || {
                                         match reqwest::blocking::get(&url_clone) {
@@ -385,26 +362,20 @@ impl eframe::App for BrowserApp {
                                     }));
                                 }
                             }
-
-                            // Initialize JS runtime and execute page scripts
-                            self.engine.init_js_for_page(&body);
-                            let overrides = self.engine.js_runtime.get_style_overrides();
-                            if !overrides.is_empty() {
-                                for (id, props) in overrides {
-                                    self.engine.js_style_overrides.entry(id).or_default().extend(props);
-                                }
-                                self.trigger_re_render(ctx, ui.available_width());
-                            }
                         }
                     }
                 }
 
-                // Check resolved image promises → re-render when new images arrive
+                // Check resolved image promises → send to engine actor, re-render when new images arrive
                 let mut newly_loaded = false;
+                let engine_handle = self.engine.clone();
                 self.image_promises.retain(|_url, promise| {
                     match promise.ready() {
                         Some(Ok((url, bytes))) => {
-                            self.engine.image_cache.insert(url.clone(), bytes.clone());
+                            let _ = engine_handle.tx.send(engine::EngineCmd::LoadImage {
+                                url: url.clone(),
+                                bytes: bytes.clone(),
+                            });
                             newly_loaded = true;
                             false
                         }
@@ -432,7 +403,6 @@ impl eframe::App for BrowserApp {
                 let texture_info = self.texture.as_ref().map(|t| (t.id(), t.size_vec2()));
                 if let Some((texture_id, texture_size)) = texture_info {
                     let mut url_to_load: Option<String> = None;
-                    let mut scripts_to_run: Vec<String> = Vec::new();
 
                     egui::ScrollArea::both()
                         .auto_shrink([false, false])
@@ -459,12 +429,16 @@ impl eframe::App for BrowserApp {
                         if response.clicked() {
                             if let Some(ptr) = response.interact_pointer_pos() {
                                 let rel = ptr - rect.min;
-                                
-                                // Dispatch standard JS 'click' events for elements with IDs
-                                for (l_rect, id) in &self.current_element_ids {
-                                    if hit(rel, l_rect) {
-                                        self.engine.js_runtime.trigger_event(id, "click");
-                                    }
+
+                                // Dispatch full click to engine actor
+                                if self.click_promise.is_none() {
+                                    let handle = self.engine.clone();
+                                    let rel_x = rel.x;
+                                    let rel_y = rel.y;
+                                    self.click_promise = Some(Promise::spawn_thread(
+                                        "click",
+                                        move || handle.send_click(rel_x, rel_y),
+                                    ));
                                 }
 
                                 // Update focused_id on click
@@ -479,11 +453,6 @@ impl eframe::App for BrowserApp {
                                     self.trigger_re_render(ctx, ui.available_width());
                                 }
 
-                                for (l_rect, script) in &self.current_event_handlers {
-                                    if hit(rel, l_rect) {
-                                        scripts_to_run.push(script.clone());
-                                    }
-                                }
                                 for (l_rect, link) in &self.current_links {
                                     if hit(rel, l_rect) {
                                         url_to_load = Some(link.clone());
@@ -523,21 +492,6 @@ impl eframe::App for BrowserApp {
                         }
                     });
 
-                    // Execute collected onclick scripts and apply style changes
-                    for script in &scripts_to_run {
-                        println!("[JS Event] onclick: {}", &script[..script.len().min(80)]);
-                        self.engine.js_runtime.execute(script);
-                    }
-                    if !scripts_to_run.is_empty() {
-                        let overrides = self.engine.js_runtime.get_style_overrides();
-                        if !overrides.is_empty() {
-                            for (id, props) in overrides {
-                                self.engine.js_style_overrides.entry(id).or_default().extend(props);
-                            }
-                            self.trigger_re_render(ctx, ui.available_width());
-                        }
-                    }
-
                     if let Some(url) = url_to_load {
                         let width = ui.available_width();
                         self.load_url(url, width);
@@ -570,6 +524,7 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod main_tests {
     use super::*;
+    use url::Url;
 
     #[test]
     fn test_collect_css_in_order() {

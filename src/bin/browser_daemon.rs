@@ -6,9 +6,9 @@
 //!   browser-daemon --port 7071  # custom port
 
 use std::collections::HashMap;
-use std::sync::mpsc;
 
 use browser::{engine, layout};
+use browser::engine::{EngineCmd, EngineHandle};
 use eframe::egui;
 use poll_promise::Promise;
 
@@ -46,237 +46,6 @@ fn parse_args() -> DaemonArgs {
     parse_args_from(&refs)
 }
 
-// ── Engine actor — command protocol ───────────────────────────────────────────
-
-/// Commands sent to the engine actor thread.
-/// All engine work (including blocking HTTP fetches and JS) happens on that thread.
-pub enum EngineCmd {
-    Navigate {
-        url: String,
-        width: f32,
-        reply: mpsc::Sender<Result<engine::PageResult, String>>,
-    },
-    ReRender {
-        hovered_id: Option<String>,
-        focused_id: Option<String>,
-        width: f32,
-        reply: mpsc::Sender<Result<engine::PageResult, String>>,
-    },
-    Click {
-        x: f32,
-        y: f32,
-        reply: mpsc::Sender<Vec<engine::ClickResult>>,
-    },
-    TypeText {
-        text: String,
-    },
-    EvaluateJs {
-        script: String,
-        reply: mpsc::Sender<String>,
-    },
-    Screenshot {
-        reply: mpsc::Sender<Option<Vec<u8>>>,
-    },
-    DomTree {
-        reply: mpsc::Sender<String>,
-    },
-    LayoutTree {
-        reply: mpsc::Sender<String>,
-    },
-    ComputedStyle {
-        selector: String,
-        reply: mpsc::Sender<HashMap<String, String>>,
-    },
-    GetPage {
-        reply: mpsc::Sender<Option<engine::ApiPageResponse>>,
-    },
-    GetElements {
-        reply: mpsc::Sender<Vec<engine::ApiElement>>,
-    },
-    LoadImage {
-        url: String,
-        bytes: Vec<u8>,
-    },
-    Tick {
-        timestamp: f64,
-        deadline: Option<f64>,
-        reply: mpsc::Sender<bool>,
-    },
-    #[allow(dead_code)]
-    Shutdown,
-}
-
-/// Run the engine actor — owns `BrowserEngine` exclusively.
-/// Processes commands sequentially from the receiver.
-/// This guarantees all `reqwest::blocking` calls and `thread_local!` JS state
-/// are confined to a single thread.
-pub fn run_engine_actor(rx: mpsc::Receiver<EngineCmd>) {
-    let mut eng = engine::BrowserEngine::new();
-    for cmd in rx {
-        match cmd {
-            EngineCmd::Navigate { url, width, reply } => {
-                let result = eng.navigate(&url, width);
-                let _ = reply.send(result);
-            }
-            EngineCmd::ReRender { hovered_id, focused_id, width, reply } => {
-                let result = eng.re_render(hovered_id.as_deref(), focused_id.as_deref(), width);
-                let _ = reply.send(result);
-            }
-            EngineCmd::Click { x, y, reply } => {
-                let result = eng.click(x, y);
-                let _ = reply.send(result);
-            }
-            EngineCmd::TypeText { text } => {
-                eng.type_text(&text);
-            }
-            EngineCmd::EvaluateJs { script, reply } => {
-                let result = eng.evaluate_js(&script);
-                let _ = reply.send(result);
-            }
-            EngineCmd::Screenshot { reply } => {
-                let png = eng.screenshot().and_then(|pm| pm.encode_png().ok());
-                let _ = reply.send(png);
-            }
-            EngineCmd::DomTree { reply } => {
-                let _ = reply.send(eng.dom_tree());
-            }
-            EngineCmd::LayoutTree { reply } => {
-                let _ = reply.send(eng.layout_tree());
-            }
-            EngineCmd::ComputedStyle { selector, reply } => {
-                let _ = reply.send(eng.computed_style(&selector));
-            }
-            EngineCmd::GetPage { reply } => {
-                let resp = eng.last_page.as_ref().map(|p| {
-                    engine::page_to_api_response(p, &p.base_url.clone())
-                });
-                let _ = reply.send(resp);
-            }
-            EngineCmd::GetElements { reply } => {
-                // Reuse page_to_api_response to avoid duplicating the link→ApiElement mapping.
-                let elems = eng.last_page.as_ref().map(|p| {
-                    engine::page_to_api_response(p, &p.base_url.clone()).elements
-                }).unwrap_or_default();
-                let _ = reply.send(elems);
-            }
-            EngineCmd::LoadImage { url, bytes } => {
-                eng.image_cache.insert(url, bytes);
-            }
-            EngineCmd::Tick { timestamp, deadline, reply } => {
-                let needs = eng.tick_js(Some(timestamp), deadline);
-                // Drain JS style overrides produced during this tick
-                let overrides = eng.get_style_overrides();
-                for (id, props) in overrides {
-                    eng.js_style_overrides.entry(id).or_default().extend(props);
-                }
-                let _ = reply.send(needs);
-            }
-            EngineCmd::Shutdown => break,
-        }
-    }
-}
-
-// ── EngineHandle — shared across GUI and HTTP threads ─────────────────────────
-
-/// Cloneable handle used by GUI and HTTP threads to send commands to the engine actor.
-#[derive(Clone)]
-pub struct EngineHandle {
-    pub tx: mpsc::SyncSender<EngineCmd>,
-}
-
-impl EngineHandle {
-    fn send_navigate(&self, url: String, width: f32) -> Result<engine::PageResult, String> {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        self.tx
-            .send(EngineCmd::Navigate { url, width, reply: reply_tx })
-            .map_err(|_| "engine disconnected".to_string())?;
-        reply_rx.recv().map_err(|_| "engine disconnected".to_string())?
-    }
-
-    fn send_re_render(
-        &self,
-        hovered_id: Option<String>,
-        focused_id: Option<String>,
-        width: f32,
-    ) -> Result<engine::PageResult, String> {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        self.tx
-            .send(EngineCmd::ReRender { hovered_id, focused_id, width, reply: reply_tx })
-            .map_err(|_| "engine disconnected".to_string())?;
-        reply_rx.recv().map_err(|_| "engine disconnected".to_string())?
-    }
-
-    fn send_get_page(&self) -> Option<engine::ApiPageResponse> {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        self.tx.send(EngineCmd::GetPage { reply: reply_tx }).ok()?;
-        reply_rx.recv().ok()?
-    }
-
-    fn send_get_elements(&self) -> Vec<engine::ApiElement> {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        if self.tx.send(EngineCmd::GetElements { reply: reply_tx }).is_err() {
-            return vec![];
-        }
-        reply_rx.recv().unwrap_or_default()
-    }
-
-    fn send_click(&self, x: f32, y: f32) -> Vec<engine::ClickResult> {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        if self.tx.send(EngineCmd::Click { x, y, reply: reply_tx }).is_err() {
-            return vec![];
-        }
-        reply_rx.recv().unwrap_or_default()
-    }
-
-    fn send_evaluate_js(&self, script: String) -> String {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        if self.tx.send(EngineCmd::EvaluateJs { script, reply: reply_tx }).is_err() {
-            return String::new();
-        }
-        reply_rx.recv().unwrap_or_default()
-    }
-
-    fn send_screenshot(&self) -> Option<Vec<u8>> {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        self.tx.send(EngineCmd::Screenshot { reply: reply_tx }).ok()?;
-        reply_rx.recv().ok()?
-    }
-
-    fn send_dom_tree(&self) -> String {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        if self.tx.send(EngineCmd::DomTree { reply: reply_tx }).is_err() {
-            return String::new();
-        }
-        reply_rx.recv().unwrap_or_default()
-    }
-
-    fn send_layout_tree(&self) -> String {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        if self.tx.send(EngineCmd::LayoutTree { reply: reply_tx }).is_err() {
-            return String::new();
-        }
-        reply_rx.recv().unwrap_or_default()
-    }
-
-    fn send_computed_style(&self, selector: String) -> HashMap<String, String> {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        if self.tx
-            .send(EngineCmd::ComputedStyle { selector, reply: reply_tx })
-            .is_err()
-        {
-            return HashMap::new();
-        }
-        reply_rx.recv().unwrap_or_default()
-    }
-
-    fn send_tick(&self, timestamp: f64, deadline: Option<f64>) -> bool {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        if self.tx.send(EngineCmd::Tick { timestamp, deadline, reply: reply_tx }).is_err() {
-            return false;
-        }
-        reply_rx.recv().unwrap_or(false)
-    }
-}
 
 // ── axum HTTP server ──────────────────────────────────────────────────────────
 
@@ -978,14 +747,8 @@ fn daemon_hit(rel: egui::Vec2, r: &layout::Rect) -> bool {
 fn main() {
     let args = parse_args();
 
-    let (tx, rx) = mpsc::sync_channel::<EngineCmd>(64);
-    let handle = EngineHandle { tx };
-
-    // Engine actor thread — owns BrowserEngine exclusively
-    std::thread::Builder::new()
-        .name("engine-actor".into())
-        .spawn(move || run_engine_actor(rx))
-        .expect("failed to start engine actor thread");
+    // Spawn the engine actor thread and get a cloneable handle to it.
+    let handle = EngineHandle::spawn();
 
     // HTTP server thread — runs its own tokio runtime
     let handle_for_http = handle.clone();
@@ -1027,6 +790,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use browser::engine::run_engine_actor;
     use tower::ServiceExt;
 
     // ── Arg parsing ──────────────────────────────────────────────────────────
@@ -1060,9 +825,7 @@ mod tests {
     // ── Engine actor ─────────────────────────────────────────────────────────
 
     fn make_test_handle() -> EngineHandle {
-        let (tx, rx) = mpsc::sync_channel(16);
-        std::thread::spawn(move || run_engine_actor(rx));
-        EngineHandle { tx }
+        EngineHandle::spawn()
     }
 
     #[test]
