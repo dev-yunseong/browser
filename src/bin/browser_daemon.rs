@@ -344,12 +344,16 @@ async fn navigate_handler(
     State(handle): State<EngineHandle>,
     Json(req): Json<NavigateRequest>,
 ) -> impl IntoResponse {
-    let result = blocking!(move || handle.send_navigate(req.url, 800.0));
+    // `page_to_api_response` is called inside `spawn_blocking` so that any panic it raises
+    // is caught by Tokio and converted to a `JoinError`. The `blocking!` macro turns a
+    // `JoinError` into an HTTP 500 rather than dropping the TCP connection silently.
+    let result = blocking!(move || {
+        let page = handle.send_navigate(req.url, 800.0)?;
+        let base_url = page.base_url.clone();
+        Ok::<_, String>(engine::page_to_api_response(&page, &base_url))
+    });
     match result {
-        Ok(page) => {
-            let resp = engine::page_to_api_response(&page, &page.base_url.clone());
-            (StatusCode::OK, Json(resp)).into_response()
-        }
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }

@@ -104,10 +104,10 @@ pub fn page_to_api_response(page: &PageResult, base_url: &Url) -> ApiPageRespons
                 text,
                 href: Some(href.clone()),
                 rect: ApiRect {
-                    x: rect.x,
-                    y: rect.y,
-                    w: rect.width,
-                    h: rect.height,
+                    x: if rect.x.is_finite() { rect.x } else { 0.0 },
+                    y: if rect.y.is_finite() { rect.y } else { 0.0 },
+                    w: if rect.width.is_finite() { rect.width } else { 0.0 },
+                    h: if rect.height.is_finite() { rect.height } else { 0.0 },
                 },
             }
         })
@@ -127,10 +127,10 @@ pub fn page_to_api_response(page: &PageResult, base_url: &Url) -> ApiPageRespons
                 name,
                 element_type,
                 rect: ApiRect {
-                    x: rect.x,
-                    y: rect.y,
-                    w: rect.width,
-                    h: rect.height,
+                    x: if rect.x.is_finite() { rect.x } else { 0.0 },
+                    y: if rect.y.is_finite() { rect.y } else { 0.0 },
+                    w: if rect.width.is_finite() { rect.width } else { 0.0 },
+                    h: if rect.height.is_finite() { rect.height } else { 0.0 },
                 },
             }
         })
@@ -326,12 +326,51 @@ pub fn extract_form_controls_from_html(html: &str) -> Vec<(String, String)> {
 
 /// Extract the value of an attribute from a raw HTML tag string (e.g., `a href="url" class="x"`).
 fn extract_attr(tag: &str, attr_name: &str) -> Option<String> {
-    // Look for `attr_name=` (case-insensitive) in the tag string
+    // We need a case-insensitive search that never mixes byte offsets between two strings
+    // whose byte lengths might differ (because `to_lowercase()` can expand characters:
+    // e.g., İ U+0130 is 1 char / 2 bytes in `tag` but lowercases to "i\u{307}", 2 chars /
+    // 3 bytes, in `lower`).
+    //
+    // Strategy: search `lower` for the attribute pattern to decide *whether* it is present,
+    // then walk both `tag` and `lower` together to find the matching byte offset in `tag`.
+    // We consume one codepoint from `tag` and its lowercased expansion from `lower` at a time,
+    // so the two cursors stay synchronised even when `to_lowercase` changes char or byte counts.
     let lower = tag.to_lowercase();
     let search = format!("{}=", attr_name.to_lowercase());
-    let pos = lower.find(&search)?;
-    let rest = &tag[pos + search.len()..];
-    let rest = rest.trim_start();
+
+    // Confirm the attribute exists in the lowercased string.
+    let end_in_lower = lower.find(&search)? + search.len();
+
+    // Walk both strings in lock-step: advance `lower_consumed` by the byte length of the
+    // lowercased form of each codepoint in `tag` until we have consumed `end_in_lower` bytes
+    // of `lower`.  At that point `tag_byte_offset` is the corresponding byte position in `tag`.
+    let mut lower_consumed: usize = 0;
+    let mut tag_byte_offset: usize = 0;
+    let mut lower_chars = lower.char_indices().peekable();
+
+    'outer: for (tag_off, tag_ch) in tag.char_indices() {
+        if lower_consumed >= end_in_lower {
+            tag_byte_offset = tag_off;
+            break 'outer;
+        }
+        tag_byte_offset = tag_off + tag_ch.len_utf8(); // default: past end of tag
+        // Consume the lowercased expansion of `tag_ch` from `lower`.
+        for lc in tag_ch.to_lowercase() {
+            if let Some((_, lc_from_lower)) = lower_chars.next() {
+                debug_assert_eq!(lc, lc_from_lower,
+                    "to_lowercase mismatch: tag_ch={:?} expanded to {:?} but lower had {:?}",
+                    tag_ch, lc, lc_from_lower);
+                lower_consumed += lc.len_utf8();
+            }
+        }
+    }
+
+    if lower_consumed < end_in_lower {
+        // We exhausted `tag` before reaching `end_in_lower` — attribute not really there.
+        return None;
+    }
+
+    let rest = tag[tag_byte_offset..].trim_start();
     if rest.starts_with('"') {
         // Quoted value
         let inner = &rest[1..];
@@ -1005,5 +1044,47 @@ mod tests {
             ClickResult::FocusChanged { id } => assert_eq!(id, "search-input"),
             _ => panic!("Expected FocusChanged"),
         }
+    }
+
+    // ── extract_attr tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_attr_basic() {
+        let tag = r#"a href="https://example.com" class="link""#;
+        assert_eq!(extract_attr(tag, "href"), Some("https://example.com".to_string()));
+    }
+
+    #[test]
+    fn test_extract_attr_case_insensitive() {
+        let tag = r#"INPUT NAME="username" TYPE="text""#;
+        assert_eq!(extract_attr(tag, "name"), Some("username".to_string()));
+    }
+
+    #[test]
+    fn test_extract_attr_unicode_before_attr_no_panic() {
+        // İ (U+0130) is 1 char / 2 bytes, but lowercases to "i\u{307}" which is 2 chars / 3 bytes.
+        // Placing it before the attribute ensures the old byte-offset mixing would panic or
+        // overshoot.  The new implementation must not panic and must return the correct value.
+        let tag = "a data-İ=\"x\" href=\"/path\"";
+        let result = extract_attr(tag, "href");
+        assert_eq!(result, Some("/path".to_string()));
+    }
+
+    #[test]
+    fn test_extract_attr_missing_returns_none() {
+        let tag = r#"img src="photo.jpg""#;
+        assert_eq!(extract_attr(tag, "href"), None);
+    }
+
+    #[test]
+    fn test_extract_attr_single_quoted() {
+        let tag = "a href='/page'";
+        assert_eq!(extract_attr(tag, "href"), Some("/page".to_string()));
+    }
+
+    #[test]
+    fn test_extract_attr_unquoted() {
+        let tag = "input type=text name=user";
+        assert_eq!(extract_attr(tag, "type"), Some("text".to_string()));
     }
 }
