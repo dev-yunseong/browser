@@ -104,10 +104,10 @@ pub fn page_to_api_response(page: &PageResult, base_url: &Url) -> ApiPageRespons
                 text,
                 href: Some(href.clone()),
                 rect: ApiRect {
-                    x: rect.x,
-                    y: rect.y,
-                    w: rect.width,
-                    h: rect.height,
+                    x: if rect.x.is_finite() { rect.x } else { 0.0 },
+                    y: if rect.y.is_finite() { rect.y } else { 0.0 },
+                    w: if rect.width.is_finite() { rect.width } else { 0.0 },
+                    h: if rect.height.is_finite() { rect.height } else { 0.0 },
                 },
             }
         })
@@ -127,10 +127,10 @@ pub fn page_to_api_response(page: &PageResult, base_url: &Url) -> ApiPageRespons
                 name,
                 element_type,
                 rect: ApiRect {
-                    x: rect.x,
-                    y: rect.y,
-                    w: rect.width,
-                    h: rect.height,
+                    x: if rect.x.is_finite() { rect.x } else { 0.0 },
+                    y: if rect.y.is_finite() { rect.y } else { 0.0 },
+                    w: if rect.width.is_finite() { rect.width } else { 0.0 },
+                    h: if rect.height.is_finite() { rect.height } else { 0.0 },
                 },
             }
         })
