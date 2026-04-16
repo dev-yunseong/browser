@@ -134,8 +134,13 @@ impl DaemonClient {
                 resp.status()
             )));
         }
-        resp.json::<ApiPageResponse>()
-            .map_err(|e| CliError::Parse(e.to_string()))
+        // Read the raw body text first so we can include it in the error message if
+        // deserialization fails (e.g. because the daemon panicked and sent garbage).
+        let body = resp.text().map_err(|e| CliError::Parse(e.to_string()))?;
+        serde_json::from_str::<ApiPageResponse>(&body).map_err(|e| {
+            let preview = if body.len() > 200 { &body[..200] } else { &body };
+            CliError::Parse(format!("{} (raw body: {})", e, preview))
+        })
     }
 
     fn get_page(&self) -> Result<ApiPageResponse, CliError> {
@@ -147,8 +152,13 @@ impl DaemonClient {
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(CliError::NotFound("No page loaded".to_string()));
         }
-        resp.json::<ApiPageResponse>()
-            .map_err(|e| CliError::Parse(e.to_string()))
+        // Read the raw body text first so we can include it in the error message if
+        // deserialization fails.
+        let body = resp.text().map_err(|e| CliError::Parse(e.to_string()))?;
+        serde_json::from_str::<ApiPageResponse>(&body).map_err(|e| {
+            let preview = if body.len() > 200 { &body[..200] } else { &body };
+            CliError::Parse(format!("{} (raw body: {})", e, preview))
+        })
     }
 
     fn click_xy(&self, x: f32, y: f32) -> Result<Vec<ClickResult>, CliError> {
@@ -1022,5 +1032,23 @@ mod tests {
         let s = shorten_url(&long);
         assert!(s.ends_with("..."));
         assert!(s.len() <= 43); // 40 chars + "..."
+    }
+
+    // -- Error reporting tests --
+
+    #[test]
+    fn test_parse_error_includes_body_hint() {
+        // Simulate what happens when the daemon returns non-JSON (e.g., a panic message).
+        let invalid_json = "thread 'tokio-runtime' panicked at 'byte index 5...'";
+        let err = serde_json::from_str::<ApiPageResponse>(invalid_json)
+            .map_err(|e| {
+                let preview = if invalid_json.len() > 200 { &invalid_json[..200] } else { invalid_json };
+                CliError::Parse(format!("{} (raw body: {})", e, preview))
+            })
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Parse error:"), "expected 'Parse error:' in: {}", msg);
+        assert!(msg.contains("raw body:"), "expected 'raw body:' in: {}", msg);
+        assert!(msg.contains("panicked"), "expected panic text in: {}", msg);
     }
 }
