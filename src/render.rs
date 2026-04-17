@@ -226,14 +226,14 @@ fn execute_commands_on_tile(commands: &[PaintCommand], pixmap: &mut Pixmap, tile
                     }
                 }
             }
-            PaintCommand::Text { rect, text, font_size, color, clip } => {
+            PaintCommand::Text { rect, text, font_size, color, clip, bold, italic, text_decoration } => {
                 let mut adjusted_rect = *rect;
                 adjusted_rect.x += tx;
                 adjusted_rect.y += ty;
                 let mut adjusted_clip = *clip;
                 adjusted_clip.x += tx;
                 adjusted_clip.y += ty;
-                render_text_raw(text.clone(), adjusted_rect, *font_size, color, adjusted_clip, pixmap);
+                render_text_raw(text.clone(), adjusted_rect, *font_size, color, adjusted_clip, pixmap, *bold, *italic, *text_decoration);
             }
             PaintCommand::Shadow(r, s) => {
                 let mut paint = Paint::default();
@@ -269,7 +269,27 @@ fn create_rounded_rect_path(r: LayoutRect, radius: f32) -> Option<tiny_skia::Pat
 use std::sync::OnceLock;
 static FONT: OnceLock<FontRef<'static>> = OnceLock::new();
 
-fn render_text_raw(text: String, rect: LayoutRect, font_size: f32, color: &Color, clip: LayoutRect, pixmap: &mut Pixmap) {
+/// Render a text run into `pixmap`.
+///
+/// # Synthesis notes
+/// - **Bold** — re-draws each glyph up to 2 extra times at ±1 px offsets so the
+///   strokes appear thicker.  This is a lightweight approximation that works
+///   reasonably well for the NanumGothic TTF which only ships one weight.
+/// - **Italic** — applies a horizontal shear (skew) to every pixel coordinate
+///   before blending.  Each column is shifted left by `ITALIC_SHEAR * (baseline - y)`.
+/// - **Underline / Line-through / Overline** — drawn as filled rectangles after all
+///   glyphs are placed.
+fn render_text_raw(
+    text: String,
+    rect: LayoutRect,
+    font_size: f32,
+    color: &Color,
+    clip: LayoutRect,
+    pixmap: &mut Pixmap,
+    bold: bool,
+    italic: bool,
+    text_decoration: u8,
+) {
     let trimmed = text.trim();
     if trimmed.is_empty() { return; }
     let font = FONT.get_or_init(|| {
@@ -277,9 +297,20 @@ fn render_text_raw(text: String, rect: LayoutRect, font_size: f32, color: &Color
     });
     let scale = PxScale::from(font_size);
     let units = font.units_per_em().unwrap_or(1000.0) as f32;
-    let mut current_y = rect.y + (font_size * 0.85);
+    let baseline_offset = font_size * 0.85;
+    let mut current_y = rect.y + baseline_offset;
     let mut current_x = rect.x;
     let space_w = font.h_advance_unscaled(font.glyph_id(' ')) * (scale.x / units);
+
+    // Shear coefficient for italic synthesis: shifts pixels ~12° (tan 12° ≈ 0.213)
+    const ITALIC_SHEAR: f32 = 0.213;
+
+    // We track line segments so we can draw decorations per line.
+    // Each entry: (line_start_x, line_end_x, baseline_y)
+    let mut decoration_lines: Vec<(f32, f32, f32)> = Vec::new();
+    let mut line_start_x = current_x;
+    let mut line_end_x = current_x;
+
     for word in trimmed.split_whitespace() {
         let mut word_w = 0.0;
         let mut glyphs = Vec::new();
@@ -290,8 +321,12 @@ fn render_text_raw(text: String, rect: LayoutRect, font_size: f32, color: &Color
             word_w += adv;
         }
         if current_x + word_w > rect.x + rect.width + 1.0 && current_x > rect.x {
+            // End the current decoration line segment before wrapping.
+            decoration_lines.push((line_start_x, line_end_x, current_y));
             current_x = rect.x;
             current_y += font_size * 1.4;
+            line_start_x = current_x;
+            line_end_x = current_x;
         }
         for (gid, adv) in glyphs {
             let glyph = gid.with_scale_and_position(scale, point(current_x, current_y));
@@ -299,22 +334,82 @@ fn render_text_raw(text: String, rect: LayoutRect, font_size: f32, color: &Color
                 let bounds = outline.px_bounds();
                 let bx = bounds.min.x.floor() as i32;
                 let by = bounds.min.y.floor() as i32;
+
+                // Bold: draw glyph pixels shifted by small offsets for stroke thickening.
+                let bold_offsets: &[(i32, i32)] = if bold {
+                    &[(0, 0), (1, 0), (-1, 0), (0, 1)]
+                } else {
+                    &[(0, 0)]
+                };
+
                 outline.draw(|gx, gy, coverage| {
-                    let px = bx + gx as i32;
-                    let py = by + gy as i32;
-                    let pxf = px as f32;
-                    let pyf = py as f32;
-                    if pxf >= clip.x && pxf < (clip.x + clip.width) &&
-                       pyf >= clip.y && pyf < (clip.y + clip.height) {
-                        if px >= 0 && py >= 0 && px < pixmap.width() as i32 && py < pixmap.height() as i32 {
-                            blend_glyph_pixel(pixmap, px as u32, py as u32, coverage, color);
+                    for &(dx, dy) in bold_offsets {
+                        let mut px = bx + gx as i32 + dx;
+                        let py = by + gy as i32 + dy;
+                        let pyf = py as f32;
+
+                        // Italic shear: shift x based on distance from baseline.
+                        if italic {
+                            let shear_px = (ITALIC_SHEAR * (current_y - pyf)) as i32;
+                            px += shear_px;
+                        }
+
+                        let pxf = px as f32;
+                        if pxf >= clip.x && pxf < (clip.x + clip.width) &&
+                           pyf >= clip.y && pyf < (clip.y + clip.height) {
+                            if px >= 0 && py >= 0 && px < pixmap.width() as i32 && py < pixmap.height() as i32 {
+                                blend_glyph_pixel(pixmap, px as u32, py as u32, coverage, color);
+                            }
                         }
                     }
                 });
             }
             current_x += adv;
+            line_end_x = current_x;
         }
         current_x += space_w;
+        line_end_x = current_x;
+    }
+
+    // Close the last line segment.
+    if line_end_x > line_start_x {
+        decoration_lines.push((line_start_x, line_end_x - space_w, current_y));
+    }
+
+    // Draw text decorations.
+    if text_decoration != 0 {
+        let line_thickness = (font_size * 0.07).max(1.0);
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(color.r, color.g, color.b, color.a);
+
+        for (seg_start_x, seg_end_x, baseline_y) in decoration_lines {
+            let seg_w = (seg_end_x - seg_start_x).max(0.0);
+            if seg_w < 1.0 { continue; }
+
+            // Underline: slightly below the baseline.
+            if text_decoration & 0b001 != 0 {
+                let uy = baseline_y + line_thickness;
+                if let Some(r) = tiny_skia::Rect::from_xywh(seg_start_x, uy, seg_w, line_thickness) {
+                    pixmap.fill_rect(r, &paint, Transform::identity(), None);
+                }
+            }
+
+            // Line-through: at mid-height of the em square (≈ 40% up from baseline).
+            if text_decoration & 0b010 != 0 {
+                let ly = baseline_y - font_size * 0.30;
+                if let Some(r) = tiny_skia::Rect::from_xywh(seg_start_x, ly, seg_w, line_thickness) {
+                    pixmap.fill_rect(r, &paint, Transform::identity(), None);
+                }
+            }
+
+            // Overline: above the em square top.
+            if text_decoration & 0b100 != 0 {
+                let oy = baseline_y - font_size * 0.85;
+                if let Some(r) = tiny_skia::Rect::from_xywh(seg_start_x, oy, seg_w, line_thickness) {
+                    pixmap.fill_rect(r, &paint, Transform::identity(), None);
+                }
+            }
+        }
     }
 }
 
