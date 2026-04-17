@@ -9,6 +9,9 @@
 //!   browser-cli screenshot [<file>]      # Save screenshot
 //!   browser-cli back                     # Navigate back
 //!   browser-cli forward                  # Navigate forward
+//!   browser-cli js <script>              # Evaluate JavaScript and print result
+//!   browser-cli style [<selector>]       # Print computed CSS styles
+//!   browser-cli layout                   # Print the layout tree
 //!   browser-cli --port 7071 <command>    # Custom daemon port
 
 use std::fmt;
@@ -214,6 +217,34 @@ impl DaemonClient {
             .json()
             .map_err(|e| CliError::Parse(e.to_string()))?;
         Ok(v["result"].as_str().unwrap_or("").to_string())
+    }
+
+    /// GET /style?selector=<sel> — returns computed CSS styles as pretty-printed JSON.
+    fn get_style(&self, selector: Option<&str>) -> Result<String, CliError> {
+        let url = if let Some(sel) = selector {
+            format!("{}/style?selector={}", self.base_url, sel)
+        } else {
+            format!("{}/style", self.base_url)
+        };
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .map_err(Self::check_error)?;
+        let v: serde_json::Value = resp
+            .json()
+            .map_err(|e| CliError::Parse(e.to_string()))?;
+        serde_json::to_string_pretty(&v).map_err(|e| CliError::Parse(e.to_string()))
+    }
+
+    /// GET /layout — returns the plain-text layout tree.
+    fn get_layout(&self) -> Result<String, CliError> {
+        let resp = self
+            .client
+            .get(format!("{}/layout", self.base_url))
+            .send()
+            .map_err(Self::check_error)?;
+        resp.text().map_err(|e| CliError::Http(e.to_string()))
     }
 }
 
@@ -462,6 +493,9 @@ enum Command {
     Back,
     Forward,
     Screenshot(Option<String>),
+    Js(String),
+    Style { selector: Option<String> },
+    Layout,
     Help,
     Quit,
     Unknown(String),
@@ -537,6 +571,21 @@ fn parse_command(line: &str) -> Command {
                 Command::Screenshot(Some(rest.to_string()))
             }
         }
+        "js" => {
+            if rest.is_empty() {
+                Command::Unknown("js requires a script".to_string())
+            } else {
+                Command::Js(rest.to_string())
+            }
+        }
+        "style" => Command::Style {
+            selector: if rest.is_empty() {
+                None
+            } else {
+                Some(rest.to_string())
+            },
+        },
+        "layout" => Command::Layout,
         "help" | "?" | "h" => Command::Help,
         "quit" | "exit" | "q" => Command::Quit,
         other => Command::Unknown(other.to_string()),
@@ -555,6 +604,9 @@ fn print_help() {
     println!("  back                    Go back in history");
     println!("  forward                 Go forward in history");
     println!("  screenshot [<file>]     Save a PNG screenshot (default: screenshot.png)");
+    println!("  js <script>             Evaluate JavaScript and print the result");
+    println!("  style [<selector>]      Print computed CSS styles (optionally filtered by selector)");
+    println!("  layout                  Print the current layout tree");
     println!("  help                    Show this help");
     println!("  quit                    Exit the REPL");
     println!();
@@ -616,6 +668,24 @@ fn dispatch_command(cmd: Command, state: &mut CliState) -> bool {
         Command::Screenshot(path) => {
             if let Err(e) = state.screenshot(path.as_deref()) {
                 eprintln!("Error: {}", e);
+            }
+        }
+        Command::Js(script) => {
+            match state.client.evaluate_js(&script) {
+                Ok(result) => println!("js result: {}", result),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+        Command::Style { selector } => {
+            match state.client.get_style(selector.as_deref()) {
+                Ok(text) => println!("{}", text),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+        Command::Layout => {
+            match state.client.get_layout() {
+                Ok(text) => println!("{}", text),
+                Err(e) => eprintln!("Error: {}", e),
             }
         }
         Command::Help => print_help(),
@@ -915,6 +985,38 @@ mod tests {
     fn test_parse_command_screenshot_with_file() {
         let cmd = parse_command("screenshot out.png");
         assert_eq!(cmd, Command::Screenshot(Some("out.png".to_string())));
+    }
+
+    #[test]
+    fn test_parse_command_js() {
+        let cmd = parse_command("js document.title");
+        assert_eq!(cmd, Command::Js("document.title".to_string()));
+    }
+
+    #[test]
+    fn test_parse_command_js_no_script() {
+        let cmd = parse_command("js");
+        assert!(matches!(cmd, Command::Unknown(_)));
+    }
+
+    #[test]
+    fn test_parse_command_style_no_selector() {
+        assert_eq!(parse_command("style"), Command::Style { selector: None });
+    }
+
+    #[test]
+    fn test_parse_command_style_with_selector() {
+        assert_eq!(
+            parse_command("style body"),
+            Command::Style {
+                selector: Some("body".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_command_layout() {
+        assert_eq!(parse_command("layout"), Command::Layout);
     }
 
     #[test]
