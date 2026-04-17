@@ -23,6 +23,12 @@ pub enum PaintCommand {
         font_size: f32,
         color: Color,
         clip: LayoutRect,
+        /// `true` when `font-weight: bold` (or numeric >= 600)
+        bold: bool,
+        /// `true` when `font-style: italic` or `oblique`
+        italic: bool,
+        /// Bitmask: bit 0 = underline, bit 1 = line-through, bit 2 = overline
+        text_decoration: u8,
     },
     /// Outer box-shadow
     Shadow(LayoutRect, BoxShadow),
@@ -392,12 +398,33 @@ impl LayerTreeBuilder {
                 Some(Value::Color(c)) => c.clone(),
                 _ => Color { r: 0, g: 0, b: 0, a: 255 },
             };
+            let bold = match sv.get(&crate::css::intern("font-weight")) {
+                Some(Value::Keyword(k)) => matches!(k.as_ref(), "bold" | "bolder"),
+                Some(Value::Length(v, _)) => *v >= 600.0,
+                _ => false,
+            };
+            let italic = match sv.get(&crate::css::intern("font-style")) {
+                Some(Value::Keyword(k)) => matches!(k.as_ref(), "italic" | "oblique"),
+                _ => false,
+            };
+            let text_decoration: u8 = match sv.get(&crate::css::intern("text-decoration")) {
+                Some(Value::Keyword(k)) => match k.as_ref() {
+                    "underline"    => 0b001,
+                    "line-through" => 0b010,
+                    "overline"     => 0b100,
+                    _              => 0,
+                },
+                _ => 0,
+            };
             commands.push(PaintCommand::Text {
                 rect: d,
                 text: contents.borrow().to_string(),
                 font_size,
                 color,
                 clip,
+                bold,
+                italic,
+                text_decoration,
             });
         }
 
