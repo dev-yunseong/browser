@@ -334,6 +334,7 @@ pub struct LayoutBox<'a> {
     pub event_handlers: HashMap<String, String>,
     pub display: DisplayType,
     pub z_index: i32,
+    pub position: PositionType,
 }
 
 impl<'a> Clone for LayoutBox<'a> {
@@ -378,6 +379,7 @@ impl<'a> Clone for LayoutBox<'a> {
                         event_handlers: src.event_handlers.clone(),
                         display: src.display,
                         z_index: src.z_index,
+                        position: src.position,
                     };
                     let num_children = src.children.len();
                     // Push Post first so it is processed after all children.
@@ -420,6 +422,16 @@ impl<'a> Drop for LayoutBox<'a> {
     }
 }
 
+/// CSS `position` property values.
+#[derive(PartialEq, Debug, Clone, Copy)]
+pub enum PositionType {
+    Static,
+    Relative,
+    Absolute,
+    Fixed,
+    Sticky,
+}
+
 #[derive(PartialEq, Debug, Clone, Copy)]
 pub enum DisplayType {
     Block,
@@ -443,6 +455,24 @@ pub fn build_layout_tree<'a>(
     vw: f32,
     vh: f32,
 ) -> (Option<LayoutBox<'a>>, f32, f32) {
+    build_layout_tree_with_cb(style_node, container_start_x, current_x, current_y, container_width, vw, vh, None)
+}
+
+/// Internal variant that threads the nearest positioned ancestor rect (containing block)
+/// for absolute/fixed positioning resolution.
+///
+/// `containing_block`: `Some(rect)` = nearest `position: relative/absolute/fixed` ancestor's
+/// padding-box rect. `None` = use the initial containing block (viewport at 0,0,vw×vh).
+pub fn build_layout_tree_with_cb<'a>(
+    style_node: &'a StyledNode,
+    container_start_x: f32,
+    current_x: f32,
+    current_y: f32,
+    container_width: f32,
+    vw: f32,
+    vh: f32,
+    containing_block: Option<Rect>,
+) -> (Option<LayoutBox<'a>>, f32, f32) {
     // Guard against stack overflow on deeply nested DOM trees.
     // Allocate a fresh 64 MiB stack segment when less than 512 KiB remains.
     // A single large segment is more reliable than many chained small segments;
@@ -453,7 +483,7 @@ pub fn build_layout_tree<'a>(
             return (None, current_x, current_y);
         }
         layout.measure_box_model(container_width, vw, vh);
-        layout.perform_layout(container_start_x, current_x, current_y, container_width, vw, vh)
+        layout.perform_layout(container_start_x, current_x, current_y, container_width, vw, vh, containing_block)
     })
 }
 
@@ -464,6 +494,7 @@ impl<'a> LayoutBox<'a> {
             Some(Value::Number(n)) => *n as i32,
             _ => 0,
         };
+        let position = get_position_type(style_node);
         let mut layout = LayoutBox {
             dimensions: Rect::default(),
             padding: EdgeSizes::default(),
@@ -477,6 +508,7 @@ impl<'a> LayoutBox<'a> {
             event_handlers: HashMap::new(),
             display,
             z_index,
+            position,
         };
 
         if let NodeData::Element { ref attrs, ref name, .. } = style_node.node.data {
@@ -515,13 +547,14 @@ impl<'a> LayoutBox<'a> {
     }
 
     fn perform_layout(
-        &mut self, 
-        container_start_x: f32, 
-        _initial_x: f32, 
-        mut current_y: f32, 
+        &mut self,
+        container_start_x: f32,
+        _initial_x: f32,
+        mut current_y: f32,
         container_width: f32,
         vw: f32,
         vh: f32,
+        containing_block: Option<Rect>,
     ) -> (Option<LayoutBox<'a>>, f32, f32) {
         let is_block = is_block_level(self.display);
         
@@ -639,6 +672,22 @@ impl<'a> LayoutBox<'a> {
         let mut child_y = self.dimensions.y + self.padding.top + self.border.top;
         let mut max_child_x = self.dimensions.x;
 
+        // Containing-block computation for positioned descendants.
+        // Must appear before Flex and the main layout loop so both can access child_cb.
+        let self_establishes_cb = matches!(
+            self.position,
+            PositionType::Relative | PositionType::Absolute | PositionType::Fixed | PositionType::Sticky
+        );
+        let viewport_rect = Rect { x: 0.0, y: 0.0, width: vw, height: vh };
+        let self_cb_rect = Rect {
+            x: self.dimensions.x + self.padding.left + self.border.left,
+            y: self.dimensions.y + self.padding.top  + self.border.top,
+            width:  (self.dimensions.width  - self.padding.left - self.padding.right
+                     - self.border.left - self.border.right).max(0.0),
+            height: 0.0, // height not finalised yet
+        };
+        let child_cb = if self_establishes_cb { Some(self_cb_rect) } else { containing_block };
+
         if self.display == DisplayType::Flex {
             let flex_direction = self.style_node.specified_values.get(&crate::css::intern("flex-direction"))
                 .and_then(|v| if let Value::Keyword(k) = v { Some(&**k) } else { None })
@@ -654,7 +703,7 @@ impl<'a> LayoutBox<'a> {
             for child_node in &self.style_node.children {
                 if should_skip(child_node) { continue; }
                 // In flex, we often want children to shrink-wrap first
-                let (cb_opt, _, _) = build_layout_tree(child_node, 0.0, 0.0, 0.0, f32::INFINITY, vw, vh);
+                let (cb_opt, _, _) = build_layout_tree_with_cb(child_node, 0.0, 0.0, 0.0, f32::INFINITY, vw, vh, child_cb);
                 if let Some(cb) = cb_opt {
                     if flex_direction == "row" {
                         total_main_size += cb.dimensions.width + cb.margin.left + cb.margin.right;
@@ -733,7 +782,7 @@ impl<'a> LayoutBox<'a> {
         // This two-step split is necessary to satisfy Rust's borrow checker:
         // we cannot call self.children.push() while borrowing self.style_node.children.
 
-        enum ChildKind { Float(FloatSide), Block, Inline }
+        enum ChildKind { Float(FloatSide), Block, Inline, Positioned }
         struct ChildEntry<'entry> {
             node: &'entry StyledNode,
             kind: ChildKind,
@@ -743,6 +792,12 @@ impl<'a> LayoutBox<'a> {
         let mut entries: Vec<ChildEntry<'a>> = Vec::new();
         for child_node in &self.style_node.children {
             if should_skip(child_node) { continue; }
+            let child_pos = get_position_type(child_node);
+            // Absolute and fixed children are removed from normal flow entirely.
+            if matches!(child_pos, PositionType::Absolute | PositionType::Fixed) {
+                entries.push(ChildEntry { node: child_node, kind: ChildKind::Positioned, clear: None });
+                continue;
+            }
             let float_side = get_float(child_node);
             let clear_val  = get_clear(child_node);
             let child_disp = get_display_type(child_node);
@@ -790,14 +845,22 @@ impl<'a> LayoutBox<'a> {
             }
         }
 
+        let mut positioned_entries: Vec<&StyledNode> = Vec::new();
+
         for entry in entries {
             match entry.kind {
+                // ── Absolutely / fixedly positioned child — skip normal flow ──
+                ChildKind::Positioned => {
+                    // Collect for deferred layout after normal-flow finalisation.
+                    positioned_entries.push(entry.node);
+                }
+
                 // ── Float child ───────────────────────────────────────────────
                 ChildKind::Float(side) => {
                     flush_line!();
                     // Build with origin (0,0); offset_layout_box will reposition.
                     // Use inner_width so explicit CSS widths resolve correctly.
-                    let (cb_opt, _, _) = build_layout_tree(entry.node, 0.0, 0.0, 0.0, inner_width, vw, vh);
+                    let (cb_opt, _, _) = build_layout_tree_with_cb(entry.node, 0.0, 0.0, 0.0, inner_width, vw, vh, child_cb);
                     if let Some(mut cb) = cb_opt {
                         let float_w = cb.dimensions.width + cb.margin.left + cb.margin.right;
                         let float_h = cb.dimensions.height + cb.margin.top + cb.margin.bottom;
@@ -824,12 +887,19 @@ impl<'a> LayoutBox<'a> {
                     }
                     let (avail_w, left_indent) = float_ctx.available_at(cursor_y, 0.0);
                     let block_x = container_x + left_indent;
-                    let (cb_opt, _, _) = build_layout_tree(entry.node, block_x, block_x, 0.0, avail_w, vw, vh);
+                    let (cb_opt, _, _) = build_layout_tree_with_cb(entry.node, block_x, block_x, 0.0, avail_w, vw, vh, child_cb);
                     if let Some(mut cb) = cb_opt {
                         let collapsed = prev_margin_bottom.max(cb.margin.top);
                         let dy = (cursor_y + collapsed) - (cb.dimensions.y + cb.margin.top);
                         offset_layout_box(&mut cb, 0.0, dy);
-                        cursor_y = cb.dimensions.y + cb.dimensions.height;
+                        // cursor_y advances using pre-offset (normal-flow) bottom edge.
+                        let normal_flow_bottom = cb.dimensions.y + cb.dimensions.height;
+                        // Apply relative offset AFTER computing normal-flow bottom so sibling
+                        // placement is not affected (position:relative is a visual-only nudge).
+                        if cb.position == PositionType::Relative {
+                            apply_relative_offset(&mut cb, vw, vh);
+                        }
+                        cursor_y = normal_flow_bottom;
                         prev_margin_bottom = cb.margin.bottom;
                         max_child_x = max_child_x.max(cb.dimensions.x + cb.dimensions.width + cb.margin.right);
                         result.push(cb);
@@ -841,29 +911,38 @@ impl<'a> LayoutBox<'a> {
                 ChildKind::Inline => {
                     prev_margin_bottom = 0.0;
                     let (avail_w, left_indent) = float_ctx.available_at(line_start_y, cur_line.height.max(16.0));
-                    let (cb_opt, _, _) = build_layout_tree(
+                    let (cb_opt, _, _) = build_layout_tree_with_cb(
                         entry.node,
                         container_x + left_indent,
                         container_x + left_indent + cur_line.width,
-                        0.0, avail_w, vw, vh,
+                        0.0, avail_w, vw, vh, child_cb,
                     );
-                    if let Some(cb) = cb_opt {
+                    if let Some(mut cb) = cb_opt {
                         let item_w = cb.dimensions.width + cb.margin.left + cb.margin.right;
                         if cur_line.width + item_w > avail_w && !cur_line.members.is_empty() {
                             flush_line!();
                             // Re-lay out for new line with updated float-aware width
                             let (aw2, li2) = float_ctx.available_at(line_start_y, 16.0);
-                            let (cb2_opt, _, _) = build_layout_tree(
+                            let (cb2_opt, _, _) = build_layout_tree_with_cb(
                                 entry.node,
                                 container_x + li2, container_x + li2,
-                                0.0, aw2, vw, vh,
+                                0.0, aw2, vw, vh, child_cb,
                             );
-                            if let Some(cb2) = cb2_opt {
+                            if let Some(mut cb2) = cb2_opt {
+                                // Apply relative offset after line flush positioning.
+                                if cb2.position == PositionType::Relative {
+                                    apply_relative_offset(&mut cb2, vw, vh);
+                                }
                                 cur_line.width  = cb2.dimensions.width  + cb2.margin.left + cb2.margin.right;
                                 cur_line.height = cb2.dimensions.height + cb2.margin.top  + cb2.margin.bottom;
                                 cur_line.members.push(cb2);
                             }
                         } else {
+                            // Apply relative offset after accumulation so line-height measurement
+                            // uses the pre-offset dimensions, and the visual nudge is applied before push.
+                            if cb.position == PositionType::Relative {
+                                apply_relative_offset(&mut cb, vw, vh);
+                            }
                             cur_line.width  += item_w;
                             cur_line.height  = cur_line.height.max(
                                 cb.dimensions.height + cb.margin.top + cb.margin.bottom);
@@ -892,6 +971,83 @@ impl<'a> LayoutBox<'a> {
         if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get(&crate::css::intern("max-height")) { final_h = final_h.min(*v); }
         if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get(&crate::css::intern("min-height")) { final_h = final_h.max(*v); }
         self.dimensions.height = final_h;
+
+        // ── Layout absolutely/fixedly positioned children ─────────────────────
+        // Now that self has its final dimensions, we can resolve absolute offsets against it.
+        if !positioned_entries.is_empty() {
+            // The final content-box of self (after height is known).
+            let final_self_cb = Rect {
+                x: self.dimensions.x + self.padding.left + self.border.left,
+                y: self.dimensions.y + self.padding.top  + self.border.top,
+                width:  (self.dimensions.width  - self.padding.left - self.padding.right
+                         - self.border.left - self.border.right).max(0.0),
+                height: (self.dimensions.height - self.padding.top  - self.padding.bottom
+                         - self.border.top  - self.border.bottom).max(0.0),
+            };
+
+            for pos_node in positioned_entries {
+                let child_pos_type = get_position_type(pos_node);
+                // fixed: containing block = viewport; absolute: nearest positioned ancestor.
+                let cb_for_child = if child_pos_type == PositionType::Fixed {
+                    viewport_rect
+                } else {
+                    // absolute: use this box's content area if self establishes a CB,
+                    // otherwise fall back to the inherited containing_block.
+                    if self_establishes_cb {
+                        final_self_cb
+                    } else {
+                        containing_block.unwrap_or(viewport_rect)
+                    }
+                };
+
+                // Intrinsic width for the positioned child: explicit CSS width or shrink-wrap.
+                let child_explicit_width = pos_node.specified_values.get(&crate::css::intern("width"));
+                let child_layout_width = match child_explicit_width {
+                    Some(Value::Length(v, Unit::Px)) => *v,
+                    Some(Value::Length(v, Unit::Percent)) => cb_for_child.width * (v / 100.0),
+                    _ => {
+                        // Shrink-wrap: lay out at max-content width bounded by cb width.
+                        let max_c = compute_max_content_width(pos_node, vw, vh);
+                        max_c.min(cb_for_child.width)
+                    }
+                };
+
+                // Build the child in a temporary origin; we'll reposition it below.
+                let (pc_opt, _, _) = build_layout_tree_with_cb(
+                    pos_node,
+                    0.0, 0.0, 0.0,
+                    child_layout_width.max(1.0),
+                    vw, vh,
+                    Some(cb_for_child),
+                );
+                if let Some(mut pc) = pc_opt {
+                    // Resolve top / right / bottom / left against the containing block.
+                    let top    = resolve_offset(pos_node, "top",    cb_for_child.height, vw, vh);
+                    let right  = resolve_offset(pos_node, "right",  cb_for_child.width,  vw, vh);
+                    let bottom = resolve_offset(pos_node, "bottom", cb_for_child.height, vw, vh);
+                    let left   = resolve_offset(pos_node, "left",   cb_for_child.width,  vw, vh);
+
+                    // Determine final x.
+                    let target_x = match (left, right) {
+                        (Some(l), _) => cb_for_child.x + l + pc.margin.left,
+                        (None, Some(r)) => cb_for_child.x + cb_for_child.width - r - pc.dimensions.width - pc.margin.right,
+                        (None, None)    => cb_for_child.x + pc.margin.left, // default to CB origin
+                    };
+                    // Determine final y.
+                    let target_y = match (top, bottom) {
+                        (Some(t), _) => cb_for_child.y + t + pc.margin.top,
+                        (None, Some(b)) => cb_for_child.y + cb_for_child.height - b - pc.dimensions.height - pc.margin.bottom,
+                        (None, None)    => cb_for_child.y + pc.margin.top, // default to CB origin
+                    };
+
+                    let dx = target_x - pc.dimensions.x;
+                    let dy = target_y - pc.dimensions.y;
+                    offset_layout_box(&mut pc, dx, dy);
+
+                    self.children.push(pc);
+                }
+            }
+        }
 
         let final_x = if is_block { container_start_x } else { self.dimensions.x + self.dimensions.width + self.margin.right };
         let final_y = if is_block { self.dimensions.y + self.dimensions.height + self.margin.bottom } else { cursor_y };
@@ -976,6 +1132,62 @@ fn get_clear(sn: &StyledNode) -> Option<ClearValue> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+fn get_position_type(sn: &StyledNode) -> PositionType {
+    match sn.specified_values.get(&crate::css::intern("position")) {
+        Some(Value::Keyword(k)) => match &**k {
+            "relative" => PositionType::Relative,
+            "absolute" => PositionType::Absolute,
+            "fixed"    => PositionType::Fixed,
+            "sticky"   => PositionType::Sticky,
+            _          => PositionType::Static,
+        },
+        _ => PositionType::Static,
+    }
+}
+
+/// Resolve a single offset property (`top`, `right`, `bottom`, `left`) from a `StyledNode`.
+/// Returns `None` if the property is absent or `auto`.
+fn resolve_offset(sn: &StyledNode, prop: &str, container_size: f32, vw: f32, vh: f32) -> Option<f32> {
+    match sn.specified_values.get(&crate::css::intern(prop)) {
+        Some(Value::Length(v, Unit::Px))      => Some(*v),
+        Some(Value::Length(v, Unit::Percent)) => Some(container_size * (v / 100.0)),
+        Some(Value::Length(v, Unit::Vw))      => Some(vw * (v / 100.0)),
+        Some(Value::Length(v, Unit::Vh))      => Some(vh * (v / 100.0)),
+        Some(Value::Keyword(k)) if **k == *"auto" => None,
+        _ => None,
+    }
+}
+
+/// Apply `top`/`left`/`right`/`bottom` as visual offsets for `position: relative` elements.
+///
+/// The element keeps its normal-flow slot (no effect on layout of siblings),
+/// but its rendered position is shifted by the offset values.
+fn apply_relative_offset(layout: &mut LayoutBox, vw: f32, vh: f32) {
+    let sn = layout.style_node;
+    // For relative positioning, offsets resolve against the element's own width/height.
+    // We use 0.0 as the container dimension since percentage offsets on relative
+    // elements are relative to the containing block — a close enough approximation.
+    let top    = resolve_offset(sn, "top",    layout.dimensions.height, vw, vh);
+    let left   = resolve_offset(sn, "left",   layout.dimensions.width,  vw, vh);
+    let right  = resolve_offset(sn, "right",  layout.dimensions.width,  vw, vh);
+    let bottom = resolve_offset(sn, "bottom", layout.dimensions.height, vw, vh);
+
+    let dx = match (left, right) {
+        (Some(l), _)    => l,
+        (None, Some(r)) => -r,
+        (None, None)    => 0.0,
+    };
+    let dy = match (top, bottom) {
+        (Some(t), _)    => t,
+        (None, Some(b)) => -b,
+        (None, None)    => 0.0,
+    };
+
+    if dx != 0.0 || dy != 0.0 {
+        offset_layout_box(layout, dx, dy);
     }
 }
 
@@ -1793,5 +2005,137 @@ mod tests {
         let img = find_image_box(&layout).expect("img node must be found");
         assert!(img.dimensions.width > 0.0, "image with no dimensions must have non-zero width");
         assert!(img.dimensions.height > 0.0, "image with no dimensions must have non-zero height");
+    }
+
+    // ── CSS Positioned layout tests ───────────────────────────────────────────
+
+    /// Helper: find the first child of `parent` whose `position` matches.
+    fn find_child_with_position<'a>(
+        layout: &'a LayoutBox<'a>,
+        pos: PositionType,
+    ) -> Option<&'a LayoutBox<'a>> {
+        let mut stack = vec![layout];
+        while let Some(node) = stack.pop() {
+            if node.position == pos {
+                return Some(node);
+            }
+            for child in node.children.iter().rev() {
+                stack.push(child);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn test_position_absolute_top_left() {
+        // An absolutely-positioned child with top:10px; left:20px inside a
+        // position:relative container (100×100 at origin) should land at (20, 10).
+        let html = r#"<div style="position:relative;width:100px;height:100px;">
+            <div style="position:absolute;top:10px;left:20px;width:30px;height:30px;"></div>
+        </div>"#;
+        let dom = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout tree");
+        let abs_box = find_child_with_position(&layout, PositionType::Absolute)
+            .expect("absolute child must exist");
+        assert_eq!(abs_box.dimensions.x, 20.0,
+            "absolute child x should be 20px (left offset from relative container), got {}",
+            abs_box.dimensions.x);
+        assert_eq!(abs_box.dimensions.y, 10.0,
+            "absolute child y should be 10px (top offset from relative container), got {}",
+            abs_box.dimensions.y);
+    }
+
+    #[test]
+    fn test_position_fixed_top_left() {
+        // A fixed element with top:0; left:0 should land at viewport origin (0, 0).
+        let html = r#"<div style="position:fixed;top:0px;left:0px;width:200px;height:50px;"></div>"#;
+        let dom = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout tree");
+        let fixed_box = find_child_with_position(&layout, PositionType::Fixed)
+            .expect("fixed child must exist");
+        assert_eq!(fixed_box.dimensions.x, 0.0,
+            "fixed element with left:0 must have x=0, got {}", fixed_box.dimensions.x);
+        assert_eq!(fixed_box.dimensions.y, 0.0,
+            "fixed element with top:0 must have y=0, got {}", fixed_box.dimensions.y);
+    }
+
+    #[test]
+    fn test_position_fixed_offset() {
+        // A fixed element with top:20px; left:50px should land at (50, 20).
+        let html = r#"<div style="position:fixed;top:20px;left:50px;width:100px;height:40px;"></div>"#;
+        let dom = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout tree");
+        let fixed_box = find_child_with_position(&layout, PositionType::Fixed)
+            .expect("fixed child must exist");
+        assert_eq!(fixed_box.dimensions.x, 50.0,
+            "fixed element with left:50px must have x=50, got {}", fixed_box.dimensions.x);
+        assert_eq!(fixed_box.dimensions.y, 20.0,
+            "fixed element with top:20px must have y=20, got {}", fixed_box.dimensions.y);
+    }
+
+    #[test]
+    fn test_position_relative_offset() {
+        // A relative element with top:15px; left:10px should be offset from its
+        // normal-flow position by those amounts.
+        let html = r#"<div style="width:200px;">
+            <div style="position:relative;top:15px;left:10px;width:50px;height:20px;"></div>
+        </div>"#;
+        let dom = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout tree");
+        let rel_box = find_child_with_position(&layout, PositionType::Relative)
+            .expect("relative child must exist");
+        // Normal flow would place this at x=0, y=0 (first block child in container).
+        // After relative offset: x=10, y=15.
+        assert_eq!(rel_box.dimensions.x, 10.0,
+            "relative element with left:10px should have x=10, got {}", rel_box.dimensions.x);
+        assert_eq!(rel_box.dimensions.y, 15.0,
+            "relative element with top:15px should have y=15, got {}", rel_box.dimensions.y);
+    }
+
+    #[test]
+    fn test_absolute_child_not_in_normal_flow() {
+        // Siblings after an absolutely-positioned element should not be pushed
+        // down by it — absolute elements are removed from normal flow.
+        let html = r#"<div style="position:relative;width:200px;">
+            <div style="position:absolute;top:0;left:0;width:50px;height:100px;"></div>
+            <div id="sibling" style="width:50px;height:20px;background:red;"></div>
+        </div>"#;
+        let dom = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout tree");
+
+        // Find the normal-flow sibling (non-absolute, non-fixed, non-relative child).
+        fn find_static_block<'a>(layout: &'a LayoutBox<'a>) -> Option<&'a LayoutBox<'a>> {
+            let mut stack = vec![layout];
+            while let Some(node) = stack.pop() {
+                if node.position == PositionType::Static && node.display == DisplayType::Block
+                    && node.dimensions.height > 0.0 {
+                    return Some(node);
+                }
+                for child in node.children.iter().rev() { stack.push(child); }
+            }
+            None
+        }
+
+        let sibling = find_static_block(&layout).expect("sibling div must exist");
+        // The sibling should start at y=0 (not y=100), since the absolute child
+        // doesn't occupy space in normal flow.
+        assert!(sibling.dimensions.y < 5.0,
+            "normal-flow sibling should start at y≈0 (absolute child doesn't push it down), got y={}",
+            sibling.dimensions.y);
     }
 }

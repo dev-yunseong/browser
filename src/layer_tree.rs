@@ -64,14 +64,13 @@ pub enum CompositingTrigger {
     Transform(Matrix4x4),
     /// `position: fixed`
     ///
-    /// NOTE: The layout engine does not produce viewport-relative positions for
-    /// fixed elements. These coordinates are document-flow positions. Correct
-    /// fixed-position layout is deferred to a future layout issue.
+    /// The layout engine resolves `top`/`left`/`right`/`bottom` against the
+    /// viewport (0, 0, vw, vh) so fixed elements are correctly positioned.
     PositionFixed,
     /// `position: sticky`
     ///
-    /// Same limitation as `PositionFixed` — scroll-relative positioning is not
-    /// yet implemented in the layout engine.
+    /// Approximated as `position: relative` with offset resolution. True
+    /// scroll-threshold behaviour requires a compositor pass (future work).
     PositionSticky,
     /// `will-change` with a value other than `auto`
     WillChange(String),
