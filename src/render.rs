@@ -2,7 +2,7 @@ use tiny_skia::{Pixmap, Paint, Transform, Stroke, PathBuilder, PixmapPaint};
 use ab_glyph::{Font, FontRef, PxScale, point};
 use crate::layout::{LayoutBox, Rect as LayoutRect};
 use crate::css::Color;
-use crate::layer_tree::{LayerTree, LayerTreeBuilder, PaintCommand};
+use crate::layer_tree::{LayerTree, LayerTreeBuilder, PaintCommand, ObjectFit};
 use crate::matrix::Matrix4x4;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -214,16 +214,70 @@ fn execute_commands_on_tile(commands: &[PaintCommand], pixmap: &mut Pixmap, tile
                     }
                 }
             }
-            PaintCommand::Image(r, url) => {
-                if let Some(data) = image_cache.get(url) {
+            PaintCommand::Image { rect: r, url, object_fit, alt } => {
+                let drawn = if let Some(data) = image_cache.get(url) {
                     if let Ok(img) = image::load_from_memory(data) {
                         let rgba = img.to_rgba8();
+                        let img_w = rgba.width() as f32;
+                        let img_h = rgba.height() as f32;
                         if let Some(mut img_pixmap) = Pixmap::new(rgba.width(), rgba.height()) {
                             img_pixmap.data_mut().copy_from_slice(&rgba);
-                            pixmap.draw_pixmap(r.x as i32, r.y as i32, img_pixmap.as_ref(), &PixmapPaint::default(),
-                                transform.post_scale(r.width / rgba.width() as f32, r.height / rgba.height() as f32), None);
-                        }
-                    }
+                            match object_fit {
+                                ObjectFit::Fill => {
+                                    // Stretch to fill — existing behavior
+                                    pixmap.draw_pixmap(r.x as i32, r.y as i32, img_pixmap.as_ref(),
+                                        &PixmapPaint::default(),
+                                        transform.post_scale(r.width / img_w, r.height / img_h), None);
+                                }
+                                ObjectFit::Contain => {
+                                    // Scale uniformly to fit inside rect; letterbox with transparency
+                                    let s = (r.width / img_w).min(r.height / img_h);
+                                    let sw = img_w * s;
+                                    let sh = img_h * s;
+                                    let ox = r.x + (r.width - sw) / 2.0;
+                                    let oy = r.y + (r.height - sh) / 2.0;
+                                    pixmap.draw_pixmap(ox as i32, oy as i32, img_pixmap.as_ref(),
+                                        &PixmapPaint::default(),
+                                        transform.post_scale(s, s), None);
+                                }
+                                ObjectFit::Cover => {
+                                    // Scale uniformly to fill rect; draw into a temp pixmap to clip overflow
+                                    let s = (r.width / img_w).max(r.height / img_h);
+                                    let sw = img_w * s;
+                                    let sh = img_h * s;
+                                    let rw = r.width as u32;
+                                    let rh = r.height as u32;
+                                    if let Some(mut tmp) = Pixmap::new(rw.max(1), rh.max(1)) {
+                                        let local_ox = (r.width - sw) / 2.0;
+                                        let local_oy = (r.height - sh) / 2.0;
+                                        tmp.draw_pixmap(local_ox as i32, local_oy as i32,
+                                            img_pixmap.as_ref(), &PixmapPaint::default(),
+                                            Transform::from_scale(s, s), None);
+                                        pixmap.draw_pixmap(r.x as i32, r.y as i32, tmp.as_ref(),
+                                            &PixmapPaint::default(), transform, None);
+                                    }
+                                }
+                                ObjectFit::None => {
+                                    // Intrinsic size (1:1 scale), clip to rect using a temp pixmap
+                                    let rw = r.width as u32;
+                                    let rh = r.height as u32;
+                                    if let Some(mut tmp) = Pixmap::new(rw.max(1), rh.max(1)) {
+                                        let ox = (r.width - img_w) / 2.0;
+                                        let oy = (r.height - img_h) / 2.0;
+                                        tmp.draw_pixmap(ox as i32, oy as i32, img_pixmap.as_ref(),
+                                            &PixmapPaint::default(), Transform::identity(), None);
+                                        pixmap.draw_pixmap(r.x as i32, r.y as i32, tmp.as_ref(),
+                                            &PixmapPaint::default(), transform, None);
+                                    }
+                                }
+                            }
+                            true
+                        } else { false }
+                    } else { false }
+                } else { false };
+
+                if !drawn {
+                    draw_broken_image(pixmap, *r, alt, transform);
                 }
             }
             PaintCommand::Text { rect, text, font_size, color, clip, bold, italic, text_decoration } => {
@@ -247,6 +301,47 @@ fn execute_commands_on_tile(commands: &[PaintCommand], pixmap: &mut Pixmap, tile
                 }
             }
         }
+    }
+}
+
+/// Draw a broken-image placeholder: gray background, border, and alt text.
+fn draw_broken_image(pixmap: &mut Pixmap, r: LayoutRect, alt: &str, transform: Transform) {
+    // Light gray background
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(240, 240, 240, 255);
+    if let Some(tr) = tiny_skia::Rect::from_xywh(r.x, r.y, r.width, r.height) {
+        pixmap.fill_rect(tr, &paint, transform, None);
+    }
+    // Gray border
+    let mut border_paint = Paint::default();
+    border_paint.set_color_rgba8(180, 180, 180, 255);
+    let mut stroke = Stroke::default();
+    stroke.width = 1.0;
+    let mut pb = PathBuilder::new();
+    if let Some(tr) = tiny_skia::Rect::from_xywh(
+        r.x + 0.5, r.y + 0.5,
+        (r.width - 1.0).max(0.0), (r.height - 1.0).max(0.0),
+    ) {
+        pb.push_rect(tr);
+        if let Some(path) = pb.finish() {
+            pixmap.stroke_path(&path, &border_paint, &stroke, transform, None);
+        }
+    }
+    // Alt text (minimum size guard)
+    if r.width >= 8.0 && r.height >= 16.0 {
+        let display_text = if alt.is_empty() {
+            "[broken image]".to_string()
+        } else {
+            format!("[{}]", alt)
+        };
+        let text_rect = LayoutRect {
+            x: r.x + 4.0,
+            y: r.y + 4.0,
+            width: (r.width - 8.0).max(0.0),
+            height: (r.height - 8.0).max(0.0),
+        };
+        let text_color = Color { r: 100, g: 100, b: 100, a: 255 };
+        render_text_raw(display_text, text_rect, 12.0, &text_color, text_rect, pixmap, false, false, 0);
     }
 }
 

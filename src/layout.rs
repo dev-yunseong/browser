@@ -330,6 +330,7 @@ pub struct LayoutBox<'a> {
     pub children: Vec<LayoutBox<'a>>,
     pub link_url: Option<String>,
     pub image_url: Option<String>,
+    pub alt_text: Option<String>,
     pub event_handlers: HashMap<String, String>,
     pub display: DisplayType,
     pub z_index: i32,
@@ -373,6 +374,7 @@ impl<'a> Clone for LayoutBox<'a> {
                         children: Vec::with_capacity(src.children.len()),
                         link_url: src.link_url.clone(),
                         image_url: src.image_url.clone(),
+                        alt_text: src.alt_text.clone(),
                         event_handlers: src.event_handlers.clone(),
                         display: src.display,
                         z_index: src.z_index,
@@ -471,6 +473,7 @@ impl<'a> LayoutBox<'a> {
             children: Vec::new(),
             link_url: None,
             image_url: None,
+            alt_text: None,
             event_handlers: HashMap::new(),
             display,
             z_index,
@@ -484,6 +487,7 @@ impl<'a> LayoutBox<'a> {
                 match name.as_str() {
                     "href" if tag == "a" => layout.link_url = Some(value),
                     "src" if tag == "img" => layout.image_url = Some(value),
+                    "alt" if tag == "img" => layout.alt_text = Some(value),
                     "onclick" => { layout.event_handlers.insert("click".to_string(), value); }
                     _ => {}
                 }
@@ -610,6 +614,25 @@ impl<'a> LayoutBox<'a> {
 
         if let NodeData::Text { ref contents } = self.style_node.node.data {
             return self.layout_text(contents.borrow().to_string(), self.dimensions.x, current_y, container_width);
+        }
+
+        // Image sizing: images need explicit dimension handling before child layout.
+        // The image cache is not available at layout time, so we use placeholder
+        // dimensions based on CSS-specified values. The object-fit logic at render time
+        // will use the actual decoded image dimensions.
+        if self.display == DisplayType::Image {
+            // width is already set by the shrink-wrap / explicit-CSS path above.
+            // If no CSS width was specified, the shrink-wrap path returns a value from
+            // compute_max_content_width (100px default for images). Keep that or fall back to 150.
+            if self.dimensions.width <= 0.0 {
+                self.dimensions.width = 150.0_f32.min(container_width);
+            }
+            // Use CSS height if specified; otherwise derive a 2:3 placeholder from width.
+            let final_h = if height > 0.0 { height } else { self.dimensions.width * 0.667 };
+            self.dimensions.height = final_h.max(1.0);
+            let final_x = self.dimensions.x + self.dimensions.width + self.margin.right;
+            let final_y = self.dimensions.y + self.dimensions.height + self.margin.bottom;
+            return (Some(self.clone()), final_x, final_y);
         }
 
         let inner_width = if width > 0.0 { width } else { (container_width - self.padding.left - self.padding.right - self.border.left - self.border.right).max(0.0) };
@@ -1720,5 +1743,55 @@ mod tests {
         );
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         assert!(layout_opt.is_some(), "layout must succeed for 5000 mixed-display nested divs");
+    }
+
+    // ── Image rendering tests ─────────────────────────────────────────────────
+
+    fn find_image_box<'a>(lb: &'a LayoutBox<'a>) -> Option<&'a LayoutBox<'a>> {
+        if lb.display == DisplayType::Image { return Some(lb); }
+        for c in &lb.children {
+            if let Some(r) = find_image_box(c) { return Some(r); }
+        }
+        None
+    }
+
+    #[test]
+    fn test_image_alt_text_stored() {
+        let html = r#"<img src="x.png" alt="hello">"#;
+        let dom = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let (layout_opt, _, _) = build_layout_tree(&style, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout tree must be built");
+        let img = find_image_box(&layout).expect("img node must be found");
+        assert_eq!(img.alt_text, Some("hello".to_string()), "alt attribute must be stored as alt_text");
+    }
+
+    #[test]
+    fn test_image_fallback_height() {
+        // Only width is specified — height must be derived as a non-zero placeholder.
+        let html = r#"<img src="x.png" style="width:200px">"#;
+        let dom = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let (layout_opt, _, _) = build_layout_tree(&style, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout tree must be built");
+        let img = find_image_box(&layout).expect("img node must be found");
+        assert!(img.dimensions.height > 0.0,
+            "image with only width specified must have non-zero height, got {}", img.dimensions.height);
+    }
+
+    #[test]
+    fn test_image_no_dimensions_gets_default() {
+        // No width or height — must fall back to ~150px default.
+        let html = r#"<img src="x.png">"#;
+        let dom = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let (layout_opt, _, _) = build_layout_tree(&style, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout tree must be built");
+        let img = find_image_box(&layout).expect("img node must be found");
+        assert!(img.dimensions.width > 0.0, "image with no dimensions must have non-zero width");
+        assert!(img.dimensions.height > 0.0, "image with no dimensions must have non-zero height");
     }
 }
