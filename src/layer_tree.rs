@@ -3,6 +3,21 @@ use crate::css::{Value, Color, BoxShadow, TransformOp};
 use crate::matrix::{Matrix3x3, Matrix4x4};
 use markup5ever_rcdom::NodeData;
 
+// ── Object-Fit ────────────────────────────────────────────────────────────────
+
+/// CSS `object-fit` property values controlling how an image fills its layout rect.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ObjectFit {
+    /// Stretch to fill (default). Aspect ratio is not preserved.
+    Fill,
+    /// Scale uniformly to fit inside the rect; letterbox with transparency.
+    Contain,
+    /// Scale uniformly to fill the rect; crop overflow.
+    Cover,
+    /// Use intrinsic image size; clip to rect.
+    None,
+}
+
 // ── Paint Commands ────────────────────────────────────────────────────────────
 
 /// A single atomic drawing operation. Moved from render.rs so that layer_tree.rs
@@ -14,8 +29,8 @@ pub enum PaintCommand {
     Rect(LayoutRect, Color, f32),
     /// Stroked rectangle border: (bounds, stroke-width, color, corner-radius)
     Border(LayoutRect, f32, Color, f32),
-    /// Image placeholder: (bounds, url)
-    Image(LayoutRect, String),
+    /// Image: layout rect, source URL, object-fit mode, alt text
+    Image { rect: LayoutRect, url: String, object_fit: ObjectFit, alt: String },
     /// Text run with clipping rect
     Text {
         rect: LayoutRect,
@@ -384,7 +399,17 @@ impl LayerTreeBuilder {
         // Image
         if layout.display == DisplayType::Image {
             if let Some(ref url) = layout.image_url {
-                commands.push(PaintCommand::Image(d, url.clone()));
+                let object_fit = match sv.get(&crate::css::intern("object-fit")) {
+                    Some(Value::Keyword(k)) => match k.as_ref() {
+                        "contain" => ObjectFit::Contain,
+                        "cover"   => ObjectFit::Cover,
+                        "none"    => ObjectFit::None,
+                        _         => ObjectFit::Fill,
+                    },
+                    _ => ObjectFit::Fill,
+                };
+                let alt = layout.alt_text.clone().unwrap_or_default();
+                commands.push(PaintCommand::Image { rect: d, url: url.clone(), object_fit, alt });
             }
         }
 
@@ -440,7 +465,7 @@ impl LayerTreeBuilder {
             let cmd_rect = match &cmd {
                 PaintCommand::Rect(r, ..) => *r,
                 PaintCommand::Border(r, ..) => *r,
-                PaintCommand::Image(r, ..) => *r,
+                PaintCommand::Image { rect, .. } => *rect,
                 PaintCommand::Text { rect, .. } => *rect,
                 PaintCommand::Shadow(r, ..) => *r,
             };
@@ -583,5 +608,32 @@ mod tests {
         assert!(found_transform, "layer must have Transform trigger with matrix");
         assert_eq!(t_layer.transform.0[3], 50.0);
         assert_eq!(t_layer.transform.0[7], 100.0);
+    }
+
+    #[test]
+    fn test_image_paint_command_carries_object_fit_and_alt() {
+        let tree = build_tree_from_html(
+            r#"<img src="x.png" alt="test" style="width:100px;height:100px;object-fit:cover;">"#,
+            "",
+        );
+        let has_cover = tree.layers.iter()
+            .flat_map(|l| l.content_commands.iter().chain(l.background_commands.iter()))
+            .any(|cmd| matches!(
+                cmd,
+                PaintCommand::Image { object_fit: ObjectFit::Cover, alt, .. } if alt == "test"
+            ));
+        assert!(has_cover, "expected PaintCommand::Image with ObjectFit::Cover and alt='test'");
+    }
+
+    #[test]
+    fn test_image_paint_command_default_fill() {
+        let tree = build_tree_from_html(
+            r#"<img src="photo.jpg" alt="" style="width:200px;height:150px;">"#,
+            "",
+        );
+        let has_fill = tree.layers.iter()
+            .flat_map(|l| l.content_commands.iter().chain(l.background_commands.iter()))
+            .any(|cmd| matches!(cmd, PaintCommand::Image { object_fit: ObjectFit::Fill, .. }));
+        assert!(has_fill, "image with no object-fit must default to ObjectFit::Fill");
     }
 }
