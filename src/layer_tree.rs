@@ -1,4 +1,4 @@
-use crate::layout::{LayoutBox, DisplayType, Rect as LayoutRect};
+use crate::layout::{LayoutBox, DisplayType, PositionType, Rect as LayoutRect};
 use crate::css::{Value, Color, BoxShadow, TransformOp};
 use crate::matrix::{Matrix3x3, Matrix4x4};
 use markup5ever_rcdom::NodeData;
@@ -391,7 +391,11 @@ impl LayerTreeBuilder {
         let sv = &layout.style_node.specified_values;
         let mut matrix = Matrix4x4::identity();
 
-        if layout.z_index != 0 {
+        // CSS spec: any non-static positioned element establishes a stacking context.
+        // We always emit a ZIndex trigger for positioned elements (even when z-index is 0/auto)
+        // so they get their own layer and participate in the correct stacking order.
+        let is_positioned = !matches!(layout.position, PositionType::Static);
+        if layout.z_index != 0 || is_positioned {
             triggers.push(CompositingTrigger::ZIndex(layout.z_index));
         }
 
@@ -405,9 +409,9 @@ impl LayerTreeBuilder {
             triggers.push(CompositingTrigger::Transform(matrix));
         }
 
-        match sv.get(&crate::css::intern("position")) {
-            Some(Value::Keyword(k)) if **k == *"fixed" => triggers.push(CompositingTrigger::PositionFixed),
-            Some(Value::Keyword(k)) if **k == *"sticky" => triggers.push(CompositingTrigger::PositionSticky),
+        match layout.position {
+            PositionType::Fixed => triggers.push(CompositingTrigger::PositionFixed),
+            PositionType::Sticky => triggers.push(CompositingTrigger::PositionSticky),
             _ => {}
         }
 
@@ -765,6 +769,90 @@ mod tests {
             .flat_map(|l| l.content_commands.iter().chain(l.background_commands.iter()))
             .any(|cmd| matches!(cmd, PaintCommand::PushClip { radius, .. } if *radius > 0.0));
         assert!(has_rounded_push, "overflow:hidden + border-radius must emit PushClip with radius > 0");
+    }
+
+    /// A positioned element (position:relative) without explicit z-index must establish a layer.
+    #[test]
+    fn test_positioned_element_creates_layer() {
+        let tree = build_tree_from_html(
+            r#"<div style="width:200px;height:200px;background-color:white;">
+                <div style="position:relative;width:100px;height:100px;background-color:red;">content</div>
+            </div>"#,
+            "",
+        );
+        // The positioned child must create its own layer (z-index: auto = 0 but still positioned).
+        assert!(tree.layers.len() >= 2, "positioned element should create a new layer; got {} layers", tree.layers.len());
+        let pos_layer = tree.layers.iter().find(|l| l.id != 0).expect("should have child layer");
+        assert!(
+            pos_layer.triggers.iter().any(|t| matches!(t, CompositingTrigger::ZIndex(_))),
+            "positioned layer must have ZIndex trigger"
+        );
+    }
+
+    /// A modal with z-index:1000 must produce a layer with z_index == 1000.
+    #[test]
+    fn test_modal_high_z_index_creates_correct_layer() {
+        let tree = build_tree_from_html(
+            r#"<div>
+                <div style="width:800px;height:600px;background-color:white;">page content</div>
+                <div style="position:absolute;top:100px;left:100px;width:400px;height:300px;z-index:1000;background-color:gray;">modal</div>
+            </div>"#,
+            "",
+        );
+        // Modal must create a layer with z_index = 1000
+        let modal_layer = tree.layers.iter().find(|l| l.z_index == 1000);
+        assert!(modal_layer.is_some(), "modal with z-index:1000 must create a layer with z_index=1000");
+    }
+
+    /// Negative z-index element must be categorized as a negative child.
+    #[test]
+    fn test_negative_z_index_categorized_correctly() {
+        let tree = build_tree_from_html(
+            r#"<div style="position:relative;width:200px;height:200px;">
+                <div style="position:absolute;z-index:-1;width:100px;height:100px;background-color:blue;">behind</div>
+                <div style="width:100px;height:50px;background-color:red;">front</div>
+            </div>"#,
+            "",
+        );
+        // Find the layer with z_index = -1
+        let neg_layer = tree.layers.iter().find(|l| l.z_index == -1);
+        assert!(neg_layer.is_some(), "negative z-index element must create a layer with z_index=-1");
+
+        // That layer must be a negative child of its parent
+        let neg_id = neg_layer.unwrap().id;
+        // Find a parent layer that has neg_id as a child
+        let parent_has_neg = tree.layers.iter().any(|l| l.child_layer_ids.contains(&neg_id));
+        assert!(parent_has_neg, "negative z-index layer must be registered as child of a parent layer");
+
+        // Verify categorize_children puts it in the negative bucket
+        let found_in_negative = tree.layers.iter().any(|l| {
+            let (neg, _, _) = tree.categorize_children(l.id);
+            neg.contains(&neg_id)
+        });
+        assert!(found_in_negative, "negative z-index layer must appear in negative bucket of categorize_children");
+    }
+
+    /// Layers sorted by z-index must produce a stable ascending order within a stacking context.
+    #[test]
+    fn test_stacking_context_paint_order_stable() {
+        let tree = build_tree_from_html(
+            r#"<div style="position:relative;">
+                <div style="position:absolute;z-index:2;width:50px;height:50px;">z2</div>
+                <div style="position:absolute;z-index:1;width:50px;height:50px;">z1</div>
+                <div style="position:absolute;z-index:3;width:50px;height:50px;">z3</div>
+            </div>"#,
+            "",
+        );
+        let sorted = tree.sorted_layers();
+        for pair in sorted.windows(2) {
+            assert!(pair[0].z_index <= pair[1].z_index,
+                "layers must be in ascending z-index order: {} vs {}", pair[0].z_index, pair[1].z_index);
+        }
+        // Confirm all 3 z-index layers were created (plus root + the relative container)
+        let z_indices: Vec<i32> = tree.layers.iter().map(|l| l.z_index).collect();
+        assert!(z_indices.contains(&1), "z-index:1 layer must exist");
+        assert!(z_indices.contains(&2), "z-index:2 layer must exist");
+        assert!(z_indices.contains(&3), "z-index:3 layer must exist");
     }
 
     /// Normal boxes without overflow:hidden must not be affected (regression guard).
