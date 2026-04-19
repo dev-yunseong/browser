@@ -1,4 +1,4 @@
-use tiny_skia::{Pixmap, Paint, Transform, Stroke, PathBuilder, PixmapPaint};
+use tiny_skia::{Pixmap, Paint, Transform, Stroke, PathBuilder, PixmapPaint, Mask, FillRule};
 use ab_glyph::{Font, FontRef, PxScale, point};
 use crate::layout::{LayoutBox, Rect as LayoutRect};
 use crate::css::Color;
@@ -179,22 +179,84 @@ fn composite_layer_to_tile(
     }
 }
 
+/// Build a `Mask` (sized to the tile pixmap) for an overflow clip region.
+///
+/// The clip rect is in document space; `tx`/`ty` translate it to tile-local space.
+/// If `parent_mask` is provided the new mask is AND-ed with the parent so nested
+/// `overflow: hidden` containers accumulate correctly.
+fn build_clip_mask(
+    rect: LayoutRect,
+    radius: f32,
+    tx: f32,
+    ty: f32,
+    pw: u32,
+    ph: u32,
+    parent_mask: Option<&Mask>,
+) -> Option<Mask> {
+    if pw == 0 || ph == 0 { return None; }
+    let mut m = Mask::new(pw, ph)?;
+
+    let local_rect = LayoutRect { x: rect.x + tx, y: rect.y + ty, width: rect.width, height: rect.height };
+    let path = if radius > 0.0 {
+        create_rounded_rect_path(local_rect, radius)
+    } else {
+        tiny_skia::Rect::from_xywh(local_rect.x, local_rect.y, local_rect.width, local_rect.height)
+            .and_then(|tr| { let mut pb = PathBuilder::new(); pb.push_rect(tr); pb.finish() })
+    }?;
+    m.fill_path(&path, FillRule::Winding, true, Transform::identity());
+
+    // Intersect with parent clip by multiplying alpha values.
+    if let Some(pm) = parent_mask {
+        let pd = pm.data();
+        let md = m.data_mut();
+        for (d, s) in md.iter_mut().zip(pd.iter()) {
+            *d = ((*d as u32 * *s as u32) / 255) as u8;
+        }
+    }
+    Some(m)
+}
+
 fn execute_commands_on_tile(commands: &[PaintCommand], pixmap: &mut Pixmap, tile_rect: LayoutRect, image_cache: &HashMap<String, Vec<u8>>) {
     let tx = -tile_rect.x;
     let ty = -tile_rect.y;
     let transform = Transform::from_translate(tx, ty);
 
+    // Clip mask stack: each entry is the accumulated mask for that clip level.
+    // `None` means the clip region did not intersect this tile or allocation failed.
+    let mut clip_stack: Vec<Option<Mask>> = Vec::new();
+
+    // Returns the top active mask (or `None` if the stack is empty / top is None).
+    macro_rules! active_mask {
+        () => {
+            clip_stack.last().and_then(|m| m.as_ref())
+        }
+    }
+
     for cmd in commands {
         match cmd {
+            PaintCommand::PushClip { rect, radius } => {
+                let parent = clip_stack.last().and_then(|m| m.as_ref());
+                let mask = build_clip_mask(
+                    *rect, *radius, tx, ty,
+                    pixmap.width(), pixmap.height(),
+                    parent,
+                );
+                clip_stack.push(mask);
+            }
+
+            PaintCommand::PopClip => {
+                clip_stack.pop();
+            }
+
             PaintCommand::Rect(r, c, radius) => {
                 let mut paint = Paint::default();
                 paint.set_color_rgba8(c.r, c.g, c.b, c.a);
                 if *radius > 0.0 {
                     if let Some(path) = create_rounded_rect_path(*r, *radius) {
-                        pixmap.fill_path(&path, &paint, tiny_skia::FillRule::Winding, transform, None);
+                        pixmap.fill_path(&path, &paint, FillRule::Winding, transform, active_mask!());
                     }
                 } else if let Some(tr) = tiny_skia::Rect::from_xywh(r.x, r.y, r.width, r.height) {
-                    pixmap.fill_rect(tr, &paint, transform, None);
+                    pixmap.fill_rect(tr, &paint, transform, active_mask!());
                 }
             }
             PaintCommand::Border(r, w, c, radius) => {
@@ -204,13 +266,13 @@ fn execute_commands_on_tile(commands: &[PaintCommand], pixmap: &mut Pixmap, tile
                 stroke.width = *w;
                 if *radius > 0.0 {
                     if let Some(path) = create_rounded_rect_path(*r, *radius) {
-                        pixmap.stroke_path(&path, &paint, &stroke, transform, None);
+                        pixmap.stroke_path(&path, &paint, &stroke, transform, active_mask!());
                     }
                 } else if let Some(tr) = tiny_skia::Rect::from_xywh(r.x + w/2.0, r.y + w/2.0, (r.width - w).max(0.0), (r.height - w).max(0.0)) {
                     let mut pb = PathBuilder::new();
                     pb.push_rect(tr);
                     if let Some(path) = pb.finish() {
-                        pixmap.stroke_path(&path, &paint, &stroke, transform, None);
+                        pixmap.stroke_path(&path, &paint, &stroke, transform, active_mask!());
                     }
                 }
             }
@@ -227,7 +289,7 @@ fn execute_commands_on_tile(commands: &[PaintCommand], pixmap: &mut Pixmap, tile
                                     // Stretch to fill — existing behavior
                                     pixmap.draw_pixmap(r.x as i32, r.y as i32, img_pixmap.as_ref(),
                                         &PixmapPaint::default(),
-                                        transform.post_scale(r.width / img_w, r.height / img_h), None);
+                                        transform.post_scale(r.width / img_w, r.height / img_h), active_mask!());
                                 }
                                 ObjectFit::Contain => {
                                     // Scale uniformly to fit inside rect; letterbox with transparency
@@ -238,7 +300,7 @@ fn execute_commands_on_tile(commands: &[PaintCommand], pixmap: &mut Pixmap, tile
                                     let oy = r.y + (r.height - sh) / 2.0;
                                     pixmap.draw_pixmap(ox as i32, oy as i32, img_pixmap.as_ref(),
                                         &PixmapPaint::default(),
-                                        transform.post_scale(s, s), None);
+                                        transform.post_scale(s, s), active_mask!());
                                 }
                                 ObjectFit::Cover => {
                                     // Scale uniformly to fill rect; draw into a temp pixmap to clip overflow
@@ -254,7 +316,7 @@ fn execute_commands_on_tile(commands: &[PaintCommand], pixmap: &mut Pixmap, tile
                                             img_pixmap.as_ref(), &PixmapPaint::default(),
                                             Transform::from_scale(s, s), None);
                                         pixmap.draw_pixmap(r.x as i32, r.y as i32, tmp.as_ref(),
-                                            &PixmapPaint::default(), transform, None);
+                                            &PixmapPaint::default(), transform, active_mask!());
                                     }
                                 }
                                 ObjectFit::None => {
@@ -267,7 +329,7 @@ fn execute_commands_on_tile(commands: &[PaintCommand], pixmap: &mut Pixmap, tile
                                         tmp.draw_pixmap(ox as i32, oy as i32, img_pixmap.as_ref(),
                                             &PixmapPaint::default(), Transform::identity(), None);
                                         pixmap.draw_pixmap(r.x as i32, r.y as i32, tmp.as_ref(),
-                                            &PixmapPaint::default(), transform, None);
+                                            &PixmapPaint::default(), transform, active_mask!());
                                     }
                                 }
                             }
@@ -297,7 +359,7 @@ fn execute_commands_on_tile(commands: &[PaintCommand], pixmap: &mut Pixmap, tile
                 let sw = r.width + (*s.spread * 2.0);
                 let sh = r.height + (*s.spread * 2.0);
                 if let Some(tr) = tiny_skia::Rect::from_xywh(sx, sy, sw, sh) {
-                    pixmap.fill_rect(tr, &paint, transform, None);
+                    pixmap.fill_rect(tr, &paint, transform, active_mask!());
                 }
             }
         }
