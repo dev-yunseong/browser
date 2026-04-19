@@ -361,36 +361,55 @@ pub fn build_style_tree(
         // Gather simple-selector matches for this signature.
         // "Simple" means no ancestor combinator — result is position-independent.
         let candidates = sel_index.candidates(node);
-        let mut rule_best: HashMap<usize, (usize, usize, usize)> = HashMap::new();
+        // Use Vec instead of HashMap to avoid per-element HashMap allocation.
+        // Each entry is (rule_idx, specificity); we dedup by taking the max spec per rule_idx.
+        let mut rule_matches: Vec<(usize, (usize, usize, usize))> = Vec::new();
         for entry in &candidates {
             if entry.is_complex { continue; } // skip; needs full DOM context
             let sel = &all_rules[entry.rule_idx].selectors[entry.sel_idx];
             if matches_selector_arena(sel, idx, &arena, hovered_id, focused_id) {
-                let e = rule_best.entry(entry.rule_idx).or_insert((0, 0, 0));
-                if entry.specificity > *e { *e = entry.specificity; }
+                // Track max specificity per rule_idx without a HashMap.
+                if let Some(existing) = rule_matches.iter_mut().find(|(ridx, _)| *ridx == entry.rule_idx) {
+                    if entry.specificity > existing.1 { existing.1 = entry.specificity; }
+                } else {
+                    rule_matches.push((entry.rule_idx, entry.specificity));
+                }
             }
         }
-        let mut matched: Vec<((usize, usize, usize), usize)> = rule_best.into_iter().map(|(ridx, spec)| (spec, ridx)).collect();
+        let mut matched: Vec<((usize, usize, usize), usize)> = rule_matches.into_iter().map(|(ridx, spec)| (spec, ridx)).collect();
         matched.sort_by_key(|&(spec, _)| spec);
         sig_cache.insert(sig, matched);
     }
 
     // Phase 1: Parallel CSS Matching (index-accelerated, O(N × bucket_size))
-    let mut raw_styles: Vec<HashMap<Arc<str>, Value>> = arena.par_iter().enumerate().map(|(idx, node)| {
+    //
+    // Memory bound: limit parallelism to 4 threads so at most 4 per-node HashMaps
+    // are allocated simultaneously. On a large Bootstrap page with many nodes this
+    // is the primary driver of peak RSS; uncapped Rayon (16+ threads) causes OOM.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
+
+    let mut raw_styles: Vec<HashMap<Arc<str>, Value>> = pool.install(|| {
+        arena.par_iter().enumerate().map(|(idx, node)| {
         if !node.is_element { return HashMap::new(); }
         let mut map = HashMap::new();
         apply_default_styles(&node.tag, &mut map);
 
         // --- Collect matching rules ---
-        // rule_best maps rule_idx -> highest specificity seen for that rule
-        let mut rule_best: HashMap<usize, (usize, usize, usize)> = HashMap::new();
+        // Use a Vec to track (rule_idx, max_specificity) without HashMap allocation.
+        let mut rule_matches: Vec<(usize, (usize, usize, usize))> = Vec::new();
 
         // 1. Simple-selector matches via the signature cache (no DOM traversal needed)
         let sig = ElementSignature::from_node(node);
         if let Some(simple_matches) = sig_cache.get(&sig) {
             for &(spec, rule_idx) in simple_matches {
-                let e = rule_best.entry(rule_idx).or_insert((0, 0, 0));
-                if spec > *e { *e = spec; }
+                if let Some(existing) = rule_matches.iter_mut().find(|(ridx, _)| *ridx == rule_idx) {
+                    if spec > existing.1 { existing.1 = spec; }
+                } else {
+                    rule_matches.push((rule_idx, spec));
+                }
             }
         }
 
@@ -400,32 +419,36 @@ pub fn build_style_tree(
             if !entry.is_complex { continue; }
             let sel = &all_rules[entry.rule_idx].selectors[entry.sel_idx];
             if matches_selector_arena(sel, idx, &arena, hovered_id, focused_id) {
-                let e = rule_best.entry(entry.rule_idx).or_insert((0, 0, 0));
-                if entry.specificity > *e { *e = entry.specificity; }
+                if let Some(existing) = rule_matches.iter_mut().find(|(ridx, _)| *ridx == entry.rule_idx) {
+                    if entry.specificity > existing.1 { existing.1 = entry.specificity; }
+                } else {
+                    rule_matches.push((entry.rule_idx, entry.specificity));
+                }
             }
         }
 
         // Sort by specificity (ascending) so higher specificity overwrites lower
-        let mut matches: Vec<((usize, usize, usize), usize)> = rule_best.into_iter().map(|(ridx, spec)| (spec, ridx)).collect();
-        matches.sort_by_key(|&(spec, _)| spec);
+        rule_matches.sort_by_key(|&(_, spec)| spec);
 
-        let mut important: HashMap<Arc<str>, Value> = HashMap::new();
-        for (_, rule_idx) in &matches {
+        // Apply matched rules; defer important declarations.
+        // Only allocate `important` if needed (most nodes have no !important rules).
+        let mut important: Vec<(Arc<str>, Value)> = Vec::new();
+        let mut inline_important: Vec<(Arc<str>, Value)> = Vec::new();
+        for (rule_idx, _) in &rule_matches {
             for decl in &all_rules[*rule_idx].declarations {
                 if !decl.important { map.insert(decl.name.clone(), decl.value.clone()); }
-                else { important.insert(decl.name.clone(), decl.value.clone()); }
+                else { important.push((decl.name.clone(), decl.value.clone())); }
             }
         }
 
         apply_attribute_styles_arena(node, &mut map);
 
-        let mut inline_important = HashMap::new();
         if let Some(v) = node.attrs.iter().find(|(k, _)| k == "style").map(|(_, v)| v) {
             let mut inline_map = Vec::new();
             parse_inline_style_into_vec(v, &mut inline_map);
             for decl in inline_map {
                 if !decl.important { map.insert(decl.name, decl.value); }
-                else { inline_important.insert(decl.name, decl.value); }
+                else { inline_important.push((decl.name, decl.value)); }
             }
         }
 
@@ -438,7 +461,8 @@ pub fn build_style_tree(
             }
         }
         map
-    }).collect();
+    }).collect()
+    });
 
     // Phase 2: Sequential Inheritance & Deduplication
     let mut store = StyleStore::default();
