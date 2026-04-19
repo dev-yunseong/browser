@@ -47,6 +47,12 @@ pub enum PaintCommand {
     },
     /// Outer box-shadow
     Shadow(LayoutRect, BoxShadow),
+    /// Push a clip region onto the clip stack.
+    /// All subsequent commands are clipped to `rect` (optionally with rounded corners
+    /// when `radius` > 0). Paired with `PopClip`.
+    PushClip { rect: LayoutRect, radius: f32 },
+    /// Pop the most recently pushed clip region from the clip stack.
+    PopClip,
 }
 
 // ── Compositing Triggers ──────────────────────────────────────────────────────
@@ -250,57 +256,128 @@ impl LayerTreeBuilder {
     /// each write touches a single distinct index, so there is no simultaneous
     /// aliasing of two entries.
     fn traverse(layout: &LayoutBox, tree: &mut LayerTree, current_layer_id: usize, clip: LayoutRect) {
-        struct Frame<'f> {
-            layout: &'f LayoutBox<'f>,
-            layer_id: usize,
-            clip: LayoutRect,
+        enum Frame<'f> {
+            /// Process a layout box and push its children.
+            Process {
+                layout: &'f LayoutBox<'f>,
+                layer_id: usize,
+                clip: LayoutRect,
+            },
+            /// Emit a PopClip command into the given layer after children are done.
+            PopClip {
+                layer_id: usize,
+                is_background: bool,
+            },
         }
 
-        let mut stack: Vec<Frame> = vec![Frame { layout, layer_id: current_layer_id, clip }];
+        let mut stack: Vec<Frame> = vec![Frame::Process { layout, layer_id: current_layer_id, clip }];
 
         while let Some(frame) = stack.pop() {
-            let d = frame.layout.dimensions;
-
-            // Skip zero-sized boxes but still visit children.
-            if d.width < 0.1 || d.height < 0.1 {
-                let next_clip = frame.clip.intersect(&frame.layout.get_content_rect());
-                // Push children in reverse order so the first child is processed first.
-                for child in frame.layout.children.iter().rev() {
-                    stack.push(Frame { layout: child, layer_id: frame.layer_id, clip: next_clip });
+            match frame {
+                Frame::PopClip { layer_id, is_background } => {
+                    let cmd = PaintCommand::PopClip;
+                    if is_background {
+                        tree.layers[layer_id].background_commands.push(cmd.clone());
+                    } else {
+                        tree.layers[layer_id].content_commands.push(cmd.clone());
+                    }
+                    // Also add to overlapping tiles
+                    for tile in &mut tree.layers[layer_id].tiles {
+                        if is_background {
+                            tile.background_commands.push(cmd.clone());
+                        } else {
+                            tile.content_commands.push(cmd.clone());
+                        }
+                        tile.dirty = true;
+                    }
                 }
-                continue;
+
+                Frame::Process { layout: frame_layout, layer_id: frame_layer_id, clip: frame_clip } => {
+                    let d = frame_layout.dimensions;
+
+                    // Skip zero-sized boxes but still visit children.
+                    if d.width < 0.1 || d.height < 0.1 {
+                        let next_clip = frame_clip.intersect(&frame_layout.get_content_rect());
+                        // Push children in reverse order so the first child is processed first.
+                        for child in frame_layout.children.iter().rev() {
+                            stack.push(Frame::Process { layout: child, layer_id: frame_layer_id, clip: next_clip });
+                        }
+                        continue;
+                    }
+
+                    // Check if this box clips its overflow.
+                    let overflow_hidden = Self::has_overflow_hidden(frame_layout);
+                    let border_radius = match frame_layout.style_node.specified_values.get(&crate::css::intern("border-radius")) {
+                        Some(Value::Length(v, _)) => *v,
+                        _ => 0.0,
+                    };
+
+                    let (triggers, matrix) = Self::detect_triggers(frame_layout);
+
+                    if !triggers.is_empty() {
+                        // This box establishes a new compositing layer.
+                        let new_id = tree.layers.len();
+                        let opacity = frame_layout.get_opacity();
+                        let new_layer = Layer::new(new_id, frame_layout.z_index, opacity, d, triggers, matrix);
+                        tree.add_layer(new_layer);
+
+                        // Record parent → child relationship: access parent index first,
+                        // then new_id — both are distinct indices so no aliasing.
+                        tree.layers[frame_layer_id].child_layer_ids.push(new_id);
+
+                        // Collect this box's paint commands into the new layer as BACKGROUND.
+                        Self::collect_paint_commands(frame_layout, &mut tree.layers[new_id], frame_clip, true);
+
+                        // If overflow:hidden, emit PushClip before children and schedule PopClip after.
+                        if overflow_hidden && !frame_layout.children.is_empty() {
+                            let clip_rect = frame_layout.dimensions;
+                            let push_cmd = PaintCommand::PushClip { rect: clip_rect, radius: border_radius };
+                            tree.layers[new_id].background_commands.push(push_cmd.clone());
+                            for tile in &mut tree.layers[new_id].tiles {
+                                tile.background_commands.push(push_cmd.clone());
+                                tile.dirty = true;
+                            }
+                            // Schedule PopClip to be emitted after all children finish.
+                            stack.push(Frame::PopClip { layer_id: new_id, is_background: true });
+                        }
+
+                        // All children belong to the new layer's stacking context.
+                        let next_clip = frame_clip.intersect(&frame_layout.get_content_rect());
+                        for child in frame_layout.children.iter().rev() {
+                            stack.push(Frame::Process { layout: child, layer_id: new_id, clip: next_clip });
+                        }
+                    } else {
+                        // No trigger — paint into the current ancestor layer as CONTENT.
+                        Self::collect_paint_commands(frame_layout, &mut tree.layers[frame_layer_id], frame_clip, false);
+
+                        // If overflow:hidden, emit PushClip before children and schedule PopClip after.
+                        if overflow_hidden && !frame_layout.children.is_empty() {
+                            let clip_rect = frame_layout.dimensions;
+                            let push_cmd = PaintCommand::PushClip { rect: clip_rect, radius: border_radius };
+                            tree.layers[frame_layer_id].content_commands.push(push_cmd.clone());
+                            for tile in &mut tree.layers[frame_layer_id].tiles {
+                                tile.content_commands.push(push_cmd.clone());
+                                tile.dirty = true;
+                            }
+                            // Schedule PopClip to be emitted after all children finish.
+                            stack.push(Frame::PopClip { layer_id: frame_layer_id, is_background: false });
+                        }
+
+                        let next_clip = frame_clip.intersect(&frame_layout.get_content_rect());
+                        for child in frame_layout.children.iter().rev() {
+                            stack.push(Frame::Process { layout: child, layer_id: frame_layer_id, clip: next_clip });
+                        }
+                    }
+                }
             }
+        }
+    }
 
-            let (triggers, matrix) = Self::detect_triggers(frame.layout);
-
-            if !triggers.is_empty() {
-                // This box establishes a new compositing layer.
-                let new_id = tree.layers.len();
-                let opacity = frame.layout.get_opacity();
-                let new_layer = Layer::new(new_id, frame.layout.z_index, opacity, d, triggers, matrix);
-                tree.add_layer(new_layer);
-
-                // Record parent → child relationship: access parent index first,
-                // then new_id — both are distinct indices so no aliasing.
-                tree.layers[frame.layer_id].child_layer_ids.push(new_id);
-
-                // Collect this box's paint commands into the new layer as BACKGROUND.
-                Self::collect_paint_commands(frame.layout, &mut tree.layers[new_id], frame.clip, true);
-
-                // All children belong to the new layer's stacking context.
-                let next_clip = frame.clip.intersect(&frame.layout.get_content_rect());
-                for child in frame.layout.children.iter().rev() {
-                    stack.push(Frame { layout: child, layer_id: new_id, clip: next_clip });
-                }
-            } else {
-                // No trigger — paint into the current ancestor layer as CONTENT.
-                Self::collect_paint_commands(frame.layout, &mut tree.layers[frame.layer_id], frame.clip, false);
-
-                let next_clip = frame.clip.intersect(&frame.layout.get_content_rect());
-                for child in frame.layout.children.iter().rev() {
-                    stack.push(Frame { layout: child, layer_id: frame.layer_id, clip: next_clip });
-                }
-            }
+    /// Returns `true` if this box has `overflow: hidden` set.
+    fn has_overflow_hidden(layout: &LayoutBox) -> bool {
+        match layout.style_node.specified_values.get(&crate::css::intern("overflow")) {
+            Some(Value::Keyword(k)) => **k == *"hidden",
+            _ => false,
         }
     }
 
@@ -461,12 +538,16 @@ impl LayerTreeBuilder {
 
         // Also distribute to overlapping tiles
         for cmd in commands {
+            // PushClip/PopClip are emitted directly in traverse(); they never appear in
+            // the `commands` Vec built by collect_paint_commands. Handle them defensively.
             let cmd_rect = match &cmd {
                 PaintCommand::Rect(r, ..) => *r,
                 PaintCommand::Border(r, ..) => *r,
                 PaintCommand::Image { rect, .. } => *rect,
                 PaintCommand::Text { rect, .. } => *rect,
                 PaintCommand::Shadow(r, ..) => *r,
+                PaintCommand::PushClip { rect, .. } => *rect,
+                PaintCommand::PopClip => continue,
             };
 
             for tile in &mut layer.tiles {
@@ -634,5 +715,77 @@ mod tests {
             .flat_map(|l| l.content_commands.iter().chain(l.background_commands.iter()))
             .any(|cmd| matches!(cmd, PaintCommand::Image { object_fit: ObjectFit::Fill, .. }));
         assert!(has_fill, "image with no object-fit must default to ObjectFit::Fill");
+    }
+
+    /// A plain div without `overflow: hidden` must not emit any PushClip/PopClip commands.
+    #[test]
+    fn test_no_clip_commands_for_visible_overflow() {
+        let tree = build_tree_from_html(
+            r#"<div style="width:200px;height:100px;background-color:red;">
+                <div style="width:200px;height:200px;background-color:blue;">tall child</div>
+            </div>"#,
+            "",
+        );
+        let has_push_clip = tree.layers.iter()
+            .flat_map(|l| l.content_commands.iter().chain(l.background_commands.iter()))
+            .any(|cmd| matches!(cmd, PaintCommand::PushClip { .. }));
+        assert!(!has_push_clip, "overflow:visible (default) must not emit PushClip");
+    }
+
+    /// A div with `overflow: hidden` must emit a PushClip command followed by a PopClip.
+    #[test]
+    fn test_overflow_hidden_emits_push_pop_clip() {
+        let tree = build_tree_from_html(
+            r#"<div style="width:200px;height:100px;overflow:hidden;background-color:red;">
+                <div style="width:200px;height:200px;background-color:blue;">tall child</div>
+            </div>"#,
+            "",
+        );
+        let all_cmds: Vec<&PaintCommand> = tree.layers.iter()
+            .flat_map(|l| l.content_commands.iter().chain(l.background_commands.iter()))
+            .collect();
+
+        let push_count = all_cmds.iter().filter(|c| matches!(c, PaintCommand::PushClip { .. })).count();
+        let pop_count  = all_cmds.iter().filter(|c| matches!(c, PaintCommand::PopClip)).count();
+
+        assert!(push_count >= 1, "overflow:hidden must emit at least one PushClip; got {}", push_count);
+        assert_eq!(push_count, pop_count, "PushClip and PopClip must be balanced");
+    }
+
+    /// A div with `overflow: hidden` + `border-radius` must emit a PushClip with non-zero radius.
+    #[test]
+    fn test_overflow_hidden_with_border_radius_emits_rounded_clip() {
+        let tree = build_tree_from_html(
+            r#"<div style="width:200px;height:100px;overflow:hidden;border-radius:8px;">
+                <div style="width:300px;height:300px;background-color:blue;">overflow child</div>
+            </div>"#,
+            "",
+        );
+        let has_rounded_push = tree.layers.iter()
+            .flat_map(|l| l.content_commands.iter().chain(l.background_commands.iter()))
+            .any(|cmd| matches!(cmd, PaintCommand::PushClip { radius, .. } if *radius > 0.0));
+        assert!(has_rounded_push, "overflow:hidden + border-radius must emit PushClip with radius > 0");
+    }
+
+    /// Normal boxes without overflow:hidden must not be affected (regression guard).
+    #[test]
+    fn test_overflow_hidden_does_not_affect_sibling_boxes() {
+        let tree = build_tree_from_html(
+            r#"<div>
+                <div style="width:100px;height:50px;overflow:hidden;background:red;">
+                    <span>clipped</span>
+                </div>
+                <div style="width:100px;height:50px;background:green;">
+                    <span>not clipped</span>
+                </div>
+            </div>"#,
+            "",
+        );
+        // Verify there is exactly one PushClip (from the overflow:hidden div only).
+        let push_count = tree.layers.iter()
+            .flat_map(|l| l.content_commands.iter().chain(l.background_commands.iter()))
+            .filter(|c| matches!(c, PaintCommand::PushClip { .. }))
+            .count();
+        assert_eq!(push_count, 1, "only the overflow:hidden div should emit PushClip; got {}", push_count);
     }
 }
