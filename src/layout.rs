@@ -1421,7 +1421,10 @@ impl<'a> LayoutBox<'a> {
     }
 
     pub fn establishes_stacking_context(&self) -> bool {
-        self.z_index != 0 || self.establishes_bfc()
+        // CSS spec: positioned elements (non-static) always form a stacking context,
+        // as do elements with z-index != 0, opacity < 1, transforms, etc.
+        let is_positioned = !matches!(self.position, PositionType::Static);
+        is_positioned || self.z_index != 0 || self.establishes_bfc()
     }
 
     pub fn establishes_bfc(&self) -> bool {
