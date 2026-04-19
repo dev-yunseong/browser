@@ -816,6 +816,14 @@ impl<'a> LayoutBox<'a> {
         let mut float_ctx = FloatContext::new(inner_width);
         let mut cursor_y = self.dimensions.y + self.padding.top + self.border.top;
         let mut prev_margin_bottom = 0.0f32;
+        // True once the first block child has been placed (used for parent-child margin
+        // collapsing: Case 2 of the CSS spec).
+        let mut first_block_placed = false;
+        // Whether the parent's top edge is "open" to margin collapsing (no border/padding
+        // separating parent from its first block child).
+        let parent_open_top = self.padding.top == 0.0 && self.border.top == 0.0;
+        // Whether the parent's bottom edge is "open" to margin collapsing.
+        let parent_open_bottom = self.padding.bottom == 0.0 && self.border.bottom == 0.0;
         let mut result: Vec<LayoutBox<'a>> = Vec::new();
 
         // Inline line accumulator
@@ -889,8 +897,27 @@ impl<'a> LayoutBox<'a> {
                     let block_x = container_x + left_indent;
                     let (cb_opt, _, _) = build_layout_tree_with_cb(entry.node, block_x, block_x, 0.0, avail_w, vw, vh, child_cb);
                     if let Some(mut cb) = cb_opt {
-                        let collapsed = prev_margin_bottom.max(cb.margin.top);
-                        let dy = (cursor_y + collapsed) - (cb.dimensions.y + cb.margin.top);
+                        // CSS margin collapsing (spec § 8.3.1):
+                        //
+                        // Case 1 — adjacent siblings: the bottom margin of the previous
+                        // block and the top margin of this block collapse to max(prev, cur).
+                        //
+                        // Case 2 — parent / first-child: when no border or padding separates
+                        // the parent's top edge from the first block child, the child's top
+                        // margin collapses *into* the parent's top margin (no internal space).
+                        let collapsed = if !first_block_placed && parent_open_top {
+                            // Case 2: no space between parent content edge and first child.
+                            // The child's margin has already been "consumed" by the parent's
+                            // own margin; don't add it as interior spacing.
+                            0.0
+                        } else {
+                            // Case 1: standard adjacent-sibling collapse.
+                            prev_margin_bottom.max(cb.margin.top)
+                        };
+                        first_block_placed = true;
+                        // `cb` was built at current_y = 0, so cb.dimensions.y == cb.margin.top.
+                        // We want the content box to land at cursor_y + collapsed.
+                        let dy = (cursor_y + collapsed) - cb.dimensions.y;
                         offset_layout_box(&mut cb, 0.0, dy);
                         // cursor_y advances using pre-offset (normal-flow) bottom edge.
                         let normal_flow_bottom = cb.dimensions.y + cb.dimensions.height;
@@ -909,7 +936,6 @@ impl<'a> LayoutBox<'a> {
 
                 // ── Inline child ──────────────────────────────────────────────
                 ChildKind::Inline => {
-                    prev_margin_bottom = 0.0;
                     let (avail_w, left_indent) = float_ctx.available_at(line_start_y, cur_line.height.max(16.0));
                     let (cb_opt, _, _) = build_layout_tree_with_cb(
                         entry.node,
@@ -918,6 +944,10 @@ impl<'a> LayoutBox<'a> {
                         0.0, avail_w, vw, vh, child_cb,
                     );
                     if let Some(mut cb) = cb_opt {
+                        // Only reset prev_margin_bottom when a visible inline element is
+                        // actually placed.  Empty/whitespace-only text nodes return None and
+                        // must NOT interrupt adjacent-block margin collapsing.
+                        prev_margin_bottom = 0.0;
                         let item_w = cb.dimensions.width + cb.margin.left + cb.margin.right;
                         if cur_line.width + item_w > avail_w && !cur_line.members.is_empty() {
                             flush_line!();
@@ -954,7 +984,14 @@ impl<'a> LayoutBox<'a> {
         }
 
         flush_line!();
-        cursor_y += prev_margin_bottom;
+        // Case 2 (bottom) — parent / last-child margin collapsing:
+        // When no border or padding separates the parent's bottom edge from the last
+        // block child, the child's bottom margin collapses into the parent's bottom margin
+        // (no interior spacing at the bottom).  Only apply the last child's margin when
+        // the parent *does* have a bottom border or padding.
+        if !parent_open_bottom {
+            cursor_y += prev_margin_bottom;
+        }
         // Clearfix: ensure the container is tall enough to cover all floated children.
         cursor_y = cursor_y.max(float_ctx.bottom());
 
@@ -2140,5 +2177,115 @@ mod tests {
         assert!(sibling.dimensions.y < 5.0,
             "normal-flow sibling should start at y≈0 (absolute child doesn't push it down), got y={}",
             sibling.dimensions.y);
+    }
+
+    // ── Margin collapsing tests ───────────────────────────────────────────────
+
+    /// Case 1: Two adjacent `<p>` elements each with `margin: 16px 0`.
+    /// CSS spec requires the gap to be 16px (collapsed), not 32px (summed).
+    #[test]
+    fn test_margin_collapsing_adjacent_siblings() {
+        let html = r#"<div style="width:800px;">
+            <p style="margin-top:16px;margin-bottom:16px;height:50px;">A</p>
+            <p style="margin-top:16px;margin-bottom:16px;height:50px;">B</p>
+        </div>"#;
+        let dom = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout");
+
+        // Navigate html > body > div, then get the two <p> children.
+        let outer_div = find_outer_div(&layout).expect("outer div not found");
+        let ps: Vec<&LayoutBox> = outer_div.children.iter()
+            .filter(|c| is_block_level(c.display))
+            .collect();
+        assert_eq!(ps.len(), 2, "expected 2 block children");
+
+        let p1 = ps[0];
+        let p2 = ps[1];
+
+        let p1_bottom = p1.dimensions.y + p1.dimensions.height; // content bottom of p1
+        let gap = p2.dimensions.y - p1_bottom;
+        assert_eq!(gap, 16.0,
+            "adjacent <p> margins should collapse to 16px gap, got {}px (p1.y={}, p1.h={}, p2.y={})",
+            gap, p1.dimensions.y, p1.dimensions.height, p2.dimensions.y);
+    }
+
+    /// Case 1b: Asymmetric adjacent margins collapse to the larger value.
+    /// `<div margin-bottom:32px>` followed by `<div margin-top:16px>` → 32px gap.
+    #[test]
+    fn test_margin_collapsing_asymmetric() {
+        let html = r#"<div style="width:800px;">
+            <div style="margin-bottom:32px;height:50px;">A</div>
+            <div style="margin-top:16px;height:50px;">B</div>
+        </div>"#;
+        let dom = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout");
+
+        let outer_div = find_outer_div(&layout).expect("outer div not found");
+        let blocks: Vec<&LayoutBox> = outer_div.children.iter()
+            .filter(|c| is_block_level(c.display))
+            .collect();
+        assert_eq!(blocks.len(), 2, "expected 2 block children");
+
+        let b1 = blocks[0];
+        let b2 = blocks[1];
+        let gap = b2.dimensions.y - (b1.dimensions.y + b1.dimensions.height);
+        assert_eq!(gap, 32.0,
+            "asymmetric margins should collapse to max(32,16)=32px, got {}px", gap);
+    }
+
+    /// Case 2 (top): First block child inside a padding-less parent.
+    /// The child's top margin should collapse with the parent's — no internal
+    /// space between the parent's content edge and the child's content edge.
+    #[test]
+    fn test_margin_collapsing_parent_first_child_top() {
+        // Container has no padding or border; h1 has margin-top:32px.
+        // The h1 should start at y=0 (same as the container's content top).
+        let html = r#"<div style="width:800px;margin:0;padding:0;">
+            <h1 style="margin-top:32px;height:40px;">Hello</h1>
+        </div>"#;
+        let dom = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout");
+
+        let outer_div = find_outer_div(&layout).expect("outer div not found");
+        let h1 = outer_div.children.iter()
+            .find(|c| is_block_level(c.display))
+            .expect("h1 block child");
+
+        // h1 content box should start at the parent's content top (no internal margin gap).
+        assert_eq!(h1.dimensions.y, outer_div.dimensions.y,
+            "first child margin should collapse into parent (no internal gap): h1.y={}, div.y={}",
+            h1.dimensions.y, outer_div.dimensions.y);
+    }
+
+    /// Case 2 (bottom): Last block child inside a padding-less parent.
+    /// The child's bottom margin should collapse with the parent's — no extra
+    /// space added at the bottom of the parent's content area.
+    #[test]
+    fn test_margin_collapsing_parent_last_child_bottom() {
+        // Container with no bottom padding/border; inner div has margin-bottom:24px.
+        // Parent's content height should equal the child's height (24px margin not added inside).
+        let html = r#"<div style="width:800px;margin:0;padding:0;">
+            <div style="height:60px;margin-bottom:24px;">Inner</div>
+        </div>"#;
+        let dom = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout");
+
+        let outer_div = find_outer_div(&layout).expect("outer div not found");
+        // Parent height should be 60px (the child height), not 84px (60 + 24 margin).
+        assert_eq!(outer_div.dimensions.height, 60.0,
+            "last child bottom margin should collapse into parent (height should be 60, not 84): got {}",
+            outer_div.dimensions.height);
     }
 }
