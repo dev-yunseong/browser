@@ -2,7 +2,7 @@ use crate::css::{Stylesheet, Value, Selector, parse_value, parse_color, Combinat
 
 use markup5ever_rcdom::{Handle, NodeData};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::hash::{Hash, Hasher};
 use rayon::prelude::*;
 
@@ -361,35 +361,31 @@ pub fn build_style_tree(
         // Gather simple-selector matches for this signature.
         // "Simple" means no ancestor combinator — result is position-independent.
         let candidates = sel_index.candidates(node);
-        // Use Vec instead of HashMap to avoid per-element HashMap allocation.
-        // Each entry is (rule_idx, specificity); we dedup by taking the max spec per rule_idx.
-        let mut rule_matches: Vec<(usize, (usize, usize, usize))> = Vec::new();
+        let mut rule_best: HashMap<usize, (usize, usize, usize)> = HashMap::new();
         for entry in &candidates {
             if entry.is_complex { continue; } // skip; needs full DOM context
             let sel = &all_rules[entry.rule_idx].selectors[entry.sel_idx];
             if matches_selector_arena(sel, idx, &arena, hovered_id, focused_id) {
-                // Track max specificity per rule_idx without a HashMap.
-                if let Some(existing) = rule_matches.iter_mut().find(|(ridx, _)| *ridx == entry.rule_idx) {
-                    if entry.specificity > existing.1 { existing.1 = entry.specificity; }
-                } else {
-                    rule_matches.push((entry.rule_idx, entry.specificity));
-                }
+                let e = rule_best.entry(entry.rule_idx).or_insert((0, 0, 0));
+                if entry.specificity > *e { *e = entry.specificity; }
             }
         }
-        let mut matched: Vec<((usize, usize, usize), usize)> = rule_matches.into_iter().map(|(ridx, spec)| (spec, ridx)).collect();
+        let mut matched: Vec<((usize, usize, usize), usize)> = rule_best.into_iter().map(|(ridx, spec)| (spec, ridx)).collect();
         matched.sort_by_key(|&(spec, _)| spec);
         sig_cache.insert(sig, matched);
     }
 
     // Phase 1: Parallel CSS Matching (index-accelerated, O(N × bucket_size))
     //
-    // Memory bound: limit parallelism to 4 threads so at most 4 per-node HashMaps
-    // are allocated simultaneously. On a large Bootstrap page with many nodes this
-    // is the primary driver of peak RSS; uncapped Rayon (16+ threads) causes OOM.
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(4)
-        .build()
-        .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
+    // Memory bound: cap at 4 threads so peak RSS stays bounded on large pages.
+    // Static pool avoids recreating threads on every render call.
+    static CSS_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    let pool = CSS_POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("CSS thread pool init failed")
+    });
 
     let mut raw_styles: Vec<HashMap<Arc<str>, Value>> = pool.install(|| {
         arena.par_iter().enumerate().map(|(idx, node)| {
@@ -401,16 +397,11 @@ pub fn build_style_tree(
         // Use a Vec to track (rule_idx, max_specificity) without HashMap allocation.
         let mut rule_matches: Vec<(usize, (usize, usize, usize))> = Vec::new();
 
-        // 1. Simple-selector matches via the signature cache (no DOM traversal needed)
+        // 1. Simple-selector matches via the signature cache (no DOM traversal needed).
+        // sig_cache is already deduped by rule_idx — extend directly, no find needed.
         let sig = ElementSignature::from_node(node);
         if let Some(simple_matches) = sig_cache.get(&sig) {
-            for &(spec, rule_idx) in simple_matches {
-                if let Some(existing) = rule_matches.iter_mut().find(|(ridx, _)| *ridx == rule_idx) {
-                    if spec > existing.1 { existing.1 = spec; }
-                } else {
-                    rule_matches.push((rule_idx, spec));
-                }
-            }
+            rule_matches.extend(simple_matches.iter().map(|&(spec, rule_idx)| (rule_idx, spec)));
         }
 
         // 2. Complex-selector matches via the index (need full DOM context for ancestor checks)
