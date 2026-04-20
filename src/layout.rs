@@ -702,8 +702,11 @@ impl<'a> LayoutBox<'a> {
 
             for child_node in &self.style_node.children {
                 if should_skip(child_node) { continue; }
-                // In flex, we often want children to shrink-wrap first
-                let (cb_opt, _, _) = build_layout_tree_with_cb(child_node, 0.0, 0.0, 0.0, f32::INFINITY, vw, vh, child_cb);
+                // In flex, measure children unconstrained but use a large finite sentinel
+                // instead of INFINITY — INFINITY propagates into layer bounds and hangs
+                // the tile-creation loop in Layer::new() for positioned descendants.
+                let flex_measure_width = inner_width.max(vw * 10.0).max(10_000.0);
+                let (cb_opt, _, _) = build_layout_tree_with_cb(child_node, 0.0, 0.0, 0.0, flex_measure_width, vw, vh, child_cb);
                 if let Some(cb) = cb_opt {
                     if flex_direction == "row" {
                         total_main_size += cb.dimensions.width + cb.margin.left + cb.margin.right;

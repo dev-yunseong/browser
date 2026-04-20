@@ -133,6 +133,14 @@ pub struct Layer {
 
 impl Layer {
     fn new(id: usize, z_index: i32, opacity: f32, bounds: LayoutRect, triggers: Vec<CompositingTrigger>, transform: Matrix4x4) -> Self {
+        // Guard against non-finite dimensions (e.g. INFINITY from unconstrained flex
+        // measurement) which would cause the tile loop below to spin forever.
+        let bounds = LayoutRect {
+            x: if bounds.x.is_finite() { bounds.x } else { 0.0 },
+            y: if bounds.y.is_finite() { bounds.y } else { 0.0 },
+            width:  if bounds.width.is_finite()  { bounds.width.max(0.0)  } else { 0.0 },
+            height: if bounds.height.is_finite() { bounds.height.max(0.0) } else { 0.0 },
+        };
         let mut tiles = Vec::new();
         let tile_size = 256.0;
         
