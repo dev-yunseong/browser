@@ -303,9 +303,18 @@ impl LayerTreeBuilder {
                 Frame::Process { layout: frame_layout, layer_id: frame_layer_id, clip: frame_clip } => {
                     let d = frame_layout.dimensions;
 
+                    // Per CSS spec, the default `overflow: visible` means content (in particular
+                    // text) must NOT be clipped to its ancestors' content boxes. Only boxes with
+                    // `overflow: hidden|clip|auto|scroll` establish a clipping region — and those
+                    // are handled via PushClip/PopClip + the mask stack in render.rs.
+                    //
+                    // Therefore, `next_clip` is propagated unchanged to descendants; it represents
+                    // a conservative paint-order hint (current layer's drawable region) rather than
+                    // a mandatory per-glyph clip.
+                    let next_clip = frame_clip;
+
                     // Skip zero-sized boxes but still visit children.
                     if d.width < 0.1 || d.height < 0.1 {
-                        let next_clip = frame_clip.intersect(&frame_layout.get_content_rect());
                         // Push children in reverse order so the first child is processed first.
                         for child in frame_layout.children.iter().rev() {
                             stack.push(Frame::Process { layout: child, layer_id: frame_layer_id, clip: next_clip });
@@ -350,7 +359,6 @@ impl LayerTreeBuilder {
                         }
 
                         // All children belong to the new layer's stacking context.
-                        let next_clip = frame_clip.intersect(&frame_layout.get_content_rect());
                         for child in frame_layout.children.iter().rev() {
                             stack.push(Frame::Process { layout: child, layer_id: new_id, clip: next_clip });
                         }
@@ -371,7 +379,6 @@ impl LayerTreeBuilder {
                             stack.push(Frame::PopClip { layer_id: frame_layer_id, is_background: false });
                         }
 
-                        let next_clip = frame_clip.intersect(&frame_layout.get_content_rect());
                         for child in frame_layout.children.iter().rev() {
                             stack.push(Frame::Process { layout: child, layer_id: frame_layer_id, clip: next_clip });
                         }
