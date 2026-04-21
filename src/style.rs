@@ -2,7 +2,7 @@ use crate::css::{Stylesheet, Value, Selector, parse_value, parse_color, Combinat
 
 use markup5ever_rcdom::{Handle, NodeData};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::hash::{Hash, Hasher};
 use rayon::prelude::*;
 
@@ -376,22 +376,32 @@ pub fn build_style_tree(
     }
 
     // Phase 1: Parallel CSS Matching (index-accelerated, O(N × bucket_size))
-    let mut raw_styles: Vec<HashMap<Arc<str>, Value>> = arena.par_iter().enumerate().map(|(idx, node)| {
+    //
+    // Memory bound: cap at 4 threads so peak RSS stays bounded on large pages.
+    // Static pool avoids recreating threads on every render call.
+    static CSS_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    let pool = CSS_POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("CSS thread pool init failed")
+    });
+
+    let mut raw_styles: Vec<HashMap<Arc<str>, Value>> = pool.install(|| {
+        arena.par_iter().enumerate().map(|(idx, node)| {
         if !node.is_element { return HashMap::new(); }
         let mut map = HashMap::new();
         apply_default_styles(&node.tag, &mut map);
 
         // --- Collect matching rules ---
-        // rule_best maps rule_idx -> highest specificity seen for that rule
-        let mut rule_best: HashMap<usize, (usize, usize, usize)> = HashMap::new();
+        // Use a Vec to track (rule_idx, max_specificity) without HashMap allocation.
+        let mut rule_matches: Vec<(usize, (usize, usize, usize))> = Vec::new();
 
-        // 1. Simple-selector matches via the signature cache (no DOM traversal needed)
+        // 1. Simple-selector matches via the signature cache (no DOM traversal needed).
+        // sig_cache is already deduped by rule_idx — extend directly, no find needed.
         let sig = ElementSignature::from_node(node);
         if let Some(simple_matches) = sig_cache.get(&sig) {
-            for &(spec, rule_idx) in simple_matches {
-                let e = rule_best.entry(rule_idx).or_insert((0, 0, 0));
-                if spec > *e { *e = spec; }
-            }
+            rule_matches.extend(simple_matches.iter().map(|&(spec, rule_idx)| (rule_idx, spec)));
         }
 
         // 2. Complex-selector matches via the index (need full DOM context for ancestor checks)
@@ -400,32 +410,36 @@ pub fn build_style_tree(
             if !entry.is_complex { continue; }
             let sel = &all_rules[entry.rule_idx].selectors[entry.sel_idx];
             if matches_selector_arena(sel, idx, &arena, hovered_id, focused_id) {
-                let e = rule_best.entry(entry.rule_idx).or_insert((0, 0, 0));
-                if entry.specificity > *e { *e = entry.specificity; }
+                if let Some(existing) = rule_matches.iter_mut().find(|(ridx, _)| *ridx == entry.rule_idx) {
+                    if entry.specificity > existing.1 { existing.1 = entry.specificity; }
+                } else {
+                    rule_matches.push((entry.rule_idx, entry.specificity));
+                }
             }
         }
 
         // Sort by specificity (ascending) so higher specificity overwrites lower
-        let mut matches: Vec<((usize, usize, usize), usize)> = rule_best.into_iter().map(|(ridx, spec)| (spec, ridx)).collect();
-        matches.sort_by_key(|&(spec, _)| spec);
+        rule_matches.sort_by_key(|&(_, spec)| spec);
 
-        let mut important: HashMap<Arc<str>, Value> = HashMap::new();
-        for (_, rule_idx) in &matches {
+        // Apply matched rules; defer important declarations.
+        // Only allocate `important` if needed (most nodes have no !important rules).
+        let mut important: Vec<(Arc<str>, Value)> = Vec::new();
+        let mut inline_important: Vec<(Arc<str>, Value)> = Vec::new();
+        for (rule_idx, _) in &rule_matches {
             for decl in &all_rules[*rule_idx].declarations {
                 if !decl.important { map.insert(decl.name.clone(), decl.value.clone()); }
-                else { important.insert(decl.name.clone(), decl.value.clone()); }
+                else { important.push((decl.name.clone(), decl.value.clone())); }
             }
         }
 
         apply_attribute_styles_arena(node, &mut map);
 
-        let mut inline_important = HashMap::new();
         if let Some(v) = node.attrs.iter().find(|(k, _)| k == "style").map(|(_, v)| v) {
             let mut inline_map = Vec::new();
             parse_inline_style_into_vec(v, &mut inline_map);
             for decl in inline_map {
                 if !decl.important { map.insert(decl.name, decl.value); }
-                else { inline_important.insert(decl.name, decl.value); }
+                else { inline_important.push((decl.name, decl.value)); }
             }
         }
 
@@ -438,7 +452,8 @@ pub fn build_style_tree(
             }
         }
         map
-    }).collect();
+    }).collect()
+    });
 
     // Phase 2: Sequential Inheritance & Deduplication
     let mut store = StyleStore::default();

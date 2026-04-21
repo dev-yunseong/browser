@@ -702,9 +702,19 @@ impl<'a> LayoutBox<'a> {
 
             for child_node in &self.style_node.children {
                 if should_skip(child_node) { continue; }
-                // In flex, we often want children to shrink-wrap first
-                let (cb_opt, _, _) = build_layout_tree_with_cb(child_node, 0.0, 0.0, 0.0, f32::INFINITY, vw, vh, child_cb);
-                if let Some(cb) = cb_opt {
+                // Measure each flex item at inner_width so block children don't expand
+                // beyond the container.  We used to pass f32::INFINITY here (to get
+                // shrink-wrap sizing), but that caused the tile-creation loop in
+                // Layer::new() to spin forever for any positioned descendant.
+                // inner_width is the correct cross-axis constraint for column flex and
+                // a safe upper bound for row flex — items are clamped here anyway.
+                let (cb_opt, _, _) = build_layout_tree_with_cb(child_node, 0.0, 0.0, 0.0, inner_width, vw, vh, child_cb);
+                if let Some(mut cb) = cb_opt {
+                    // Clamp child width to inner_width so no sentinel or overflowing
+                    // value leaks into hit-test rects or the layer tree.
+                    if cb.dimensions.width > inner_width {
+                        cb.dimensions.width = inner_width;
+                    }
                     if flex_direction == "row" {
                         total_main_size += cb.dimensions.width + cb.margin.left + cb.margin.right;
                         max_cross_size = max_cross_size.max(cb.dimensions.height + cb.margin.top + cb.margin.bottom);

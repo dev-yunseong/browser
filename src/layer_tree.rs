@@ -133,6 +133,14 @@ pub struct Layer {
 
 impl Layer {
     fn new(id: usize, z_index: i32, opacity: f32, bounds: LayoutRect, triggers: Vec<CompositingTrigger>, transform: Matrix4x4) -> Self {
+        // Guard against non-finite dimensions (e.g. INFINITY from unconstrained flex
+        // measurement) which would cause the tile loop below to spin forever.
+        let bounds = LayoutRect {
+            x: if bounds.x.is_finite() { bounds.x } else { 0.0 },
+            y: if bounds.y.is_finite() { bounds.y } else { 0.0 },
+            width:  if bounds.width.is_finite()  { bounds.width.max(0.0)  } else { 0.0 },
+            height: if bounds.height.is_finite() { bounds.height.max(0.0) } else { 0.0 },
+        };
         let mut tiles = Vec::new();
         let tile_size = 256.0;
         
@@ -295,9 +303,18 @@ impl LayerTreeBuilder {
                 Frame::Process { layout: frame_layout, layer_id: frame_layer_id, clip: frame_clip } => {
                     let d = frame_layout.dimensions;
 
+                    // Per CSS spec, the default `overflow: visible` means content (in particular
+                    // text) must NOT be clipped to its ancestors' content boxes. Only boxes with
+                    // `overflow: hidden|clip|auto|scroll` establish a clipping region — and those
+                    // are handled via PushClip/PopClip + the mask stack in render.rs.
+                    //
+                    // Therefore, `next_clip` is propagated unchanged to descendants; it represents
+                    // a conservative paint-order hint (current layer's drawable region) rather than
+                    // a mandatory per-glyph clip.
+                    let next_clip = frame_clip;
+
                     // Skip zero-sized boxes but still visit children.
                     if d.width < 0.1 || d.height < 0.1 {
-                        let next_clip = frame_clip.intersect(&frame_layout.get_content_rect());
                         // Push children in reverse order so the first child is processed first.
                         for child in frame_layout.children.iter().rev() {
                             stack.push(Frame::Process { layout: child, layer_id: frame_layer_id, clip: next_clip });
@@ -342,7 +359,6 @@ impl LayerTreeBuilder {
                         }
 
                         // All children belong to the new layer's stacking context.
-                        let next_clip = frame_clip.intersect(&frame_layout.get_content_rect());
                         for child in frame_layout.children.iter().rev() {
                             stack.push(Frame::Process { layout: child, layer_id: new_id, clip: next_clip });
                         }
@@ -363,7 +379,6 @@ impl LayerTreeBuilder {
                             stack.push(Frame::PopClip { layer_id: frame_layer_id, is_background: false });
                         }
 
-                        let next_clip = frame_clip.intersect(&frame_layout.get_content_rect());
                         for child in frame_layout.children.iter().rev() {
                             stack.push(Frame::Process { layout: child, layer_id: frame_layer_id, clip: next_clip });
                         }
