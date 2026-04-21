@@ -244,6 +244,53 @@ pub fn parse_css(source: &str) -> Stylesheet {
                         declarations.push(Declaration { name: key, value: Value::BoxShadow(shadow), important });
                     }
                 }
+                // flex shorthand: "flex: <grow> [<shrink> [<basis>]]" or keyword
+                "flex" => {
+                    let parts: Vec<&str> = val_raw.split_whitespace().collect();
+                    match parts.len() {
+                        0 => {}
+                        1 => {
+                            match parts[0] {
+                                "none"    => {
+                                    declarations.push(Declaration { name: intern("flex-grow"),   value: Value::Number(0.0), important });
+                                    declarations.push(Declaration { name: intern("flex-shrink"), value: Value::Number(0.0), important });
+                                }
+                                "auto"    => {
+                                    declarations.push(Declaration { name: intern("flex-grow"),   value: Value::Number(1.0), important });
+                                    declarations.push(Declaration { name: intern("flex-shrink"), value: Value::Number(1.0), important });
+                                }
+                                _ => {
+                                    // single unitless number → flex-grow
+                                    if let Ok(n) = parts[0].parse::<f32>() {
+                                        declarations.push(Declaration { name: intern("flex-grow"),   value: Value::Number(n),   important });
+                                        declarations.push(Declaration { name: intern("flex-shrink"), value: Value::Number(1.0), important });
+                                    }
+                                }
+                            }
+                        }
+                        2 => {
+                            if let (Ok(g), Ok(s)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>()) {
+                                declarations.push(Declaration { name: intern("flex-grow"),   value: Value::Number(g), important });
+                                declarations.push(Declaration { name: intern("flex-shrink"), value: Value::Number(s), important });
+                            }
+                        }
+                        _ => {
+                            if let (Ok(g), Ok(s)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>()) {
+                                declarations.push(Declaration { name: intern("flex-grow"),   value: Value::Number(g), important });
+                                declarations.push(Declaration { name: intern("flex-shrink"), value: Value::Number(s), important });
+                                declarations.push(Declaration { name: intern("flex-basis"),  value: parse_value(parts[2]), important });
+                            }
+                        }
+                    }
+                }
+                // gap shorthand: "gap: <row-gap> [<col-gap>]"
+                "gap" => {
+                    let parts: Vec<&str> = val_raw.split_whitespace().collect();
+                    let row_val = parts.first().map(|s| parse_value(s)).unwrap_or(Value::Number(0.0));
+                    let col_val = parts.get(1).map(|s| parse_value(s)).unwrap_or_else(|| row_val.clone());
+                    declarations.push(Declaration { name: intern("row-gap"),    value: row_val,  important });
+                    declarations.push(Declaration { name: intern("column-gap"), value: col_val,  important });
+                }
                 _ => {
                     // CSS custom properties (--foo) store their raw value so that
                     // var() references can re-parse them at resolution time.
