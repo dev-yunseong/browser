@@ -1,5 +1,5 @@
 use crate::layout::{LayoutBox, DisplayType, PositionType, Rect as LayoutRect};
-use crate::css::{Value, Color, BoxShadow, TransformOp};
+use crate::css::{Value, Color, BoxShadow, TransformOp, GradientValue, CssColorStop, LinearDirection};
 use crate::matrix::{Matrix3x3, Matrix4x4};
 use markup5ever_rcdom::NodeData;
 
@@ -47,6 +47,19 @@ pub enum PaintCommand {
     },
     /// Outer box-shadow
     Shadow(LayoutRect, BoxShadow),
+    /// CSS `linear-gradient()` background fill.
+    LinearGradient {
+        rect: LayoutRect,
+        direction: LinearDirection,
+        stops: Vec<CssColorStop>,
+        radius: f32,
+    },
+    /// CSS `radial-gradient()` background fill.
+    RadialGradient {
+        rect: LayoutRect,
+        stops: Vec<CssColorStop>,
+        radius: f32,
+    },
     /// Push a clip region onto the clip stack.
     /// All subsequent commands are clipped to `rect` (optionally with rounded corners
     /// when `radius` > 0). Paired with `PopClip`.
@@ -475,10 +488,50 @@ impl LayerTreeBuilder {
         }
 
         // Background
-        let bg = sv.get(&crate::css::intern("background-color")).or_else(|| sv.get(&crate::css::intern("background")));
-        if let Some(Value::Color(c)) = bg {
-            if c.a > 0 {
+        let bg = sv.get(&crate::css::intern("background-color"))
+            .or_else(|| sv.get(&crate::css::intern("background")))
+            .or_else(|| sv.get(&crate::css::intern("background-image")));
+        match bg {
+            Some(Value::Color(c)) if c.a > 0 => {
                 commands.push(PaintCommand::Rect(d, c.clone(), radius));
+            }
+            Some(Value::Gradient(GradientValue::Linear { direction, stops })) => {
+                commands.push(PaintCommand::LinearGradient {
+                    rect: d,
+                    direction: direction.clone(),
+                    stops: stops.clone(),
+                    radius,
+                });
+            }
+            Some(Value::Gradient(GradientValue::Radial { stops, .. })) => {
+                commands.push(PaintCommand::RadialGradient {
+                    rect: d,
+                    stops: stops.clone(),
+                    radius,
+                });
+            }
+            _ => {}
+        }
+        // Also check background-image for gradients (separate from background-color)
+        if matches!(bg, Some(Value::Color(_)) | None) {
+            let bg_img = sv.get(&crate::css::intern("background-image"));
+            match bg_img {
+                Some(Value::Gradient(GradientValue::Linear { direction, stops })) => {
+                    commands.push(PaintCommand::LinearGradient {
+                        rect: d,
+                        direction: direction.clone(),
+                        stops: stops.clone(),
+                        radius,
+                    });
+                }
+                Some(Value::Gradient(GradientValue::Radial { stops, .. })) => {
+                    commands.push(PaintCommand::RadialGradient {
+                        rect: d,
+                        stops: stops.clone(),
+                        radius,
+                    });
+                }
+                _ => {}
             }
         }
 
@@ -565,6 +618,8 @@ impl LayerTreeBuilder {
                 PaintCommand::Image { rect, .. } => *rect,
                 PaintCommand::Text { rect, .. } => *rect,
                 PaintCommand::Shadow(r, ..) => *r,
+                PaintCommand::LinearGradient { rect, .. } => *rect,
+                PaintCommand::RadialGradient { rect, .. } => *rect,
                 PaintCommand::PushClip { rect, .. } => *rect,
                 PaintCommand::PopClip => continue,
             };

@@ -12,24 +12,71 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Build
 cargo build
 
-# Run the browser
+# Build all binaries (daemon + cli + browser)
+cargo build --bins
+
+# Run the browser (opens GUI window — blocks until closed)
 cargo run
 
 # Run with release optimizations
 cargo run --release
-
-# Run tests
-cargo test
-
-# Run a single test
-cargo test <test_name>
 
 # Check for compile errors without building
 cargo check
 
 # Lint
 cargo clippy
+
+# ── Tests ────────────────────────────────────────────────────────────────────
+
+# Fast: unit tests only — no render, completes in <5s
+cargo test --lib
+
+# Integration tests for a single file — each render call takes ~200ms in debug
+cargo test --test test_pipeline
+
+# Full suite — slow (~3+ min in debug due to render cost per test); always wrap
+# with timeout to prevent session hang
+timeout 300s cargo test -- --test-threads=2
+
+# Single test by name
+cargo test <test_name>
+
+# Skip the heavy perf tests (each takes 6+ seconds)
+cargo test -- --skip test_large_css --skip test_render_time_scaling
+
+# ── Manual CLI testing (headless, no GUI, no Xvfb) ──────────────────────────
+
+# Step 1: Build on host (uses local cargo cache — fast)
+cargo build --bins
+
+# Step 2: Run daemon inside drun rust:latest (resource-limited, compatible env)
+drun --network host rust:latest ./target/debug/browser-daemon --no-gui --port 7070 &
+
+# Step 3: Navigate — also inside drun rust:latest
+sleep 4 && drun --network host rust:latest timeout 30s ./target/debug/browser-cli navigate https://yunseong.dev
 ```
+
+## Execution Safety Rules
+
+**Always build on host, run risky processes inside `drun rust:latest`.**
+
+- Build on host: uses local `~/.cargo` cache — fast, incremental
+- Run inside `drun rust:latest`: same Rust/Debian environment the binary was compiled for, plus hard resource caps (4 GB RAM / 0.5 CPU / 100 pids) — a hang or OOM kills the container cleanly, not the session
+
+`drun` = `docker run --rm -v $(pwd):/app -w /app --memory=4g --cpus=0.5 --pids-limit 100`
+Installed by the SessionStart hook at `~/.local/bin/drun`.
+
+| Situation | Safe command |
+|---|---|
+| Compile / check / lint | `cargo build`, `cargo check`, `cargo clippy` — host only, safe |
+| Unit tests (no render) | `cargo test --lib` — host only, fast (<5s) |
+| Integration tests (render) | `timeout 300s cargo test -- --test-threads=2` — timeout required |
+| Run full browser (GUI) | **Never run directly** — GUI event loop blocks forever |
+| Run daemon headless | `cargo build --bins && drun --network host rust:latest ./target/debug/browser-daemon --no-gui` |
+| Run CLI navigate | `drun --network host rust:latest timeout 30s ./target/debug/browser-cli navigate <url>` |
+
+**Why drun for execution**: each render allocates a large Pixmap (~800×N×4 bytes). A hang or OOM in the render path kills the Docker container cleanly instead of freezing the session.
 
 ## Architecture
 
@@ -44,7 +91,8 @@ The pipeline runs: **Network → DOM → Style → Layout → Render → GUI**
 | `css.rs` | Custom CSS parser. Defines `Value`, `Unit`, `Color`, `Selector`, `Rule`, `Stylesheet`. Supports `px`/`vw`/`vh`/`em` units and color keywords. Selector specificity computed as `(id, class, tag)`. |
 | `style.rs` | Builds a `StyledNode` tree from a DOM `Handle` and a `Stylesheet`. Handles CSS inheritance (`color`, `font-size`, `font-family`), selector matching, and inline `style` attributes. Extracts `<style>` blocks and `<link rel=stylesheet>` hrefs. |
 | `layout.rs` | Converts a `StyledNode` tree into a `LayoutBox` tree with computed `Rect` positions. Supports `Block`, `Inline`, `InlineBlock`, `ListItem`, `Table`/`TableRow`/`TableCell`, `Input`, and `Image` display types. Returns `(layout_tree, _, final_y)` from `build_layout_tree`. |
-| `render.rs` | Walks the `LayoutBox` tree and paints into a `tiny_skia::Pixmap`. Handles text (via `ab_glyph`), background colors, borders, and images. |
+| `layer_tree.rs` | Builds a `PaintCommand` list from the `LayoutBox` tree. Emits `PushClip`/`PopClip` commands for boxes with `overflow: hidden` (with optional `border-radius` rounding). |
+| `render.rs` | Walks the `LayoutBox` tree and paints into a `tiny_skia::Pixmap`. Handles text (via `ab_glyph`), background colors, borders, images, and clip masks (`overflow: hidden`). |
 | `js.rs` | Wraps `boa_engine` (`Context`). `JsRuntime::new()` installs mock globals (`window`, `document`, `navigator`, `console.log`). `execute()` runs script strings, silently skipping `import.meta` and suppressing repetitive DOM errors. |
 
 ### Key data-flow details
@@ -57,6 +105,20 @@ The pipeline runs: **Network → DOM → Style → Layout → Render → GUI**
 ### Fixed viewport width
 
 The render width is hardcoded to **800 px** (`src/main.rs:155`). Height is computed from layout (clamped 600–16384 px).
+
+## CLI Review (browser-cli-reviewer agent)
+
+The developer agent **must always** invoke the `browser-cli-reviewer` agent before creating a PR — for every issue, regardless of which files changed. `cargo test` and `cargo clippy` verify code correctness only; the CLI reviewer verifies the browser actually runs and renders pages correctly.
+
+The `browser-cli-reviewer` agent:
+- Runs `cargo build --bins` to build fresh binaries
+- Starts `./target/debug/browser-daemon --no-gui --port 7070` (headless HTTP server — no GUI event loop, no Xvfb needed)
+- Runs `./target/debug/browser-cli navigate <url>` with `timeout 30s` against **both** `https://yunseong.dev` and `https://google.com`
+- Returns **PASS** or **NONPASS** with full output and diagnosis
+
+All CLI commands are wrapped with `timeout` to prevent infinite loops from hanging the session.
+
+If the reviewer returns **NONPASS**, fix the issue and re-run the reviewer before proceeding to PR.
 
 ## Issue Priority
 
