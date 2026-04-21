@@ -1,7 +1,8 @@
-use tiny_skia::{Pixmap, Paint, Transform, Stroke, PathBuilder, PixmapPaint, Mask, FillRule};
+use tiny_skia::{Pixmap, Paint, Transform, Stroke, PathBuilder, PixmapPaint, Mask, FillRule,
+    LinearGradient, RadialGradient, GradientStop, SpreadMode, Point as SkPoint};
 use ab_glyph::{Font, FontRef, PxScale, point};
 use crate::layout::{LayoutBox, Rect as LayoutRect};
-use crate::css::Color;
+use crate::css::{Color, CssColorStop, LinearDirection};
 use crate::layer_tree::{LayerTree, LayerTreeBuilder, PaintCommand, ObjectFit};
 use crate::matrix::Matrix4x4;
 use std::collections::HashMap;
@@ -259,6 +260,36 @@ fn execute_commands_on_tile(commands: &[PaintCommand], pixmap: &mut Pixmap, tile
                     pixmap.fill_rect(tr, &paint, transform, active_mask!());
                 }
             }
+            PaintCommand::LinearGradient { rect: r, direction, stops, radius } => {
+                if let Some(shader) = build_linear_gradient_shader(*r, direction, stops) {
+                    let mut paint = Paint::default();
+                    paint.shader = shader;
+                    paint.anti_alias = true;
+                    if *radius > 0.0 {
+                        if let Some(path) = create_rounded_rect_path(*r, *radius) {
+                            pixmap.fill_path(&path, &paint, FillRule::Winding, transform, active_mask!());
+                        }
+                    } else if let Some(tr) = tiny_skia::Rect::from_xywh(r.x, r.y, r.width, r.height) {
+                        pixmap.fill_rect(tr, &paint, transform, active_mask!());
+                    }
+                }
+            }
+
+            PaintCommand::RadialGradient { rect: r, stops, radius } => {
+                if let Some(shader) = build_radial_gradient_shader(*r, stops) {
+                    let mut paint = Paint::default();
+                    paint.shader = shader;
+                    paint.anti_alias = true;
+                    if *radius > 0.0 {
+                        if let Some(path) = create_rounded_rect_path(*r, *radius) {
+                            pixmap.fill_path(&path, &paint, FillRule::Winding, transform, active_mask!());
+                        }
+                    } else if let Some(tr) = tiny_skia::Rect::from_xywh(r.x, r.y, r.width, r.height) {
+                        pixmap.fill_rect(tr, &paint, transform, active_mask!());
+                    }
+                }
+            }
+
             PaintCommand::Border(r, w, c, radius) => {
                 let mut paint = Paint::default();
                 paint.set_color_rgba8(c.r, c.g, c.b, c.a);
@@ -568,6 +599,96 @@ fn render_text_raw(
             }
         }
     }
+}
+
+/// Convert a `CssColorStop` slice into `tiny_skia::GradientStop`s.
+fn css_stops_to_skia(stops: &[CssColorStop]) -> Vec<GradientStop> {
+    stops.iter().filter_map(|s| {
+        let pos = s.position.unwrap_or(0.0).clamp(0.0, 1.0);
+        let color = tiny_skia::Color::from_rgba8(s.color.r, s.color.g, s.color.b, s.color.a);
+        GradientStop::new(pos, color).into()
+    }).collect()
+}
+
+/// Build a tiny-skia `Shader` for a CSS `linear-gradient()`.
+fn build_linear_gradient_shader<'a>(
+    r: LayoutRect,
+    direction: &LinearDirection,
+    stops: &[CssColorStop],
+) -> Option<tiny_skia::Shader<'a>> {
+    let skia_stops = css_stops_to_skia(stops);
+    if skia_stops.len() < 2 { return None; }
+
+    // Compute start/end points from the direction and the rect bounds.
+    let cx = r.x + r.width / 2.0;
+    let cy = r.y + r.height / 2.0;
+
+    let (start, end) = match direction {
+        LinearDirection::Angle(rad) => {
+            // CSS angle: 0 = to top, 90deg = to right (clockwise from 12 o'clock).
+            // tiny-skia uses standard math coords (+y down).
+            // We want: direction vector = (sin(rad), -cos(rad)) for CSS convention.
+            let dx = rad.sin();
+            let dy = -rad.cos();
+            // Determine the distance from center to edge along that direction.
+            let half_w = r.width / 2.0;
+            let half_h = r.height / 2.0;
+            // Scale so the gradient covers the full box diagonal.
+            let scale = if dx.abs() < 1e-6 {
+                half_h / dy.abs().max(1e-6)
+            } else if dy.abs() < 1e-6 {
+                half_w / dx.abs().max(1e-6)
+            } else {
+                (half_w / dx.abs()).min(half_h / dy.abs())
+            };
+            (
+                SkPoint::from_xy(cx - dx * scale, cy - dy * scale),
+                SkPoint::from_xy(cx + dx * scale, cy + dy * scale),
+            )
+        }
+        LinearDirection::ToSide(dx, dy) => {
+            let mag = (dx * dx + dy * dy).sqrt().max(1e-6);
+            let ndx = dx / mag;
+            let ndy = dy / mag;
+            let half_w = r.width / 2.0;
+            let half_h = r.height / 2.0;
+            let scale = if ndx.abs() < 1e-6 {
+                half_h / ndy.abs().max(1e-6)
+            } else if ndy.abs() < 1e-6 {
+                half_w / ndx.abs().max(1e-6)
+            } else {
+                (half_w / ndx.abs()).min(half_h / ndy.abs())
+            };
+            (
+                SkPoint::from_xy(cx - ndx * scale, cy - ndy * scale),
+                SkPoint::from_xy(cx + ndx * scale, cy + ndy * scale),
+            )
+        }
+    };
+
+    LinearGradient::new(start, end, skia_stops, SpreadMode::Pad, Transform::identity())
+}
+
+/// Build a tiny-skia `Shader` for a CSS `radial-gradient()`.
+fn build_radial_gradient_shader<'a>(
+    r: LayoutRect,
+    stops: &[CssColorStop],
+) -> Option<tiny_skia::Shader<'a>> {
+    let skia_stops = css_stops_to_skia(stops);
+    if skia_stops.len() < 2 { return None; }
+
+    let center = SkPoint::from_xy(r.x + r.width / 2.0, r.y + r.height / 2.0);
+    let radius = (r.width.min(r.height) / 2.0).max(1.0);
+
+    RadialGradient::new(
+        center,
+        0.0,
+        center,
+        radius,
+        skia_stops,
+        SpreadMode::Pad,
+        Transform::identity(),
+    )
 }
 
 fn blend_glyph_pixel(pixmap: &mut Pixmap, x: u32, y: u32, coverage: f32, color: &Color) {

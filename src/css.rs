@@ -17,6 +17,60 @@ pub fn intern(s: &str) -> Arc<str> {
     arc
 }
 
+/// A single color stop inside a CSS gradient.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CssColorStop {
+    pub color: Color,
+    /// Position in [0.0, 1.0]. `None` means "auto-distribute".
+    pub position: Option<f32>,
+}
+
+impl Hash for CssColorStop {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.color.hash(state);
+        match self.position {
+            Some(f) => f.to_bits().hash(state),
+            None => 0u32.hash(state),
+        }
+    }
+}
+
+impl Eq for CssColorStop {}
+
+/// The direction / angle for a linear gradient.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LinearDirection {
+    /// Angle in radians, measured clockwise from "up" (12 o'clock).
+    Angle(f32),
+    /// `to <side>` keyword: (dx, dy) unit vector in CSS geometry (+y = down).
+    ToSide(f32, f32),
+}
+
+impl Hash for LinearDirection {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            LinearDirection::Angle(f) => f.to_bits().hash(state),
+            LinearDirection::ToSide(x, y) => { x.to_bits().hash(state); y.to_bits().hash(state); }
+        }
+    }
+}
+
+impl Eq for LinearDirection {}
+
+#[derive(Debug, Clone, PartialEq, Hash, Eq)]
+pub enum GradientValue {
+    Linear {
+        direction: LinearDirection,
+        stops: Vec<CssColorStop>,
+    },
+    Radial {
+        /// `true` = circle, `false` = ellipse (we render both as circle for simplicity).
+        circle: bool,
+        stops: Vec<CssColorStop>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Keyword(Arc<str>),
@@ -34,6 +88,8 @@ pub enum Value {
     /// Used internally so that custom property values can be re-parsed when resolved
     /// by a `var()` reference on another property.
     RawCustomProp(Arc<str>),
+    /// CSS gradient: `linear-gradient(...)` or `radial-gradient(...)`.
+    Gradient(GradientValue),
 }
 
 impl Eq for Value {}
@@ -57,6 +113,7 @@ impl Hash for Value {
                 fallback.hash(state);
             }
             Value::RawCustomProp(s) => s.hash(state),
+            Value::Gradient(g) => g.hash(state),
         }
     }
 }
@@ -545,6 +602,187 @@ pub fn parse_box_shadow(s: &str) -> Option<BoxShadow> {
     })
 }
 
+/// Split gradient arguments by top-level commas (ignoring commas inside `rgb()` etc.).
+fn split_gradient_args(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut depth: i32 = 0;
+    for c in s.chars() {
+        match c {
+            '(' => { depth += 1; current.push(c); }
+            ')' => { depth -= 1; current.push(c); }
+            ',' if depth == 0 => {
+                let t = current.trim().to_string();
+                if !t.is_empty() { parts.push(t); }
+                current.clear();
+            }
+            _ => current.push(c),
+        }
+    }
+    let t = current.trim().to_string();
+    if !t.is_empty() { parts.push(t); }
+    parts
+}
+
+/// Parse a single color stop like `#ff0`, `red`, `blue 30%`, `rgba(0,0,0,0.5) 100%`.
+fn parse_color_stop(s: &str) -> Option<CssColorStop> {
+    let s = s.trim();
+    // Find the split point: last whitespace not inside parens.
+    let mut depth: i32 = 0;
+    let mut last_space: Option<usize> = None;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ' ' | '\t' if depth == 0 => last_space = Some(i),
+            _ => {}
+        }
+    }
+
+    let (color_str, position) = if let Some(sp) = last_space {
+        let possible_pos = s[sp + 1..].trim();
+        if possible_pos.ends_with('%') || possible_pos.ends_with("px") {
+            (&s[..sp], Some(possible_pos))
+        } else {
+            (s, None)
+        }
+    } else {
+        (s, None)
+    };
+
+    let color = parse_color(color_str.trim())?;
+    let pos = position.map(|p| {
+        if p.ends_with('%') {
+            p.trim_end_matches('%').parse::<f32>().unwrap_or(0.0) / 100.0
+        } else {
+            // px positions are not normalized here; we treat them as ratios (best-effort)
+            p.trim_end_matches("px").parse::<f32>().unwrap_or(0.0) / 100.0
+        }
+    });
+
+    Some(CssColorStop { color, position: pos })
+}
+
+/// Parse `linear-gradient(...)` or `radial-gradient(...)`. Returns `None` on failure.
+pub fn parse_gradient(val: &str) -> Option<GradientValue> {
+    let val = val.trim();
+
+    let (is_linear, inner) = if let Some(rest) = val.strip_prefix("linear-gradient(").and_then(|r| r.strip_suffix(')')) {
+        (true, rest)
+    } else if let Some(rest) = val.strip_prefix("radial-gradient(").and_then(|r| r.strip_suffix(')')) {
+        (false, rest)
+    } else {
+        return None;
+    };
+
+    let args = split_gradient_args(inner);
+    if args.is_empty() { return None; }
+
+    if is_linear {
+        // First arg may be a direction keyword or angle.
+        let mut stop_start = 0;
+        let direction = {
+            let first = args[0].trim().to_lowercase();
+            if first.ends_with("deg") {
+                // e.g. "90deg"
+                let deg: f32 = first.trim_end_matches("deg").parse().unwrap_or(0.0);
+                stop_start = 1;
+                LinearDirection::Angle(deg.to_radians())
+            } else if first.starts_with("to ") {
+                let side = first[3..].trim();
+                let (dx, dy) = match side {
+                    "right"        => (1.0_f32, 0.0_f32),
+                    "left"         => (-1.0, 0.0),
+                    "bottom"       => (0.0, 1.0),
+                    "top"          => (0.0, -1.0),
+                    "right bottom" | "bottom right" => (1.0, 1.0),
+                    "right top"    | "top right"    => (1.0, -1.0),
+                    "left bottom"  | "bottom left"  => (-1.0, 1.0),
+                    "left top"     | "top left"     => (-1.0, -1.0),
+                    _              => (0.0, 1.0),
+                };
+                stop_start = 1;
+                LinearDirection::ToSide(dx, dy)
+            } else {
+                // No explicit direction — default is "to bottom" (top → bottom)
+                LinearDirection::ToSide(0.0, 1.0)
+            }
+        };
+
+        let stops: Vec<CssColorStop> = args[stop_start..]
+            .iter()
+            .filter_map(|s| parse_color_stop(s))
+            .collect();
+
+        if stops.len() < 2 { return None; }
+
+        // Auto-distribute stops that have no explicit position.
+        let stops = auto_distribute_stops(stops);
+        Some(GradientValue::Linear { direction, stops })
+    } else {
+        // radial-gradient: first arg may be shape keyword.
+        let mut stop_start = 0;
+        let first = args[0].trim().to_lowercase();
+        let circle = if first == "circle" || first.starts_with("circle ") {
+            stop_start = 1;
+            true
+        } else if first == "ellipse" || first.starts_with("ellipse ") || first.starts_with("closest") || first.starts_with("farthest") {
+            stop_start = 1;
+            false
+        } else {
+            false
+        };
+
+        let stops: Vec<CssColorStop> = args[stop_start..]
+            .iter()
+            .filter_map(|s| parse_color_stop(s))
+            .collect();
+
+        if stops.len() < 2 { return None; }
+
+        let stops = auto_distribute_stops(stops);
+        Some(GradientValue::Radial { circle, stops })
+    }
+}
+
+/// Assign evenly-spaced positions to any stops that don't have an explicit position.
+fn auto_distribute_stops(mut stops: Vec<CssColorStop>) -> Vec<CssColorStop> {
+    // If the first stop has no position, assign 0.0.
+    if stops[0].position.is_none() {
+        stops[0].position = Some(0.0);
+    }
+    // If the last stop has no position, assign 1.0.
+    let last = stops.len() - 1;
+    if stops[last].position.is_none() {
+        stops[last].position = Some(1.0);
+    }
+    // Fill in any remaining None positions by linear interpolation between
+    // the nearest positioned neighbors.
+    let n = stops.len();
+    let mut i = 0;
+    while i < n {
+        if stops[i].position.is_none() {
+            // Find the next stop that has a position.
+            let mut j = i + 1;
+            while j < n && stops[j].position.is_none() {
+                j += 1;
+            }
+            // Interpolate between stops[i-1] and stops[j].
+            let start_pos = stops[i - 1].position.unwrap_or(0.0);
+            let end_pos = stops[j].position.unwrap_or(1.0);
+            let count = (j - i + 1) as f32;
+            for k in i..j {
+                let t = (k - i + 1) as f32 / count;
+                stops[k].position = Some(start_pos + t * (end_pos - start_pos));
+            }
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    stops
+}
+
 pub fn parse_value(val: &str) -> Value {
     let val = val.trim();
     // Strip !important
@@ -580,6 +818,13 @@ pub fn parse_value(val: &str) -> Value {
         if name_str.starts_with("--") {
             let fallback = fallback_str.map(|fb| Box::new(parse_value(fb)));
             return Value::CssVar { name: intern(name_str), fallback };
+        }
+    }
+
+    // gradient: linear-gradient(...) or radial-gradient(...)
+    if val.starts_with("linear-gradient(") || val.starts_with("radial-gradient(") {
+        if let Some(g) = parse_gradient(val) {
+            return Value::Gradient(g);
         }
     }
 
@@ -817,6 +1062,74 @@ mod tests {
         let s = parse_selector("div .bar");
         // The rightmost selector part is .bar, so key should be Class("bar")
         assert_eq!(s.key_feature(), SelectorKey::Class("bar".to_string()));
+    }
+
+    #[test]
+    fn test_parse_linear_gradient_to_right() {
+        let v = parse_value("linear-gradient(to right, #ff0, #f00)");
+        match v {
+            Value::Gradient(GradientValue::Linear { direction, stops }) => {
+                assert!(matches!(direction, LinearDirection::ToSide(dx, _) if dx > 0.0));
+                assert_eq!(stops.len(), 2);
+                assert_eq!(stops[0].position, Some(0.0));
+                assert_eq!(stops[1].position, Some(1.0));
+            }
+            other => panic!("expected linear gradient, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_linear_gradient_angle() {
+        let v = parse_value("linear-gradient(90deg, #fff, #000)");
+        match v {
+            Value::Gradient(GradientValue::Linear { direction, stops }) => {
+                assert!(matches!(direction, LinearDirection::Angle(_)));
+                assert_eq!(stops.len(), 2);
+            }
+            other => panic!("expected linear gradient, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_radial_gradient_circle() {
+        let v = parse_value("radial-gradient(circle, #fff, #000)");
+        match v {
+            Value::Gradient(GradientValue::Radial { circle, stops }) => {
+                assert!(circle);
+                assert_eq!(stops.len(), 2);
+                assert_eq!(stops[0].position, Some(0.0));
+                assert_eq!(stops[1].position, Some(1.0));
+            }
+            other => panic!("expected radial gradient, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_gradient_color_stops_with_percentages() {
+        let v = parse_value("linear-gradient(to right, #ff0 0%, #f00 50%, #00f 100%)");
+        match v {
+            Value::Gradient(GradientValue::Linear { stops, .. }) => {
+                assert_eq!(stops.len(), 3);
+                assert!((stops[0].position.unwrap() - 0.0).abs() < 1e-5);
+                assert!((stops[1].position.unwrap() - 0.5).abs() < 1e-5);
+                assert!((stops[2].position.unwrap() - 1.0).abs() < 1e-5);
+            }
+            other => panic!("expected linear gradient, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_gradient_auto_distribute_middle_stops() {
+        // Three stops: first and last have positions, middle does not.
+        let v = parse_value("linear-gradient(to right, red 0%, green, blue 100%)");
+        match v {
+            Value::Gradient(GradientValue::Linear { stops, .. }) => {
+                assert_eq!(stops.len(), 3);
+                assert!((stops[1].position.unwrap() - 0.5).abs() < 1e-5,
+                    "middle stop should be auto-distributed to 0.5, got {:?}", stops[1].position);
+            }
+            other => panic!("expected linear gradient, got {:?}", other),
+        }
     }
 }
 
