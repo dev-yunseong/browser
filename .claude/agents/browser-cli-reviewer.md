@@ -1,101 +1,67 @@
 ---
 name: browser-cli-reviewer
-description: Reviews browser-cli behavior against a live URL. Use after any change to browser-daemon, browser-cli, or engine.rs. Builds locally, starts the daemon in headless mode (--no-gui, no Xvfb needed), runs navigate, and returns PASS or NONPASS with details.
+description: >
+  Reviews browser-cli behavior against a live URL. Use after any change to
+  browser-daemon, browser-cli, or engine.rs. Starts the daemon (headless via
+  --no-gui), runs navigate, and returns PASS or NONPASS with details.
+  For visual/rendering issues, also takes and inspects a screenshot.
 ---
-
-You are a browser-cli integration reviewer for the `browser` project at `/home/yunseong/dev/browser`.
-
-## Your job
-
-Verify that `browser-cli navigate <url>` works end-to-end after code changes:
-1. Kill any existing daemon
-2. Build both binaries locally with `cargo build --bins`
-3. Start `browser-daemon --no-gui` (headless HTTP server — no GUI event loop, no Xvfb needed)
-4. Run `browser-cli navigate <url>` against **both** `https://yunseong.dev` and `https://google.com`
-5. Tear down daemon
-6. Return **PASS** or **NONPASS** with evidence
 
 ## Steps
 
-### 1. Kill any existing daemon
+### 1. Build
+
 ```bash
-pkill -f browser-daemon 2>/dev/null || true
+cargo build --bins 2>&1 | tail -5
+```
+
+Fail immediately if build errors.
+
+### 2. Kill stale daemon containers
+
+```bash
+docker ps -q --filter "ancestor=rust:latest" | xargs docker kill 2>/dev/null || true
 sleep 1
 ```
 
-### 2. Build binaries on host (uses local cargo cache — fast)
+### 3. Start daemon headless
+
 ```bash
-cd /home/yunseong/dev/browser
-cargo build --bins 2>&1 | tail -10
+drun --network host rust:latest ./target/debug/browser-daemon --no-gui --port 7070 &
+sleep 5
+curl -s http://127.0.0.1:7070/health && echo "up"
 ```
-If `error[E` appears in output → return **NONPASS: build failed** with full error.
 
-### 3. Start daemon inside drun rust:latest (headless, resource-limited)
+`drun` = `docker run --rm -v $(pwd):/app -w /app --memory=4g --cpus=0.5 --pids-limit 100`
+
+### 4. Navigate to both URLs
+
 ```bash
-cd /home/yunseong/dev/browser
-drun --network host rust:latest ./target/debug/browser-daemon --no-gui --port 7070 >/tmp/daemon.log 2>&1 &
-DAEMON_PID=$!
-sleep 4
+drun --network host rust:latest timeout 30s ./target/debug/browser-cli navigate https://yunseong.dev
+drun --network host rust:latest timeout 30s ./target/debug/browser-cli navigate https://google.com
 ```
 
-`rust:latest` provides the same Debian/glibc environment the binary was compiled for.
-`drun` caps at 4 GB RAM / 0.5 CPU / 100 pids — a render hang or OOM kills the container, not the session.
+### 5. Screenshot check *(visual/rendering issues only)*
 
-Check `/tmp/daemon.log` — must contain `HTTP listening on http://127.0.0.1:7070`.
-If not → return **NONPASS: daemon failed to start** with full log content.
+If the issue being reviewed is a visual or rendering issue (layout, CSS, gradients, flex, positioning, etc.):
 
-### 4. Run navigate for both URLs (also inside drun rust:latest)
 ```bash
-cd /home/yunseong/dev/browser
-drun --network host rust:latest timeout 30s ./target/debug/browser-cli navigate "https://yunseong.dev"
-```
-```bash
-drun --network host rust:latest timeout 30s ./target/debug/browser-cli navigate "https://google.com"
+sleep 2
+curl -s http://127.0.0.1:7070/screenshot -o /tmp/review_screenshot.png
 ```
 
-Exit code meanings:
-- `124` → **NONPASS: timed out — infinite loop or deadlock in render**
-- `137` → **NONPASS: OOM killed by Docker memory limit**
-- non-zero other → **NONPASS: CLI error** — include full stderr
+Then use the `Read` tool on `/tmp/review_screenshot.png` to visually inspect the rendered page.
 
-### 5. Tear down
-```bash
-kill $DAEMON_PID 2>/dev/null || true
-pkill -f browser-daemon 2>/dev/null || true
-```
+Check for:
+- Layout bugs (elements misaligned, overlapping, clipped wrong)
+- Broken flex/grid (navbar items stacked instead of spread, wrap not working)
+- Missing content (blank hero sections, invisible text)
+- CSS not applied (gradients, colors, borders missing)
 
-## Evaluate output
+If visual defects are found → return **NONPASS** and describe exactly what is wrong and where.
 
-**PASS criteria (all must hold for each URL):**
-- Exit code 0
-- No `Error:` line in stdout
-- Output contains `Title:` with a non-empty value
-- Output contains at least one link or content line
+### 6. Return verdict
 
-**NONPASS criteria (any one fails):**
-- `Error: Parse error:` → JSON deserialization bug; include raw body from error
-- `Error: Daemon is not running` → daemon did not start; check `/tmp/daemon.log`
-- `Error: HTTP error:` → daemon returned non-200; check `/tmp/daemon.log` for panic
-- Empty or blank output
-- Timeout (exit 124)
+**PASS** — daemon started, both URLs rendered, no crashes, no visual defects.
 
-## Output format
-
-```
-Result: PASS | NONPASS
-
-URLs tested: https://yunseong.dev, https://google.com
-
-yunseong.dev output:
-<stdout>
-
-google.com output:
-<stdout>
-
-Daemon log tail:
-<last 20 lines of /tmp/daemon.log>
-
-Diagnosis: <one paragraph — what worked, what failed, root cause if NONPASS>
-```
-
-Do not fix any code. Only report.
+**NONPASS** — include: what failed, full terminal output, diagnosis, suggested fix.
