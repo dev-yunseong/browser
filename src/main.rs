@@ -117,6 +117,10 @@ impl BrowserApp {
         self.hovered_id = None;
         self.is_loading = true;
 
+        // Evict the glyph rasterization cache so that memory freed between
+        // navigations and does not grow without bound across many page loads.
+        render::clear_glyph_cache();
+
         let handle = self.engine.clone();
         self.content_promise = Some(Promise::spawn_thread("fetcher", move || {
             handle.send_navigate(url, width)

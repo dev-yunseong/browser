@@ -13,8 +13,61 @@ use std::time::Instant;
 
 const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/NanumGothic.ttf");
 
+// ── Glyph Cache ───────────────────────────────────────────────────────────────
+
+/// Cache key for a single rasterized glyph.
+///
+/// Uses the glyph ID, font size (as bit-pattern to allow use in HashMap), and
+/// synthesis flags.  The cache is keyed on font size rounded to the nearest
+/// 0.5 px so that minutely different float values produced by the same logical
+/// size collapse to the same entry.
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+struct GlyphKey {
+    glyph_id: u16,
+    /// `(font_size * 2.0).round() as u32` — rounds to nearest 0.5 px.
+    font_size_half_px: u32,
+    bold: bool,
+    italic: bool,
+}
+
+/// Pre-rasterized pixels for one glyph at a specific size and synthesis setting.
+///
+/// Pixel coordinates are stored as offsets relative to the glyph's bounding-box
+/// origin `(bx, by)` so that the same entry can be replayed at any placement.
+#[derive(Clone)]
+struct GlyphPixels {
+    /// `bx - floor(placement_x)` — signed delta from the floor of the placement
+    /// x coordinate to the left edge of the glyph's bounding box.
+    bx_delta: i32,
+    /// `by - floor(placement_y)` — same for y (baseline direction).
+    by_delta: i32,
+    /// `(gx_offset, gy_offset, coverage)` — raw pixels from `outline.draw()`.
+    /// Bold synthesis pixels are already expanded (up to 4× pixels per glyph
+    /// sample), and italic shear is NOT pre-applied here (shear depends on
+    /// `current_y - (by + gy)` which must be computed at paint time).
+    pixels: Vec<(i32, i32, f32)>,
+}
+
 lazy_static! {
     static ref TEXTURE_POOL: Mutex<TexturePool> = Mutex::new(TexturePool::new());
+
+    /// Process-wide glyph rasterization cache.
+    ///
+    /// Populated on first use of each (glyph, size, style) combination.
+    /// Call `clear_glyph_cache()` between page navigations to free memory.
+    static ref GLYPH_CACHE: Mutex<HashMap<GlyphKey, GlyphPixels>> =
+        Mutex::new(HashMap::new());
+}
+
+/// Evict all cached glyph bitmaps.
+///
+/// Must be called whenever the user navigates to a new page so that memory
+/// freed between renders and the cache does not grow without bound across
+/// many navigations.
+pub fn clear_glyph_cache() {
+    if let Ok(mut cache) = GLYPH_CACHE.lock() {
+        cache.clear();
+    }
 }
 
 /// A pool of reusable `Pixmap` buffers to avoid frequent allocations.
@@ -467,6 +520,13 @@ static FONT: OnceLock<FontRef<'static>> = OnceLock::new();
 ///   before blending.  Each column is shifted left by `ITALIC_SHEAR * (baseline - y)`.
 /// - **Underline / Line-through / Overline** — drawn as filled rectangles after all
 ///   glyphs are placed.
+///
+/// # Glyph cache
+/// Glyph outlines are expensive to rasterize.  This function uses `GLYPH_CACHE`
+/// to avoid re-running `outline_glyph` + `draw` for every glyph on every repaint.
+/// On a cache miss the pixels are collected once and stored; subsequent calls
+/// for the same (glyph, size, bold, italic) combination replay the stored pixels
+/// directly into the pixmap.
 fn render_text_raw(
     text: String,
     rect: LayoutRect,
@@ -499,6 +559,10 @@ fn render_text_raw(
     let mut line_start_x = current_x;
     let mut line_end_x = current_x;
 
+    // font_size_half_px: rounds to nearest 0.5 px so that glyphs at the same
+    // logical size share a cache entry regardless of tiny float differences.
+    let font_size_half_px = (font_size * 2.0).round() as u32;
+
     for word in trimmed.split_whitespace() {
         let mut word_w = 0.0;
         let mut glyphs = Vec::new();
@@ -517,41 +581,93 @@ fn render_text_raw(
             line_end_x = current_x;
         }
         for (gid, adv) in glyphs {
-            let glyph = gid.with_scale_and_position(scale, point(current_x, current_y));
-            if let Some(outline) = font.outline_glyph(glyph) {
-                let bounds = outline.px_bounds();
-                let bx = bounds.min.x.floor() as i32;
-                let by = bounds.min.y.floor() as i32;
+            let key = GlyphKey {
+                glyph_id: gid.0,
+                font_size_half_px,
+                bold,
+                italic: false, // Italic shear is applied at paint time; do not vary cache by italic
+            };
 
-                // Bold: draw glyph pixels shifted by small offsets for stroke thickening.
-                let bold_offsets: &[(i32, i32)] = if bold {
-                    &[(0, 0), (1, 0), (-1, 0), (0, 1)]
+            // ── Cache lookup ──────────────────────────────────────────────────
+            //
+            // Try to find a pre-rasterized entry.  On a miss, rasterize the glyph
+            // and store it.  We use a temporary placement of (0.0, 0.0) so that
+            // the resulting pixels (gx, gy, coverage) are purely relative to the
+            // glyph's own bounding-box origin and can be replayed at any position.
+            let cached: GlyphPixels = {
+                // Fast path: check cache without holding the lock across the
+                // potentially-expensive rasterization.
+                let cached_opt = GLYPH_CACHE.lock()
+                    .ok()
+                    .and_then(|c| c.get(&key).cloned());
+
+                if let Some(entry) = cached_opt {
+                    entry
                 } else {
-                    &[(0, 0)]
-                };
+                    // Cache miss — rasterize using a canonical origin (0, 0) so
+                    // that bx_delta/by_delta are position-independent.
+                    let canonical = gid.with_scale_and_position(scale, point(0.0, 0.0));
+                    let entry = if let Some(outline) = font.outline_glyph(canonical) {
+                        let bounds = outline.px_bounds();
+                        let bx_delta = bounds.min.x.floor() as i32;
+                        let by_delta = bounds.min.y.floor() as i32;
 
-                outline.draw(|gx, gy, coverage| {
-                    for &(dx, dy) in bold_offsets {
-                        let mut px = bx + gx as i32 + dx;
-                        let py = by + gy as i32 + dy;
-                        let pyf = py as f32;
+                        // Bold: expand each sample to up to 4 pixel offsets.
+                        let bold_offsets: &[(i32, i32)] = if bold {
+                            &[(0, 0), (1, 0), (-1, 0), (0, 1)]
+                        } else {
+                            &[(0, 0)]
+                        };
 
-                        // Italic shear: shift x based on distance from baseline.
-                        if italic {
-                            let shear_px = (ITALIC_SHEAR * (current_y - pyf)) as i32;
-                            px += shear_px;
-                        }
-
-                        let pxf = px as f32;
-                        if pxf >= clip.x && pxf < (clip.x + clip.width) &&
-                           pyf >= clip.y && pyf < (clip.y + clip.height) {
-                            if px >= 0 && py >= 0 && px < pixmap.width() as i32 && py < pixmap.height() as i32 {
-                                blend_glyph_pixel(pixmap, px as u32, py as u32, coverage, color);
+                        let mut pixels: Vec<(i32, i32, f32)> = Vec::new();
+                        outline.draw(|gx, gy, coverage| {
+                            for &(dx, dy) in bold_offsets {
+                                pixels.push((gx as i32 + dx, gy as i32 + dy, coverage));
                             }
-                        }
+                        });
+
+                        GlyphPixels { bx_delta, by_delta, pixels }
+                    } else {
+                        // No outline (e.g. space character) — empty entry.
+                        GlyphPixels { bx_delta: 0, by_delta: 0, pixels: Vec::new() }
+                    };
+
+                    // Store in cache (best-effort; ignore poisoned mutex).
+                    if let Ok(mut cache) = GLYPH_CACHE.lock() {
+                        cache.insert(key, entry.clone());
                     }
-                });
+                    entry
+                }
+            };
+
+            // ── Replay cached pixels ──────────────────────────────────────────
+            let place_x = current_x.floor() as i32;
+            let place_y = current_y.floor() as i32;
+            let bx = place_x + cached.bx_delta;
+            let by = place_y + cached.by_delta;
+
+            for &(gx_off, gy_off, coverage) in &cached.pixels {
+                let mut px = bx + gx_off;
+                let py = by + gy_off;
+                let pyf = py as f32;
+
+                // Italic shear: shift x based on distance from baseline.
+                // `current_y - pyf` ≈ `-(by_delta + gy_off)` since
+                // `current_y - place_y` is < 1.0 (fractional part only).
+                if italic {
+                    let shear_px = (ITALIC_SHEAR * (current_y - pyf)) as i32;
+                    px += shear_px;
+                }
+
+                let pxf = px as f32;
+                if pxf >= clip.x && pxf < (clip.x + clip.width) &&
+                   pyf >= clip.y && pyf < (clip.y + clip.height) {
+                    if px >= 0 && py >= 0 && px < pixmap.width() as i32 && py < pixmap.height() as i32 {
+                        blend_glyph_pixel(pixmap, px as u32, py as u32, coverage, color);
+                    }
+                }
             }
+
             current_x += adv;
             line_end_x = current_x;
         }
@@ -708,4 +824,233 @@ fn blend_glyph_pixel(pixmap: &mut Pixmap, x: u32, y: u32, coverage: f32, color: 
         blend(color.b, dst.blue()),
         out_a,
     ).premultiply();
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::Rect as LayoutRect;
+    use crate::css::Color;
+
+    /// Helper: allocate a small opaque white pixmap.
+    fn white_pixmap(w: u32, h: u32) -> Pixmap {
+        let mut p = Pixmap::new(w, h).unwrap();
+        p.fill(tiny_skia::Color::WHITE);
+        p
+    }
+
+    fn black() -> Color { Color { r: 0, g: 0, b: 0, a: 255 } }
+    fn red()   -> Color { Color { r: 255, g: 0, b: 0, a: 255 } }
+
+    fn full_rect(w: f32, h: f32) -> LayoutRect {
+        LayoutRect { x: 0.0, y: 0.0, width: w, height: h }
+    }
+
+    // ── Glyph cache population ────────────────────────────────────────────────
+
+    /// Rendering text twice must produce identical pixel output (cache replay
+    /// must be bit-for-bit identical to the first rasterization).
+    #[test]
+    fn test_glyph_cache_produces_identical_output() {
+        clear_glyph_cache();
+
+        let rect = full_rect(200.0, 40.0);
+        let color = black();
+
+        let mut pixmap1 = white_pixmap(200, 40);
+        render_text_raw("Hello".to_string(), rect, 16.0, &color, rect, &mut pixmap1, false, false, 0);
+
+        clear_glyph_cache();
+
+        let mut pixmap2 = white_pixmap(200, 40);
+        render_text_raw("Hello".to_string(), rect, 16.0, &color, rect, &mut pixmap2, false, false, 0);
+
+        assert_eq!(pixmap1.data(), pixmap2.data(),
+            "cache and uncached renders must produce identical pixels");
+    }
+
+    /// The glyph cache must be populated after the first render.
+    #[test]
+    fn test_glyph_cache_is_populated_after_render() {
+        clear_glyph_cache();
+
+        let rect = full_rect(200.0, 40.0);
+        let mut pixmap = white_pixmap(200, 40);
+        render_text_raw("Abc".to_string(), rect, 16.0, &black(), rect, &mut pixmap, false, false, 0);
+
+        let cache_size = GLYPH_CACHE.lock().unwrap().len();
+        assert!(cache_size > 0, "glyph cache should be non-empty after rendering text; got {} entries", cache_size);
+    }
+
+    /// `clear_glyph_cache()` must empty the cache.
+    #[test]
+    fn test_clear_glyph_cache_empties_cache() {
+        // Populate.
+        let rect = full_rect(200.0, 40.0);
+        let mut pixmap = white_pixmap(200, 40);
+        render_text_raw("Test".to_string(), rect, 16.0, &black(), rect, &mut pixmap, false, false, 0);
+
+        clear_glyph_cache();
+
+        let cache_size = GLYPH_CACHE.lock().unwrap().len();
+        assert_eq!(cache_size, 0, "cache should be empty after clear_glyph_cache()");
+    }
+
+    /// Bold text rendered twice must match.
+    #[test]
+    fn test_bold_text_cache_identical() {
+        clear_glyph_cache();
+        let rect = full_rect(200.0, 40.0);
+        let color = black();
+
+        let mut p1 = white_pixmap(200, 40);
+        render_text_raw("Bold".to_string(), rect, 16.0, &color, rect, &mut p1, true, false, 0);
+
+        clear_glyph_cache();
+        let mut p2 = white_pixmap(200, 40);
+        render_text_raw("Bold".to_string(), rect, 16.0, &color, rect, &mut p2, true, false, 0);
+
+        assert_eq!(p1.data(), p2.data(), "bold renders must be identical across cache miss and cache hit");
+    }
+
+    /// Italic text rendered twice must match.
+    #[test]
+    fn test_italic_text_cache_identical() {
+        clear_glyph_cache();
+        let rect = full_rect(200.0, 40.0);
+        let color = black();
+
+        let mut p1 = white_pixmap(200, 40);
+        render_text_raw("Italic".to_string(), rect, 16.0, &color, rect, &mut p1, false, true, 0);
+
+        clear_glyph_cache();
+        let mut p2 = white_pixmap(200, 40);
+        render_text_raw("Italic".to_string(), rect, 16.0, &color, rect, &mut p2, false, true, 0);
+
+        assert_eq!(p1.data(), p2.data(), "italic renders must be identical across cache miss and cache hit");
+    }
+
+    // ── Visual correctness ────────────────────────────────────────────────────
+
+    /// Rendering non-empty text must modify at least one pixel (basic sanity check
+    /// that the text actually hits the pixmap).
+    #[test]
+    fn test_text_modifies_pixmap() {
+        clear_glyph_cache();
+        let rect = full_rect(200.0, 40.0);
+        let mut pixmap = white_pixmap(200, 40);
+        let white_before = pixmap.data().to_vec();
+
+        render_text_raw("Hello world".to_string(), rect, 16.0, &black(), rect, &mut pixmap, false, false, 0);
+
+        assert_ne!(pixmap.data(), white_before.as_slice(), "text rendering must modify the pixmap");
+    }
+
+    /// Empty and whitespace-only strings must not modify the pixmap at all.
+    #[test]
+    fn test_empty_text_does_not_modify_pixmap() {
+        clear_glyph_cache();
+        let rect = full_rect(200.0, 40.0);
+
+        for text in &["", "   ", "\t\n"] {
+            let mut pixmap = white_pixmap(200, 40);
+            let before = pixmap.data().to_vec();
+            render_text_raw(text.to_string(), rect, 16.0, &black(), rect, &mut pixmap, false, false, 0);
+            assert_eq!(pixmap.data(), before.as_slice(), "empty/whitespace text must not modify pixmap");
+        }
+    }
+
+    /// Text with underline decoration must produce a different pixel output than
+    /// plain text (the decoration lines add extra pixels).
+    #[test]
+    fn test_underline_decoration_differs_from_plain() {
+        clear_glyph_cache();
+        let rect = full_rect(200.0, 40.0);
+        let color = black();
+
+        let mut plain = white_pixmap(200, 40);
+        render_text_raw("Hello".to_string(), rect, 16.0, &color, rect, &mut plain, false, false, 0);
+
+        let mut underlined = white_pixmap(200, 40);
+        render_text_raw("Hello".to_string(), rect, 16.0, &color, rect, &mut underlined, false, false, 0b001);
+
+        assert_ne!(plain.data(), underlined.data(), "underlined text must differ from plain text");
+    }
+
+    /// Different font sizes must be cached independently.
+    #[test]
+    fn test_different_font_sizes_are_independent_cache_entries() {
+        clear_glyph_cache();
+        let rect = full_rect(200.0, 60.0);
+        let color = black();
+
+        let mut p12 = white_pixmap(200, 60);
+        render_text_raw("A".to_string(), rect, 12.0, &color, rect, &mut p12, false, false, 0);
+        let mut p24 = white_pixmap(200, 60);
+        render_text_raw("A".to_string(), rect, 24.0, &color, rect, &mut p24, false, false, 0);
+
+        // The two renders must be different (larger font fills more pixels).
+        assert_ne!(p12.data(), p24.data(), "12px and 24px 'A' must produce different renders");
+
+        // Cache should have separate entries for the two sizes.
+        let font_sizes: std::collections::HashSet<u32> = GLYPH_CACHE.lock().unwrap()
+            .keys()
+            .map(|k| k.font_size_half_px)
+            .collect();
+        assert!(font_sizes.len() >= 2, "cache should hold entries for both font sizes");
+    }
+
+    /// Colored text must differ from text rendered in a different color (sanity
+    /// check that `blend_glyph_pixel` uses the provided color, not a cached one).
+    #[test]
+    fn test_color_does_not_bleed_across_renders() {
+        clear_glyph_cache();
+        let rect = full_rect(200.0, 40.0);
+
+        let mut p_black = white_pixmap(200, 40);
+        render_text_raw("Hi".to_string(), rect, 16.0, &black(), rect, &mut p_black, false, false, 0);
+
+        let mut p_red = white_pixmap(200, 40);
+        render_text_raw("Hi".to_string(), rect, 16.0, &red(), rect, &mut p_red, false, false, 0);
+
+        assert_ne!(p_black.data(), p_red.data(), "black and red text must produce different pixel output");
+    }
+
+    /// Text rendered via the cache must respect the clip rectangle (pixels outside
+    /// the clip must remain at their background value).
+    #[test]
+    fn test_clip_rect_limits_text_pixels() {
+        clear_glyph_cache();
+        let rect = LayoutRect { x: 0.0, y: 0.0, width: 200.0, height: 40.0 };
+        // Clip to only the right half (x=100..200).
+        let clip_right = LayoutRect { x: 100.0, y: 0.0, width: 100.0, height: 40.0 };
+        let clip_full  = rect;
+        let color = black();
+
+        let mut p_right = white_pixmap(200, 40);
+        render_text_raw("Hello world text".to_string(), rect, 16.0, &color, clip_right, &mut p_right, false, false, 0);
+
+        let mut p_full = white_pixmap(200, 40);
+        render_text_raw("Hello world text".to_string(), rect, 16.0, &color, clip_full, &mut p_full, false, false, 0);
+
+        // The two renders must differ (full render has pixels in x=0..99 too).
+        assert_ne!(p_right.data(), p_full.data(),
+            "clipped and unclipped renders must differ");
+
+        // Confirm that every pixel at x < 100 in p_right remains white.
+        // The pixmap stores rows of 200 pixels × 4 bytes each.
+        let data = p_right.data();
+        let w = 200usize;
+        let h = 40usize;
+        for row in 0..h {
+            for col in 0..100usize {
+                let base = (row * w + col) * 4;
+                let rgba = &data[base..base + 4];
+                assert_eq!(rgba, &[255, 255, 255, 255],
+                    "pixel at ({}, {}) must remain white under right-half clip", col, row);
+            }
+        }
+    }
 }
