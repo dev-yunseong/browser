@@ -549,7 +549,7 @@ impl<'a> LayoutBox<'a> {
     fn perform_layout(
         &mut self,
         container_start_x: f32,
-        _initial_x: f32,
+        initial_x: f32,
         mut current_y: f32,
         container_width: f32,
         vw: f32,
@@ -559,7 +559,7 @@ impl<'a> LayoutBox<'a> {
         let is_block = is_block_level(self.display);
         
         // Block formatting context or similar check
-        if is_block && _initial_x > container_start_x {
+        if is_block && initial_x > container_start_x {
             current_y += 5.0; // Break line before block
         }
 
@@ -646,7 +646,13 @@ impl<'a> LayoutBox<'a> {
         };
 
         if let NodeData::Text { ref contents } = self.style_node.node.data {
-            return self.layout_text(contents.borrow().to_string(), self.dimensions.x, current_y, container_width);
+            let available_width = if container_width.is_finite() {
+                let consumed = (initial_x - container_start_x).max(0.0);
+                (container_width - consumed).max(0.0)
+            } else {
+                container_width
+            };
+            return self.layout_text(contents.borrow().to_string(), initial_x, current_y, available_width);
         }
 
         // Image sizing: images need explicit dimension handling before child layout.
@@ -738,7 +744,24 @@ impl<'a> LayoutBox<'a> {
 
             for child_node in &self.style_node.children {
                 if should_skip(child_node) { continue; }
-                let (cb_opt, _, _) = build_layout_tree_with_cb(child_node, 0.0, 0.0, 0.0, inner_width, vw, vh, child_cb);
+                // For row flex containers, block-level items must not stretch to fill the
+                // container width — per CSS spec, flex items use their "hypothetical main size"
+                // which is their max-content width when no explicit width is set.  Passing
+                // max_content_width as container_width causes the block sizing path
+                // (`container_width - margins`) to produce the correct shrink-wrapped size.
+                // Column flex containers still pass inner_width so block children stretch normally.
+                let child_has_explicit_width = matches!(
+                    child_node.specified_values.get(&crate::css::intern("width")),
+                    Some(Value::Length(_, _)) | Some(Value::Keyword(_)) | Some(Value::FitContent(_))
+                );
+                let child_display = get_display_type(child_node);
+                let measure_width = if is_row && is_block_level(child_display) && !child_has_explicit_width {
+                    // Shrink-wrap: use max-content so block items don't fill the flex container.
+                    compute_max_content_width(child_node, vw, vh).min(inner_width).max(0.0)
+                } else {
+                    inner_width
+                };
+                let (cb_opt, _, _) = build_layout_tree_with_cb(child_node, 0.0, 0.0, 0.0, measure_width, vw, vh, child_cb);
                 if let Some(mut cb) = cb_opt {
                     if cb.dimensions.width > inner_width {
                         cb.dimensions.width = inner_width;
@@ -829,6 +852,16 @@ impl<'a> LayoutBox<'a> {
             let mut cross_cursor = 0.0f32; // offset within the container's cross axis
 
             for line_indices in &lines {
+                let initial_line_mains: Vec<f32> = line_indices.iter()
+                    .map(|&i| {
+                        if is_row {
+                            raw_items[i].cb.dimensions.width
+                        } else {
+                            raw_items[i].cb.dimensions.height
+                        }
+                    })
+                    .collect();
+
                 // Compute total main size + gaps for this line.
                 let gaps_total = if line_indices.len() > 1 { main_gap * (line_indices.len() - 1) as f32 } else { 0.0 };
                 let line_total_main: f32 = line_indices.iter().map(|&i| main_size(&raw_items[i].cb)).sum::<f32>() + gaps_total;
@@ -864,7 +897,40 @@ impl<'a> LayoutBox<'a> {
                     }
                 }
 
-                // Recompute totals after grow/shrink.
+                // A flex item's descendants may depend on the resolved main-axis size
+                // (for example, `width: 100%` inside a growing navbar-collapse item).
+                // Re-layout items whose main size changed so percentage widths and
+                // auto-width descendants are measured against the final flexed size.
+                for (&i, &initial_main) in line_indices.iter().zip(initial_line_mains.iter()) {
+                    let final_main = if is_row {
+                        raw_items[i].cb.dimensions.width
+                    } else {
+                        raw_items[i].cb.dimensions.height
+                    };
+                    if (final_main - initial_main).abs() < 0.5 {
+                        continue;
+                    }
+                    let (reflowed_opt, _, _) = build_layout_tree_with_cb(
+                        raw_items[i].cb.style_node,
+                        0.0,
+                        0.0,
+                        0.0,
+                        if is_row { final_main.max(0.0) } else { inner_width },
+                        vw,
+                        vh,
+                        child_cb,
+                    );
+                    if let Some(mut reflowed) = reflowed_opt {
+                        if is_row {
+                            reflowed.dimensions.width = final_main.max(0.0);
+                        } else {
+                            reflowed.dimensions.height = final_main.max(0.0);
+                        }
+                        raw_items[i].cb = reflowed;
+                    }
+                }
+
+                // Recompute totals after grow/shrink/reflow.
                 let gaps_total2 = if line_indices.len() > 1 { main_gap * (line_indices.len() - 1) as f32 } else { 0.0 };
                 let line_total_main2: f32 = line_indices.iter().map(|&i| main_size(&raw_items[i].cb)).sum::<f32>() + gaps_total2;
                 // Free space is 0 when container has no definite size (INFINITY).
@@ -1833,6 +1899,22 @@ mod tests {
         None
     }
 
+    fn find_text_box_containing<'a>(layout: &'a LayoutBox<'a>, needle: &str) -> Option<&'a LayoutBox<'a>> {
+        if let NodeData::Text { ref contents } = layout.style_node.node.data {
+            if contents.borrow().contains(needle) {
+                return Some(layout);
+            }
+        }
+
+        for child in &layout.children {
+            if let Some(found) = find_text_box_containing(child, needle) {
+                return Some(found);
+            }
+        }
+
+        None
+    }
+
     #[test]
     fn test_inline_element_shrinks_to_content() {
         // An inline <span> should derive its width from text content,
@@ -1858,6 +1940,33 @@ mod tests {
         assert!(span.dimensions.width < 800.0,
             "span width {} must be < container_width 800 (should shrink to content)",
             span.dimensions.width);
+    }
+
+    #[test]
+    fn test_inline_text_wraps_against_remaining_line_width() {
+        let html = r#"
+            <div style="width: 800px;">
+                <span style="display: inline-block; width: 280px;">prefix</span>
+                This sentence should wrap based on the remaining line width after the inline prefix instead of overflowing past the viewport edge.
+            </div>
+        "#;
+        let dom = dom::parse_html(html);
+        let stylesheet = css::parse_css("");
+        let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None, None, None);
+
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 768.0);
+        let layout = layout_opt.expect("layout");
+        let text = find_text_box_containing(&layout, "This sentence").expect("text node not found");
+
+        assert!(text.dimensions.x >= 280.0,
+            "inline text should start after the prefix, got x={}",
+            text.dimensions.x);
+        assert!(text.dimensions.width <= 520.0,
+            "inline text width should be limited by the remaining line width, got {}",
+            text.dimensions.width);
+        assert!(text.dimensions.height > 24.0,
+            "inline text should wrap onto multiple lines when the prefix consumes horizontal space, got height={}",
+            text.dimensions.height);
     }
 
     // ── Float layout tests ────────────────────────────────────────────────────
@@ -2494,5 +2603,72 @@ mod tests {
         assert_eq!(outer_div.dimensions.height, 60.0,
             "last child bottom margin should collapse into parent (height should be 60, not 84): got {}",
             outer_div.dimensions.height);
+    }
+
+    #[test]
+    fn test_bootstrap_navbar_expand_lg_stays_horizontal() {
+        let html = r#"
+            <nav class="navbar navbar-expand-lg navbar-dark bg-dark shadow-sm">
+                <div class="container-fluid">
+                    <a class="navbar-brand" href="/">Yunseong</a>
+                    <div class="collapse navbar-collapse" id="navbarNav">
+                        <ul class="navbar-nav w-100">
+                            <li class="nav-item"><a class="nav-link active" href="/">Home</a></li>
+                            <li class="nav-item"><a class="nav-link active" href="/blog">Blog</a></li>
+                            <li class="nav-item"><a class="nav-link active" href="/projects">Projects</a></li>
+                            <li class="nav-item"><a class="nav-link active" href="/apps">Mini Apps</a></li>
+                            <li class="nav-item"><a class="nav-link active" href="/chat">Curator</a></li>
+                            <li class="nav-item ms-auto"><a class="nav-link" href="/login">Login</a></li>
+                        </ul>
+                    </div>
+                </div>
+            </nav>
+        "#;
+        let css = r#"
+            .navbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; padding: 8px 16px; }
+            .container-fluid { display: flex; flex-wrap: inherit; align-items: center; justify-content: space-between; width: 100%; }
+            .navbar-brand { padding-top: 5px; padding-bottom: 5px; margin-right: 16px; font-size: 20px; }
+            .navbar-nav { display: flex; flex-direction: column; padding-left: 0; margin-bottom: 0; }
+            .navbar-collapse { flex-basis: 100%; flex-grow: 1; align-items: center; }
+            .nav-link { display: block; padding: 8px; }
+            .w-100 { width: 100%; }
+            .ms-auto { margin-left: auto; }
+            @media (min-width: 992px) {
+                .navbar-expand-lg .navbar-nav { flex-direction: row; }
+                .navbar-expand-lg .navbar-collapse { display: flex; flex-basis: auto; }
+            }
+        "#;
+
+        let dom_tree = dom::parse_html(html);
+        let ss = css::parse_css(css);
+        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None, None);
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout");
+
+        let ul = find_element_by_tag(&layout, "ul").expect("ul not found");
+        assert!(ul.dimensions.width > 500.0,
+            "navbar ul should expand close to full row width, got {}",
+            ul.dimensions.width);
+
+        let items: Vec<&LayoutBox> = ul.children.iter()
+            .filter(|c| matches!(c.style_node.node.data, NodeData::Element { .. }))
+            .collect();
+        assert_eq!(items.len(), 6, "expected 6 nav items");
+
+        let y0 = items[0].dimensions.y;
+        let mut prev_right = items[0].dimensions.x + items[0].dimensions.width;
+        for (idx, item) in items.iter().enumerate().skip(1) {
+            assert!((item.dimensions.y - y0).abs() < 1.0,
+                "nav item {} should stay on the same row: y0={}, y={}",
+                idx, y0, item.dimensions.y);
+            assert!(item.dimensions.x >= prev_right - 1.0,
+                "nav item {} should not overlap the previous item: prev_right={}, x={}",
+                idx, prev_right, item.dimensions.x);
+            prev_right = item.dimensions.x + item.dimensions.width;
+        }
+
+        assert!(items[5].dimensions.x > items[0].dimensions.x + 250.0,
+            "login item should remain on the same horizontal navbar row, not collapse into the left cluster: x1={}, x6={}",
+            items[0].dimensions.x, items[5].dimensions.x);
     }
 }

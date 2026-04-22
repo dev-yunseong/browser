@@ -310,35 +310,131 @@ pub fn parse_css(source: &str) -> Stylesheet {
     Stylesheet { items }
 }
 
+/// Viewport width used for `@media` query evaluation.
+///
+/// The browser currently renders into a relatively narrow fixed canvas, but most
+/// real pages we inspect in the desktop app are authored around desktop breakpoints.
+/// Using a desktop viewport here keeps Bootstrap-style navigation bars in their
+/// expanded horizontal layout instead of forcing the collapsed mobile rules.
+const VIEWPORT_WIDTH_PX: f32 = 1200.0;
+
+/// Parse a single media condition string like "(min-width: 992px)" or
+/// "(max-width: 768px)".  Returns `true` if the VIEWPORT_WIDTH_PX satisfies
+/// the condition.  Unknown/unsupported queries return `false` so their blocks
+/// are safely skipped.
+fn media_query_matches(query: &str) -> bool {
+    let q = query.trim().to_lowercase();
+    // Strip surrounding parens if present
+    let q = q.trim_start_matches('(').trim_end_matches(')');
+    if let Some(rest) = q.strip_prefix("min-width:") {
+        let val_str = rest.trim().trim_end_matches("px").trim();
+        if let Ok(min) = val_str.parse::<f32>() {
+            return VIEWPORT_WIDTH_PX >= min;
+        }
+    } else if let Some(rest) = q.strip_prefix("max-width:") {
+        let val_str = rest.trim().trim_end_matches("px").trim();
+        if let Ok(max) = val_str.parse::<f32>() {
+            return VIEWPORT_WIDTH_PX <= max;
+        }
+    }
+    false
+}
+
+/// Returns true if the @media query string (the part after `@media` before the
+/// opening `{`) should be treated as matching given VIEWPORT_WIDTH_PX.
+/// Handles simple single-condition queries like `(min-width: 992px)` and
+/// compound `screen and (min-width: 992px)` queries.
+fn evaluate_media_query(query_str: &str) -> bool {
+    // Strip "screen"/"all"/"print" type tokens and "and" keywords, then evaluate
+    // whatever condition remains.
+    let q = query_str.trim().to_lowercase();
+    // Skip print-only queries
+    if q.starts_with("print") { return false; }
+    // Extract the parenthesised portion
+    if let Some(start) = q.find('(') {
+        let sub = &q[start..];
+        if let Some(end) = sub.rfind(')') {
+            let condition = &sub[..=end];
+            return media_query_matches(condition);
+        }
+    }
+    // Bare "all" or "screen" without a condition → always match
+    if q == "all" || q == "screen" { return true; }
+    false
+}
+
 fn strip_at_rules(source: &str) -> String {
     let mut result = String::with_capacity(source.len());
-    let mut depth = 0usize;
-    let mut in_at_rule = false;
     let chars: Vec<char> = source.chars().collect();
+    let len = chars.len();
     let mut i = 0;
 
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '@' && depth == 0 {
-            in_at_rule = true;
-        }
-        if in_at_rule {
-            if c == '{' {
-                depth += 1;
-            } else if c == '}' {
-                if depth > 0 {
-                    depth -= 1;
+    while i < len {
+        if chars[i] == '@' {
+            // Collect the at-keyword and query up to the first '{' or ';'
+            let at_start = i;
+            i += 1; // skip '@'
+            // Read keyword (letters only)
+            let mut keyword = String::new();
+            while i < len && (chars[i].is_alphanumeric() || chars[i] == '-') {
+                keyword.push(chars[i]);
+                i += 1;
+            }
+            let keyword = keyword.to_lowercase();
+
+            if keyword == "media" {
+                // Collect the query text up to the opening '{'
+                let mut query = String::new();
+                while i < len && chars[i] != '{' {
+                    query.push(chars[i]);
+                    i += 1;
                 }
-                if depth == 0 {
-                    in_at_rule = false;
+                if i >= len { break; }
+                i += 1; // consume '{'
+
+                // Decide whether to include the body.
+                let include = evaluate_media_query(&query);
+
+                // Walk the nested braces, copying content only if include == true.
+                let mut depth = 1usize;
+                while i < len && depth > 0 {
+                    let c = chars[i];
+                    if c == '{' { depth += 1; }
+                    else if c == '}' {
+                        depth -= 1;
+                        if depth == 0 { i += 1; break; }
+                    }
+                    if include { result.push(c); }
+                    i += 1;
                 }
-            } else if c == ';' && depth == 0 {
-                in_at_rule = false;
+                // closing '}' already consumed by the break above
+            } else {
+                // Non-@media at-rule: skip it entirely.
+                // Determine if it's a block rule (has '{...}') or a simple statement ending with ';'.
+                // Collect up to the first '{' or ';' to decide.
+                let mut preamble = String::new();
+                while i < len && chars[i] != '{' && chars[i] != ';' {
+                    preamble.push(chars[i]);
+                    i += 1;
+                }
+                if i < len && chars[i] == '{' {
+                    i += 1; // consume '{'
+                    let mut depth = 1usize;
+                    while i < len && depth > 0 {
+                        let c = chars[i];
+                        if c == '{' { depth += 1; }
+                        else if c == '}' { depth -= 1; }
+                        i += 1;
+                    }
+                } else if i < len && chars[i] == ';' {
+                    i += 1; // consume ';'
+                }
+                let _ = (at_start, preamble); // suppress unused warnings
             }
         } else {
-            result.push(c);
+            result.push(chars[i]);
+            i += 1;
         }
-        i += 1;
     }
     result
 }
