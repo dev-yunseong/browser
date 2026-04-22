@@ -77,5 +77,5 @@ All development tasks MUST follow the **Plan-Review-Act-Verify** steps below:
 
 ## Roadmap
 
-To see the canonical priority list and dependency graph, always refer to **`docs/issue-priority.md`**.
+To see the canonical priority list and dependency graph, always refer to **`./.agents/PRIORITY.md`**.
 All tasks should follow the order specified there.

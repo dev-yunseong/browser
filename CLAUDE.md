@@ -112,17 +112,16 @@ The developer agent **must always** invoke the `browser-cli-reviewer` agent befo
 
 The `browser-cli-reviewer` agent:
 - Runs `cargo build --bins` to build fresh binaries
-- Starts `./target/debug/browser-daemon --no-gui --port 7070` (headless HTTP server — no GUI event loop, no Xvfb needed)
+- Kills any existing daemon containers (`docker ps -q --filter "ancestor=rust:latest" | xargs docker kill`)
+- Starts `./target/debug/browser-daemon --no-gui --port 7070` inside `drun rust:latest` (headless — no GUI)
 - Runs `./target/debug/browser-cli navigate <url>` with `timeout 30s` against **both** `https://yunseong.dev` and `https://google.com`
+- **For visual/rendering issues**: after navigation, also takes a screenshot by hitting `GET http://127.0.0.1:7070/screenshot`, saves the PNG, and uses the `Read` tool to visually inspect it — checking for layout bugs, misaligned elements, broken flex/grid, missing content. If visual defects are found, fix them and repeat before creating the PR.
 - Returns **PASS** or **NONPASS** with full output and diagnosis
-
-All CLI commands are wrapped with `timeout` to prevent infinite loops from hanging the session.
-
 If the reviewer returns **NONPASS**, fix the issue and re-run the reviewer before proceeding to PR.
 
 ## Issue Priority
 
-When choosing which issue to work on next, always consult **`docs/issue-priority.md`**.
+When choosing which issue to work on next, always consult **`./.agents/PRIORITY.md`**.
 It defines the canonical priority order and dependency graph for all open issues.
 Pick the highest-priority open issue that has no unresolved dependencies.
 

@@ -10,7 +10,7 @@
 ## Current Project
 - **Goal:** Build a web browser from scratch using Rust.
 - **Key components to consider:** Networking, HTML Parsing, DOM, CSS Parsing, Layout Engine, Rendering, and JS Engine integration.
-- **Priority:** Always refer to `docs/issue-priority.md` for the canonical priority order and dependency graph.
+- **Priority:** Always refer to `./.agents/PRIORITY.md` for the canonical priority order and dependency graph.
 
 ## Engineering Standards & Mandates
 - **Language:** Internal (English), User-facing (Korean).
