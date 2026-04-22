@@ -549,7 +549,7 @@ impl<'a> LayoutBox<'a> {
     fn perform_layout(
         &mut self,
         container_start_x: f32,
-        _initial_x: f32,
+        initial_x: f32,
         mut current_y: f32,
         container_width: f32,
         vw: f32,
@@ -559,7 +559,7 @@ impl<'a> LayoutBox<'a> {
         let is_block = is_block_level(self.display);
         
         // Block formatting context or similar check
-        if is_block && _initial_x > container_start_x {
+        if is_block && initial_x > container_start_x {
             current_y += 5.0; // Break line before block
         }
 
@@ -646,7 +646,13 @@ impl<'a> LayoutBox<'a> {
         };
 
         if let NodeData::Text { ref contents } = self.style_node.node.data {
-            return self.layout_text(contents.borrow().to_string(), self.dimensions.x, current_y, container_width);
+            let available_width = if container_width.is_finite() {
+                let consumed = (initial_x - container_start_x).max(0.0);
+                (container_width - consumed).max(0.0)
+            } else {
+                container_width
+            };
+            return self.layout_text(contents.borrow().to_string(), initial_x, current_y, available_width);
         }
 
         // Image sizing: images need explicit dimension handling before child layout.
@@ -689,93 +695,350 @@ impl<'a> LayoutBox<'a> {
         let child_cb = if self_establishes_cb { Some(self_cb_rect) } else { containing_block };
 
         if self.display == DisplayType::Flex {
+            // ── Read flex container properties ────────────────────────────────
             let flex_direction = self.style_node.specified_values.get(&crate::css::intern("flex-direction"))
                 .and_then(|v| if let Value::Keyword(k) = v { Some(&**k) } else { None })
                 .unwrap_or("row");
+            let is_row = flex_direction == "row" || flex_direction == "row-reverse";
             let justify = self.style_node.specified_values.get(&crate::css::intern("justify-content"))
                 .and_then(|v| if let Value::Keyword(k) = v { Some(&**k) } else { None })
                 .unwrap_or("flex-start");
+            let align_items = self.style_node.specified_values.get(&crate::css::intern("align-items"))
+                .and_then(|v| if let Value::Keyword(k) = v { Some(&**k) } else { None })
+                .unwrap_or("stretch");
+            let flex_wrap = self.style_node.specified_values.get(&crate::css::intern("flex-wrap"))
+                .and_then(|v| if let Value::Keyword(k) = v { Some(&**k) } else { None })
+                .unwrap_or("nowrap");
+            let do_wrap = flex_wrap == "wrap" || flex_wrap == "wrap-reverse";
 
-            let mut flex_children = Vec::new();
-            let mut total_main_size = 0.0f32;
-            let mut max_cross_size = 0.0f32;
+            // gap / row-gap / column-gap
+            let col_gap = match self.style_node.specified_values.get(&crate::css::intern("column-gap"))
+                .or_else(|| self.style_node.specified_values.get(&crate::css::intern("gap"))) {
+                Some(Value::Length(v, Unit::Px)) => *v,
+                Some(Value::Number(v))            => *v,
+                _ => 0.0,
+            };
+            let row_gap = match self.style_node.specified_values.get(&crate::css::intern("row-gap"))
+                .or_else(|| self.style_node.specified_values.get(&crate::css::intern("gap"))) {
+                Some(Value::Length(v, Unit::Px)) => *v,
+                Some(Value::Number(v))            => *v,
+                _ => 0.0,
+            };
+            // For a row flex container the gap between items on the main axis is col_gap;
+            // for a column container it is row_gap.
+            let main_gap  = if is_row { col_gap } else { row_gap };
+            let cross_gap = if is_row { row_gap } else { col_gap };
+
+            // ── Measure all flex children ─────────────────────────────────────
+            // Each child is laid out at inner_width to get natural dimensions.
+            // We store (LayoutBox, flex-grow, flex-shrink, align-self, order).
+            struct FlexItem<'fi> {
+                cb: LayoutBox<'fi>,
+                grow:       f32,
+                shrink:     f32,
+                align_self: Option<&'fi str>,
+                order:      i32,
+            }
+
+            let mut raw_items: Vec<FlexItem<'_>> = Vec::new();
 
             for child_node in &self.style_node.children {
                 if should_skip(child_node) { continue; }
-                // Measure each flex item at inner_width so block children don't expand
-                // beyond the container.  We used to pass f32::INFINITY here (to get
-                // shrink-wrap sizing), but that caused the tile-creation loop in
-                // Layer::new() to spin forever for any positioned descendant.
-                // inner_width is the correct cross-axis constraint for column flex and
-                // a safe upper bound for row flex — items are clamped here anyway.
-                let (cb_opt, _, _) = build_layout_tree_with_cb(child_node, 0.0, 0.0, 0.0, inner_width, vw, vh, child_cb);
+                // For row flex containers, block-level items must not stretch to fill the
+                // container width — per CSS spec, flex items use their "hypothetical main size"
+                // which is their max-content width when no explicit width is set.  Passing
+                // max_content_width as container_width causes the block sizing path
+                // (`container_width - margins`) to produce the correct shrink-wrapped size.
+                // Column flex containers still pass inner_width so block children stretch normally.
+                let child_has_explicit_width = matches!(
+                    child_node.specified_values.get(&crate::css::intern("width")),
+                    Some(Value::Length(_, _)) | Some(Value::Keyword(_)) | Some(Value::FitContent(_))
+                );
+                let child_display = get_display_type(child_node);
+                let measure_width = if is_row && is_block_level(child_display) && !child_has_explicit_width {
+                    // Shrink-wrap: use max-content so block items don't fill the flex container.
+                    compute_max_content_width(child_node, vw, vh).min(inner_width).max(0.0)
+                } else {
+                    inner_width
+                };
+                let (cb_opt, _, _) = build_layout_tree_with_cb(child_node, 0.0, 0.0, 0.0, measure_width, vw, vh, child_cb);
                 if let Some(mut cb) = cb_opt {
-                    // Clamp child width to inner_width so no sentinel or overflowing
-                    // value leaks into hit-test rects or the layer tree.
                     if cb.dimensions.width > inner_width {
                         cb.dimensions.width = inner_width;
                     }
-                    if flex_direction == "row" {
-                        total_main_size += cb.dimensions.width + cb.margin.left + cb.margin.right;
-                        max_cross_size = max_cross_size.max(cb.dimensions.height + cb.margin.top + cb.margin.bottom);
-                    } else {
-                        total_main_size += cb.dimensions.height + cb.margin.top + cb.margin.bottom;
-                        max_cross_size = max_cross_size.max(cb.dimensions.width + cb.margin.left + cb.margin.right);
+                    // Flex items that come out with width=0 (e.g. inline <a> elements) need
+                    // an intrinsic size so they participate correctly in the flex algorithm.
+                    // Use max-content width capped to inner_width as the shrink-wrap fallback.
+                    if cb.dimensions.width == 0.0 {
+                        let max_c = compute_max_content_width(child_node, vw, vh);
+                        cb.dimensions.width = max_c.min(inner_width).max(0.0);
                     }
-                    flex_children.push(cb);
+                    let grow = child_node.specified_values.get(&crate::css::intern("flex-grow"))
+                        .and_then(|v| if let Value::Number(n) = v { Some(*n) } else { None })
+                        .unwrap_or(0.0);
+                    let shrink = child_node.specified_values.get(&crate::css::intern("flex-shrink"))
+                        .and_then(|v| if let Value::Number(n) = v { Some(*n) } else { None })
+                        .unwrap_or(1.0);
+                    // align-self: the keyword stored as a &str tied to the child's Arc<str> lifetime.
+                    // We keep it as Option<&str> borrowed from the child_node's map.
+                    let align_self: Option<&str> = child_node.specified_values
+                        .get(&crate::css::intern("align-self"))
+                        .and_then(|v| if let Value::Keyword(k) = v { Some(&**k) } else { None });
+                    let order = child_node.specified_values.get(&crate::css::intern("order"))
+                        .and_then(|v| match v { Value::Number(n) => Some(*n as i32), _ => None })
+                        .unwrap_or(0);
+                    raw_items.push(FlexItem { cb, grow, shrink, align_self, order });
                 }
             }
 
-            let main_container_size = if flex_direction == "row" { inner_width } else { height.max(total_main_size) };
-            let free_space = (main_container_size - total_main_size).max(0.0);
-            
-            // Simple flex-grow: distribute free space equally among children for now
-            let grow_share = if !flex_children.is_empty() { free_space / flex_children.len() as f32 } else { 0.0 };
+            // Apply `order` sorting (stable sort preserves DOM order for ties).
+            raw_items.sort_by_key(|item| item.order);
 
-            let mut main_cursor = 0.0f32;
-            // Apply justification offsets if no grow
-            if free_space > 0.0 && grow_share < 0.1 {
-                match justify {
-                    "center" => main_cursor += free_space / 2.0,
-                    "flex-end" => main_cursor += free_space,
-                    _ => {}
+            // ── Helper: compute main/cross size of a laid-out box ─────────────
+            let main_size  = |cb: &LayoutBox<'_>| -> f32 {
+                if is_row { cb.dimensions.width  + cb.margin.left + cb.margin.right  }
+                else      { cb.dimensions.height + cb.margin.top  + cb.margin.bottom }
+            };
+            let cross_size = |cb: &LayoutBox<'_>| -> f32 {
+                if is_row { cb.dimensions.height + cb.margin.top  + cb.margin.bottom }
+                else      { cb.dimensions.width  + cb.margin.left + cb.margin.right  }
+            };
+
+            // ── Build flex lines (wrapping) ────────────────────────────────────
+            // Each line is a Vec of indices into raw_items.
+            //
+            // For column flex containers with auto height (height == 0), the main axis
+            // has no definite size.  Using 0.0001 caused flex-shrink to collapse all items
+            // to zero height.  Instead, use f32::INFINITY so the deficit is always 0
+            // (no shrinking) and the container grows to fit its items.  Row containers
+            // always have a definite main size (inner_width from the block width).
+            let main_container_size = if is_row {
+                inner_width
+            } else if height > 0.0 {
+                height
+            } else {
+                f32::INFINITY // auto-height column: no shrinking, grow to content
+            };
+            let mut lines: Vec<Vec<usize>> = Vec::new();
+            {
+                let mut cur_line: Vec<usize> = Vec::new();
+                let mut line_main: f32 = 0.0;
+                for (i, item) in raw_items.iter().enumerate() {
+                    let item_main = main_size(&item.cb);
+                    let gap_contribution = if cur_line.is_empty() { 0.0 } else { main_gap };
+                    if do_wrap && !cur_line.is_empty() && line_main + gap_contribution + item_main > main_container_size {
+                        lines.push(std::mem::take(&mut cur_line));
+                        line_main = 0.0;
+                    }
+                    if !cur_line.is_empty() { line_main += main_gap; }
+                    line_main += item_main;
+                    cur_line.push(i);
                 }
+                if !cur_line.is_empty() { lines.push(cur_line); }
             }
 
-            for mut cb in flex_children {
-                let main_grow = if flex_direction == "row" { grow_share } else { 0.0 };
-                let cross_grow = if flex_direction == "row" { 0.0 } else { grow_share };
-                
-                cb.dimensions.width += main_grow;
-                cb.dimensions.height += cross_grow;
+            // ── Lay out each line ─────────────────────────────────────────────
+            let container_main_start  = if is_row {
+                self.dimensions.x + self.padding.left + self.border.left
+            } else {
+                self.dimensions.y + self.padding.top  + self.border.top
+            };
+            let container_cross_start = if is_row {
+                self.dimensions.y + self.padding.top  + self.border.top
+            } else {
+                self.dimensions.x + self.padding.left + self.border.left
+            };
 
-                let (x, y) = if flex_direction == "row" {
-                    (self.dimensions.x + self.padding.left + self.border.left + main_cursor + cb.margin.left,
-                     self.dimensions.y + self.padding.top + self.border.top + cb.margin.top)
-                } else {
-                    (self.dimensions.x + self.padding.left + self.border.left + cb.margin.left,
-                     self.dimensions.y + self.padding.top + self.border.top + main_cursor + cb.margin.top)
+            let mut cross_cursor = 0.0f32; // offset within the container's cross axis
+
+            for line_indices in &lines {
+                let initial_line_mains: Vec<f32> = line_indices.iter()
+                    .map(|&i| {
+                        if is_row {
+                            raw_items[i].cb.dimensions.width
+                        } else {
+                            raw_items[i].cb.dimensions.height
+                        }
+                    })
+                    .collect();
+
+                // Compute total main size + gaps for this line.
+                let gaps_total = if line_indices.len() > 1 { main_gap * (line_indices.len() - 1) as f32 } else { 0.0 };
+                let line_total_main: f32 = line_indices.iter().map(|&i| main_size(&raw_items[i].cb)).sum::<f32>() + gaps_total;
+                // When main_container_size is INFINITY (auto-height column), there is no
+                // definite container size: free space is 0 and deficit is 0.
+                let free = if main_container_size.is_infinite() { 0.0 } else { (main_container_size - line_total_main).max(0.0) };
+                let deficit = if main_container_size.is_infinite() { 0.0 } else { (line_total_main - main_container_size).max(0.0) };
+
+                // Flex-grow distribution (only if there is free space).
+                let total_grow: f32 = line_indices.iter().map(|&i| raw_items[i].grow).sum();
+                if free > 0.0 && total_grow > 0.0 {
+                    for &i in line_indices {
+                        let share = (raw_items[i].grow / total_grow) * free;
+                        if is_row { raw_items[i].cb.dimensions.width  += share; }
+                        else      { raw_items[i].cb.dimensions.height += share; }
+                    }
+                }
+
+                // Flex-shrink distribution (only if items overflow).
+                let total_shrink_weighted: f32 = line_indices.iter()
+                    .map(|&i| raw_items[i].shrink * main_size(&raw_items[i].cb))
+                    .sum();
+                if deficit > 0.0 && total_shrink_weighted > 0.0 {
+                    for &i in line_indices {
+                        let ms = main_size(&raw_items[i].cb);
+                        let weight = raw_items[i].shrink * ms / total_shrink_weighted;
+                        let reduction = weight * deficit;
+                        if is_row {
+                            raw_items[i].cb.dimensions.width  = (raw_items[i].cb.dimensions.width  - reduction).max(0.0);
+                        } else {
+                            raw_items[i].cb.dimensions.height = (raw_items[i].cb.dimensions.height - reduction).max(0.0);
+                        }
+                    }
+                }
+
+                // A flex item's descendants may depend on the resolved main-axis size
+                // (for example, `width: 100%` inside a growing navbar-collapse item).
+                // Re-layout items whose main size changed so percentage widths and
+                // auto-width descendants are measured against the final flexed size.
+                for (&i, &initial_main) in line_indices.iter().zip(initial_line_mains.iter()) {
+                    let final_main = if is_row {
+                        raw_items[i].cb.dimensions.width
+                    } else {
+                        raw_items[i].cb.dimensions.height
+                    };
+                    if (final_main - initial_main).abs() < 0.5 {
+                        continue;
+                    }
+                    let (reflowed_opt, _, _) = build_layout_tree_with_cb(
+                        raw_items[i].cb.style_node,
+                        0.0,
+                        0.0,
+                        0.0,
+                        if is_row { final_main.max(0.0) } else { inner_width },
+                        vw,
+                        vh,
+                        child_cb,
+                    );
+                    if let Some(mut reflowed) = reflowed_opt {
+                        if is_row {
+                            reflowed.dimensions.width = final_main.max(0.0);
+                        } else {
+                            reflowed.dimensions.height = final_main.max(0.0);
+                        }
+                        raw_items[i].cb = reflowed;
+                    }
+                }
+
+                // Recompute totals after grow/shrink/reflow.
+                let gaps_total2 = if line_indices.len() > 1 { main_gap * (line_indices.len() - 1) as f32 } else { 0.0 };
+                let line_total_main2: f32 = line_indices.iter().map(|&i| main_size(&raw_items[i].cb)).sum::<f32>() + gaps_total2;
+                // Free space is 0 when container has no definite size (INFINITY).
+                let free2 = if main_container_size.is_infinite() { 0.0 } else { (main_container_size - line_total_main2).max(0.0) };
+                let n = line_indices.len();
+
+                // Compute main-axis starting cursor and per-item gap for justify-content.
+                let (mut main_cursor, between_gap) = match justify {
+                    "flex-end"      => (free2,      0.0),
+                    "center"        => (free2 / 2.0, 0.0),
+                    "space-between" => (0.0, if n > 1 { free2 / (n - 1) as f32 } else { 0.0 }),
+                    "space-around"  => {
+                        let slot = free2 / n as f32;
+                        (slot / 2.0, slot)
+                    }
+                    "space-evenly"  => {
+                        let slot = free2 / (n + 1) as f32;
+                        (slot, slot)
+                    }
+                    _ => (0.0, 0.0), // flex-start
                 };
-                
-                let dx = x - cb.dimensions.x;
-                let dy = y - cb.dimensions.y;
-                offset_layout_box(&mut cb, dx, dy);
-                
-                main_cursor += if flex_direction == "row" { 
-                    cb.dimensions.width + cb.margin.left + cb.margin.right 
-                } else { 
-                    cb.dimensions.height + cb.margin.top + cb.margin.bottom 
-                };
-                
-                max_child_x = max_child_x.max(cb.dimensions.x + cb.dimensions.width + cb.margin.right);
-                child_y = child_y.max(cb.dimensions.y + cb.dimensions.height + cb.margin.bottom);
-                self.children.push(cb);
+
+                // Cross-axis size of this line (max of all items' cross sizes).
+                let line_cross: f32 = line_indices.iter().map(|&i| cross_size(&raw_items[i].cb)).fold(0.0_f32, f32::max);
+
+                // Place each item.
+                for (idx_in_line, &i) in line_indices.iter().enumerate() {
+                    let item = &mut raw_items[i];
+
+                    // align-self overrides align-items for this item.
+                    let effective_align = item.align_self.unwrap_or(align_items);
+
+                    // Stretch cross axis if needed.
+                    if effective_align == "stretch" {
+                        if is_row {
+                            item.cb.dimensions.height = (line_cross - item.cb.margin.top - item.cb.margin.bottom).max(0.0);
+                        } else {
+                            item.cb.dimensions.width  = (line_cross - item.cb.margin.left - item.cb.margin.right).max(0.0);
+                        }
+                    }
+
+                    // Cross-axis offset within the line.
+                    let item_cross = cross_size(&item.cb);
+                    let cross_offset = match effective_align {
+                        "flex-end"  => line_cross - item_cross,
+                        "center"    => (line_cross - item_cross) / 2.0,
+                        "baseline"  => 0.0, // simplified: treat like flex-start
+                        _           => 0.0, // flex-start / stretch (already resized)
+                    };
+
+                    // Add gap between items (not before the first item).
+                    if idx_in_line > 0 { main_cursor += main_gap + between_gap; }
+
+                    // Compute absolute position.
+                    let (x, y) = if is_row {
+                        (container_main_start  + main_cursor          + item.cb.margin.left,
+                         container_cross_start + cross_cursor         + cross_offset + item.cb.margin.top)
+                    } else {
+                        (container_cross_start + cross_cursor         + cross_offset + item.cb.margin.left,
+                         container_main_start  + main_cursor          + item.cb.margin.top)
+                    };
+
+                    let dx = x - item.cb.dimensions.x;
+                    let dy = y - item.cb.dimensions.y;
+                    offset_layout_box(&mut item.cb, dx, dy);
+
+                    main_cursor += if is_row {
+                        item.cb.dimensions.width  + item.cb.margin.left + item.cb.margin.right
+                    } else {
+                        item.cb.dimensions.height + item.cb.margin.top  + item.cb.margin.bottom
+                    };
+
+                    max_child_x = max_child_x.max(item.cb.dimensions.x + item.cb.dimensions.width  + item.cb.margin.right);
+                    child_y     = child_y    .max(item.cb.dimensions.y + item.cb.dimensions.height + item.cb.margin.bottom);
+                }
+
+                cross_cursor += line_cross + cross_gap;
             }
-            
-            // Finalize flex container size
-            if self.dimensions.width <= 0.0 { self.dimensions.width = if flex_direction == "row" { main_container_size } else { max_cross_size }; }
-            self.dimensions.height = if flex_direction == "row" { max_cross_size } else { main_container_size };
-            
+
+            // Move items from raw_items into self.children.
+            for item in raw_items {
+                self.children.push(item.cb);
+            }
+
+            // Finalize flex container size.
+            // cross_cursor already accumulated line heights + cross_gaps; subtract the last
+            // trailing cross_gap (we don't add one after the last line).
+            let total_cross = if cross_cursor > 0.0 && lines.len() > 1 {
+                cross_cursor - cross_gap
+            } else {
+                cross_cursor
+            };
+            // For column containers, derive the main-axis (height) from the actual child
+            // positions rather than main_container_size (which is near-zero when height is auto).
+            // Include padding.bottom + border.bottom, consistent with block layout (line ~1197).
+            let column_main = if !is_row {
+                let content_top = self.dimensions.y + self.padding.top + self.border.top;
+                (child_y - content_top + self.padding.bottom + self.border.bottom).max(0.0)
+            } else {
+                0.0
+            };
+            if self.dimensions.width  <= 0.0 {
+                self.dimensions.width  = if is_row { main_container_size } else { total_cross };
+            }
+            if self.dimensions.height <= 0.0 || height <= 0.0 {
+                self.dimensions.height = if is_row { total_cross } else { column_main };
+            }
+
             let final_x = if is_block { container_start_x } else { self.dimensions.x + self.dimensions.width + self.margin.right };
             let final_y = self.dimensions.y + self.dimensions.height + self.margin.bottom;
             return (Some(self.clone()), final_x, final_y);
@@ -1636,6 +1899,22 @@ mod tests {
         None
     }
 
+    fn find_text_box_containing<'a>(layout: &'a LayoutBox<'a>, needle: &str) -> Option<&'a LayoutBox<'a>> {
+        if let NodeData::Text { ref contents } = layout.style_node.node.data {
+            if contents.borrow().contains(needle) {
+                return Some(layout);
+            }
+        }
+
+        for child in &layout.children {
+            if let Some(found) = find_text_box_containing(child, needle) {
+                return Some(found);
+            }
+        }
+
+        None
+    }
+
     #[test]
     fn test_inline_element_shrinks_to_content() {
         // An inline <span> should derive its width from text content,
@@ -1661,6 +1940,33 @@ mod tests {
         assert!(span.dimensions.width < 800.0,
             "span width {} must be < container_width 800 (should shrink to content)",
             span.dimensions.width);
+    }
+
+    #[test]
+    fn test_inline_text_wraps_against_remaining_line_width() {
+        let html = r#"
+            <div style="width: 800px;">
+                <span style="display: inline-block; width: 280px;">prefix</span>
+                This sentence should wrap based on the remaining line width after the inline prefix instead of overflowing past the viewport edge.
+            </div>
+        "#;
+        let dom = dom::parse_html(html);
+        let stylesheet = css::parse_css("");
+        let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None, None, None);
+
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 768.0);
+        let layout = layout_opt.expect("layout");
+        let text = find_text_box_containing(&layout, "This sentence").expect("text node not found");
+
+        assert!(text.dimensions.x >= 280.0,
+            "inline text should start after the prefix, got x={}",
+            text.dimensions.x);
+        assert!(text.dimensions.width <= 520.0,
+            "inline text width should be limited by the remaining line width, got {}",
+            text.dimensions.width);
+        assert!(text.dimensions.height > 24.0,
+            "inline text should wrap onto multiple lines when the prefix consumes horizontal space, got height={}",
+            text.dimensions.height);
     }
 
     // ── Float layout tests ────────────────────────────────────────────────────
@@ -2297,5 +2603,72 @@ mod tests {
         assert_eq!(outer_div.dimensions.height, 60.0,
             "last child bottom margin should collapse into parent (height should be 60, not 84): got {}",
             outer_div.dimensions.height);
+    }
+
+    #[test]
+    fn test_bootstrap_navbar_expand_lg_stays_horizontal() {
+        let html = r#"
+            <nav class="navbar navbar-expand-lg navbar-dark bg-dark shadow-sm">
+                <div class="container-fluid">
+                    <a class="navbar-brand" href="/">Yunseong</a>
+                    <div class="collapse navbar-collapse" id="navbarNav">
+                        <ul class="navbar-nav w-100">
+                            <li class="nav-item"><a class="nav-link active" href="/">Home</a></li>
+                            <li class="nav-item"><a class="nav-link active" href="/blog">Blog</a></li>
+                            <li class="nav-item"><a class="nav-link active" href="/projects">Projects</a></li>
+                            <li class="nav-item"><a class="nav-link active" href="/apps">Mini Apps</a></li>
+                            <li class="nav-item"><a class="nav-link active" href="/chat">Curator</a></li>
+                            <li class="nav-item ms-auto"><a class="nav-link" href="/login">Login</a></li>
+                        </ul>
+                    </div>
+                </div>
+            </nav>
+        "#;
+        let css = r#"
+            .navbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; padding: 8px 16px; }
+            .container-fluid { display: flex; flex-wrap: inherit; align-items: center; justify-content: space-between; width: 100%; }
+            .navbar-brand { padding-top: 5px; padding-bottom: 5px; margin-right: 16px; font-size: 20px; }
+            .navbar-nav { display: flex; flex-direction: column; padding-left: 0; margin-bottom: 0; }
+            .navbar-collapse { flex-basis: 100%; flex-grow: 1; align-items: center; }
+            .nav-link { display: block; padding: 8px; }
+            .w-100 { width: 100%; }
+            .ms-auto { margin-left: auto; }
+            @media (min-width: 992px) {
+                .navbar-expand-lg .navbar-nav { flex-direction: row; }
+                .navbar-expand-lg .navbar-collapse { display: flex; flex-basis: auto; }
+            }
+        "#;
+
+        let dom_tree = dom::parse_html(html);
+        let ss = css::parse_css(css);
+        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None, None);
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout");
+
+        let ul = find_element_by_tag(&layout, "ul").expect("ul not found");
+        assert!(ul.dimensions.width > 500.0,
+            "navbar ul should expand close to full row width, got {}",
+            ul.dimensions.width);
+
+        let items: Vec<&LayoutBox> = ul.children.iter()
+            .filter(|c| matches!(c.style_node.node.data, NodeData::Element { .. }))
+            .collect();
+        assert_eq!(items.len(), 6, "expected 6 nav items");
+
+        let y0 = items[0].dimensions.y;
+        let mut prev_right = items[0].dimensions.x + items[0].dimensions.width;
+        for (idx, item) in items.iter().enumerate().skip(1) {
+            assert!((item.dimensions.y - y0).abs() < 1.0,
+                "nav item {} should stay on the same row: y0={}, y={}",
+                idx, y0, item.dimensions.y);
+            assert!(item.dimensions.x >= prev_right - 1.0,
+                "nav item {} should not overlap the previous item: prev_right={}, x={}",
+                idx, prev_right, item.dimensions.x);
+            prev_right = item.dimensions.x + item.dimensions.width;
+        }
+
+        assert!(items[5].dimensions.x > items[0].dimensions.x + 250.0,
+            "login item should remain on the same horizontal navbar row, not collapse into the left cluster: x1={}, x6={}",
+            items[0].dimensions.x, items[5].dimensions.x);
     }
 }
