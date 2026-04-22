@@ -1,18 +1,255 @@
+use crate::css::{Unit, Value};
 use crate::style::StyledNode;
-use crate::css::{Value, Unit};
-use std::collections::HashMap;
-use markup5ever_rcdom::NodeData;
 use ab_glyph::{Font, FontRef, PxScale};
+use markup5ever_rcdom::NodeData;
+use std::collections::HashMap;
 extern crate stacker;
 
 // ── Intrinsic sizing helpers ──────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct IntrinsicSizeKey {
+    node: *const StyledNode,
+    vw: u32,
+    vh: u32,
+}
+
+struct IntrinsicSizeCache {
+    max_content: HashMap<IntrinsicSizeKey, f32>,
+    min_content: HashMap<IntrinsicSizeKey, f32>,
+}
+
+impl IntrinsicSizeCache {
+    fn new() -> Self {
+        Self {
+            max_content: HashMap::new(),
+            min_content: HashMap::new(),
+        }
+    }
+
+    fn key(sn: &StyledNode, vw: f32, vh: f32) -> IntrinsicSizeKey {
+        IntrinsicSizeKey {
+            node: sn as *const StyledNode,
+            vw: vw.to_bits(),
+            vh: vh.to_bits(),
+        }
+    }
+
+    fn max_content_width(&mut self, sn: &StyledNode, vw: f32, vh: f32) -> f32 {
+        enum Frame<'a> {
+            Pre(&'a StyledNode),
+            Post {
+                node: *const StyledNode,
+                key: IntrinsicSizeKey,
+                num_children: usize,
+                pad_border: f32,
+            },
+        }
+
+        let mut work: Vec<Frame> = vec![Frame::Pre(sn)];
+        let mut val_stack: Vec<f32> = Vec::new();
+
+        while let Some(frame) = work.pop() {
+            match frame {
+                Frame::Pre(node) => {
+                    let key = Self::key(node, vw, vh);
+                    if let Some(width) = self.max_content.get(&key) {
+                        val_stack.push(*width);
+                        continue;
+                    }
+
+                    let width = if is_none_display(node) {
+                        Some(0.0)
+                    } else if let NodeData::Text { ref contents } = node.node.data {
+                        let font_size =
+                            match node.specified_values.get(&crate::css::intern("font-size")) {
+                                Some(Value::Length(v, Unit::Px)) => *v,
+                                _ => 16.0,
+                            };
+                        Some(measure_text_width(
+                            &contents.borrow(),
+                            font_size,
+                            f32::INFINITY,
+                        ))
+                    } else {
+                        let disp = get_display_type(node);
+                        if disp == DisplayType::Image {
+                            let w = read_px_direct(node, "width");
+                            Some(if w > 0.0 { w } else { 100.0 })
+                        } else if should_skip(node) {
+                            Some(0.0)
+                        } else if let Some(Value::Length(v, Unit::Px)) =
+                            node.specified_values.get(&crate::css::intern("width"))
+                        {
+                            Some(*v)
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some(width) = width {
+                        self.max_content.insert(key, width);
+                        val_stack.push(width);
+                        continue;
+                    }
+
+                    let pad_border = horiz_padding_border(node);
+                    let non_skip: Vec<&StyledNode> =
+                        node.children.iter().filter(|c| !should_skip(c)).collect();
+                    let num_children = non_skip.len();
+
+                    work.push(Frame::Post {
+                        node: node as *const StyledNode,
+                        key,
+                        num_children,
+                        pad_border,
+                    });
+                    for child in non_skip.into_iter().rev() {
+                        work.push(Frame::Pre(child));
+                    }
+                }
+                Frame::Post {
+                    node,
+                    key,
+                    num_children,
+                    pad_border,
+                } => {
+                    let node_ref = unsafe { &*node };
+                    let non_skip_children: Vec<&StyledNode> = node_ref
+                        .children
+                        .iter()
+                        .filter(|c| !should_skip(c))
+                        .collect();
+                    let start = val_stack.len().saturating_sub(num_children);
+                    let child_vals: Vec<f32> = val_stack.drain(start..).collect();
+
+                    let mut inline_run_width: f32 = 0.0;
+                    let mut max_w: f32 = 0.0;
+                    for (child_val, child) in child_vals.into_iter().zip(non_skip_children.iter()) {
+                        let child_disp = get_display_type(child);
+                        if is_block_level(child_disp) {
+                            max_w = max_w.max(inline_run_width);
+                            inline_run_width = 0.0;
+                            max_w = max_w.max(child_val);
+                        } else {
+                            inline_run_width += child_val;
+                        }
+                    }
+                    max_w = max_w.max(inline_run_width);
+                    let width = max_w + pad_border;
+                    self.max_content.insert(key, width);
+                    val_stack.push(width);
+                }
+            }
+        }
+
+        val_stack.pop().unwrap_or(0.0)
+    }
+
+    fn min_content_width(&mut self, sn: &StyledNode, vw: f32, vh: f32) -> f32 {
+        enum Frame<'a> {
+            Pre(&'a StyledNode),
+            Post {
+                key: IntrinsicSizeKey,
+                num_children: usize,
+                pad_border: f32,
+            },
+        }
+
+        let mut work: Vec<Frame> = vec![Frame::Pre(sn)];
+        let mut val_stack: Vec<f32> = Vec::new();
+
+        while let Some(frame) = work.pop() {
+            match frame {
+                Frame::Pre(node) => {
+                    let key = Self::key(node, vw, vh);
+                    if let Some(width) = self.min_content.get(&key) {
+                        val_stack.push(*width);
+                        continue;
+                    }
+
+                    let width = if is_none_display(node) {
+                        Some(0.0)
+                    } else if let NodeData::Text { ref contents } = node.node.data {
+                        let font_size =
+                            match node.specified_values.get(&crate::css::intern("font-size")) {
+                                Some(Value::Length(v, Unit::Px)) => *v,
+                                _ => 16.0,
+                            };
+                        let text = contents.borrow();
+                        let trimmed = text.trim();
+                        if trimmed.is_empty() {
+                            Some(0.0)
+                        } else {
+                            Some(
+                                trimmed
+                                    .split_whitespace()
+                                    .map(|word| measure_text_width(word, font_size, f32::INFINITY))
+                                    .fold(0.0f32, f32::max),
+                            )
+                        }
+                    } else {
+                        let disp = get_display_type(node);
+                        if disp == DisplayType::Image {
+                            let w = read_px_direct(node, "width");
+                            Some(if w > 0.0 { w } else { 100.0 })
+                        } else if should_skip(node) {
+                            Some(0.0)
+                        } else if let Some(Value::Length(v, Unit::Px)) =
+                            node.specified_values.get(&crate::css::intern("width"))
+                        {
+                            Some(*v)
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some(width) = width {
+                        self.min_content.insert(key, width);
+                        val_stack.push(width);
+                        continue;
+                    }
+
+                    let pad_border = horiz_padding_border(node);
+                    let non_skip: Vec<&StyledNode> =
+                        node.children.iter().filter(|c| !should_skip(c)).collect();
+                    let num_children = non_skip.len();
+
+                    work.push(Frame::Post {
+                        key,
+                        num_children,
+                        pad_border,
+                    });
+                    for child in non_skip.into_iter().rev() {
+                        work.push(Frame::Pre(child));
+                    }
+                }
+                Frame::Post {
+                    key,
+                    num_children,
+                    pad_border,
+                } => {
+                    let start = val_stack.len().saturating_sub(num_children);
+                    let child_vals = val_stack.drain(start..);
+                    let width = child_vals.fold(0.0f32, f32::max) + pad_border;
+                    self.min_content.insert(key, width);
+                    val_stack.push(width);
+                }
+            }
+        }
+
+        val_stack.pop().unwrap_or(0.0)
+    }
+}
 
 /// Measure the width of `text` rendered at `font_size` px.
 /// When `wrap_width` is `f32::INFINITY`, no wrapping occurs (max-content).
 /// When finite, line-breaks at word boundaries (min-content: longest word).
 fn measure_text_width(text: &str, font_size: f32, wrap_width: f32) -> f32 {
     let trimmed = text.trim();
-    if trimmed.is_empty() { return 0.0; }
+    if trimmed.is_empty() {
+        return 0.0;
+    }
     let font = FontRef::try_from_slice(FONT_DATA).unwrap();
     let scale = PxScale::from(font_size.max(1.0));
     let units = font.units_per_em().unwrap_or(1000.0) as f32;
@@ -30,7 +267,9 @@ fn measure_text_width(text: &str, font_size: f32, wrap_width: f32) -> f32 {
             max_w = max_w.max(line_w);
             line_w = 0.0;
         }
-        if line_w > 0.0 { line_w += space_w; }
+        if line_w > 0.0 {
+            line_w += space_w;
+        }
         line_w += word_w;
     }
     max_w.max(line_w)
@@ -60,98 +299,8 @@ fn horiz_padding_border(sn: &StyledNode) -> f32 {
 /// - Block elements: max over children's max-content widths.
 /// - Inline/inline-block elements: sum of children's max-content widths on one line.
 pub fn compute_max_content_width(sn: &StyledNode, vw: f32, vh: f32) -> f32 {
-    // Iterative post-order traversal to avoid stack overflows on deep DOM trees.
-    //
-    // Frame::Pre  — process the node's early-return cases or push children + Post.
-    // Frame::Post — reconstruct the parent's inline-run / block logic from child values.
-    //
-    // `val_stack` holds computed widths; Post frames pop their children's widths and push
-    // the aggregated result.  The final answer is `val_stack[0]`.
-
-    enum Frame<'a> {
-        Pre(&'a StyledNode),
-        /// Carries metadata needed to reconstruct the inline-run accumulation:
-        ///   - node pointer for re-deriving child display types
-        ///   - number of non-skipped children whose values are on `val_stack`
-        ///   - pad_border offset for the parent
-        Post {
-            node: *const StyledNode,
-            num_children: usize,
-            pad_border: f32,
-        },
-    }
-
-    let mut work: Vec<Frame> = vec![Frame::Pre(sn)];
-    let mut val_stack: Vec<f32> = Vec::new();
-
-    while let Some(frame) = work.pop() {
-        match frame {
-            Frame::Pre(node) => {
-                if is_none_display(node) { val_stack.push(0.0); continue; }
-
-                if let NodeData::Text { ref contents } = node.node.data {
-                    let font_size = match node.specified_values.get(&crate::css::intern("font-size")) {
-                        Some(Value::Length(v, Unit::Px)) => *v,
-                        _ => 16.0,
-                    };
-                    val_stack.push(measure_text_width(&contents.borrow(), font_size, f32::INFINITY));
-                    continue;
-                }
-
-                let disp = get_display_type(node);
-                if disp == DisplayType::Image {
-                    let w = read_px_direct(node, "width");
-                    val_stack.push(if w > 0.0 { w } else { 100.0 });
-                    continue;
-                }
-                if should_skip(node) { val_stack.push(0.0); continue; }
-                if let Some(Value::Length(v, Unit::Px)) = node.specified_values.get(&crate::css::intern("width")) {
-                    val_stack.push(*v);
-                    continue;
-                }
-
-                let pad_border = horiz_padding_border(node);
-                let non_skip: Vec<&StyledNode> = node.children.iter().filter(|c| !should_skip(c)).collect();
-                let num_children = non_skip.len();
-
-                // Push Post before children so it processes AFTER all children are done.
-                work.push(Frame::Post { node: node as *const StyledNode, num_children, pad_border });
-                for child in non_skip.into_iter().rev() {
-                    work.push(Frame::Pre(child));
-                }
-            }
-            Frame::Post { node, num_children, pad_border } => {
-                // Re-derive children display types from the stored node pointer.
-                // SAFETY: `node` was derived from a reference that outlives this call,
-                // and we only read it (no mutation), so this is safe.
-                let node_ref = unsafe { &*node };
-                let non_skip_children: Vec<&StyledNode> = node_ref.children.iter()
-                    .filter(|c| !should_skip(c))
-                    .collect();
-
-                // Pop child values in forward order (they were pushed in reverse → LIFO gives forward).
-                let start = val_stack.len().saturating_sub(num_children);
-                let child_vals: Vec<f32> = val_stack.drain(start..).collect();
-
-                let mut inline_run_width: f32 = 0.0;
-                let mut max_w: f32 = 0.0;
-                for (child_val, child) in child_vals.into_iter().zip(non_skip_children.iter()) {
-                    let child_disp = get_display_type(child);
-                    if is_block_level(child_disp) {
-                        max_w = max_w.max(inline_run_width);
-                        inline_run_width = 0.0;
-                        max_w = max_w.max(child_val);
-                    } else {
-                        inline_run_width += child_val;
-                    }
-                }
-                max_w = max_w.max(inline_run_width);
-                val_stack.push(max_w + pad_border);
-            }
-        }
-    }
-
-    val_stack.pop().unwrap_or(0.0)
+    let mut cache = IntrinsicSizeCache::new();
+    cache.max_content_width(sn, vw, vh)
 }
 
 /// Compute the **min-content** width of a `StyledNode` subtree.
@@ -161,91 +310,51 @@ pub fn compute_max_content_width(sn: &StyledNode, vw: f32, vh: f32) -> f32 {
 /// - `display: none`: 0.
 /// - All elements: max over children's min-content widths (wrapping can isolate any child).
 pub fn compute_min_content_width(sn: &StyledNode, vw: f32, vh: f32) -> f32 {
-    // Iterative approach to avoid stack overflows.
-    enum Frame<'a> {
-        Pre(&'a StyledNode),
-        Post { num_children: usize, pad_border: f32 },
-    }
-
-    let mut work: Vec<Frame> = vec![Frame::Pre(sn)];
-    let mut val_stack: Vec<f32> = Vec::new();
-
-    while let Some(frame) = work.pop() {
-        match frame {
-            Frame::Pre(node) => {
-                if is_none_display(node) { val_stack.push(0.0); continue; }
-
-                if let NodeData::Text { ref contents } = node.node.data {
-                    let font_size = match node.specified_values.get(&crate::css::intern("font-size")) {
-                        Some(Value::Length(v, Unit::Px)) => *v,
-                        _ => 16.0,
-                    };
-                    let text = contents.borrow();
-                    let trimmed = text.trim();
-                    if trimmed.is_empty() {
-                        val_stack.push(0.0);
-                    } else {
-                        let min_w = trimmed.split_whitespace()
-                            .map(|word| measure_text_width(word, font_size, f32::INFINITY))
-                            .fold(0.0f32, f32::max);
-                        val_stack.push(min_w);
-                    }
-                    continue;
-                }
-
-                let disp = get_display_type(node);
-                if disp == DisplayType::Image {
-                    let w = read_px_direct(node, "width");
-                    val_stack.push(if w > 0.0 { w } else { 100.0 });
-                    continue;
-                }
-                if should_skip(node) { val_stack.push(0.0); continue; }
-                if let Some(Value::Length(v, Unit::Px)) = node.specified_values.get(&crate::css::intern("width")) {
-                    val_stack.push(*v);
-                    continue;
-                }
-
-                let pad_border = horiz_padding_border(node);
-                let non_skip: Vec<&StyledNode> = node.children.iter().filter(|c| !should_skip(c)).collect();
-                let num_children = non_skip.len();
-
-                work.push(Frame::Post { num_children, pad_border });
-                for child in non_skip.into_iter().rev() {
-                    work.push(Frame::Pre(child));
-                }
-            }
-            Frame::Post { num_children, pad_border } => {
-                let start = val_stack.len().saturating_sub(num_children);
-                let child_vals = val_stack.drain(start..);
-                let max_child = child_vals.fold(0.0f32, f32::max);
-                val_stack.push(max_child + pad_border);
-            }
-        }
-    }
-
-    val_stack.pop().unwrap_or(0.0)
+    let mut cache = IntrinsicSizeCache::new();
+    cache.min_content_width(sn, vw, vh)
 }
 
 fn is_shrink_wrap(d: DisplayType) -> bool {
-    matches!(d, DisplayType::InlineBlock | DisplayType::Table | DisplayType::TableCell | DisplayType::Image)
+    matches!(
+        d,
+        DisplayType::InlineBlock | DisplayType::Table | DisplayType::TableCell | DisplayType::Image
+    )
 }
 
 // ── Float layout types ────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum FloatSide { Left, Right }
+enum FloatSide {
+    Left,
+    Right,
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum ClearValue { Left, Right, Both }
+enum ClearValue {
+    Left,
+    Right,
+    Both,
+}
 
 #[derive(Clone, Debug)]
-struct FloatArea { y: f32, height: f32, width: f32, side: FloatSide }
+struct FloatArea {
+    y: f32,
+    height: f32,
+    width: f32,
+    side: FloatSide,
+}
 
-struct FloatContext { areas: Vec<FloatArea>, container_width: f32 }
+struct FloatContext {
+    areas: Vec<FloatArea>,
+    container_width: f32,
+}
 
 impl FloatContext {
     fn new(container_width: f32) -> Self {
-        FloatContext { areas: vec![], container_width }
+        FloatContext {
+            areas: vec![],
+            container_width,
+        }
     }
     /// Returns (avail_width, left_indent) for a horizontal band at y..y+max(h,1).
     fn available_at(&self, y: f32, h: f32) -> (f32, f32) {
@@ -255,7 +364,7 @@ impl FloatContext {
         for fa in &self.areas {
             if fa.y < y + band && fa.y + fa.height > y {
                 match fa.side {
-                    FloatSide::Left  => left_w  += fa.width,
+                    FloatSide::Left => left_w += fa.width,
                     FloatSide::Right => right_w += fa.width,
                 }
             }
@@ -265,20 +374,26 @@ impl FloatContext {
     }
     /// Minimum y to be completely clear of floats on the given side.
     fn clear_y(&self, cv: ClearValue) -> f32 {
-        self.areas.iter()
+        self.areas
+            .iter()
             .filter(|fa| match cv {
-                ClearValue::Left  => fa.side == FloatSide::Left,
+                ClearValue::Left => fa.side == FloatSide::Left,
                 ClearValue::Right => fa.side == FloatSide::Right,
-                ClearValue::Both  => true,
+                ClearValue::Both => true,
             })
             .map(|fa| fa.y + fa.height)
             .fold(0.0f32, f32::max)
     }
     /// Bottom edge of the lowest registered float.
     fn bottom(&self) -> f32 {
-        self.areas.iter().map(|fa| fa.y + fa.height).fold(0.0f32, f32::max)
+        self.areas
+            .iter()
+            .map(|fa| fa.y + fa.height)
+            .fold(0.0f32, f32::max)
     }
-    fn add(&mut self, area: FloatArea) { self.areas.push(area); }
+    fn add(&mut self, area: FloatArea) {
+        self.areas.push(area);
+    }
 }
 
 const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/NanumGothic.ttf");
@@ -355,7 +470,10 @@ impl<'a> Clone for LayoutBox<'a> {
             /// Pointer to a source node that still needs to be cloned.
             Pre(*const LayoutBox<'f>),
             /// A partially-built clone waiting for its children.
-            Post { num_children: usize, partial: LayoutBox<'f> },
+            Post {
+                num_children: usize,
+                partial: LayoutBox<'f>,
+            },
         }
 
         let mut work: Vec<Frame<'a>> = vec![Frame::Pre(self as *const LayoutBox<'a>)];
@@ -383,13 +501,19 @@ impl<'a> Clone for LayoutBox<'a> {
                     };
                     let num_children = src.children.len();
                     // Push Post first so it is processed after all children.
-                    work.push(Frame::Post { num_children, partial });
+                    work.push(Frame::Post {
+                        num_children,
+                        partial,
+                    });
                     // Push children in reverse so the first child is popped first.
                     for child in src.children.iter().rev() {
                         work.push(Frame::Pre(child as *const LayoutBox<'a>));
                     }
                 }
-                Frame::Post { num_children, mut partial } => {
+                Frame::Post {
+                    num_children,
+                    mut partial,
+                } => {
                     // Drain the last num_children cloned nodes from result_stack.
                     let start = result_stack.len().saturating_sub(num_children);
                     partial.children = result_stack.drain(start..).collect();
@@ -398,7 +522,9 @@ impl<'a> Clone for LayoutBox<'a> {
             }
         }
 
-        result_stack.pop().expect("LayoutBox::clone: result stack must have exactly one element")
+        result_stack
+            .pop()
+            .expect("LayoutBox::clone: result stack must have exactly one element")
     }
 }
 
@@ -455,7 +581,18 @@ pub fn build_layout_tree<'a>(
     vw: f32,
     vh: f32,
 ) -> (Option<LayoutBox<'a>>, f32, f32) {
-    build_layout_tree_with_cb(style_node, container_start_x, current_x, current_y, container_width, vw, vh, None)
+    let mut intrinsic_cache = IntrinsicSizeCache::new();
+    build_layout_tree_with_cb_cached(
+        style_node,
+        container_start_x,
+        current_x,
+        current_y,
+        container_width,
+        vw,
+        vh,
+        None,
+        &mut intrinsic_cache,
+    )
 }
 
 /// Internal variant that threads the nearest positioned ancestor rect (containing block)
@@ -473,6 +610,31 @@ pub fn build_layout_tree_with_cb<'a>(
     vh: f32,
     containing_block: Option<Rect>,
 ) -> (Option<LayoutBox<'a>>, f32, f32) {
+    let mut intrinsic_cache = IntrinsicSizeCache::new();
+    build_layout_tree_with_cb_cached(
+        style_node,
+        container_start_x,
+        current_x,
+        current_y,
+        container_width,
+        vw,
+        vh,
+        containing_block,
+        &mut intrinsic_cache,
+    )
+}
+
+fn build_layout_tree_with_cb_cached<'a>(
+    style_node: &'a StyledNode,
+    container_start_x: f32,
+    current_x: f32,
+    current_y: f32,
+    container_width: f32,
+    vw: f32,
+    vh: f32,
+    containing_block: Option<Rect>,
+    intrinsic_cache: &mut IntrinsicSizeCache,
+) -> (Option<LayoutBox<'a>>, f32, f32) {
     // Guard against stack overflow on deeply nested DOM trees.
     // Allocate a fresh 64 MiB stack segment when less than 512 KiB remains.
     // A single large segment is more reliable than many chained small segments;
@@ -483,14 +645,26 @@ pub fn build_layout_tree_with_cb<'a>(
             return (None, current_x, current_y);
         }
         layout.measure_box_model(container_width, vw, vh);
-        layout.perform_layout(container_start_x, current_x, current_y, container_width, vw, vh, containing_block)
+        layout.perform_layout(
+            container_start_x,
+            current_x,
+            current_y,
+            container_width,
+            vw,
+            vh,
+            containing_block,
+            intrinsic_cache,
+        )
     })
 }
 
 impl<'a> LayoutBox<'a> {
     fn new(style_node: &'a StyledNode) -> Self {
         let display = get_display_type(style_node);
-        let z_index = match style_node.specified_values.get(&crate::css::intern("z-index")) {
+        let z_index = match style_node
+            .specified_values
+            .get(&crate::css::intern("z-index"))
+        {
             Some(Value::Number(n)) => *n as i32,
             _ => 0,
         };
@@ -511,7 +685,12 @@ impl<'a> LayoutBox<'a> {
             position,
         };
 
-        if let NodeData::Element { ref attrs, ref name, .. } = style_node.node.data {
+        if let NodeData::Element {
+            ref attrs,
+            ref name,
+            ..
+        } = style_node.node.data
+        {
             let tag = name.local.to_string();
             for attr in attrs.borrow().iter() {
                 let name = attr.name.local.to_string();
@@ -520,7 +699,9 @@ impl<'a> LayoutBox<'a> {
                     "href" if tag == "a" => layout.link_url = Some(value),
                     "src" if tag == "img" => layout.image_url = Some(value),
                     "alt" if tag == "img" => layout.alt_text = Some(value),
-                    "onclick" => { layout.event_handlers.insert("click".to_string(), value); }
+                    "onclick" => {
+                        layout.event_handlers.insert("click".to_string(), value);
+                    }
                     _ => {}
                 }
             }
@@ -541,13 +722,24 @@ impl<'a> LayoutBox<'a> {
 
         let b_width = match sn.specified_values.get(&crate::css::intern("border-width")) {
             Some(Value::Length(v, Unit::Px)) => *v,
-            _ => if self.display == DisplayType::Input { 1.0 } else { 0.0 },
+            _ => {
+                if self.display == DisplayType::Input {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
         };
-        self.border = EdgeSizes { left: b_width, right: b_width, top: b_width, bottom: b_width };
+        self.border = EdgeSizes {
+            left: b_width,
+            right: b_width,
+            top: b_width,
+            bottom: b_width,
+        };
     }
 
     fn perform_layout(
-        &mut self,
+        mut self,
         container_start_x: f32,
         initial_x: f32,
         mut current_y: f32,
@@ -555,44 +747,49 @@ impl<'a> LayoutBox<'a> {
         vw: f32,
         vh: f32,
         containing_block: Option<Rect>,
+        intrinsic_cache: &mut IntrinsicSizeCache,
     ) -> (Option<LayoutBox<'a>>, f32, f32) {
         let is_block = is_block_level(self.display);
-        
+
         // Block formatting context or similar check
         if is_block && initial_x > container_start_x {
             current_y += 5.0; // Break line before block
         }
 
-        let mut width = match self.style_node.specified_values.get(&crate::css::intern("width")) {
+        let mut width = match self
+            .style_node
+            .specified_values
+            .get(&crate::css::intern("width"))
+        {
             Some(Value::Length(v, Unit::Px)) => *v,
             Some(Value::Length(v, Unit::Percent)) => container_width * (v / 100.0),
             Some(Value::Length(v, Unit::Vw)) => vw * (v / 100.0),
             Some(Value::Length(v, Unit::Vh)) => vh * (v / 100.0),
             // CSS Intrinsic & Extrinsic Sizing Level 3
             Some(Value::Keyword(k)) if **k == *"min-content" => {
-                compute_min_content_width(self.style_node, vw, vh)
+                intrinsic_cache.min_content_width(self.style_node, vw, vh)
             }
             Some(Value::Keyword(k)) if **k == *"max-content" => {
-                compute_max_content_width(self.style_node, vw, vh)
+                intrinsic_cache.max_content_width(self.style_node, vw, vh)
             }
             Some(Value::Keyword(k)) if **k == *"fit-content" => {
-                let max_c = compute_max_content_width(self.style_node, vw, vh);
-                let min_c = compute_min_content_width(self.style_node, vw, vh);
+                let max_c = intrinsic_cache.max_content_width(self.style_node, vw, vh);
+                let min_c = intrinsic_cache.min_content_width(self.style_node, vw, vh);
                 // fit-content without argument: min(max-content, max(min-content, available))
                 max_c.min(container_width).max(min_c)
             }
             Some(Value::FitContent(limit)) => {
                 let limit = *limit;
-                let max_c = compute_max_content_width(self.style_node, vw, vh);
-                let min_c = compute_min_content_width(self.style_node, vw, vh);
+                let max_c = intrinsic_cache.max_content_width(self.style_node, vw, vh);
+                let min_c = intrinsic_cache.min_content_width(self.style_node, vw, vh);
                 // fit-content(N): min(max-content, max(min-content, min(available, N)))
                 let available = container_width.min(limit);
                 max_c.min(available).max(min_c)
             }
             _ => {
                 if is_shrink_wrap(self.display) {
-                    let max_c = compute_max_content_width(self.style_node, vw, vh);
-                    let min_c = compute_min_content_width(self.style_node, vw, vh);
+                    let max_c = intrinsic_cache.max_content_width(self.style_node, vw, vh);
+                    let min_c = intrinsic_cache.min_content_width(self.style_node, vw, vh);
                     // Shrink-wrap: min(max-content, max(min-content, available))
                     max_c.min(container_width).max(min_c)
                 } else if is_block {
@@ -603,22 +800,55 @@ impl<'a> LayoutBox<'a> {
             }
         };
 
-        let box_sizing = self.style_node.specified_values.get(&crate::css::intern("box-sizing"))
-            .and_then(|v| if let Value::Keyword(k) = v { Some(&**k) } else { None })
+        let box_sizing = self
+            .style_node
+            .specified_values
+            .get(&crate::css::intern("box-sizing"))
+            .and_then(|v| {
+                if let Value::Keyword(k) = v {
+                    Some(&**k)
+                } else {
+                    None
+                }
+            })
             .unwrap_or("content-box");
 
         if box_sizing == "border-box" && width > 0.0 {
-            width = (width - self.padding.left - self.padding.right - self.border.left - self.border.right).max(0.0);
+            width = (width
+                - self.padding.left
+                - self.padding.right
+                - self.border.left
+                - self.border.right)
+                .max(0.0);
         }
 
-        if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get(&crate::css::intern("max-width")) { width = width.min(*v); }
-        if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get(&crate::css::intern("min-width")) { width = width.max(*v); }
+        if let Some(Value::Length(v, Unit::Px)) = self
+            .style_node
+            .specified_values
+            .get(&crate::css::intern("max-width"))
+        {
+            width = width.min(*v);
+        }
+        if let Some(Value::Length(v, Unit::Px)) = self
+            .style_node
+            .specified_values
+            .get(&crate::css::intern("min-width"))
+        {
+            width = width.max(*v);
+        }
 
         if is_block && width < container_width {
             let mut is_auto = false;
             for prop in ["margin", "margin-left", "margin-right"] {
-                if let Some(Value::Keyword(s)) = self.style_node.specified_values.get(&crate::css::intern(prop)) {
-                    if s.contains("auto") { is_auto = true; break; }
+                if let Some(Value::Keyword(s)) = self
+                    .style_node
+                    .specified_values
+                    .get(&crate::css::intern(prop))
+                {
+                    if s.contains("auto") {
+                        is_auto = true;
+                        break;
+                    }
                 }
             }
             if is_auto {
@@ -632,7 +862,11 @@ impl<'a> LayoutBox<'a> {
         self.dimensions.y = current_y + self.margin.top;
         self.dimensions.width = width;
 
-        let height = match self.style_node.specified_values.get(&crate::css::intern("height")) {
+        let height = match self
+            .style_node
+            .specified_values
+            .get(&crate::css::intern("height"))
+        {
             Some(Value::Length(v, Unit::Px)) => *v,
             Some(Value::Length(v, Unit::Vw)) => vw * (v / 100.0),
             Some(Value::Length(v, Unit::Vh)) => vh * (v / 100.0),
@@ -640,7 +874,11 @@ impl<'a> LayoutBox<'a> {
             // For block containers, min-content and max-content height are both
             // equivalent to the natural auto height (content-derived). Return 0.0
             // so the existing content-height calculation takes over.
-            Some(Value::Keyword(k)) if **k == *"min-content" || **k == *"max-content" || **k == *"fit-content" => 0.0,
+            Some(Value::Keyword(k))
+                if **k == *"min-content" || **k == *"max-content" || **k == *"fit-content" =>
+            {
+                0.0
+            }
             Some(Value::FitContent(_)) => 0.0,
             _ => 0.0,
         };
@@ -652,7 +890,12 @@ impl<'a> LayoutBox<'a> {
             } else {
                 container_width
             };
-            return self.layout_text(contents.borrow().to_string(), initial_x, current_y, available_width);
+            return self.layout_text(
+                contents.borrow().to_string(),
+                initial_x,
+                current_y,
+                available_width,
+            );
         }
 
         // Image sizing: images need explicit dimension handling before child layout.
@@ -667,14 +910,27 @@ impl<'a> LayoutBox<'a> {
                 self.dimensions.width = 150.0_f32.min(container_width);
             }
             // Use CSS height if specified; otherwise derive a 2:3 placeholder from width.
-            let final_h = if height > 0.0 { height } else { self.dimensions.width * 0.667 };
+            let final_h = if height > 0.0 {
+                height
+            } else {
+                self.dimensions.width * 0.667
+            };
             self.dimensions.height = final_h.max(1.0);
             let final_x = self.dimensions.x + self.dimensions.width + self.margin.right;
             let final_y = self.dimensions.y + self.dimensions.height + self.margin.bottom;
-            return (Some(self.clone()), final_x, final_y);
+            return (Some(self), final_x, final_y);
         }
 
-        let inner_width = if width > 0.0 { width } else { (container_width - self.padding.left - self.padding.right - self.border.left - self.border.right).max(0.0) };
+        let inner_width = if width > 0.0 {
+            width
+        } else {
+            (container_width
+                - self.padding.left
+                - self.padding.right
+                - self.border.left
+                - self.border.right)
+                .max(0.0)
+        };
         let mut child_y = self.dimensions.y + self.padding.top + self.border.top;
         let mut max_child_x = self.dimensions.x;
 
@@ -682,51 +938,117 @@ impl<'a> LayoutBox<'a> {
         // Must appear before Flex and the main layout loop so both can access child_cb.
         let self_establishes_cb = matches!(
             self.position,
-            PositionType::Relative | PositionType::Absolute | PositionType::Fixed | PositionType::Sticky
+            PositionType::Relative
+                | PositionType::Absolute
+                | PositionType::Fixed
+                | PositionType::Sticky
         );
-        let viewport_rect = Rect { x: 0.0, y: 0.0, width: vw, height: vh };
+        let viewport_rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: vw,
+            height: vh,
+        };
         let self_cb_rect = Rect {
             x: self.dimensions.x + self.padding.left + self.border.left,
-            y: self.dimensions.y + self.padding.top  + self.border.top,
-            width:  (self.dimensions.width  - self.padding.left - self.padding.right
-                     - self.border.left - self.border.right).max(0.0),
+            y: self.dimensions.y + self.padding.top + self.border.top,
+            width: (self.dimensions.width
+                - self.padding.left
+                - self.padding.right
+                - self.border.left
+                - self.border.right)
+                .max(0.0),
             height: 0.0, // height not finalised yet
         };
-        let child_cb = if self_establishes_cb { Some(self_cb_rect) } else { containing_block };
+        let child_cb = if self_establishes_cb {
+            Some(self_cb_rect)
+        } else {
+            containing_block
+        };
 
         if self.display == DisplayType::Flex {
             // ── Read flex container properties ────────────────────────────────
-            let flex_direction = self.style_node.specified_values.get(&crate::css::intern("flex-direction"))
-                .and_then(|v| if let Value::Keyword(k) = v { Some(&**k) } else { None })
+            let flex_direction = self
+                .style_node
+                .specified_values
+                .get(&crate::css::intern("flex-direction"))
+                .and_then(|v| {
+                    if let Value::Keyword(k) = v {
+                        Some(&**k)
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or("row");
             let is_row = flex_direction == "row" || flex_direction == "row-reverse";
-            let justify = self.style_node.specified_values.get(&crate::css::intern("justify-content"))
-                .and_then(|v| if let Value::Keyword(k) = v { Some(&**k) } else { None })
+            let justify = self
+                .style_node
+                .specified_values
+                .get(&crate::css::intern("justify-content"))
+                .and_then(|v| {
+                    if let Value::Keyword(k) = v {
+                        Some(&**k)
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or("flex-start");
-            let align_items = self.style_node.specified_values.get(&crate::css::intern("align-items"))
-                .and_then(|v| if let Value::Keyword(k) = v { Some(&**k) } else { None })
+            let align_items = self
+                .style_node
+                .specified_values
+                .get(&crate::css::intern("align-items"))
+                .and_then(|v| {
+                    if let Value::Keyword(k) = v {
+                        Some(&**k)
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or("stretch");
-            let flex_wrap = self.style_node.specified_values.get(&crate::css::intern("flex-wrap"))
-                .and_then(|v| if let Value::Keyword(k) = v { Some(&**k) } else { None })
+            let flex_wrap = self
+                .style_node
+                .specified_values
+                .get(&crate::css::intern("flex-wrap"))
+                .and_then(|v| {
+                    if let Value::Keyword(k) = v {
+                        Some(&**k)
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or("nowrap");
             let do_wrap = flex_wrap == "wrap" || flex_wrap == "wrap-reverse";
 
             // gap / row-gap / column-gap
-            let col_gap = match self.style_node.specified_values.get(&crate::css::intern("column-gap"))
-                .or_else(|| self.style_node.specified_values.get(&crate::css::intern("gap"))) {
+            let col_gap = match self
+                .style_node
+                .specified_values
+                .get(&crate::css::intern("column-gap"))
+                .or_else(|| {
+                    self.style_node
+                        .specified_values
+                        .get(&crate::css::intern("gap"))
+                }) {
                 Some(Value::Length(v, Unit::Px)) => *v,
-                Some(Value::Number(v))            => *v,
+                Some(Value::Number(v)) => *v,
                 _ => 0.0,
             };
-            let row_gap = match self.style_node.specified_values.get(&crate::css::intern("row-gap"))
-                .or_else(|| self.style_node.specified_values.get(&crate::css::intern("gap"))) {
+            let row_gap = match self
+                .style_node
+                .specified_values
+                .get(&crate::css::intern("row-gap"))
+                .or_else(|| {
+                    self.style_node
+                        .specified_values
+                        .get(&crate::css::intern("gap"))
+                }) {
                 Some(Value::Length(v, Unit::Px)) => *v,
-                Some(Value::Number(v))            => *v,
+                Some(Value::Number(v)) => *v,
                 _ => 0.0,
             };
             // For a row flex container the gap between items on the main axis is col_gap;
             // for a column container it is row_gap.
-            let main_gap  = if is_row { col_gap } else { row_gap };
+            let main_gap = if is_row { col_gap } else { row_gap };
             let cross_gap = if is_row { row_gap } else { col_gap };
 
             // ── Measure all flex children ─────────────────────────────────────
@@ -734,16 +1056,18 @@ impl<'a> LayoutBox<'a> {
             // We store (LayoutBox, flex-grow, flex-shrink, align-self, order).
             struct FlexItem<'fi> {
                 cb: LayoutBox<'fi>,
-                grow:       f32,
-                shrink:     f32,
+                grow: f32,
+                shrink: f32,
                 align_self: Option<&'fi str>,
-                order:      i32,
+                order: i32,
             }
 
             let mut raw_items: Vec<FlexItem<'_>> = Vec::new();
 
             for child_node in &self.style_node.children {
-                if should_skip(child_node) { continue; }
+                if should_skip(child_node) {
+                    continue;
+                }
                 // For row flex containers, block-level items must not stretch to fill the
                 // container width — per CSS spec, flex items use their "hypothetical main size"
                 // which is their max-content width when no explicit width is set.  Passing
@@ -751,17 +1075,35 @@ impl<'a> LayoutBox<'a> {
                 // (`container_width - margins`) to produce the correct shrink-wrapped size.
                 // Column flex containers still pass inner_width so block children stretch normally.
                 let child_has_explicit_width = matches!(
-                    child_node.specified_values.get(&crate::css::intern("width")),
-                    Some(Value::Length(_, _)) | Some(Value::Keyword(_)) | Some(Value::FitContent(_))
+                    child_node
+                        .specified_values
+                        .get(&crate::css::intern("width")),
+                    Some(Value::Length(_, _))
+                        | Some(Value::Keyword(_))
+                        | Some(Value::FitContent(_))
                 );
                 let child_display = get_display_type(child_node);
-                let measure_width = if is_row && is_block_level(child_display) && !child_has_explicit_width {
-                    // Shrink-wrap: use max-content so block items don't fill the flex container.
-                    compute_max_content_width(child_node, vw, vh).min(inner_width).max(0.0)
-                } else {
-                    inner_width
-                };
-                let (cb_opt, _, _) = build_layout_tree_with_cb(child_node, 0.0, 0.0, 0.0, measure_width, vw, vh, child_cb);
+                let measure_width =
+                    if is_row && is_block_level(child_display) && !child_has_explicit_width {
+                        // Shrink-wrap: use max-content so block items don't fill the flex container.
+                        intrinsic_cache
+                            .max_content_width(child_node, vw, vh)
+                            .min(inner_width)
+                            .max(0.0)
+                    } else {
+                        inner_width
+                    };
+                let (cb_opt, _, _) = build_layout_tree_with_cb_cached(
+                    child_node,
+                    0.0,
+                    0.0,
+                    0.0,
+                    measure_width,
+                    vw,
+                    vh,
+                    child_cb,
+                    intrinsic_cache,
+                );
                 if let Some(mut cb) = cb_opt {
                     if cb.dimensions.width > inner_width {
                         cb.dimensions.width = inner_width;
@@ -770,24 +1112,58 @@ impl<'a> LayoutBox<'a> {
                     // an intrinsic size so they participate correctly in the flex algorithm.
                     // Use max-content width capped to inner_width as the shrink-wrap fallback.
                     if cb.dimensions.width == 0.0 {
-                        let max_c = compute_max_content_width(child_node, vw, vh);
+                        let max_c = intrinsic_cache.max_content_width(child_node, vw, vh);
                         cb.dimensions.width = max_c.min(inner_width).max(0.0);
                     }
-                    let grow = child_node.specified_values.get(&crate::css::intern("flex-grow"))
-                        .and_then(|v| if let Value::Number(n) = v { Some(*n) } else { None })
+                    let grow = child_node
+                        .specified_values
+                        .get(&crate::css::intern("flex-grow"))
+                        .and_then(|v| {
+                            if let Value::Number(n) = v {
+                                Some(*n)
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or(0.0);
-                    let shrink = child_node.specified_values.get(&crate::css::intern("flex-shrink"))
-                        .and_then(|v| if let Value::Number(n) = v { Some(*n) } else { None })
+                    let shrink = child_node
+                        .specified_values
+                        .get(&crate::css::intern("flex-shrink"))
+                        .and_then(|v| {
+                            if let Value::Number(n) = v {
+                                Some(*n)
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or(1.0);
                     // align-self: the keyword stored as a &str tied to the child's Arc<str> lifetime.
                     // We keep it as Option<&str> borrowed from the child_node's map.
-                    let align_self: Option<&str> = child_node.specified_values
+                    let align_self: Option<&str> = child_node
+                        .specified_values
                         .get(&crate::css::intern("align-self"))
-                        .and_then(|v| if let Value::Keyword(k) = v { Some(&**k) } else { None });
-                    let order = child_node.specified_values.get(&crate::css::intern("order"))
-                        .and_then(|v| match v { Value::Number(n) => Some(*n as i32), _ => None })
+                        .and_then(|v| {
+                            if let Value::Keyword(k) = v {
+                                Some(&**k)
+                            } else {
+                                None
+                            }
+                        });
+                    let order = child_node
+                        .specified_values
+                        .get(&crate::css::intern("order"))
+                        .and_then(|v| match v {
+                            Value::Number(n) => Some(*n as i32),
+                            _ => None,
+                        })
                         .unwrap_or(0);
-                    raw_items.push(FlexItem { cb, grow, shrink, align_self, order });
+                    raw_items.push(FlexItem {
+                        cb,
+                        grow,
+                        shrink,
+                        align_self,
+                        order,
+                    });
                 }
             }
 
@@ -795,13 +1171,19 @@ impl<'a> LayoutBox<'a> {
             raw_items.sort_by_key(|item| item.order);
 
             // ── Helper: compute main/cross size of a laid-out box ─────────────
-            let main_size  = |cb: &LayoutBox<'_>| -> f32 {
-                if is_row { cb.dimensions.width  + cb.margin.left + cb.margin.right  }
-                else      { cb.dimensions.height + cb.margin.top  + cb.margin.bottom }
+            let main_size = |cb: &LayoutBox<'_>| -> f32 {
+                if is_row {
+                    cb.dimensions.width + cb.margin.left + cb.margin.right
+                } else {
+                    cb.dimensions.height + cb.margin.top + cb.margin.bottom
+                }
             };
             let cross_size = |cb: &LayoutBox<'_>| -> f32 {
-                if is_row { cb.dimensions.height + cb.margin.top  + cb.margin.bottom }
-                else      { cb.dimensions.width  + cb.margin.left + cb.margin.right  }
+                if is_row {
+                    cb.dimensions.height + cb.margin.top + cb.margin.bottom
+                } else {
+                    cb.dimensions.width + cb.margin.left + cb.margin.right
+                }
             };
 
             // ── Build flex lines (wrapping) ────────────────────────────────────
@@ -826,25 +1208,32 @@ impl<'a> LayoutBox<'a> {
                 for (i, item) in raw_items.iter().enumerate() {
                     let item_main = main_size(&item.cb);
                     let gap_contribution = if cur_line.is_empty() { 0.0 } else { main_gap };
-                    if do_wrap && !cur_line.is_empty() && line_main + gap_contribution + item_main > main_container_size {
+                    if do_wrap
+                        && !cur_line.is_empty()
+                        && line_main + gap_contribution + item_main > main_container_size
+                    {
                         lines.push(std::mem::take(&mut cur_line));
                         line_main = 0.0;
                     }
-                    if !cur_line.is_empty() { line_main += main_gap; }
+                    if !cur_line.is_empty() {
+                        line_main += main_gap;
+                    }
                     line_main += item_main;
                     cur_line.push(i);
                 }
-                if !cur_line.is_empty() { lines.push(cur_line); }
+                if !cur_line.is_empty() {
+                    lines.push(cur_line);
+                }
             }
 
             // ── Lay out each line ─────────────────────────────────────────────
-            let container_main_start  = if is_row {
+            let container_main_start = if is_row {
                 self.dimensions.x + self.padding.left + self.border.left
             } else {
-                self.dimensions.y + self.padding.top  + self.border.top
+                self.dimensions.y + self.padding.top + self.border.top
             };
             let container_cross_start = if is_row {
-                self.dimensions.y + self.padding.top  + self.border.top
+                self.dimensions.y + self.padding.top + self.border.top
             } else {
                 self.dimensions.x + self.padding.left + self.border.left
             };
@@ -852,7 +1241,8 @@ impl<'a> LayoutBox<'a> {
             let mut cross_cursor = 0.0f32; // offset within the container's cross axis
 
             for line_indices in &lines {
-                let initial_line_mains: Vec<f32> = line_indices.iter()
+                let initial_line_mains: Vec<f32> = line_indices
+                    .iter()
                     .map(|&i| {
                         if is_row {
                             raw_items[i].cb.dimensions.width
@@ -863,25 +1253,45 @@ impl<'a> LayoutBox<'a> {
                     .collect();
 
                 // Compute total main size + gaps for this line.
-                let gaps_total = if line_indices.len() > 1 { main_gap * (line_indices.len() - 1) as f32 } else { 0.0 };
-                let line_total_main: f32 = line_indices.iter().map(|&i| main_size(&raw_items[i].cb)).sum::<f32>() + gaps_total;
+                let gaps_total = if line_indices.len() > 1 {
+                    main_gap * (line_indices.len() - 1) as f32
+                } else {
+                    0.0
+                };
+                let line_total_main: f32 = line_indices
+                    .iter()
+                    .map(|&i| main_size(&raw_items[i].cb))
+                    .sum::<f32>()
+                    + gaps_total;
                 // When main_container_size is INFINITY (auto-height column), there is no
                 // definite container size: free space is 0 and deficit is 0.
-                let free = if main_container_size.is_infinite() { 0.0 } else { (main_container_size - line_total_main).max(0.0) };
-                let deficit = if main_container_size.is_infinite() { 0.0 } else { (line_total_main - main_container_size).max(0.0) };
+                let free = if main_container_size.is_infinite() {
+                    0.0
+                } else {
+                    (main_container_size - line_total_main).max(0.0)
+                };
+                let deficit = if main_container_size.is_infinite() {
+                    0.0
+                } else {
+                    (line_total_main - main_container_size).max(0.0)
+                };
 
                 // Flex-grow distribution (only if there is free space).
                 let total_grow: f32 = line_indices.iter().map(|&i| raw_items[i].grow).sum();
                 if free > 0.0 && total_grow > 0.0 {
                     for &i in line_indices {
                         let share = (raw_items[i].grow / total_grow) * free;
-                        if is_row { raw_items[i].cb.dimensions.width  += share; }
-                        else      { raw_items[i].cb.dimensions.height += share; }
+                        if is_row {
+                            raw_items[i].cb.dimensions.width += share;
+                        } else {
+                            raw_items[i].cb.dimensions.height += share;
+                        }
                     }
                 }
 
                 // Flex-shrink distribution (only if items overflow).
-                let total_shrink_weighted: f32 = line_indices.iter()
+                let total_shrink_weighted: f32 = line_indices
+                    .iter()
                     .map(|&i| raw_items[i].shrink * main_size(&raw_items[i].cb))
                     .sum();
                 if deficit > 0.0 && total_shrink_weighted > 0.0 {
@@ -890,9 +1300,11 @@ impl<'a> LayoutBox<'a> {
                         let weight = raw_items[i].shrink * ms / total_shrink_weighted;
                         let reduction = weight * deficit;
                         if is_row {
-                            raw_items[i].cb.dimensions.width  = (raw_items[i].cb.dimensions.width  - reduction).max(0.0);
+                            raw_items[i].cb.dimensions.width =
+                                (raw_items[i].cb.dimensions.width - reduction).max(0.0);
                         } else {
-                            raw_items[i].cb.dimensions.height = (raw_items[i].cb.dimensions.height - reduction).max(0.0);
+                            raw_items[i].cb.dimensions.height =
+                                (raw_items[i].cb.dimensions.height - reduction).max(0.0);
                         }
                     }
                 }
@@ -910,15 +1322,20 @@ impl<'a> LayoutBox<'a> {
                     if (final_main - initial_main).abs() < 0.5 {
                         continue;
                     }
-                    let (reflowed_opt, _, _) = build_layout_tree_with_cb(
+                    let (reflowed_opt, _, _) = build_layout_tree_with_cb_cached(
                         raw_items[i].cb.style_node,
                         0.0,
                         0.0,
                         0.0,
-                        if is_row { final_main.max(0.0) } else { inner_width },
+                        if is_row {
+                            final_main.max(0.0)
+                        } else {
+                            inner_width
+                        },
                         vw,
                         vh,
                         child_cb,
+                        intrinsic_cache,
                     );
                     if let Some(mut reflowed) = reflowed_opt {
                         if is_row {
@@ -931,22 +1348,34 @@ impl<'a> LayoutBox<'a> {
                 }
 
                 // Recompute totals after grow/shrink/reflow.
-                let gaps_total2 = if line_indices.len() > 1 { main_gap * (line_indices.len() - 1) as f32 } else { 0.0 };
-                let line_total_main2: f32 = line_indices.iter().map(|&i| main_size(&raw_items[i].cb)).sum::<f32>() + gaps_total2;
+                let gaps_total2 = if line_indices.len() > 1 {
+                    main_gap * (line_indices.len() - 1) as f32
+                } else {
+                    0.0
+                };
+                let line_total_main2: f32 = line_indices
+                    .iter()
+                    .map(|&i| main_size(&raw_items[i].cb))
+                    .sum::<f32>()
+                    + gaps_total2;
                 // Free space is 0 when container has no definite size (INFINITY).
-                let free2 = if main_container_size.is_infinite() { 0.0 } else { (main_container_size - line_total_main2).max(0.0) };
+                let free2 = if main_container_size.is_infinite() {
+                    0.0
+                } else {
+                    (main_container_size - line_total_main2).max(0.0)
+                };
                 let n = line_indices.len();
 
                 // Compute main-axis starting cursor and per-item gap for justify-content.
                 let (mut main_cursor, between_gap) = match justify {
-                    "flex-end"      => (free2,      0.0),
-                    "center"        => (free2 / 2.0, 0.0),
+                    "flex-end" => (free2, 0.0),
+                    "center" => (free2 / 2.0, 0.0),
                     "space-between" => (0.0, if n > 1 { free2 / (n - 1) as f32 } else { 0.0 }),
-                    "space-around"  => {
+                    "space-around" => {
                         let slot = free2 / n as f32;
                         (slot / 2.0, slot)
                     }
-                    "space-evenly"  => {
+                    "space-evenly" => {
                         let slot = free2 / (n + 1) as f32;
                         (slot, slot)
                     }
@@ -954,7 +1383,10 @@ impl<'a> LayoutBox<'a> {
                 };
 
                 // Cross-axis size of this line (max of all items' cross sizes).
-                let line_cross: f32 = line_indices.iter().map(|&i| cross_size(&raw_items[i].cb)).fold(0.0_f32, f32::max);
+                let line_cross: f32 = line_indices
+                    .iter()
+                    .map(|&i| cross_size(&raw_items[i].cb))
+                    .fold(0.0_f32, f32::max);
 
                 // Place each item.
                 for (idx_in_line, &i) in line_indices.iter().enumerate() {
@@ -966,31 +1398,45 @@ impl<'a> LayoutBox<'a> {
                     // Stretch cross axis if needed.
                     if effective_align == "stretch" {
                         if is_row {
-                            item.cb.dimensions.height = (line_cross - item.cb.margin.top - item.cb.margin.bottom).max(0.0);
+                            item.cb.dimensions.height =
+                                (line_cross - item.cb.margin.top - item.cb.margin.bottom).max(0.0);
                         } else {
-                            item.cb.dimensions.width  = (line_cross - item.cb.margin.left - item.cb.margin.right).max(0.0);
+                            item.cb.dimensions.width =
+                                (line_cross - item.cb.margin.left - item.cb.margin.right).max(0.0);
                         }
                     }
 
                     // Cross-axis offset within the line.
                     let item_cross = cross_size(&item.cb);
                     let cross_offset = match effective_align {
-                        "flex-end"  => line_cross - item_cross,
-                        "center"    => (line_cross - item_cross) / 2.0,
-                        "baseline"  => 0.0, // simplified: treat like flex-start
-                        _           => 0.0, // flex-start / stretch (already resized)
+                        "flex-end" => line_cross - item_cross,
+                        "center" => (line_cross - item_cross) / 2.0,
+                        "baseline" => 0.0, // simplified: treat like flex-start
+                        _ => 0.0,          // flex-start / stretch (already resized)
                     };
 
                     // Add gap between items (not before the first item).
-                    if idx_in_line > 0 { main_cursor += main_gap + between_gap; }
+                    if idx_in_line > 0 {
+                        main_cursor += main_gap + between_gap;
+                    }
 
                     // Compute absolute position.
                     let (x, y) = if is_row {
-                        (container_main_start  + main_cursor          + item.cb.margin.left,
-                         container_cross_start + cross_cursor         + cross_offset + item.cb.margin.top)
+                        (
+                            container_main_start + main_cursor + item.cb.margin.left,
+                            container_cross_start
+                                + cross_cursor
+                                + cross_offset
+                                + item.cb.margin.top,
+                        )
                     } else {
-                        (container_cross_start + cross_cursor         + cross_offset + item.cb.margin.left,
-                         container_main_start  + main_cursor          + item.cb.margin.top)
+                        (
+                            container_cross_start
+                                + cross_cursor
+                                + cross_offset
+                                + item.cb.margin.left,
+                            container_main_start + main_cursor + item.cb.margin.top,
+                        )
                     };
 
                     let dx = x - item.cb.dimensions.x;
@@ -998,13 +1444,17 @@ impl<'a> LayoutBox<'a> {
                     offset_layout_box(&mut item.cb, dx, dy);
 
                     main_cursor += if is_row {
-                        item.cb.dimensions.width  + item.cb.margin.left + item.cb.margin.right
+                        item.cb.dimensions.width + item.cb.margin.left + item.cb.margin.right
                     } else {
-                        item.cb.dimensions.height + item.cb.margin.top  + item.cb.margin.bottom
+                        item.cb.dimensions.height + item.cb.margin.top + item.cb.margin.bottom
                     };
 
-                    max_child_x = max_child_x.max(item.cb.dimensions.x + item.cb.dimensions.width  + item.cb.margin.right);
-                    child_y     = child_y    .max(item.cb.dimensions.y + item.cb.dimensions.height + item.cb.margin.bottom);
+                    max_child_x = max_child_x.max(
+                        item.cb.dimensions.x + item.cb.dimensions.width + item.cb.margin.right,
+                    );
+                    child_y = child_y.max(
+                        item.cb.dimensions.y + item.cb.dimensions.height + item.cb.margin.bottom,
+                    );
                 }
 
                 cross_cursor += line_cross + cross_gap;
@@ -1032,16 +1482,24 @@ impl<'a> LayoutBox<'a> {
             } else {
                 0.0
             };
-            if self.dimensions.width  <= 0.0 {
-                self.dimensions.width  = if is_row { main_container_size } else { total_cross };
+            if self.dimensions.width <= 0.0 {
+                self.dimensions.width = if is_row {
+                    main_container_size
+                } else {
+                    total_cross
+                };
             }
             if self.dimensions.height <= 0.0 || height <= 0.0 {
                 self.dimensions.height = if is_row { total_cross } else { column_main };
             }
 
-            let final_x = if is_block { container_start_x } else { self.dimensions.x + self.dimensions.width + self.margin.right };
+            let final_x = if is_block {
+                container_start_x
+            } else {
+                self.dimensions.x + self.dimensions.width + self.margin.right
+            };
             let final_y = self.dimensions.y + self.dimensions.height + self.margin.bottom;
-            return (Some(self.clone()), final_x, final_y);
+            return (Some(self), final_x, final_y);
         }
 
         // --- FLOAT-AWARE SINGLE-PASS LAYOUT ---
@@ -1055,7 +1513,12 @@ impl<'a> LayoutBox<'a> {
         // This two-step split is necessary to satisfy Rust's borrow checker:
         // we cannot call self.children.push() while borrowing self.style_node.children.
 
-        enum ChildKind { Float(FloatSide), Block, Inline, Positioned }
+        enum ChildKind {
+            Float(FloatSide),
+            Block,
+            Inline,
+            Positioned,
+        }
         struct ChildEntry<'entry> {
             node: &'entry StyledNode,
             kind: ChildKind,
@@ -1064,15 +1527,21 @@ impl<'a> LayoutBox<'a> {
 
         let mut entries: Vec<ChildEntry<'a>> = Vec::new();
         for child_node in &self.style_node.children {
-            if should_skip(child_node) { continue; }
+            if should_skip(child_node) {
+                continue;
+            }
             let child_pos = get_position_type(child_node);
             // Absolute and fixed children are removed from normal flow entirely.
             if matches!(child_pos, PositionType::Absolute | PositionType::Fixed) {
-                entries.push(ChildEntry { node: child_node, kind: ChildKind::Positioned, clear: None });
+                entries.push(ChildEntry {
+                    node: child_node,
+                    kind: ChildKind::Positioned,
+                    clear: None,
+                });
                 continue;
             }
             let float_side = get_float(child_node);
-            let clear_val  = get_clear(child_node);
+            let clear_val = get_clear(child_node);
             let child_disp = get_display_type(child_node);
             let kind = if let Some(side) = float_side {
                 ChildKind::Float(side)
@@ -1081,7 +1550,11 @@ impl<'a> LayoutBox<'a> {
             } else {
                 ChildKind::Inline
             };
-            entries.push(ChildEntry { node: child_node, kind, clear: clear_val });
+            entries.push(ChildEntry {
+                node: child_node,
+                kind,
+                clear: clear_val,
+            });
         }
         // Immutable borrow of self.style_node.children is now released.
 
@@ -1100,21 +1573,31 @@ impl<'a> LayoutBox<'a> {
         let mut result: Vec<LayoutBox<'a>> = Vec::new();
 
         // Inline line accumulator
-        struct InlineLine<'a> { members: Vec<LayoutBox<'a>>, width: f32, height: f32 }
-        let mut cur_line = InlineLine::<'a> { members: vec![], width: 0.0, height: 0.0 };
+        struct InlineLine<'a> {
+            members: Vec<LayoutBox<'a>>,
+            width: f32,
+            height: f32,
+        }
+        let mut cur_line = InlineLine::<'a> {
+            members: vec![],
+            width: 0.0,
+            height: 0.0,
+        };
         let mut line_start_y = cursor_y;
 
         // Flush the current inline line into `result`, advancing cursor_y.
         macro_rules! flush_line {
             () => {
                 if !cur_line.members.is_empty() {
-                    let (_, left_indent) = float_ctx.available_at(line_start_y, cur_line.height.max(1.0));
+                    let (_, left_indent) =
+                        float_ctx.available_at(line_start_y, cur_line.height.max(1.0));
                     let mut lx = container_x + left_indent;
                     for mut m in cur_line.members.drain(..) {
                         let dx = lx - (m.dimensions.x - m.margin.left);
                         let dy = cursor_y - (m.dimensions.y - m.margin.top);
                         offset_layout_box(&mut m, dx, dy);
-                        max_child_x = max_child_x.max(m.dimensions.x + m.dimensions.width + m.margin.right);
+                        max_child_x =
+                            max_child_x.max(m.dimensions.x + m.dimensions.width + m.margin.right);
                         lx += m.dimensions.width + m.margin.left + m.margin.right;
                         result.push(m);
                     }
@@ -1123,7 +1606,7 @@ impl<'a> LayoutBox<'a> {
                     cur_line.height = 0.0;
                     line_start_y = cursor_y;
                 }
-            }
+            };
         }
 
         let mut positioned_entries: Vec<&StyledNode> = Vec::new();
@@ -1141,20 +1624,36 @@ impl<'a> LayoutBox<'a> {
                     flush_line!();
                     // Build with origin (0,0); offset_layout_box will reposition.
                     // Use inner_width so explicit CSS widths resolve correctly.
-                    let (cb_opt, _, _) = build_layout_tree_with_cb(entry.node, 0.0, 0.0, 0.0, inner_width, vw, vh, child_cb);
+                    let (cb_opt, _, _) = build_layout_tree_with_cb_cached(
+                        entry.node,
+                        0.0,
+                        0.0,
+                        0.0,
+                        inner_width,
+                        vw,
+                        vh,
+                        child_cb,
+                        intrinsic_cache,
+                    );
                     if let Some(mut cb) = cb_opt {
                         let float_w = cb.dimensions.width + cb.margin.left + cb.margin.right;
                         let float_h = cb.dimensions.height + cb.margin.top + cb.margin.bottom;
                         let (avail_w, left_indent) = float_ctx.available_at(cursor_y, float_h);
                         let fx = match side {
-                            FloatSide::Left  => container_x + left_indent,
+                            FloatSide::Left => container_x + left_indent,
                             FloatSide::Right => container_x + left_indent + avail_w - float_w,
                         };
                         let dx = fx - (cb.dimensions.x - cb.margin.left);
                         let dy = cursor_y - (cb.dimensions.y - cb.margin.top);
                         offset_layout_box(&mut cb, dx, dy);
-                        float_ctx.add(FloatArea { y: cursor_y, height: float_h, width: float_w, side });
-                        max_child_x = max_child_x.max(cb.dimensions.x + cb.dimensions.width + cb.margin.right);
+                        float_ctx.add(FloatArea {
+                            y: cursor_y,
+                            height: float_h,
+                            width: float_w,
+                            side,
+                        });
+                        max_child_x = max_child_x
+                            .max(cb.dimensions.x + cb.dimensions.width + cb.margin.right);
                         result.push(cb);
                     }
                     // cursor_y does NOT advance for floats
@@ -1168,7 +1667,17 @@ impl<'a> LayoutBox<'a> {
                     }
                     let (avail_w, left_indent) = float_ctx.available_at(cursor_y, 0.0);
                     let block_x = container_x + left_indent;
-                    let (cb_opt, _, _) = build_layout_tree_with_cb(entry.node, block_x, block_x, 0.0, avail_w, vw, vh, child_cb);
+                    let (cb_opt, _, _) = build_layout_tree_with_cb_cached(
+                        entry.node,
+                        block_x,
+                        block_x,
+                        0.0,
+                        avail_w,
+                        vw,
+                        vh,
+                        child_cb,
+                        intrinsic_cache,
+                    );
                     if let Some(mut cb) = cb_opt {
                         // CSS margin collapsing (spec § 8.3.1):
                         //
@@ -1201,7 +1710,8 @@ impl<'a> LayoutBox<'a> {
                         }
                         cursor_y = normal_flow_bottom;
                         prev_margin_bottom = cb.margin.bottom;
-                        max_child_x = max_child_x.max(cb.dimensions.x + cb.dimensions.width + cb.margin.right);
+                        max_child_x = max_child_x
+                            .max(cb.dimensions.x + cb.dimensions.width + cb.margin.right);
                         result.push(cb);
                     }
                     line_start_y = cursor_y; // keep line_start_y in sync after block advances cursor_y
@@ -1209,12 +1719,18 @@ impl<'a> LayoutBox<'a> {
 
                 // ── Inline child ──────────────────────────────────────────────
                 ChildKind::Inline => {
-                    let (avail_w, left_indent) = float_ctx.available_at(line_start_y, cur_line.height.max(16.0));
-                    let (cb_opt, _, _) = build_layout_tree_with_cb(
+                    let (avail_w, left_indent) =
+                        float_ctx.available_at(line_start_y, cur_line.height.max(16.0));
+                    let (cb_opt, _, _) = build_layout_tree_with_cb_cached(
                         entry.node,
                         container_x + left_indent,
                         container_x + left_indent + cur_line.width,
-                        0.0, avail_w, vw, vh, child_cb,
+                        0.0,
+                        avail_w,
+                        vw,
+                        vh,
+                        child_cb,
+                        intrinsic_cache,
                     );
                     if let Some(mut cb) = cb_opt {
                         // Only reset prev_margin_bottom when a visible inline element is
@@ -1226,18 +1742,26 @@ impl<'a> LayoutBox<'a> {
                             flush_line!();
                             // Re-lay out for new line with updated float-aware width
                             let (aw2, li2) = float_ctx.available_at(line_start_y, 16.0);
-                            let (cb2_opt, _, _) = build_layout_tree_with_cb(
+                            let (cb2_opt, _, _) = build_layout_tree_with_cb_cached(
                                 entry.node,
-                                container_x + li2, container_x + li2,
-                                0.0, aw2, vw, vh, child_cb,
+                                container_x + li2,
+                                container_x + li2,
+                                0.0,
+                                aw2,
+                                vw,
+                                vh,
+                                child_cb,
+                                intrinsic_cache,
                             );
                             if let Some(mut cb2) = cb2_opt {
                                 // Apply relative offset after line flush positioning.
                                 if cb2.position == PositionType::Relative {
                                     apply_relative_offset(&mut cb2, vw, vh);
                                 }
-                                cur_line.width  = cb2.dimensions.width  + cb2.margin.left + cb2.margin.right;
-                                cur_line.height = cb2.dimensions.height + cb2.margin.top  + cb2.margin.bottom;
+                                cur_line.width =
+                                    cb2.dimensions.width + cb2.margin.left + cb2.margin.right;
+                                cur_line.height =
+                                    cb2.dimensions.height + cb2.margin.top + cb2.margin.bottom;
                                 cur_line.members.push(cb2);
                             }
                         } else {
@@ -1246,9 +1770,10 @@ impl<'a> LayoutBox<'a> {
                             if cb.position == PositionType::Relative {
                                 apply_relative_offset(&mut cb, vw, vh);
                             }
-                            cur_line.width  += item_w;
-                            cur_line.height  = cur_line.height.max(
-                                cb.dimensions.height + cb.margin.top + cb.margin.bottom);
+                            cur_line.width += item_w;
+                            cur_line.height = cur_line
+                                .height
+                                .max(cb.dimensions.height + cb.margin.top + cb.margin.bottom);
                             cur_line.members.push(cb);
                         }
                     }
@@ -1273,13 +1798,30 @@ impl<'a> LayoutBox<'a> {
 
         if self.dimensions.width <= 0.0 {
             let derived = max_child_x - self.dimensions.x + self.padding.right + self.border.right;
-            self.dimensions.width = if container_width.is_finite() { derived.min(container_width) } else { derived };
+            self.dimensions.width = if container_width.is_finite() {
+                derived.min(container_width)
+            } else {
+                derived
+            };
         }
 
-        let content_height = (cursor_y - self.dimensions.y + self.padding.bottom + self.border.bottom).max(0.0);
+        let content_height =
+            (cursor_y - self.dimensions.y + self.padding.bottom + self.border.bottom).max(0.0);
         let mut final_h = if height > 0.0 { height } else { content_height };
-        if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get(&crate::css::intern("max-height")) { final_h = final_h.min(*v); }
-        if let Some(Value::Length(v, Unit::Px)) = self.style_node.specified_values.get(&crate::css::intern("min-height")) { final_h = final_h.max(*v); }
+        if let Some(Value::Length(v, Unit::Px)) = self
+            .style_node
+            .specified_values
+            .get(&crate::css::intern("max-height"))
+        {
+            final_h = final_h.min(*v);
+        }
+        if let Some(Value::Length(v, Unit::Px)) = self
+            .style_node
+            .specified_values
+            .get(&crate::css::intern("min-height"))
+        {
+            final_h = final_h.max(*v);
+        }
         self.dimensions.height = final_h;
 
         // ── Layout absolutely/fixedly positioned children ─────────────────────
@@ -1288,11 +1830,19 @@ impl<'a> LayoutBox<'a> {
             // The final content-box of self (after height is known).
             let final_self_cb = Rect {
                 x: self.dimensions.x + self.padding.left + self.border.left,
-                y: self.dimensions.y + self.padding.top  + self.border.top,
-                width:  (self.dimensions.width  - self.padding.left - self.padding.right
-                         - self.border.left - self.border.right).max(0.0),
-                height: (self.dimensions.height - self.padding.top  - self.padding.bottom
-                         - self.border.top  - self.border.bottom).max(0.0),
+                y: self.dimensions.y + self.padding.top + self.border.top,
+                width: (self.dimensions.width
+                    - self.padding.left
+                    - self.padding.right
+                    - self.border.left
+                    - self.border.right)
+                    .max(0.0),
+                height: (self.dimensions.height
+                    - self.padding.top
+                    - self.padding.bottom
+                    - self.border.top
+                    - self.border.bottom)
+                    .max(0.0),
             };
 
             for pos_node in positioned_entries {
@@ -1311,43 +1861,58 @@ impl<'a> LayoutBox<'a> {
                 };
 
                 // Intrinsic width for the positioned child: explicit CSS width or shrink-wrap.
-                let child_explicit_width = pos_node.specified_values.get(&crate::css::intern("width"));
+                let child_explicit_width =
+                    pos_node.specified_values.get(&crate::css::intern("width"));
                 let child_layout_width = match child_explicit_width {
                     Some(Value::Length(v, Unit::Px)) => *v,
                     Some(Value::Length(v, Unit::Percent)) => cb_for_child.width * (v / 100.0),
                     _ => {
                         // Shrink-wrap: lay out at max-content width bounded by cb width.
-                        let max_c = compute_max_content_width(pos_node, vw, vh);
+                        let max_c = intrinsic_cache.max_content_width(pos_node, vw, vh);
                         max_c.min(cb_for_child.width)
                     }
                 };
 
                 // Build the child in a temporary origin; we'll reposition it below.
-                let (pc_opt, _, _) = build_layout_tree_with_cb(
+                let (pc_opt, _, _) = build_layout_tree_with_cb_cached(
                     pos_node,
-                    0.0, 0.0, 0.0,
+                    0.0,
+                    0.0,
+                    0.0,
                     child_layout_width.max(1.0),
-                    vw, vh,
+                    vw,
+                    vh,
                     Some(cb_for_child),
+                    intrinsic_cache,
                 );
                 if let Some(mut pc) = pc_opt {
                     // Resolve top / right / bottom / left against the containing block.
-                    let top    = resolve_offset(pos_node, "top",    cb_for_child.height, vw, vh);
-                    let right  = resolve_offset(pos_node, "right",  cb_for_child.width,  vw, vh);
+                    let top = resolve_offset(pos_node, "top", cb_for_child.height, vw, vh);
+                    let right = resolve_offset(pos_node, "right", cb_for_child.width, vw, vh);
                     let bottom = resolve_offset(pos_node, "bottom", cb_for_child.height, vw, vh);
-                    let left   = resolve_offset(pos_node, "left",   cb_for_child.width,  vw, vh);
+                    let left = resolve_offset(pos_node, "left", cb_for_child.width, vw, vh);
 
                     // Determine final x.
                     let target_x = match (left, right) {
                         (Some(l), _) => cb_for_child.x + l + pc.margin.left,
-                        (None, Some(r)) => cb_for_child.x + cb_for_child.width - r - pc.dimensions.width - pc.margin.right,
-                        (None, None)    => cb_for_child.x + pc.margin.left, // default to CB origin
+                        (None, Some(r)) => {
+                            cb_for_child.x + cb_for_child.width
+                                - r
+                                - pc.dimensions.width
+                                - pc.margin.right
+                        }
+                        (None, None) => cb_for_child.x + pc.margin.left, // default to CB origin
                     };
                     // Determine final y.
                     let target_y = match (top, bottom) {
                         (Some(t), _) => cb_for_child.y + t + pc.margin.top,
-                        (None, Some(b)) => cb_for_child.y + cb_for_child.height - b - pc.dimensions.height - pc.margin.bottom,
-                        (None, None)    => cb_for_child.y + pc.margin.top, // default to CB origin
+                        (None, Some(b)) => {
+                            cb_for_child.y + cb_for_child.height
+                                - b
+                                - pc.dimensions.height
+                                - pc.margin.bottom
+                        }
+                        (None, None) => cb_for_child.y + pc.margin.top, // default to CB origin
                     };
 
                     let dx = target_x - pc.dimensions.x;
@@ -1359,15 +1924,35 @@ impl<'a> LayoutBox<'a> {
             }
         }
 
-        let final_x = if is_block { container_start_x } else { self.dimensions.x + self.dimensions.width + self.margin.right };
-        let final_y = if is_block { self.dimensions.y + self.dimensions.height + self.margin.bottom } else { cursor_y };
-        (Some(self.clone()), final_x, final_y)
+        let final_x = if is_block {
+            container_start_x
+        } else {
+            self.dimensions.x + self.dimensions.width + self.margin.right
+        };
+        let final_y = if is_block {
+            self.dimensions.y + self.dimensions.height + self.margin.bottom
+        } else {
+            cursor_y
+        };
+        (Some(self), final_x, final_y)
     }
 
-    fn layout_text(&mut self, text: String, current_x: f32, current_y: f32, container_width: f32) -> (Option<LayoutBox<'a>>, f32, f32) {
+    fn layout_text(
+        mut self,
+        text: String,
+        current_x: f32,
+        current_y: f32,
+        container_width: f32,
+    ) -> (Option<LayoutBox<'a>>, f32, f32) {
         let trimmed = text.trim();
-        if trimmed.is_empty() { return (None, current_x, current_y); }
-        let font_size = match self.style_node.specified_values.get(&crate::css::intern("font-size")) {
+        if trimmed.is_empty() {
+            return (None, current_x, current_y);
+        }
+        let font_size = match self
+            .style_node
+            .specified_values
+            .get(&crate::css::intern("font-size"))
+        {
             Some(Value::Length(v, Unit::Px)) => v.max(1.0),
             _ => 16.0,
         };
@@ -1382,8 +1967,10 @@ impl<'a> LayoutBox<'a> {
 
         for word in trimmed.split_whitespace() {
             let mut word_w = 0.0;
-            for c in word.chars() { word_w += font.h_advance_unscaled(font.glyph_id(c)) * (scale.x / units); }
-            
+            for c in word.chars() {
+                word_w += font.h_advance_unscaled(font.glyph_id(c)) * (scale.x / units);
+            }
+
             // If word is too long for current line
             if container_width.is_finite() && line_w + word_w > container_width && line_w > 0.0 {
                 max_w = max_w.max(line_w);
@@ -1403,29 +1990,35 @@ impl<'a> LayoutBox<'a> {
                     line_w += char_w;
                 }
             } else {
-                if line_w > 0.0 { line_w += space_w; }
+                if line_w > 0.0 {
+                    line_w += space_w;
+                }
                 line_w += word_w;
             }
         }
         max_w = max_w.max(line_w);
-        
+
         self.dimensions.x = current_x + self.margin.left;
         self.dimensions.y = current_y + self.margin.top;
-        self.dimensions.width = if container_width.is_finite() { max_w.min(container_width) } else { max_w };
-        
+        self.dimensions.width = if container_width.is_finite() {
+            max_w.min(container_width)
+        } else {
+            max_w
+        };
+
         let line_height = font_size * 1.4;
         self.dimensions.height = lines_count as f32 * line_height;
-        
+
         let final_x = self.dimensions.x + self.dimensions.width + self.margin.right;
         let final_y = self.dimensions.y + self.dimensions.height + self.margin.bottom;
-        (Some(self.clone()), final_x, final_y)
+        (Some(self), final_x, final_y)
     }
 }
 
 fn get_float(sn: &StyledNode) -> Option<FloatSide> {
     match sn.specified_values.get(&crate::css::intern("float")) {
         Some(Value::Keyword(k)) => match &**k {
-            "left"  => Some(FloatSide::Left),
+            "left" => Some(FloatSide::Left),
             "right" => Some(FloatSide::Right),
             _ => None,
         },
@@ -1436,9 +2029,9 @@ fn get_float(sn: &StyledNode) -> Option<FloatSide> {
 fn get_clear(sn: &StyledNode) -> Option<ClearValue> {
     match sn.specified_values.get(&crate::css::intern("clear")) {
         Some(Value::Keyword(k)) => match &**k {
-            "left"  => Some(ClearValue::Left),
+            "left" => Some(ClearValue::Left),
             "right" => Some(ClearValue::Right),
-            "both"  => Some(ClearValue::Both),
+            "both" => Some(ClearValue::Both),
             _ => None,
         },
         _ => None,
@@ -1450,9 +2043,9 @@ fn get_position_type(sn: &StyledNode) -> PositionType {
         Some(Value::Keyword(k)) => match &**k {
             "relative" => PositionType::Relative,
             "absolute" => PositionType::Absolute,
-            "fixed"    => PositionType::Fixed,
-            "sticky"   => PositionType::Sticky,
-            _          => PositionType::Static,
+            "fixed" => PositionType::Fixed,
+            "sticky" => PositionType::Sticky,
+            _ => PositionType::Static,
         },
         _ => PositionType::Static,
     }
@@ -1460,12 +2053,18 @@ fn get_position_type(sn: &StyledNode) -> PositionType {
 
 /// Resolve a single offset property (`top`, `right`, `bottom`, `left`) from a `StyledNode`.
 /// Returns `None` if the property is absent or `auto`.
-fn resolve_offset(sn: &StyledNode, prop: &str, container_size: f32, vw: f32, vh: f32) -> Option<f32> {
+fn resolve_offset(
+    sn: &StyledNode,
+    prop: &str,
+    container_size: f32,
+    vw: f32,
+    vh: f32,
+) -> Option<f32> {
     match sn.specified_values.get(&crate::css::intern(prop)) {
-        Some(Value::Length(v, Unit::Px))      => Some(*v),
+        Some(Value::Length(v, Unit::Px)) => Some(*v),
         Some(Value::Length(v, Unit::Percent)) => Some(container_size * (v / 100.0)),
-        Some(Value::Length(v, Unit::Vw))      => Some(vw * (v / 100.0)),
-        Some(Value::Length(v, Unit::Vh))      => Some(vh * (v / 100.0)),
+        Some(Value::Length(v, Unit::Vw)) => Some(vw * (v / 100.0)),
+        Some(Value::Length(v, Unit::Vh)) => Some(vh * (v / 100.0)),
         Some(Value::Keyword(k)) if **k == *"auto" => None,
         _ => None,
     }
@@ -1480,20 +2079,20 @@ fn apply_relative_offset(layout: &mut LayoutBox, vw: f32, vh: f32) {
     // For relative positioning, offsets resolve against the element's own width/height.
     // We use 0.0 as the container dimension since percentage offsets on relative
     // elements are relative to the containing block — a close enough approximation.
-    let top    = resolve_offset(sn, "top",    layout.dimensions.height, vw, vh);
-    let left   = resolve_offset(sn, "left",   layout.dimensions.width,  vw, vh);
-    let right  = resolve_offset(sn, "right",  layout.dimensions.width,  vw, vh);
+    let top = resolve_offset(sn, "top", layout.dimensions.height, vw, vh);
+    let left = resolve_offset(sn, "left", layout.dimensions.width, vw, vh);
+    let right = resolve_offset(sn, "right", layout.dimensions.width, vw, vh);
     let bottom = resolve_offset(sn, "bottom", layout.dimensions.height, vw, vh);
 
     let dx = match (left, right) {
-        (Some(l), _)    => l,
+        (Some(l), _) => l,
         (None, Some(r)) => -r,
-        (None, None)    => 0.0,
+        (None, None) => 0.0,
     };
     let dy = match (top, bottom) {
-        (Some(t), _)    => t,
+        (Some(t), _) => t,
         (None, Some(b)) => -b,
-        (None, None)    => 0.0,
+        (None, None) => 0.0,
     };
 
     if dx != 0.0 || dy != 0.0 {
@@ -1502,7 +2101,11 @@ fn apply_relative_offset(layout: &mut LayoutBox, vw: f32, vh: f32) {
 }
 
 fn get_prop(sn: &StyledNode, p1: &str, p2: &str, cw: f32, vw: f32, vh: f32) -> f32 {
-    match sn.specified_values.get(&crate::css::intern(p1)).or(sn.specified_values.get(&crate::css::intern(p2))) {
+    match sn
+        .specified_values
+        .get(&crate::css::intern(p1))
+        .or(sn.specified_values.get(&crate::css::intern(p2)))
+    {
         Some(Value::Length(v, Unit::Px)) => *v,
         Some(Value::Length(v, Unit::Percent)) => cw * (v / 100.0),
         Some(Value::Length(v, Unit::Vw)) => vw * (v / 100.0),
@@ -1512,7 +2115,9 @@ fn get_prop(sn: &StyledNode, p1: &str, p2: &str, cw: f32, vw: f32, vh: f32) -> f
 }
 
 fn get_display_type(sn: &StyledNode) -> DisplayType {
-    if let NodeData::Text { .. } = sn.node.data { return DisplayType::Inline; }
+    if let NodeData::Text { .. } = sn.node.data {
+        return DisplayType::Inline;
+    }
     if let Some(Value::Keyword(d)) = sn.specified_values.get(&crate::css::intern("display")) {
         match &**d {
             "block" => return DisplayType::Block,
@@ -1525,12 +2130,10 @@ fn get_display_type(sn: &StyledNode) -> DisplayType {
     if let NodeData::Element { ref name, .. } = sn.node.data {
         match name.local.to_string().as_str() {
             // Genuine block-level elements (fill container width, force line break)
-            "html" |
-            "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" |
-            "body" | "header" | "footer" | "nav" | "section" | "article" |
-            "ul" | "ol" | "li" | "main" | "aside" | "form" |
-            "details" | "summary" | "figure" | "figcaption" | "address" |
-            "blockquote" | "pre" | "hr" | "fieldset" | "legend" => DisplayType::Block,
+            "html" | "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "body" | "header"
+            | "footer" | "nav" | "section" | "article" | "ul" | "ol" | "li" | "main" | "aside"
+            | "form" | "details" | "summary" | "figure" | "figcaption" | "address"
+            | "blockquote" | "pre" | "hr" | "fieldset" | "legend" => DisplayType::Block,
             // table and its sub-elements: use TableRow/TableCell so they shrink-wrap
             // rather than expand to full container width like block elements do.
             "table" => DisplayType::Table,
@@ -1541,25 +2144,38 @@ fn get_display_type(sn: &StyledNode) -> DisplayType {
             "img" => DisplayType::Image,
             _ => DisplayType::Inline,
         }
-    } else { DisplayType::Block }
+    } else {
+        DisplayType::Block
+    }
 }
-
 
 fn is_block_level(d: DisplayType) -> bool {
     // Table/TableRow/TableCell are NOT block-level: they shrink-wrap to content
     // rather than filling the full container width.
-    matches!(d, DisplayType::Block | DisplayType::ListItem | DisplayType::Flex)
+    matches!(
+        d,
+        DisplayType::Block | DisplayType::ListItem | DisplayType::Flex
+    )
 }
 
 fn is_none_display(sn: &StyledNode) -> bool {
-    if let Some(Value::Keyword(d)) = sn.specified_values.get(&crate::css::intern("display")) { **d == *"none" } else { false }
+    if let Some(Value::Keyword(d)) = sn.specified_values.get(&crate::css::intern("display")) {
+        **d == *"none"
+    } else {
+        false
+    }
 }
 
 fn should_skip(child: &StyledNode) -> bool {
     if let NodeData::Element { ref name, .. } = child.node.data {
         let t = name.local.to_string();
-        matches!(t.as_str(), "head" | "style" | "meta" | "title" | "script" | "link" | "noscript")
-    } else { false }
+        matches!(
+            t.as_str(),
+            "head" | "style" | "meta" | "title" | "script" | "link" | "noscript"
+        )
+    } else {
+        false
+    }
 }
 
 /// Iterative replacement for the formerly recursive offset_layout_box.
@@ -1601,8 +2217,10 @@ impl<'a> LayoutBox<'a> {
     pub fn hit_test(&self, x: f32, y: f32) -> Option<&LayoutBox<'a>> {
         // Check if the root contains the point at all.
         let root_d = self.dimensions;
-        if !(x >= root_d.x && x <= root_d.x + root_d.width
-            && y >= root_d.y && y <= root_d.y + root_d.height)
+        if !(x >= root_d.x
+            && x <= root_d.x + root_d.width
+            && y >= root_d.y
+            && y <= root_d.y + root_d.height)
         {
             return None;
         }
@@ -1610,7 +2228,8 @@ impl<'a> LayoutBox<'a> {
         // DFS stack: each entry is a node that contains the point, plus the index of
         // the next child to try (children are tried in reverse, i.e., last painter first).
         // Invariant: every node on the stack contains the point.
-        let mut stack: Vec<(&LayoutBox<'a>, isize)> = vec![(self, self.children.len() as isize - 1)];
+        let mut stack: Vec<(&LayoutBox<'a>, isize)> =
+            vec![(self, self.children.len() as isize - 1)];
 
         while let Some((node, child_idx)) = stack.last_mut() {
             let idx = *child_idx;
@@ -1637,8 +2256,12 @@ impl<'a> LayoutBox<'a> {
     pub fn collect_links(&self, list: &mut Vec<(Rect, String)>) {
         let mut stack: Vec<&LayoutBox<'a>> = vec![self];
         while let Some(node) = stack.pop() {
-            if let Some(ref url) = node.link_url { list.push((node.dimensions, url.clone())); }
-            for child in node.children.iter().rev() { stack.push(child); }
+            if let Some(ref url) = node.link_url {
+                list.push((node.dimensions, url.clone()));
+            }
+            for child in node.children.iter().rev() {
+                stack.push(child);
+            }
         }
     }
 
@@ -1649,7 +2272,9 @@ impl<'a> LayoutBox<'a> {
             if let Some(script) = node.event_handlers.get("click") {
                 list.push((node.dimensions, script.clone()));
             }
-            for child in node.children.iter().rev() { stack.push(child); }
+            for child in node.children.iter().rev() {
+                stack.push(child);
+            }
         }
     }
 
@@ -1670,7 +2295,9 @@ impl<'a> LayoutBox<'a> {
                     }
                 }
             }
-            for child in node.children.iter().rev() { stack.push(child); }
+            for child in node.children.iter().rev() {
+                stack.push(child);
+            }
         }
     }
 
@@ -1678,8 +2305,12 @@ impl<'a> LayoutBox<'a> {
     pub fn collect_images(&self, list: &mut Vec<(Rect, String)>) {
         let mut stack: Vec<&LayoutBox<'a>> = vec![self];
         while let Some(node) = stack.pop() {
-            if let Some(ref url) = node.image_url { list.push((node.dimensions, url.clone())); }
-            for child in node.children.iter().rev() { stack.push(child); }
+            if let Some(ref url) = node.image_url {
+                list.push((node.dimensions, url.clone()));
+            }
+            for child in node.children.iter().rev() {
+                stack.push(child);
+            }
         }
     }
 
@@ -1694,7 +2325,9 @@ impl<'a> LayoutBox<'a> {
                     }
                 }
             }
-            for child in node.children.iter().rev() { stack.push(child); }
+            for child in node.children.iter().rev() {
+                stack.push(child);
+            }
         }
     }
 
@@ -1702,15 +2335,24 @@ impl<'a> LayoutBox<'a> {
     pub fn collect_focusable_elements(&self, list: &mut Vec<(Rect, String)>) {
         let mut stack: Vec<&LayoutBox<'a>> = vec![self];
         while let Some(node) = stack.pop() {
-            if let NodeData::Element { ref name, ref attrs, .. } = node.style_node.node.data {
+            if let NodeData::Element {
+                ref name,
+                ref attrs,
+                ..
+            } = node.style_node.node.data
+            {
                 let tag = name.local.to_string();
                 let mut id = None;
                 let mut has_href = false;
 
                 for attr in attrs.borrow().iter() {
                     let key = attr.name.local.to_string();
-                    if key == "id" { id = Some(attr.value.to_string()); }
-                    if key == "href" { has_href = true; }
+                    if key == "id" {
+                        id = Some(attr.value.to_string());
+                    }
+                    if key == "href" {
+                        has_href = true;
+                    }
                 }
 
                 let is_focusable = match tag.as_str() {
@@ -1726,7 +2368,9 @@ impl<'a> LayoutBox<'a> {
                     }
                 }
             }
-            for child in node.children.iter().rev() { stack.push(child); }
+            for child in node.children.iter().rev() {
+                stack.push(child);
+            }
         }
     }
 
@@ -1742,7 +2386,11 @@ impl<'a> LayoutBox<'a> {
             DisplayType::InlineBlock | DisplayType::Flex | DisplayType::TableCell => true,
             _ => {
                 // overflow != visible also establishes BFC
-                if let Some(Value::Keyword(v)) = self.style_node.specified_values.get(&crate::css::intern("overflow")) {
+                if let Some(Value::Keyword(v)) = self
+                    .style_node
+                    .specified_values
+                    .get(&crate::css::intern("overflow"))
+                {
                     **v != *"visible"
                 } else {
                     false
@@ -1757,10 +2405,16 @@ pub fn print_layout_tree(layout: &LayoutBox, indent: usize) {
     let mut stack: Vec<(&LayoutBox, usize)> = vec![(layout, indent)];
     while let Some((node, depth)) = stack.pop() {
         let indent_str = " ".repeat(depth * 2);
-        println!("{}{} [{:?}] [{:.1},{:.1} {:.1}x{:.1}]",
-            indent_str, "Node", node.display,
-            node.dimensions.x, node.dimensions.y,
-            node.dimensions.width, node.dimensions.height);
+        println!(
+            "{}{} [{:?}] [{:.1},{:.1} {:.1}x{:.1}]",
+            indent_str,
+            "Node",
+            node.display,
+            node.dimensions.x,
+            node.dimensions.y,
+            node.dimensions.width,
+            node.dimensions.height
+        );
         // Push children in reverse order so the first child is printed first.
         for child in node.children.iter().rev() {
             stack.push((child, depth + 1));
@@ -1773,15 +2427,29 @@ impl<'a> LayoutBox<'a> {
         Rect {
             x: self.dimensions.x + self.border.left + self.padding.left,
             y: self.dimensions.y + self.border.top + self.padding.top,
-            width: (self.dimensions.width - self.border.left - self.border.right - self.padding.left - self.padding.right).max(0.0),
-            height: (self.dimensions.height - self.border.top - self.border.bottom - self.padding.top - self.padding.bottom).max(0.0),
+            width: (self.dimensions.width
+                - self.border.left
+                - self.border.right
+                - self.padding.left
+                - self.padding.right)
+                .max(0.0),
+            height: (self.dimensions.height
+                - self.border.top
+                - self.border.bottom
+                - self.padding.top
+                - self.padding.bottom)
+                .max(0.0),
         }
     }
 
     /// Returns the CSS `opacity` value for this box, clamped to [0.0, 1.0].
     /// Defaults to 1.0 (fully opaque) if the property is absent or unparseable.
     pub fn get_opacity(&self) -> f32 {
-        match self.style_node.specified_values.get(&crate::css::intern("opacity")) {
+        match self
+            .style_node
+            .specified_values
+            .get(&crate::css::intern("opacity"))
+        {
             Some(Value::Number(n)) => n.clamp(0.0, 1.0),
             _ => 1.0,
         }
@@ -1790,25 +2458,34 @@ impl<'a> LayoutBox<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use super::*;
-    use crate::dom;
     use crate::css;
+    use crate::dom;
     use crate::style;
+    use std::sync::Arc;
 
     #[test]
     fn test_button_coordinate_collection() {
         let html = r#"<button onclick="alert(1)" style="width: 100px; height: 50px; margin: 10px;">Click me</button>"#;
         let dom = dom::parse_html(html);
         let stylesheet = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None, None, None);
-        
-        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 1024.0, 1024.0, 768.0);
+        let style_tree = style::build_style_tree(
+            &dom.document,
+            &stylesheet,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+        );
+
+        let (layout_opt, _, _) =
+            build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 1024.0, 1024.0, 768.0);
         let layout = layout_opt.unwrap();
-        
+
         let mut handlers = Vec::new();
         layout.collect_event_handlers(&mut handlers);
-        
+
         assert_eq!(handlers.len(), 1);
         let (rect, script) = &handlers[0];
         assert_eq!(script, "alert(1)");
@@ -1822,21 +2499,49 @@ mod tests {
         let html = r#"<div style="display: block; width: 500px; margin: auto;">Content</div>"#;
         let dom = dom::parse_html(html);
         let stylesheet = css::parse_css("");
-        let mut style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None, None, None);
-        
+        let mut style_tree = style::build_style_tree(
+            &dom.document,
+            &stylesheet,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+        );
+
         // Ensure the style is manually set if parser was ambiguous
         if let NodeData::Element { .. } = style_tree.children[0].node.data {
             let mut map = (*style_tree.children[0].specified_values.0).clone();
-            map.insert(crate::css::intern("display"), css::Value::Keyword(crate::css::intern("block")));
-            map.insert(crate::css::intern("width"), css::Value::Length(500.0, css::Unit::Px));
-            map.insert(crate::css::intern("margin-left"), css::Value::Keyword(crate::css::intern("auto")));
-            map.insert(crate::css::intern("margin-right"), css::Value::Keyword(crate::css::intern("auto")));
+            map.insert(
+                crate::css::intern("display"),
+                css::Value::Keyword(crate::css::intern("block")),
+            );
+            map.insert(
+                crate::css::intern("width"),
+                css::Value::Length(500.0, css::Unit::Px),
+            );
+            map.insert(
+                crate::css::intern("margin-left"),
+                css::Value::Keyword(crate::css::intern("auto")),
+            );
+            map.insert(
+                crate::css::intern("margin-right"),
+                css::Value::Keyword(crate::css::intern("auto")),
+            );
             style_tree.children[0].specified_values = style::PropertyMap(Arc::new(map));
         }
 
-        let (layout_opt, _, _) = build_layout_tree(&style_tree.children[0], 0.0, 0.0, 0.0, 1000.0, 1000.0, 768.0);
+        let (layout_opt, _, _) = build_layout_tree(
+            &style_tree.children[0],
+            0.0,
+            0.0,
+            0.0,
+            1000.0,
+            1000.0,
+            768.0,
+        );
         let layout = layout_opt.unwrap();
-        
+
         assert_eq!(layout.dimensions.width, 500.0);
         assert_eq!(layout.dimensions.x, 250.0); // (1000 - 500) / 2
     }
@@ -1846,7 +2551,15 @@ mod tests {
         let html = r#"<div style="margin-left: 48px; margin-top: 24px;">Hello world</div>"#;
         let dom = dom::parse_html(html);
         let stylesheet = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None, None, None);
+        let style_tree = style::build_style_tree(
+            &dom.document,
+            &stylesheet,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+        );
 
         let div_node = style_tree
             .children
@@ -1899,7 +2612,10 @@ mod tests {
         None
     }
 
-    fn find_text_box_containing<'a>(layout: &'a LayoutBox<'a>, needle: &str) -> Option<&'a LayoutBox<'a>> {
+    fn find_text_box_containing<'a>(
+        layout: &'a LayoutBox<'a>,
+        needle: &str,
+    ) -> Option<&'a LayoutBox<'a>> {
         if let NodeData::Text { ref contents } = layout.style_node.node.data {
             if contents.borrow().contains(needle) {
                 return Some(layout);
@@ -1922,24 +2638,40 @@ mod tests {
         let html = r#"<span>Hi</span>"#;
         let dom = dom::parse_html(html);
         let stylesheet = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None, None, None);
+        let style_tree = style::build_style_tree(
+            &dom.document,
+            &stylesheet,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+        );
 
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 768.0);
         let layout = layout_opt.unwrap();
 
         fn find_span<'a>(b: &'a LayoutBox<'a>) -> Option<&'a LayoutBox<'a>> {
             if let NodeData::Element { ref name, .. } = b.style_node.node.data {
-                if name.local.to_string() == "span" { return Some(b); }
+                if name.local.to_string() == "span" {
+                    return Some(b);
+                }
             }
-            for c in &b.children { if let Some(f) = find_span(c) { return Some(f); } }
+            for c in &b.children {
+                if let Some(f) = find_span(c) {
+                    return Some(f);
+                }
+            }
             None
         }
 
         let span = find_span(&layout).expect("span not found");
         assert!(span.dimensions.width > 0.0, "span width must be > 0");
-        assert!(span.dimensions.width < 800.0,
+        assert!(
+            span.dimensions.width < 800.0,
             "span width {} must be < container_width 800 (should shrink to content)",
-            span.dimensions.width);
+            span.dimensions.width
+        );
     }
 
     #[test]
@@ -1952,18 +2684,30 @@ mod tests {
         "#;
         let dom = dom::parse_html(html);
         let stylesheet = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None, None, None);
+        let style_tree = style::build_style_tree(
+            &dom.document,
+            &stylesheet,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+        );
 
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 768.0);
         let layout = layout_opt.expect("layout");
         let text = find_text_box_containing(&layout, "This sentence").expect("text node not found");
 
-        assert!(text.dimensions.x >= 280.0,
+        assert!(
+            text.dimensions.x >= 280.0,
             "inline text should start after the prefix, got x={}",
-            text.dimensions.x);
-        assert!(text.dimensions.width <= 520.0,
+            text.dimensions.x
+        );
+        assert!(
+            text.dimensions.width <= 520.0,
             "inline text width should be limited by the remaining line width, got {}",
-            text.dimensions.width);
+            text.dimensions.width
+        );
         assert!(text.dimensions.height > 24.0,
             "inline text should wrap onto multiple lines when the prefix consumes horizontal space, got height={}",
             text.dimensions.height);
@@ -1974,11 +2718,17 @@ mod tests {
     /// Deep-search the layout tree for the first child that has `float: left` or `float: right`.
     fn find_float_child_deep<'a>(layout: &'a LayoutBox<'a>) -> Option<&'a LayoutBox<'a>> {
         for child in &layout.children {
-            match child.style_node.specified_values.get(&crate::css::intern("float")) {
+            match child
+                .style_node
+                .specified_values
+                .get(&crate::css::intern("float"))
+            {
                 Some(Value::Keyword(k)) if &**k == "left" || &**k == "right" => return Some(child),
                 _ => {}
             }
-            if let Some(f) = find_float_child_deep(child) { return Some(f); }
+            if let Some(f) = find_float_child_deep(child) {
+                return Some(f);
+            }
         }
         None
     }
@@ -2005,7 +2755,9 @@ mod tests {
                         if let NodeData::Element { ref name, .. } = body.style_node.node.data {
                             if name.local.to_string() == "body" {
                                 for div in &body.children {
-                                    if let NodeData::Element { ref name, .. } = div.style_node.node.data {
+                                    if let NodeData::Element { ref name, .. } =
+                                        div.style_node.node.data
+                                    {
                                         if name.local.to_string() == "div" {
                                             return Some(div);
                                         }
@@ -2025,12 +2777,23 @@ mod tests {
         let html = r#"<div style="width:800px;"><div style="float:left;width:100px;height:50px;">F</div></div>"#;
         let dom_tree = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None, None);
+        let style_tree = style::build_style_tree(
+            &dom_tree.document,
+            &ss,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+        );
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.unwrap();
         let float_child = find_float_child_deep(&layout).expect("float child not found");
-        assert_eq!(float_child.dimensions.x, 0.0,
-            "float:left child should have x=0.0, got {}", float_child.dimensions.x);
+        assert_eq!(
+            float_child.dimensions.x, 0.0,
+            "float:left child should have x=0.0, got {}",
+            float_child.dimensions.x
+        );
     }
 
     #[test]
@@ -2038,13 +2801,23 @@ mod tests {
         let html = r#"<div style="width:800px;"><div style="float:right;width:100px;height:50px;">F</div></div>"#;
         let dom_tree = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None, None);
+        let style_tree = style::build_style_tree(
+            &dom_tree.document,
+            &ss,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+        );
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.unwrap();
         let float_child = find_float_child_deep(&layout).expect("float child not found");
-        assert_eq!(float_child.dimensions.x, 700.0,
+        assert_eq!(
+            float_child.dimensions.x, 700.0,
             "float:right child (width 100px) in 800px container should have x=700.0, got {}",
-            float_child.dimensions.x);
+            float_child.dimensions.x
+        );
     }
 
     #[test]
@@ -2052,16 +2825,26 @@ mod tests {
         let html = r#"<div style="width:800px;"><div style="float:left;width:100px;height:50px;">F</div><div style="clear:left;">C</div></div>"#;
         let dom_tree = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None, None);
+        let style_tree = style::build_style_tree(
+            &dom_tree.document,
+            &ss,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+        );
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.unwrap();
         // Navigate to the outer div (width:800px) then look at its direct children.
         let outer_div = find_outer_div(&layout).expect("outer div not found");
         let clear_block = find_direct_non_float_block(outer_div)
             .expect("clear:left block not found among outer div's children");
-        assert!(clear_block.dimensions.y >= 50.0,
+        assert!(
+            clear_block.dimensions.y >= 50.0,
             "clear:left block must start at or below float bottom (50px), got y={}",
-            clear_block.dimensions.y);
+            clear_block.dimensions.y
+        );
     }
 
     #[test]
@@ -2070,15 +2853,25 @@ mod tests {
         let html = r#"<div style="width:800px;"><div style="float:left;width:100px;height:50px;">F</div><div style="display:block;">S</div></div>"#;
         let dom_tree = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None, None);
+        let style_tree = style::build_style_tree(
+            &dom_tree.document,
+            &ss,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+        );
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.unwrap();
         let outer_div = find_outer_div(&layout).expect("outer div not found");
-        let sibling = find_direct_non_float_block(outer_div)
-            .expect("non-float sibling block not found");
-        assert_eq!(sibling.dimensions.width, 700.0,
+        let sibling =
+            find_direct_non_float_block(outer_div).expect("non-float sibling block not found");
+        assert_eq!(
+            sibling.dimensions.width, 700.0,
             "sibling block should be narrowed to 700px by the 100px left float, got {}",
-            sibling.dimensions.width);
+            sibling.dimensions.width
+        );
     }
 
     // ── Intrinsic sizing tests ────────────────────────────────────────────────
@@ -2087,10 +2880,14 @@ mod tests {
     /// local tag name matches `tag`.
     fn find_element_by_tag<'a>(b: &'a LayoutBox<'a>, tag: &str) -> Option<&'a LayoutBox<'a>> {
         if let NodeData::Element { ref name, .. } = b.style_node.node.data {
-            if name.local.to_string() == tag { return Some(b); }
+            if name.local.to_string() == tag {
+                return Some(b);
+            }
         }
         for c in &b.children {
-            if let Some(found) = find_element_by_tag(c, tag) { return Some(found); }
+            if let Some(found) = find_element_by_tag(c, tag) {
+                return Some(found);
+            }
         }
         None
     }
@@ -2105,8 +2902,14 @@ mod tests {
     /// `parse_value("min-content")` must return a Keyword.
     #[test]
     fn test_css_min_max_content_parse() {
-        assert_eq!(css::parse_value("min-content"), css::Value::Keyword(crate::css::intern("min-content")));
-        assert_eq!(css::parse_value("max-content"), css::Value::Keyword(crate::css::intern("max-content")));
+        assert_eq!(
+            css::parse_value("min-content"),
+            css::Value::Keyword(crate::css::intern("min-content"))
+        );
+        assert_eq!(
+            css::parse_value("max-content"),
+            css::Value::Keyword(crate::css::intern("max-content"))
+        );
     }
 
     /// `compute_max_content_width` on "Hello World" must be wider than `compute_min_content_width`.
@@ -2115,14 +2918,30 @@ mod tests {
         let html = r#"<span>Hello World</span>"#;
         let dom_tree = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None, None);
+        let style_tree = style::build_style_tree(
+            &dom_tree.document,
+            &ss,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+        );
 
         // Locate the <span> StyledNode
-        fn find_span_node<'a>(sn: &'a crate::style::StyledNode) -> Option<&'a crate::style::StyledNode> {
+        fn find_span_node<'a>(
+            sn: &'a crate::style::StyledNode,
+        ) -> Option<&'a crate::style::StyledNode> {
             if let NodeData::Element { ref name, .. } = sn.node.data {
-                if name.local.to_string() == "span" { return Some(sn); }
+                if name.local.to_string() == "span" {
+                    return Some(sn);
+                }
             }
-            for c in &sn.children { if let Some(f) = find_span_node(c) { return Some(f); } }
+            for c in &sn.children {
+                if let Some(f) = find_span_node(c) {
+                    return Some(f);
+                }
+            }
             None
         }
         let span_node = find_span_node(&style_tree).expect("span not found");
@@ -2131,8 +2950,10 @@ mod tests {
         let max_c = compute_max_content_width(span_node, 800.0, 600.0);
 
         assert!(min_c > 0.0, "min-content must be > 0, got {min_c}");
-        assert!(max_c > min_c,
-            "max-content ({max_c}) must be wider than min-content ({min_c}) for multi-word text");
+        assert!(
+            max_c > min_c,
+            "max-content ({max_c}) must be wider than min-content ({min_c}) for multi-word text"
+        );
     }
 
     /// `width: min-content` — the div must not span the full 800 px container.
@@ -2141,15 +2962,25 @@ mod tests {
         let html = r#"<div style="width: min-content;">Hello World</div>"#;
         let dom_tree = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None, None);
+        let style_tree = style::build_style_tree(
+            &dom_tree.document,
+            &ss,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+        );
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.unwrap();
 
         let div = find_element_by_tag(&layout, "div").expect("div not found");
         assert!(div.dimensions.width > 0.0, "div width must be > 0");
-        assert!(div.dimensions.width < 800.0,
+        assert!(
+            div.dimensions.width < 800.0,
             "div with width:min-content must be < 800px (container), got {}",
-            div.dimensions.width);
+            div.dimensions.width
+        );
     }
 
     /// `width: max-content` — the div must be wider than a min-content div.
@@ -2158,23 +2989,49 @@ mod tests {
         // min-content case
         let dom_min = dom::parse_html(r#"<div style="width: min-content;">Hello World</div>"#);
         let ss_min = css::parse_css("");
-        let st_min = style::build_style_tree(&dom_min.document, &ss_min, None, &HashMap::new(), None, None, None);
+        let st_min = style::build_style_tree(
+            &dom_min.document,
+            &ss_min,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+        );
         let (lo_min, _, _) = build_layout_tree(&st_min, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout_min = lo_min.unwrap();
-        let div_min_w = find_element_by_tag(&layout_min, "div").unwrap().dimensions.width;
+        let div_min_w = find_element_by_tag(&layout_min, "div")
+            .unwrap()
+            .dimensions
+            .width;
 
         // max-content case
         let dom_max = dom::parse_html(r#"<div style="width: max-content;">Hello World</div>"#);
         let ss_max = css::parse_css("");
-        let st_max = style::build_style_tree(&dom_max.document, &ss_max, None, &HashMap::new(), None, None, None);
+        let st_max = style::build_style_tree(
+            &dom_max.document,
+            &ss_max,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+        );
         let (lo_max, _, _) = build_layout_tree(&st_max, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout_max = lo_max.unwrap();
-        let div_max_w = find_element_by_tag(&layout_max, "div").unwrap().dimensions.width;
+        let div_max_w = find_element_by_tag(&layout_max, "div")
+            .unwrap()
+            .dimensions
+            .width;
 
-        assert!(div_max_w >= div_min_w,
-            "max-content width ({div_max_w}) must be >= min-content width ({div_min_w})");
-        assert!(div_max_w < 800.0,
-            "max-content width ({div_max_w}) must be < container (800px) for short text");
+        assert!(
+            div_max_w >= div_min_w,
+            "max-content width ({div_max_w}) must be >= min-content width ({div_min_w})"
+        );
+        assert!(
+            div_max_w < 800.0,
+            "max-content width ({div_max_w}) must be < container (800px) for short text"
+        );
     }
 
     /// `width: fit-content(150px)` — clamps to at most 150 px.
@@ -2184,14 +3041,28 @@ mod tests {
         let html = r#"<div style="width: fit-content(150px);">Hello World this is some longer text for the test</div>"#;
         let dom_tree = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None, None);
+        let style_tree = style::build_style_tree(
+            &dom_tree.document,
+            &ss,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+        );
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.unwrap();
         let div = find_element_by_tag(&layout, "div").expect("div not found");
-        assert!(div.dimensions.width <= 150.0,
-            "fit-content(150px) must be <= 150px, got {}", div.dimensions.width);
-        assert!(div.dimensions.width > 0.0,
-            "fit-content(150px) must be > 0, got {}", div.dimensions.width);
+        assert!(
+            div.dimensions.width <= 150.0,
+            "fit-content(150px) must be <= 150px, got {}",
+            div.dimensions.width
+        );
+        assert!(
+            div.dimensions.width > 0.0,
+            "fit-content(150px) must be > 0, got {}",
+            div.dimensions.width
+        );
     }
 
     /// `width: fit-content` (no argument) — shrinks to content but stays <= container.
@@ -2200,12 +3071,23 @@ mod tests {
         let html = r#"<div style="width: fit-content;">Hello</div>"#;
         let dom_tree = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None, None);
+        let style_tree = style::build_style_tree(
+            &dom_tree.document,
+            &ss,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+        );
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.unwrap();
         let div = find_element_by_tag(&layout, "div").expect("div not found");
         assert!(div.dimensions.width > 0.0, "fit-content width must be > 0");
-        assert!(div.dimensions.width <= 800.0, "fit-content width must be <= container (800px)");
+        assert!(
+            div.dimensions.width <= 800.0,
+            "fit-content width must be <= container (800px)"
+        );
     }
 
     // ── get_opacity tests ────────────────────────────────────────────────────
@@ -2216,11 +3098,15 @@ mod tests {
         let html = r#"<div style="width:100px;height:50px;">Content</div>"#;
         let dom = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let style_tree =
+            style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.unwrap();
         let div = find_element_by_tag(&layout, "div").expect("div not found");
-        assert!((div.get_opacity() - 1.0).abs() < f32::EPSILON, "default opacity must be 1.0");
+        assert!(
+            (div.get_opacity() - 1.0).abs() < f32::EPSILON,
+            "default opacity must be 1.0"
+        );
     }
 
     #[test]
@@ -2229,11 +3115,16 @@ mod tests {
         let html = r#"<div style="width:100px;height:50px;opacity:0.5;">Content</div>"#;
         let dom = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let style_tree =
+            style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.unwrap();
         let div = find_element_by_tag(&layout, "div").expect("div not found");
-        assert!((div.get_opacity() - 0.5).abs() < 0.01, "opacity must be 0.5, got {}", div.get_opacity());
+        assert!(
+            (div.get_opacity() - 0.5).abs() < 0.01,
+            "opacity must be 0.5, got {}",
+            div.get_opacity()
+        );
     }
 
     // ── Deep-nesting / stack-overflow regression tests ───────────────────────
@@ -2248,16 +3139,19 @@ mod tests {
         // Build 5000 nested divs: <div><div>...<div>leaf</div>...</div></div>
         let depth = 5000usize;
         let mut html = String::with_capacity(depth * 12);
-        for _ in 0..depth { html.push_str("<div>"); }
+        for _ in 0..depth {
+            html.push_str("<div>");
+        }
         html.push_str("leaf");
-        for _ in 0..depth { html.push_str("</div>"); }
+        for _ in 0..depth {
+            html.push_str("</div>");
+        }
 
         let dom = dom::parse_html(&html);
         let ss = css::parse_css("");
         // build_style_tree calls flatten_dom and build_final_tree — both iterative.
-        let style_tree = style::build_style_tree(
-            &dom.document, &ss, None, &HashMap::new(), None, None, None,
-        );
+        let style_tree =
+            style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
 
         // build_layout_tree calls perform_layout which recurses via stacker::maybe_grow.
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
@@ -2302,23 +3196,31 @@ mod tests {
             }
         }
         html.push_str("x");
-        for _ in 0..5000 { html.push_str("</div>"); }
+        for _ in 0..5000 {
+            html.push_str("</div>");
+        }
 
         let dom = dom::parse_html(&html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(
-            &dom.document, &ss, None, &HashMap::new(), None, None, None,
-        );
+        let style_tree =
+            style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
-        assert!(layout_opt.is_some(), "layout must succeed for 5000 mixed-display nested divs");
+        assert!(
+            layout_opt.is_some(),
+            "layout must succeed for 5000 mixed-display nested divs"
+        );
     }
 
     // ── Image rendering tests ─────────────────────────────────────────────────
 
     fn find_image_box<'a>(lb: &'a LayoutBox<'a>) -> Option<&'a LayoutBox<'a>> {
-        if lb.display == DisplayType::Image { return Some(lb); }
+        if lb.display == DisplayType::Image {
+            return Some(lb);
+        }
         for c in &lb.children {
-            if let Some(r) = find_image_box(c) { return Some(r); }
+            if let Some(r) = find_image_box(c) {
+                return Some(r);
+            }
         }
         None
     }
@@ -2328,11 +3230,16 @@ mod tests {
         let html = r#"<img src="x.png" alt="hello">"#;
         let dom = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let style =
+            style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
         let (layout_opt, _, _) = build_layout_tree(&style, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.expect("layout tree must be built");
         let img = find_image_box(&layout).expect("img node must be found");
-        assert_eq!(img.alt_text, Some("hello".to_string()), "alt attribute must be stored as alt_text");
+        assert_eq!(
+            img.alt_text,
+            Some("hello".to_string()),
+            "alt attribute must be stored as alt_text"
+        );
     }
 
     #[test]
@@ -2341,12 +3248,16 @@ mod tests {
         let html = r#"<img src="x.png" style="width:200px">"#;
         let dom = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let style =
+            style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
         let (layout_opt, _, _) = build_layout_tree(&style, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.expect("layout tree must be built");
         let img = find_image_box(&layout).expect("img node must be found");
-        assert!(img.dimensions.height > 0.0,
-            "image with only width specified must have non-zero height, got {}", img.dimensions.height);
+        assert!(
+            img.dimensions.height > 0.0,
+            "image with only width specified must have non-zero height, got {}",
+            img.dimensions.height
+        );
     }
 
     #[test]
@@ -2355,12 +3266,19 @@ mod tests {
         let html = r#"<img src="x.png">"#;
         let dom = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let style =
+            style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
         let (layout_opt, _, _) = build_layout_tree(&style, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.expect("layout tree must be built");
         let img = find_image_box(&layout).expect("img node must be found");
-        assert!(img.dimensions.width > 0.0, "image with no dimensions must have non-zero width");
-        assert!(img.dimensions.height > 0.0, "image with no dimensions must have non-zero height");
+        assert!(
+            img.dimensions.width > 0.0,
+            "image with no dimensions must have non-zero width"
+        );
+        assert!(
+            img.dimensions.height > 0.0,
+            "image with no dimensions must have non-zero height"
+        );
     }
 
     // ── CSS Positioned layout tests ───────────────────────────────────────────
@@ -2391,51 +3309,72 @@ mod tests {
         </div>"#;
         let dom = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let style_tree =
+            style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.expect("layout tree");
         let abs_box = find_child_with_position(&layout, PositionType::Absolute)
             .expect("absolute child must exist");
-        assert_eq!(abs_box.dimensions.x, 20.0,
+        assert_eq!(
+            abs_box.dimensions.x, 20.0,
             "absolute child x should be 20px (left offset from relative container), got {}",
-            abs_box.dimensions.x);
-        assert_eq!(abs_box.dimensions.y, 10.0,
+            abs_box.dimensions.x
+        );
+        assert_eq!(
+            abs_box.dimensions.y, 10.0,
             "absolute child y should be 10px (top offset from relative container), got {}",
-            abs_box.dimensions.y);
+            abs_box.dimensions.y
+        );
     }
 
     #[test]
     fn test_position_fixed_top_left() {
         // A fixed element with top:0; left:0 should land at viewport origin (0, 0).
-        let html = r#"<div style="position:fixed;top:0px;left:0px;width:200px;height:50px;"></div>"#;
+        let html =
+            r#"<div style="position:fixed;top:0px;left:0px;width:200px;height:50px;"></div>"#;
         let dom = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let style_tree =
+            style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.expect("layout tree");
-        let fixed_box = find_child_with_position(&layout, PositionType::Fixed)
-            .expect("fixed child must exist");
-        assert_eq!(fixed_box.dimensions.x, 0.0,
-            "fixed element with left:0 must have x=0, got {}", fixed_box.dimensions.x);
-        assert_eq!(fixed_box.dimensions.y, 0.0,
-            "fixed element with top:0 must have y=0, got {}", fixed_box.dimensions.y);
+        let fixed_box =
+            find_child_with_position(&layout, PositionType::Fixed).expect("fixed child must exist");
+        assert_eq!(
+            fixed_box.dimensions.x, 0.0,
+            "fixed element with left:0 must have x=0, got {}",
+            fixed_box.dimensions.x
+        );
+        assert_eq!(
+            fixed_box.dimensions.y, 0.0,
+            "fixed element with top:0 must have y=0, got {}",
+            fixed_box.dimensions.y
+        );
     }
 
     #[test]
     fn test_position_fixed_offset() {
         // A fixed element with top:20px; left:50px should land at (50, 20).
-        let html = r#"<div style="position:fixed;top:20px;left:50px;width:100px;height:40px;"></div>"#;
+        let html =
+            r#"<div style="position:fixed;top:20px;left:50px;width:100px;height:40px;"></div>"#;
         let dom = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let style_tree =
+            style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.expect("layout tree");
-        let fixed_box = find_child_with_position(&layout, PositionType::Fixed)
-            .expect("fixed child must exist");
-        assert_eq!(fixed_box.dimensions.x, 50.0,
-            "fixed element with left:50px must have x=50, got {}", fixed_box.dimensions.x);
-        assert_eq!(fixed_box.dimensions.y, 20.0,
-            "fixed element with top:20px must have y=20, got {}", fixed_box.dimensions.y);
+        let fixed_box =
+            find_child_with_position(&layout, PositionType::Fixed).expect("fixed child must exist");
+        assert_eq!(
+            fixed_box.dimensions.x, 50.0,
+            "fixed element with left:50px must have x=50, got {}",
+            fixed_box.dimensions.x
+        );
+        assert_eq!(
+            fixed_box.dimensions.y, 20.0,
+            "fixed element with top:20px must have y=20, got {}",
+            fixed_box.dimensions.y
+        );
     }
 
     #[test]
@@ -2447,17 +3386,24 @@ mod tests {
         </div>"#;
         let dom = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let style_tree =
+            style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.expect("layout tree");
         let rel_box = find_child_with_position(&layout, PositionType::Relative)
             .expect("relative child must exist");
         // Normal flow would place this at x=0, y=0 (first block child in container).
         // After relative offset: x=10, y=15.
-        assert_eq!(rel_box.dimensions.x, 10.0,
-            "relative element with left:10px should have x=10, got {}", rel_box.dimensions.x);
-        assert_eq!(rel_box.dimensions.y, 15.0,
-            "relative element with top:15px should have y=15, got {}", rel_box.dimensions.y);
+        assert_eq!(
+            rel_box.dimensions.x, 10.0,
+            "relative element with left:10px should have x=10, got {}",
+            rel_box.dimensions.x
+        );
+        assert_eq!(
+            rel_box.dimensions.y, 15.0,
+            "relative element with top:15px should have y=15, got {}",
+            rel_box.dimensions.y
+        );
     }
 
     #[test]
@@ -2470,7 +3416,8 @@ mod tests {
         </div>"#;
         let dom = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let style_tree =
+            style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.expect("layout tree");
 
@@ -2478,11 +3425,15 @@ mod tests {
         fn find_static_block<'a>(layout: &'a LayoutBox<'a>) -> Option<&'a LayoutBox<'a>> {
             let mut stack = vec![layout];
             while let Some(node) = stack.pop() {
-                if node.position == PositionType::Static && node.display == DisplayType::Block
-                    && node.dimensions.height > 0.0 {
+                if node.position == PositionType::Static
+                    && node.display == DisplayType::Block
+                    && node.dimensions.height > 0.0
+                {
                     return Some(node);
                 }
-                for child in node.children.iter().rev() { stack.push(child); }
+                for child in node.children.iter().rev() {
+                    stack.push(child);
+                }
             }
             None
         }
@@ -2507,13 +3458,16 @@ mod tests {
         </div>"#;
         let dom = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let style_tree =
+            style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.expect("layout");
 
         // Navigate html > body > div, then get the two <p> children.
         let outer_div = find_outer_div(&layout).expect("outer div not found");
-        let ps: Vec<&LayoutBox> = outer_div.children.iter()
+        let ps: Vec<&LayoutBox> = outer_div
+            .children
+            .iter()
             .filter(|c| is_block_level(c.display))
             .collect();
         assert_eq!(ps.len(), 2, "expected 2 block children");
@@ -2538,12 +3492,15 @@ mod tests {
         </div>"#;
         let dom = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let style_tree =
+            style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.expect("layout");
 
         let outer_div = find_outer_div(&layout).expect("outer div not found");
-        let blocks: Vec<&LayoutBox> = outer_div.children.iter()
+        let blocks: Vec<&LayoutBox> = outer_div
+            .children
+            .iter()
             .filter(|c| is_block_level(c.display))
             .collect();
         assert_eq!(blocks.len(), 2, "expected 2 block children");
@@ -2551,8 +3508,11 @@ mod tests {
         let b1 = blocks[0];
         let b2 = blocks[1];
         let gap = b2.dimensions.y - (b1.dimensions.y + b1.dimensions.height);
-        assert_eq!(gap, 32.0,
-            "asymmetric margins should collapse to max(32,16)=32px, got {}px", gap);
+        assert_eq!(
+            gap, 32.0,
+            "asymmetric margins should collapse to max(32,16)=32px, got {}px",
+            gap
+        );
     }
 
     /// Case 2 (top): First block child inside a padding-less parent.
@@ -2567,19 +3527,24 @@ mod tests {
         </div>"#;
         let dom = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let style_tree =
+            style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.expect("layout");
 
         let outer_div = find_outer_div(&layout).expect("outer div not found");
-        let h1 = outer_div.children.iter()
+        let h1 = outer_div
+            .children
+            .iter()
             .find(|c| is_block_level(c.display))
             .expect("h1 block child");
 
         // h1 content box should start at the parent's content top (no internal margin gap).
-        assert_eq!(h1.dimensions.y, outer_div.dimensions.y,
+        assert_eq!(
+            h1.dimensions.y, outer_div.dimensions.y,
             "first child margin should collapse into parent (no internal gap): h1.y={}, div.y={}",
-            h1.dimensions.y, outer_div.dimensions.y);
+            h1.dimensions.y, outer_div.dimensions.y
+        );
     }
 
     /// Case 2 (bottom): Last block child inside a padding-less parent.
@@ -2594,7 +3559,8 @@ mod tests {
         </div>"#;
         let dom = dom::parse_html(html);
         let ss = css::parse_css("");
-        let style_tree = style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let style_tree =
+            style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.expect("layout");
 
@@ -2641,16 +3607,28 @@ mod tests {
 
         let dom_tree = dom::parse_html(html);
         let ss = css::parse_css(css);
-        let style_tree = style::build_style_tree(&dom_tree.document, &ss, None, &HashMap::new(), None, None, None);
+        let style_tree = style::build_style_tree(
+            &dom_tree.document,
+            &ss,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+        );
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.expect("layout");
 
         let ul = find_element_by_tag(&layout, "ul").expect("ul not found");
-        assert!(ul.dimensions.width > 500.0,
+        assert!(
+            ul.dimensions.width > 500.0,
             "navbar ul should expand close to full row width, got {}",
-            ul.dimensions.width);
+            ul.dimensions.width
+        );
 
-        let items: Vec<&LayoutBox> = ul.children.iter()
+        let items: Vec<&LayoutBox> = ul
+            .children
+            .iter()
             .filter(|c| matches!(c.style_node.node.data, NodeData::Element { .. }))
             .collect();
         assert_eq!(items.len(), 6, "expected 6 nav items");
@@ -2658,12 +3636,20 @@ mod tests {
         let y0 = items[0].dimensions.y;
         let mut prev_right = items[0].dimensions.x + items[0].dimensions.width;
         for (idx, item) in items.iter().enumerate().skip(1) {
-            assert!((item.dimensions.y - y0).abs() < 1.0,
+            assert!(
+                (item.dimensions.y - y0).abs() < 1.0,
                 "nav item {} should stay on the same row: y0={}, y={}",
-                idx, y0, item.dimensions.y);
-            assert!(item.dimensions.x >= prev_right - 1.0,
+                idx,
+                y0,
+                item.dimensions.y
+            );
+            assert!(
+                item.dimensions.x >= prev_right - 1.0,
                 "nav item {} should not overlap the previous item: prev_right={}, x={}",
-                idx, prev_right, item.dimensions.x);
+                idx,
+                prev_right,
+                item.dimensions.x
+            );
             prev_right = item.dimensions.x + item.dimensions.width;
         }
 
