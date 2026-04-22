@@ -743,6 +743,13 @@ impl<'a> LayoutBox<'a> {
                     if cb.dimensions.width > inner_width {
                         cb.dimensions.width = inner_width;
                     }
+                    // Flex items that come out with width=0 (e.g. inline <a> elements) need
+                    // an intrinsic size so they participate correctly in the flex algorithm.
+                    // Use max-content width capped to inner_width as the shrink-wrap fallback.
+                    if cb.dimensions.width == 0.0 {
+                        let max_c = compute_max_content_width(child_node, vw, vh);
+                        cb.dimensions.width = max_c.min(inner_width).max(0.0);
+                    }
                     let grow = child_node.specified_values.get(&crate::css::intern("flex-grow"))
                         .and_then(|v| if let Value::Number(n) = v { Some(*n) } else { None })
                         .unwrap_or(0.0);
@@ -776,7 +783,19 @@ impl<'a> LayoutBox<'a> {
 
             // ── Build flex lines (wrapping) ────────────────────────────────────
             // Each line is a Vec of indices into raw_items.
-            let main_container_size = if is_row { inner_width } else { height.max(0.0001) };
+            //
+            // For column flex containers with auto height (height == 0), the main axis
+            // has no definite size.  Using 0.0001 caused flex-shrink to collapse all items
+            // to zero height.  Instead, use f32::INFINITY so the deficit is always 0
+            // (no shrinking) and the container grows to fit its items.  Row containers
+            // always have a definite main size (inner_width from the block width).
+            let main_container_size = if is_row {
+                inner_width
+            } else if height > 0.0 {
+                height
+            } else {
+                f32::INFINITY // auto-height column: no shrinking, grow to content
+            };
             let mut lines: Vec<Vec<usize>> = Vec::new();
             {
                 let mut cur_line: Vec<usize> = Vec::new();
@@ -813,8 +832,10 @@ impl<'a> LayoutBox<'a> {
                 // Compute total main size + gaps for this line.
                 let gaps_total = if line_indices.len() > 1 { main_gap * (line_indices.len() - 1) as f32 } else { 0.0 };
                 let line_total_main: f32 = line_indices.iter().map(|&i| main_size(&raw_items[i].cb)).sum::<f32>() + gaps_total;
-                let free = (main_container_size - line_total_main).max(0.0);
-                let deficit = (line_total_main - main_container_size).max(0.0);
+                // When main_container_size is INFINITY (auto-height column), there is no
+                // definite container size: free space is 0 and deficit is 0.
+                let free = if main_container_size.is_infinite() { 0.0 } else { (main_container_size - line_total_main).max(0.0) };
+                let deficit = if main_container_size.is_infinite() { 0.0 } else { (line_total_main - main_container_size).max(0.0) };
 
                 // Flex-grow distribution (only if there is free space).
                 let total_grow: f32 = line_indices.iter().map(|&i| raw_items[i].grow).sum();
@@ -846,7 +867,8 @@ impl<'a> LayoutBox<'a> {
                 // Recompute totals after grow/shrink.
                 let gaps_total2 = if line_indices.len() > 1 { main_gap * (line_indices.len() - 1) as f32 } else { 0.0 };
                 let line_total_main2: f32 = line_indices.iter().map(|&i| main_size(&raw_items[i].cb)).sum::<f32>() + gaps_total2;
-                let free2 = (main_container_size - line_total_main2).max(0.0);
+                // Free space is 0 when container has no definite size (INFINITY).
+                let free2 = if main_container_size.is_infinite() { 0.0 } else { (main_container_size - line_total_main2).max(0.0) };
                 let n = line_indices.len();
 
                 // Compute main-axis starting cursor and per-item gap for justify-content.
@@ -935,11 +957,20 @@ impl<'a> LayoutBox<'a> {
             } else {
                 cross_cursor
             };
+            // For column containers, derive the main-axis (height) from the actual child
+            // positions rather than main_container_size (which is near-zero when height is auto).
+            // Include padding.bottom + border.bottom, consistent with block layout (line ~1197).
+            let column_main = if !is_row {
+                let content_top = self.dimensions.y + self.padding.top + self.border.top;
+                (child_y - content_top + self.padding.bottom + self.border.bottom).max(0.0)
+            } else {
+                0.0
+            };
             if self.dimensions.width  <= 0.0 {
                 self.dimensions.width  = if is_row { main_container_size } else { total_cross };
             }
             if self.dimensions.height <= 0.0 || height <= 0.0 {
-                self.dimensions.height = if is_row { total_cross } else { main_container_size.max(total_cross) };
+                self.dimensions.height = if is_row { total_cross } else { column_main };
             }
 
             let final_x = if is_block { container_start_x } else { self.dimensions.x + self.dimensions.width + self.margin.right };
