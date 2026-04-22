@@ -436,16 +436,168 @@ fn execute_commands_on_tile(commands: &[PaintCommand], pixmap: &mut Pixmap, tile
                 render_text_raw(text.clone(), adjusted_rect, *font_size, color, adjusted_clip, pixmap, *bold, *italic, *text_decoration);
             }
             PaintCommand::Shadow(r, s) => {
-                let mut paint = Paint::default();
-                paint.set_color_rgba8(s.color.r, s.color.g, s.color.b, s.color.a / 2);
+                let blur = *s.blur;
                 let sx = r.x + *s.offset_x - *s.spread;
                 let sy = r.y + *s.offset_y - *s.spread;
-                let sw = r.width + (*s.spread * 2.0);
-                let sh = r.height + (*s.spread * 2.0);
-                if let Some(tr) = tiny_skia::Rect::from_xywh(sx, sy, sw, sh) {
-                    pixmap.fill_rect(tr, &paint, transform, active_mask!());
+                let sw = (r.width + (*s.spread * 2.0)).max(1.0);
+                let sh = (r.height + (*s.spread * 2.0)).max(1.0);
+
+                if blur <= 0.0 {
+                    // No blur: draw a sharp shadow rect directly.
+                    let mut paint = Paint::default();
+                    paint.set_color_rgba8(s.color.r, s.color.g, s.color.b, s.color.a);
+                    if let Some(tr) = tiny_skia::Rect::from_xywh(sx, sy, sw, sh) {
+                        pixmap.fill_rect(tr, &paint, transform, active_mask!());
+                    }
+                } else {
+                    // Blurred shadow: render shape into temp pixmap, box-blur it,
+                    // then composite onto the main pixmap.
+                    //
+                    // The blur "spreads" the shadow by roughly `blur` pixels in each
+                    // direction, so the temp pixmap needs extra padding around the
+                    // shadow shape equal to the blur radius so the falloff has room.
+                    let pad = blur.ceil() as i32 + 1;
+                    let pad_f = pad as f32;
+
+                    let tmp_w = (sw + pad_f * 2.0).ceil() as u32;
+                    let tmp_h = (sh + pad_f * 2.0).ceil() as u32;
+
+                    if let Some(mut shadow_px) = Pixmap::new(tmp_w.max(1), tmp_h.max(1)) {
+                        // Fill the shadow shape (solid, full alpha) in the temp pixmap.
+                        // Shape is offset by `pad` so there is room for the blur halo.
+                        let local_x = pad_f;
+                        let local_y = pad_f;
+                        if let Some(tr) = tiny_skia::Rect::from_xywh(local_x, local_y, sw, sh) {
+                            let mut shape_paint = Paint::default();
+                            // Use full opacity here; we apply the shadow color alpha when compositing.
+                            shape_paint.set_color_rgba8(255, 255, 255, 255);
+                            shadow_px.fill_rect(tr, &shape_paint, Transform::identity(), None);
+                        }
+
+                        // Apply a 3-pass separable box-blur to approximate a Gaussian.
+                        // sigma ≈ blur / 2  →  box radius ≈ (blur / 2).round() as usize
+                        let sigma = (blur / 2.0).max(1.0);
+                        let radius = sigma.round() as usize;
+                        box_blur_alpha(&mut shadow_px, radius);
+                        box_blur_alpha(&mut shadow_px, radius);
+                        box_blur_alpha(&mut shadow_px, radius);
+
+                        // Composite the blurred shadow onto the target pixmap.
+                        // The top-left of the temp pixmap (in document space) is at
+                        // (sx - pad_f, sy - pad_f).  The tile transform shifts by tx/ty.
+                        let dest_x = (sx - pad_f + tx) as i32;
+                        let dest_y = (sy - pad_f + ty) as i32;
+
+                        let cr = s.color.r;
+                        let cg = s.color.g;
+                        let cb = s.color.b;
+                        let ca = s.color.a as f32 / 255.0;
+
+                        // Walk every pixel of the blurred shadow and composite with
+                        // the shadow color into the target pixmap.
+                        let pw = pixmap.width() as i32;
+                        let ph = pixmap.height() as i32;
+                        let tw = shadow_px.width() as i32;
+                        let th = shadow_px.height() as i32;
+                        let shadow_data = shadow_px.data().to_vec();
+
+                        for ty_off in 0..th {
+                            let py = dest_y + ty_off;
+                            if py < 0 || py >= ph { continue; }
+                            for tx_off in 0..tw {
+                                let px_coord = dest_x + tx_off;
+                                if px_coord < 0 || px_coord >= pw { continue; }
+
+                                // Each pixel in the shadow pixmap is RGBA premultiplied.
+                                // We stored white (255,255,255) and blurred — the
+                                // alpha channel holds the coverage.
+                                let src_base = ((ty_off * tw + tx_off) * 4) as usize;
+                                if src_base + 3 >= shadow_data.len() { continue; }
+                                // After blurring, the alpha channel encodes coverage.
+                                let coverage = shadow_data[src_base + 3] as f32 / 255.0;
+                                if coverage <= 0.0 { continue; }
+
+                                let alpha = (coverage * ca).clamp(0.0, 1.0);
+                                if alpha <= 0.0 { continue; }
+
+                                let dst_idx = (py as u32 * pixmap.width() + px_coord as u32) as usize;
+                                let pixel = &mut pixmap.pixels_mut()[dst_idx];
+                                let dst = pixel.demultiply();
+                                let blend = |src: u8, d: u8| -> u8 {
+                                    ((src as f32 * alpha) + (d as f32 * (1.0 - alpha))).round() as u8
+                                };
+                                let out_a = ((alpha + (dst.alpha() as f32 / 255.0) * (1.0 - alpha)) * 255.0).round() as u8;
+                                *pixel = tiny_skia::ColorU8::from_rgba(
+                                    blend(cr, dst.red()),
+                                    blend(cg, dst.green()),
+                                    blend(cb, dst.blue()),
+                                    out_a,
+                                ).premultiply();
+                            }
+                        }
+                    }
                 }
             }
+        }
+    }
+}
+
+/// Apply a single-pass separable box blur to the alpha channel of a pixmap.
+///
+/// Performs a 1D horizontal blur then a 1D vertical blur.  Running this
+/// function three times with the same `radius` gives a very good
+/// approximation of a Gaussian blur with sigma ≈ `radius * sqrt(1/3)`.
+///
+/// The kernel width is `2 * radius + 1`.  Only the alpha channel is blurred;
+/// the RGB channels are left at their initial values (white in the shadow
+/// case) because we only use alpha as coverage when compositing.
+fn box_blur_alpha(pixmap: &mut Pixmap, radius: usize) {
+    if radius == 0 { return; }
+
+    let w = pixmap.width() as usize;
+    let h = pixmap.height() as usize;
+    let data = pixmap.data_mut();
+    let k = 2 * radius + 1;
+
+    // Horizontal pass — blur each row independently.
+    for row in 0..h {
+        let base = row * w * 4;
+        // Accumulate the first window.
+        let mut acc = 0u32;
+        for x in 0..k.min(w) {
+            acc += data[base + x * 4 + 3] as u32;
+        }
+
+        let mut tmp = vec![0u8; w];
+        for x in 0..w {
+            tmp[x] = (acc / k as u32) as u8;
+            // Slide window: add leading edge, remove trailing edge.
+            let lead = x + radius + 1;
+            let trail = if x >= radius { x - radius } else { w }; // sentinel: skip
+            if lead < w { acc += data[base + lead * 4 + 3] as u32; }
+            if x >= radius { acc = acc.saturating_sub(data[base + trail * 4 + 3] as u32); }
+        }
+        for x in 0..w {
+            data[base + x * 4 + 3] = tmp[x];
+        }
+    }
+
+    // Vertical pass — blur each column independently.
+    for col in 0..w {
+        let mut acc = 0u32;
+        for y in 0..k.min(h) {
+            acc += data[(y * w + col) * 4 + 3] as u32;
+        }
+
+        let mut tmp = vec![0u8; h];
+        for y in 0..h {
+            tmp[y] = (acc / k as u32) as u8;
+            let lead = y + radius + 1;
+            if lead < h { acc += data[(lead * w + col) * 4 + 3] as u32; }
+            if y >= radius { acc = acc.saturating_sub(data[((y - radius) * w + col) * 4 + 3] as u32); }
+        }
+        for y in 0..h {
+            data[(y * w + col) * 4 + 3] = tmp[y];
         }
     }
 }
@@ -1016,6 +1168,99 @@ mod tests {
         render_text_raw("Hi".to_string(), rect, 16.0, &red(), rect, &mut p_red, false, false, 0);
 
         assert_ne!(p_black.data(), p_red.data(), "black and red text must produce different pixel output");
+    }
+
+    // ── Shadow blur ───────────────────────────────────────────────────────────
+
+    /// `box_blur_alpha` with radius > 0 must produce a different alpha channel
+    /// than the original (un-blurred) pixmap.
+    #[test]
+    fn test_box_blur_alpha_changes_pixels() {
+        let mut p = Pixmap::new(20, 20).unwrap();
+        // Draw a solid white rect in the center.
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(255, 255, 255, 255);
+        if let Some(tr) = tiny_skia::Rect::from_xywh(5.0, 5.0, 10.0, 10.0) {
+            p.fill_rect(tr, &paint, Transform::identity(), None);
+        }
+        let before = p.data().to_vec();
+        box_blur_alpha(&mut p, 2);
+        assert_ne!(p.data(), before.as_slice(), "blur must change the pixmap");
+    }
+
+    /// After blurring a fully opaque center patch, the pixels just outside the
+    /// original solid area must become non-zero alpha (the halo effect).
+    #[test]
+    fn test_box_blur_alpha_produces_halo() {
+        let mut p = Pixmap::new(20, 20).unwrap();
+        // Draw a 4×4 fully opaque white square in the very center.
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(255, 255, 255, 255);
+        if let Some(tr) = tiny_skia::Rect::from_xywh(8.0, 8.0, 4.0, 4.0) {
+            p.fill_rect(tr, &paint, Transform::identity(), None);
+        }
+        // Three-pass box blur (Gaussian approximation).
+        box_blur_alpha(&mut p, 2);
+        box_blur_alpha(&mut p, 2);
+        box_blur_alpha(&mut p, 2);
+
+        // The pixel one step outside the original rect should now be non-zero.
+        let halo_pixel_alpha = p.data()[(7 * 20 + 8) * 4 + 3]; // row 7, col 8
+        assert!(halo_pixel_alpha > 0, "halo pixel should have non-zero alpha after blur, got {}", halo_pixel_alpha);
+    }
+
+    /// A sharp shadow (blur == 0) must modify the pixmap: the shadow rect area
+    /// must differ from a transparent background.
+    #[test]
+    fn test_shadow_zero_blur_renders_rect() {
+        use crate::css::{BoxShadow, OrderedFloat};
+        use crate::layer_tree::PaintCommand;
+
+        let mut pixmap = Pixmap::new(100, 100).unwrap();
+        let shadow = BoxShadow {
+            offset_x: OrderedFloat(0.0),
+            offset_y: OrderedFloat(4.0),
+            blur:     OrderedFloat(0.0),
+            spread:   OrderedFloat(0.0),
+            color:    Color { r: 0, g: 0, b: 0, a: 76 },
+            inset:    false,
+        };
+        let rect = LayoutRect { x: 10.0, y: 10.0, width: 40.0, height: 20.0 };
+        let before = pixmap.data().to_vec();
+
+        let tile_rect = LayoutRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
+        let cmds = vec![PaintCommand::Shadow(rect, shadow)];
+        execute_commands_on_tile(&cmds, &mut pixmap, tile_rect, &HashMap::new());
+
+        assert_ne!(pixmap.data(), before.as_slice(), "zero-blur shadow must modify the pixmap");
+    }
+
+    /// A blurred shadow (blur > 0) must modify the pixmap and produce a
+    /// non-zero alpha region larger than the element rect itself (the halo).
+    #[test]
+    fn test_shadow_with_blur_produces_halo() {
+        use crate::css::{BoxShadow, OrderedFloat};
+        use crate::layer_tree::PaintCommand;
+
+        let mut pixmap = Pixmap::new(100, 100).unwrap();
+        let shadow = BoxShadow {
+            offset_x: OrderedFloat(0.0),
+            offset_y: OrderedFloat(0.0),
+            blur:     OrderedFloat(8.0),
+            spread:   OrderedFloat(0.0),
+            color:    Color { r: 0, g: 0, b: 0, a: 76 },
+            inset:    false,
+        };
+        let rect = LayoutRect { x: 40.0, y: 40.0, width: 20.0, height: 20.0 };
+
+        let tile_rect = LayoutRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
+        let cmds = vec![PaintCommand::Shadow(rect, shadow)];
+        execute_commands_on_tile(&cmds, &mut pixmap, tile_rect, &HashMap::new());
+
+        // The pixel several pixels outside the shadow rect should have non-zero alpha
+        // due to the blur halo.  Shadow at (40,40) size (20,20); check pixel at (34,40).
+        let halo_alpha = pixmap.data()[(40 * 100 + 34) * 4 + 3];
+        assert!(halo_alpha > 0, "blurred shadow halo pixel should be non-zero alpha, got {}", halo_alpha);
     }
 
     /// Text rendered via the cache must respect the clip rectangle (pixels outside
