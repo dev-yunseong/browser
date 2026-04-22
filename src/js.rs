@@ -491,6 +491,386 @@ impl JsRuntime {
         });
         context.register_global_callable(js_string!("__aura_fetch"), 3, aura_fetch).unwrap();
 
+        // ── DOM Query APIs ────────────────────────────────────────────────────
+
+        // __aura_query_selector(root_nid_or_0, selector_str) → nid | null
+        let query_selector = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let root_nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let selector = args.get(1).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            let found = DOM_ROOT.with(|root| {
+                if let Some(ref r) = *root.borrow() {
+                    let search_root = if root_nid == 0 {
+                        r.clone()
+                    } else {
+                        NODE_REGISTRY.with(|reg| reg.borrow().get(&root_nid).cloned()).unwrap_or_else(|| r.clone())
+                    };
+                    query_selector_first(&search_root, &selector, root_nid != 0)
+                } else { None }
+            });
+            Ok(found.map(|h| JsValue::from(register_node(h))).unwrap_or(JsValue::null()))
+        });
+        context.register_global_callable(js_string!("__aura_query_selector"), 2, query_selector).unwrap();
+
+        // __aura_query_selector_all(root_nid_or_0, selector_str) → JSON array of nids
+        let query_selector_all = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let root_nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let selector = args.get(1).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            let nids = DOM_ROOT.with(|root| {
+                if let Some(ref r) = *root.borrow() {
+                    let search_root = if root_nid == 0 {
+                        r.clone()
+                    } else {
+                        NODE_REGISTRY.with(|reg| reg.borrow().get(&root_nid).cloned()).unwrap_or_else(|| r.clone())
+                    };
+                    query_selector_all_nodes(&search_root, &selector, root_nid != 0)
+                } else { vec![] }
+            });
+            let ids: Vec<u32> = nids.into_iter().map(register_node).collect();
+            let json = format!("[{}]", ids.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","));
+            Ok(JsValue::from(js_string!(json)))
+        });
+        context.register_global_callable(js_string!("__aura_query_selector_all"), 2, query_selector_all).unwrap();
+
+        // __aura_get_elements_by_class(root_nid_or_0, class_name) → JSON array of nids
+        let get_by_class = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let root_nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let cls = args.get(1).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            let nids = DOM_ROOT.with(|root| {
+                if let Some(ref r) = *root.borrow() {
+                    let search_root = if root_nid == 0 {
+                        r.clone()
+                    } else {
+                        NODE_REGISTRY.with(|reg| reg.borrow().get(&root_nid).cloned()).unwrap_or_else(|| r.clone())
+                    };
+                    find_elements_by_class(&search_root, &cls, root_nid != 0)
+                } else { vec![] }
+            });
+            let ids: Vec<u32> = nids.into_iter().map(register_node).collect();
+            let json = format!("[{}]", ids.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","));
+            Ok(JsValue::from(js_string!(json)))
+        });
+        context.register_global_callable(js_string!("__aura_get_elements_by_class"), 2, get_by_class).unwrap();
+
+        // __aura_get_elements_by_tag(root_nid_or_0, tag_name) → JSON array of nids
+        let get_by_tag = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let root_nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let tag = args.get(1).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default().to_lowercase();
+            let nids = DOM_ROOT.with(|root| {
+                if let Some(ref r) = *root.borrow() {
+                    let search_root = if root_nid == 0 {
+                        r.clone()
+                    } else {
+                        NODE_REGISTRY.with(|reg| reg.borrow().get(&root_nid).cloned()).unwrap_or_else(|| r.clone())
+                    };
+                    find_elements_by_tag_name(&search_root, &tag, root_nid != 0)
+                } else { vec![] }
+            });
+            let ids: Vec<u32> = nids.into_iter().map(register_node).collect();
+            let json = format!("[{}]", ids.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","));
+            Ok(JsValue::from(js_string!(json)))
+        });
+        context.register_global_callable(js_string!("__aura_get_elements_by_tag"), 2, get_by_tag).unwrap();
+
+        // ── DOM Mutation APIs ─────────────────────────────────────────────────
+
+        // __aura_create_element(tag) → nid
+        let create_element = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let tag = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_else(|| "div".to_string()).to_lowercase();
+            let nid = DOM_ROOT.with(|root| {
+                use html5ever::{QualName, LocalName, ns};
+                use markup5ever_rcdom::{Node, NodeData};
+                let new_node = Node::new(NodeData::Element {
+                    name: QualName::new(None, ns!(html), LocalName::from(tag)),
+                    attrs: std::cell::RefCell::new(vec![]),
+                    template_contents: std::cell::RefCell::new(None),
+                    mathml_annotation_xml_integration_point: false,
+                });
+                // Store it even without a DOM parent so it can be used
+                let nid = register_node(new_node.clone());
+                // If there's a DOM root, we register it but don't attach yet
+                let _ = root; // suppress warning
+                nid
+            });
+            Ok(JsValue::from(nid))
+        });
+        context.register_global_callable(js_string!("__aura_create_element"), 1, create_element).unwrap();
+
+        // __aura_append_child(parent_nid, child_nid) → void
+        let append_child = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let parent_nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let child_nid = args.get(1).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            NODE_REGISTRY.with(|reg| {
+                let reg = reg.borrow();
+                if let (Some(parent), Some(child)) = (reg.get(&parent_nid), reg.get(&child_nid)) {
+                    // Remove from existing parent if any
+                    let child_ptr = Rc::as_ptr(child) as usize;
+                    if let Some(old_parent_handle) = find_parent_by_ptr_in_dom(child_ptr) {
+                        old_parent_handle.children.borrow_mut().retain(|c| Rc::as_ptr(c) as usize != child_ptr);
+                    }
+                    // Set new parent relationship via Cell::set
+                    child.parent.set(Some(Rc::downgrade(parent)));
+                    parent.children.borrow_mut().push(child.clone());
+                }
+            });
+            Ok(JsValue::undefined())
+        });
+        context.register_global_callable(js_string!("__aura_append_child"), 2, append_child).unwrap();
+
+        // __aura_remove_child(parent_nid, child_nid) → void
+        let remove_child = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let parent_nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let child_nid = args.get(1).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            NODE_REGISTRY.with(|reg| {
+                let reg = reg.borrow();
+                if let (Some(parent), Some(child)) = (reg.get(&parent_nid), reg.get(&child_nid)) {
+                    let child_ptr = Rc::as_ptr(child) as usize;
+                    parent.children.borrow_mut().retain(|c| Rc::as_ptr(c) as usize != child_ptr);
+                    child.parent.set(None);
+                }
+            });
+            Ok(JsValue::undefined())
+        });
+        context.register_global_callable(js_string!("__aura_remove_child"), 2, remove_child).unwrap();
+
+        // __aura_insert_before(parent_nid, new_child_nid, ref_nid_or_null) → void
+        let insert_before = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let parent_nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let new_nid = args.get(1).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let ref_nid = args.get(2).and_then(|v| if v.is_null() { None } else { v.as_number().map(|n| n as u32) });
+            NODE_REGISTRY.with(|reg| {
+                let reg = reg.borrow();
+                if let (Some(parent), Some(new_child)) = (reg.get(&parent_nid), reg.get(&new_nid)) {
+                    // Remove from existing parent
+                    let new_ptr = Rc::as_ptr(new_child) as usize;
+                    if let Some(old_parent) = find_parent_by_ptr_in_dom(new_ptr) {
+                        old_parent.children.borrow_mut().retain(|c| Rc::as_ptr(c) as usize != new_ptr);
+                    }
+                    new_child.parent.set(Some(Rc::downgrade(parent)));
+
+                    let mut children = parent.children.borrow_mut();
+                    if let Some(ref_nid_val) = ref_nid {
+                        if let Some(ref_node) = reg.get(&ref_nid_val) {
+                            let ref_ptr = Rc::as_ptr(ref_node) as usize;
+                            if let Some(pos) = children.iter().position(|c| Rc::as_ptr(c) as usize == ref_ptr) {
+                                children.insert(pos, new_child.clone());
+                                return;
+                            }
+                        }
+                    }
+                    children.push(new_child.clone());
+                }
+            });
+            Ok(JsValue::undefined())
+        });
+        context.register_global_callable(js_string!("__aura_insert_before"), 3, insert_before).unwrap();
+
+        // __aura_remove_self(nid) → void
+        let remove_self = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            NODE_REGISTRY.with(|reg| {
+                let reg = reg.borrow();
+                if let Some(node) = reg.get(&nid) {
+                    let node_ptr = Rc::as_ptr(node) as usize;
+                    // Get parent via Cell::take/set pattern
+                    let parent_weak = node.parent.take();
+                    if let Some(ref pw) = parent_weak {
+                        if let Some(parent) = pw.upgrade() {
+                            parent.children.borrow_mut().retain(|c| Rc::as_ptr(c) as usize != node_ptr);
+                        }
+                    }
+                    // parent_weak was taken (None now), leave it as None
+                }
+            });
+            Ok(JsValue::undefined())
+        });
+        context.register_global_callable(js_string!("__aura_remove_self"), 1, remove_self).unwrap();
+
+        // __aura_get_inner_html(nid) → string
+        let get_inner_html = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let html = NODE_REGISTRY.with(|reg| {
+                let reg = reg.borrow();
+                if let Some(node) = reg.get(&nid) {
+                    serialize_inner_html(node)
+                } else {
+                    String::new()
+                }
+            });
+            Ok(JsValue::from(js_string!(html)))
+        });
+        context.register_global_callable(js_string!("__aura_get_inner_html"), 1, get_inner_html).unwrap();
+
+        // __aura_set_inner_html(nid, html_str) → void
+        let set_inner_html = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let html_str = args.get(1).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            NODE_REGISTRY.with(|reg| {
+                let reg = reg.borrow();
+                if let Some(node) = reg.get(&nid) {
+                    // Determine context tag for fragment parsing
+                    let ctx_tag = if let NodeData::Element { ref name, .. } = node.data {
+                        name.local.to_string()
+                    } else { "div".to_string() };
+                    let fragment_nodes = parse_html_fragment(&html_str, &ctx_tag);
+                    // Replace children
+                    let mut children = node.children.borrow_mut();
+                    children.clear();
+                    for child in fragment_nodes {
+                        child.parent.set(Some(Rc::downgrade(node)));
+                        children.push(child);
+                    }
+                }
+            });
+            Ok(JsValue::undefined())
+        });
+        context.register_global_callable(js_string!("__aura_set_inner_html"), 2, set_inner_html).unwrap();
+
+        // __aura_get_text_content(nid) → string
+        let get_text_content = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let text = NODE_REGISTRY.with(|reg| {
+                let reg = reg.borrow();
+                if let Some(node) = reg.get(&nid) {
+                    collect_text_content(node)
+                } else {
+                    String::new()
+                }
+            });
+            Ok(JsValue::from(js_string!(text)))
+        });
+        context.register_global_callable(js_string!("__aura_get_text_content"), 1, get_text_content).unwrap();
+
+        // __aura_set_text_content(nid, text) → void
+        let set_text_content = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let text = args.get(1).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            NODE_REGISTRY.with(|reg| {
+                let reg = reg.borrow();
+                if let Some(node) = reg.get(&nid) {
+                    use markup5ever_rcdom::Node;
+                    use html5ever::tendril::StrTendril;
+                    let text_node = Node::new(NodeData::Text {
+                        contents: std::cell::RefCell::new(StrTendril::from(text.as_str())),
+                    });
+                    text_node.parent.set(Some(Rc::downgrade(node)));
+                    let mut children = node.children.borrow_mut();
+                    children.clear();
+                    children.push(text_node);
+                }
+            });
+            Ok(JsValue::undefined())
+        });
+        context.register_global_callable(js_string!("__aura_set_text_content"), 2, set_text_content).unwrap();
+
+        // __aura_get_attribute(nid, name) → string | null
+        let get_attr = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let name = args.get(1).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            let val = NODE_REGISTRY.with(|reg| {
+                let reg = reg.borrow();
+                if let Some(node) = reg.get(&nid) {
+                    if let NodeData::Element { ref attrs, .. } = node.data {
+                        for attr in attrs.borrow().iter() {
+                            if attr.name.local.to_string() == name {
+                                return Some(attr.value.to_string());
+                            }
+                        }
+                    }
+                }
+                None
+            });
+            Ok(val.map(|v| JsValue::from(js_string!(v))).unwrap_or(JsValue::null()))
+        });
+        context.register_global_callable(js_string!("__aura_get_attribute"), 2, get_attr).unwrap();
+
+        // __aura_remove_attribute(nid, name) → void
+        let remove_attr = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let name = args.get(1).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            NODE_REGISTRY.with(|reg| {
+                if let Some(node) = reg.borrow().get(&nid) {
+                    if let NodeData::Element { ref attrs, .. } = node.data {
+                        attrs.borrow_mut().retain(|a| a.name.local.to_string() != name);
+                    }
+                }
+            });
+            Ok(JsValue::undefined())
+        });
+        context.register_global_callable(js_string!("__aura_remove_attribute"), 2, remove_attr).unwrap();
+
+        // __aura_has_attribute(nid, name) → bool
+        let has_attr = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let name = args.get(1).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            let found = NODE_REGISTRY.with(|reg| {
+                let reg = reg.borrow();
+                if let Some(node) = reg.get(&nid) {
+                    if let NodeData::Element { ref attrs, .. } = node.data {
+                        return attrs.borrow().iter().any(|a| a.name.local.to_string() == name);
+                    }
+                }
+                false
+            });
+            Ok(JsValue::from(found))
+        });
+        context.register_global_callable(js_string!("__aura_has_attribute"), 2, has_attr).unwrap();
+
+        // __aura_get_children_nids(nid) → JSON array of {nid, tag, string_id}
+        let get_children = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let result = NODE_REGISTRY.with(|reg| {
+                let reg = reg.borrow();
+                if let Some(node) = reg.get(&nid) {
+                    let mut items = Vec::new();
+                    for child in node.children.borrow().iter() {
+                        if let NodeData::Element { ref name, ref attrs, .. } = child.data {
+                            let tag = name.local.to_string();
+                            let id_attr = attrs.borrow().iter()
+                                .find(|a| a.name.local.to_string() == "id")
+                                .map(|a| a.value.to_string())
+                                .unwrap_or_default();
+                            let child_nid = register_node(child.clone());
+                            items.push(format!("{{\"nid\":{},\"tag\":\"{}\",\"id\":\"{}\"}}", child_nid, tag, id_attr));
+                        }
+                    }
+                    items.join(",")
+                } else {
+                    String::new()
+                }
+            });
+            Ok(JsValue::from(js_string!(format!("[{}]", result))))
+        });
+        context.register_global_callable(js_string!("__aura_get_children"), 1, get_children).unwrap();
+
+        // __aura_get_node_info(nid) → {tag, id, class} or null
+        let get_node_info = NativeFunction::from_copy_closure(|_this, args, context| {
+            let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let info = NODE_REGISTRY.with(|reg| {
+                let reg = reg.borrow();
+                if let Some(node) = reg.get(&nid) {
+                    if let NodeData::Element { ref name, ref attrs, .. } = node.data {
+                        let tag = name.local.to_string();
+                        let attrs_b = attrs.borrow();
+                        let id = attrs_b.iter().find(|a| a.name.local.to_string() == "id").map(|a| a.value.to_string()).unwrap_or_default();
+                        let class = attrs_b.iter().find(|a| a.name.local.to_string() == "class").map(|a| a.value.to_string()).unwrap_or_default();
+                        return Some((tag, id, class));
+                    }
+                }
+                None
+            });
+            if let Some((tag, id, class)) = info {
+                use boa_engine::object::ObjectInitializer;
+                let mut obj = ObjectInitializer::new(context);
+                obj.property(js_string!("tag"), JsValue::from(js_string!(tag)), boa_engine::property::Attribute::all());
+                obj.property(js_string!("id"), JsValue::from(js_string!(id)), boa_engine::property::Attribute::all());
+                obj.property(js_string!("class"), JsValue::from(js_string!(class)), boa_engine::property::Attribute::all());
+                Ok(obj.build().into())
+            } else {
+                Ok(JsValue::null())
+            }
+        });
+        context.register_global_callable(js_string!("__aura_get_node_info"), 1, get_node_info).unwrap();
+
         // Load bootstrap
         let bootstrap = include_str!("js_bootstrap.js");
         let _ = context.eval(Source::from_bytes(bootstrap.as_bytes()));
@@ -766,4 +1146,552 @@ fn register_node(handle: Handle) -> u32 {
     NODE_REGISTRY.with(|reg| reg.borrow_mut().insert(id, handle));
     REVERSE_NODE_REGISTRY.with(|reg| reg.borrow_mut().insert(ptr, id));
     id
+}
+
+// ── CSS Selector Matching ─────────────────────────────────────────────────────
+
+/// Simple CSS selector parser: supports tag, #id, .class, and combinations
+/// e.g. "div", "#foo", ".bar", "div.foo", "div#id", ".a.b"
+/// Also supports comma-separated selectors: "h1, h2, h3"
+fn selector_matches(node: &Handle, selector: &str) -> bool {
+    // Comma-separated: match any
+    if selector.contains(',') {
+        return selector.split(',').any(|s| selector_matches(node, s.trim()));
+    }
+
+    if let NodeData::Element { ref name, ref attrs, .. } = node.data {
+        let tag = name.local.to_string().to_lowercase();
+        let attrs_b = attrs.borrow();
+        let id_val = attrs_b.iter().find(|a| a.name.local.to_string() == "id").map(|a| a.value.to_string()).unwrap_or_default();
+        let class_val = attrs_b.iter().find(|a| a.name.local.to_string() == "class").map(|a| a.value.to_string()).unwrap_or_default();
+        let classes: Vec<&str> = class_val.split_whitespace().collect();
+
+        // Parse compound selector (no spaces — those would be descendant combinators)
+        // We handle simple compound selectors: tag.class#id combinations
+        let sel = selector.trim();
+
+        // Check for attribute selectors like [type="submit"] - simplified
+        if sel.contains('[') {
+            return selector_matches_with_attr(node, sel);
+        }
+
+        // Split into parts by '#' and '.'
+        // Strategy: extract optional tag prefix, then check all id/class parts
+        let mut remaining = sel;
+        let mut required_tag: Option<&str> = None;
+
+        // Extract tag prefix (before any '.' or '#')
+        let prefix_end = remaining.find(|c| c == '.' || c == '#').unwrap_or(remaining.len());
+        if prefix_end > 0 {
+            let prefix = &remaining[..prefix_end];
+            if prefix != "*" {
+                required_tag = Some(prefix);
+            }
+            remaining = &remaining[prefix_end..];
+        }
+
+        if let Some(t) = required_tag {
+            if tag != t.to_lowercase() {
+                return false;
+            }
+        }
+
+        // Check remaining .class and #id parts
+        while !remaining.is_empty() {
+            if remaining.starts_with('#') {
+                let end = remaining[1..].find(|c| c == '.' || c == '#').map(|p| p + 1).unwrap_or(remaining.len());
+                let required_id = &remaining[1..end];
+                if id_val != required_id {
+                    return false;
+                }
+                remaining = &remaining[end..];
+            } else if remaining.starts_with('.') {
+                let end = remaining[1..].find(|c| c == '.' || c == '#').map(|p| p + 1).unwrap_or(remaining.len());
+                let required_class = &remaining[1..end];
+                if !classes.contains(&required_class) {
+                    return false;
+                }
+                remaining = &remaining[end..];
+            } else {
+                break;
+            }
+        }
+        true
+    } else {
+        false
+    }
+}
+
+fn selector_matches_with_attr(node: &Handle, sel: &str) -> bool {
+    if let NodeData::Element { ref name, ref attrs, .. } = node.data {
+        let tag = name.local.to_string().to_lowercase();
+        let attrs_b = attrs.borrow();
+
+        // Extract tag part before '['
+        let bracket_pos = sel.find('[').unwrap_or(sel.len());
+        let tag_part = &sel[..bracket_pos];
+        if !tag_part.is_empty() && tag_part != "*" && tag != tag_part.to_lowercase() {
+            return false;
+        }
+
+        // Parse [attr=value] or [attr]
+        let bracket_content = &sel[bracket_pos..];
+        if let Some(inner) = bracket_content.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            if inner.contains('=') {
+                let mut parts = inner.splitn(2, '=');
+                let attr_name = parts.next().unwrap_or("").trim().trim_matches('"');
+                let attr_val = parts.next().unwrap_or("").trim().trim_matches('"');
+                return attrs_b.iter().any(|a| a.name.local.to_string() == attr_name && a.value.to_string() == attr_val);
+            } else {
+                let attr_name = inner.trim();
+                return attrs_b.iter().any(|a| a.name.local.to_string() == attr_name);
+            }
+        }
+        false
+    } else {
+        false
+    }
+}
+
+fn query_selector_first(root: &Handle, selector: &str, skip_root: bool) -> Option<Handle> {
+    // Handle descendant combinator: "ancestor descendant"
+    // We do a simple two-pass: find all ancestors, then find descendants
+    let sel = selector.trim();
+
+    // Check for descendant combinator (space not inside brackets)
+    if let Some((ancestor_sel, desc_sel)) = split_descendant_selector(sel) {
+        // Find all elements matching ancestor_sel, then search their subtrees
+        let ancestors = query_selector_all_nodes(root, ancestor_sel, skip_root);
+        for ancestor in ancestors {
+            if let Some(found) = query_selector_first(&ancestor, desc_sel, true) {
+                return Some(found);
+            }
+        }
+        return None;
+    }
+
+    if !skip_root && selector_matches(root, sel) {
+        return Some(root.clone());
+    }
+    for child in root.children.borrow().iter() {
+        if let Some(found) = query_selector_first(child, sel, false) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn query_selector_all_nodes(root: &Handle, selector: &str, skip_root: bool) -> Vec<Handle> {
+    let mut results = Vec::new();
+    let sel = selector.trim();
+
+    if let Some((ancestor_sel, desc_sel)) = split_descendant_selector(sel) {
+        let ancestors = query_selector_all_nodes(root, ancestor_sel, skip_root);
+        for ancestor in ancestors {
+            let mut desc = query_selector_all_nodes(&ancestor, desc_sel, true);
+            results.append(&mut desc);
+        }
+        return results;
+    }
+
+    if !skip_root && selector_matches(root, sel) {
+        results.push(root.clone());
+    }
+    for child in root.children.borrow().iter() {
+        let mut found = query_selector_all_nodes(child, sel, false);
+        results.append(&mut found);
+    }
+    results
+}
+
+/// Split "ancestor descendant" into (ancestor_sel, descendant_sel).
+/// Returns None if there's no descendant combinator (space outside brackets/parens).
+fn split_descendant_selector(sel: &str) -> Option<(&str, &str)> {
+    let mut depth = 0i32;
+    let bytes = sel.as_bytes();
+    let mut last_space: Option<usize> = None;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            b' ' if depth == 0 => {
+                last_space = Some(i);
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(pos) = last_space {
+        let ancestor = sel[..pos].trim_end();
+        let desc = sel[pos + 1..].trim_start();
+        if !ancestor.is_empty() && !desc.is_empty() {
+            return Some((ancestor, desc));
+        }
+    }
+    None
+}
+
+fn find_elements_by_class(root: &Handle, cls: &str, skip_root: bool) -> Vec<Handle> {
+    let mut results = Vec::new();
+    if !skip_root {
+        if let NodeData::Element { ref attrs, .. } = root.data {
+            let class_val = attrs.borrow().iter()
+                .find(|a| a.name.local.to_string() == "class")
+                .map(|a| a.value.to_string())
+                .unwrap_or_default();
+            if class_val.split_whitespace().any(|c| c == cls) {
+                results.push(root.clone());
+            }
+        }
+    }
+    for child in root.children.borrow().iter() {
+        let mut found = find_elements_by_class(child, cls, false);
+        results.append(&mut found);
+    }
+    results
+}
+
+fn find_elements_by_tag_name(root: &Handle, tag: &str, skip_root: bool) -> Vec<Handle> {
+    let mut results = Vec::new();
+    if !skip_root {
+        if let NodeData::Element { ref name, .. } = root.data {
+            if tag == "*" || name.local.to_string().to_lowercase() == tag {
+                results.push(root.clone());
+            }
+        }
+    }
+    for child in root.children.borrow().iter() {
+        let mut found = find_elements_by_tag_name(child, tag, false);
+        results.append(&mut found);
+    }
+    results
+}
+
+/// Find the parent of a node identified by its raw pointer, searching the DOM from root.
+fn find_parent_by_ptr_in_dom(child_ptr: usize) -> Option<Handle> {
+    DOM_ROOT.with(|root| {
+        if let Some(ref r) = *root.borrow() {
+            find_parent_by_ptr(r, child_ptr)
+        } else {
+            None
+        }
+    })
+}
+
+fn find_parent_by_ptr(node: &Handle, child_ptr: usize) -> Option<Handle> {
+    for child in node.children.borrow().iter() {
+        if Rc::as_ptr(child) as usize == child_ptr {
+            return Some(node.clone());
+        }
+        if let Some(found) = find_parent_by_ptr(child, child_ptr) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Serialize inner HTML of a node (children only, not the node itself).
+fn serialize_inner_html(node: &Handle) -> String {
+    let mut out = String::new();
+    for child in node.children.borrow().iter() {
+        serialize_node(child, &mut out);
+    }
+    out
+}
+
+fn serialize_node(node: &Handle, out: &mut String) {
+    match &node.data {
+        NodeData::Text { ref contents } => {
+            out.push_str(&html_escape(&contents.borrow().to_string()));
+        }
+        NodeData::Element { ref name, ref attrs, .. } => {
+            let tag = name.local.to_string();
+            out.push('<');
+            out.push_str(&tag);
+            for attr in attrs.borrow().iter() {
+                out.push(' ');
+                out.push_str(&attr.name.local.to_string());
+                out.push_str("=\"");
+                out.push_str(&html_escape(&attr.value.to_string()));
+                out.push('"');
+            }
+            out.push('>');
+            // Self-closing void elements
+            if !matches!(tag.as_str(), "area"|"base"|"br"|"col"|"embed"|"hr"|"img"|"input"|"link"|"meta"|"param"|"source"|"track"|"wbr") {
+                for child in node.children.borrow().iter() {
+                    serialize_node(child, out);
+                }
+                out.push_str("</");
+                out.push_str(&tag);
+                out.push('>');
+            }
+        }
+        NodeData::Comment { ref contents } => {
+            out.push_str("<!--");
+            out.push_str(contents);
+            out.push_str("-->");
+        }
+        _ => {}
+    }
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+     .replace('<', "&lt;")
+     .replace('>', "&gt;")
+     .replace('"', "&quot;")
+}
+
+/// Collect all text content (recursively) from a node.
+fn collect_text_content(node: &Handle) -> String {
+    let mut out = String::new();
+    match &node.data {
+        NodeData::Text { ref contents } => {
+            out.push_str(&contents.borrow().to_string());
+        }
+        NodeData::Element { .. } => {
+            for child in node.children.borrow().iter() {
+                out.push_str(&collect_text_content(child));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Parse an HTML fragment string into a vec of Handle nodes.
+/// Uses html5ever's fragment parsing.
+fn parse_html_fragment(html: &str, _ctx_tag: &str) -> Vec<Handle> {
+    use html5ever::parse_fragment;
+    use html5ever::tendril::TendrilSink;
+    use html5ever::{QualName, LocalName, ns};
+
+    let ctx_name = QualName::new(None, ns!(html), LocalName::from(_ctx_tag));
+    let dom = parse_fragment(
+        markup5ever_rcdom::RcDom::default(),
+        Default::default(),
+        ctx_name,
+        vec![],
+        false,
+    )
+    .from_utf8()
+    .read_from(&mut html.as_bytes())
+    .unwrap();
+
+    // The fragment parser puts the content as children of the context element,
+    // which is the first child of the document.
+    // IMPORTANT: We must extract the nodes from the DOM tree BEFORE `dom` is
+    // dropped, because `Node::drop` calls `mem::take` on all descendants'
+    // children to avoid deep stack recursion. If we just clone the handles
+    // and let `dom` drop naturally, the extracted nodes would have their
+    // children cleared by the drop implementation.
+    // Solution: steal (take) the children out of the DOM tree before drop.
+    let nodes = steal_fragment_children(&dom.document);
+    // dom is dropped here but since we've already cleared the tree, the custom
+    // Drop impl won't find any children to clear (they're now owned by `nodes`).
+    nodes
+}
+
+/// Steal the fragment children from the DOM tree by removing them from their
+/// parent nodes. This prevents `Node::drop` from clearing their children.
+fn steal_fragment_children(doc: &Handle) -> Vec<Handle> {
+    // Structure: document → [context_element] → [fragment nodes]
+    // We need to take ownership of the fragment nodes out of context_element.
+    for child in doc.children.borrow().iter() {
+        if let NodeData::Element { .. } = child.data {
+            // This is the context element. Take its children.
+            let children: Vec<Handle> = child.children.borrow_mut().drain(..).collect();
+            // Clear the parent pointers so they don't point into the dying dom
+            for c in &children {
+                c.parent.set(None);
+            }
+            return children;
+        }
+    }
+    vec![]
+}
+
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dom;
+
+    fn make_runtime(html: &str) -> JsRuntime {
+        let dom = dom::parse_html(html);
+        JsRuntime::new(Some(dom.document), None, None)
+    }
+
+    fn eval(rt: &mut JsRuntime, code: &str) -> String {
+        if let Ok(val) = rt.context.eval(Source::from_bytes(code.as_bytes())) {
+            if let Ok(s) = val.to_string(&mut rt.context) {
+                return s.to_std_string_escaped();
+            }
+        }
+        String::new()
+    }
+
+    #[test]
+    fn test_query_selector_h1() {
+        let mut rt = make_runtime("<html><body><h1>Hello</h1></body></html>");
+        let result = eval(&mut rt, "document.querySelector('h1') !== null ? 'found' : 'null'");
+        assert_eq!(result, "found");
+    }
+
+    #[test]
+    fn test_query_selector_returns_null_for_missing() {
+        let mut rt = make_runtime("<html><body><p>text</p></body></html>");
+        let result = eval(&mut rt, "document.querySelector('h1') === null ? 'null' : 'found'");
+        assert_eq!(result, "null");
+    }
+
+    #[test]
+    fn test_text_content_getter() {
+        let mut rt = make_runtime("<html><body><h1>Hello World</h1></body></html>");
+        let result = eval(&mut rt, "document.querySelector('h1').textContent");
+        assert_eq!(result, "Hello World");
+    }
+
+    #[test]
+    fn test_get_element_by_id() {
+        let mut rt = make_runtime("<html><body><div id='main'>content</div></body></html>");
+        let result = eval(&mut rt, "document.getElementById('main') !== null ? 'found' : 'null'");
+        assert_eq!(result, "found");
+    }
+
+    #[test]
+    fn test_query_selector_all_count() {
+        let mut rt = make_runtime("<html><body><p>a</p><p>b</p><p>c</p></body></html>");
+        let result = eval(&mut rt, "document.querySelectorAll('p').length");
+        assert_eq!(result, "3");
+    }
+
+    #[test]
+    fn test_get_attribute() {
+        let mut rt = make_runtime("<html><body><a href='/path' id='link1'>link</a></body></html>");
+        let result = eval(&mut rt, "document.querySelector('a').getAttribute('href')");
+        assert_eq!(result, "/path");
+    }
+
+    #[test]
+    fn test_get_attribute_missing_returns_null() {
+        let mut rt = make_runtime("<html><body><a>link</a></body></html>");
+        let result = eval(&mut rt, "document.querySelector('a').getAttribute('href') === null ? 'null' : 'found'");
+        assert_eq!(result, "null");
+    }
+
+    #[test]
+    fn test_class_list_add_contains() {
+        let mut rt = make_runtime("<html><body><div id='el'>x</div></body></html>");
+        let result = eval(&mut rt,
+            "var el = document.getElementById('el'); el.classList.add('active'); el.classList.contains('active')");
+        assert_eq!(result, "true");
+    }
+
+    #[test]
+    fn test_class_list_remove() {
+        let mut rt = make_runtime("<html><body><div id='el' class='active foo'>x</div></body></html>");
+        let result = eval(&mut rt,
+            "var el = document.getElementById('el'); el.classList.remove('active'); el.classList.contains('active')");
+        assert_eq!(result, "false");
+    }
+
+    #[test]
+    fn test_class_list_toggle_adds() {
+        let mut rt = make_runtime("<html><body><div id='el'>x</div></body></html>");
+        let result = eval(&mut rt,
+            "var el = document.getElementById('el'); el.classList.toggle('visible'); el.classList.contains('visible')");
+        assert_eq!(result, "true");
+    }
+
+    #[test]
+    fn test_class_list_toggle_removes() {
+        let mut rt = make_runtime("<html><body><div id='el' class='visible'>x</div></body></html>");
+        let result = eval(&mut rt,
+            "var el = document.getElementById('el'); el.classList.toggle('visible'); el.classList.contains('visible')");
+        assert_eq!(result, "false");
+    }
+
+    #[test]
+    fn test_get_elements_by_class_name() {
+        let mut rt = make_runtime("<html><body><div class='card'>a</div><div class='card'>b</div><p>c</p></body></html>");
+        let result = eval(&mut rt, "document.getElementsByClassName('card').length");
+        assert_eq!(result, "2");
+    }
+
+    #[test]
+    fn test_get_elements_by_tag_name() {
+        let mut rt = make_runtime("<html><body><span>a</span><span>b</span></body></html>");
+        let result = eval(&mut rt, "document.getElementsByTagName('span').length");
+        assert_eq!(result, "2");
+    }
+
+    #[test]
+    fn test_add_event_listener_fires() {
+        let mut rt = make_runtime("<html><body><button id='btn'>click</button></body></html>");
+        eval(&mut rt, "var clicked = false; var btn = document.getElementById('btn'); btn.addEventListener('click', function() { clicked = true; });");
+        eval(&mut rt, "btn.dispatchEvent(new Event('click'))");
+        let result = eval(&mut rt, "clicked");
+        assert_eq!(result, "true");
+    }
+
+    #[test]
+    fn test_document_add_event_listener_domcontentloaded() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        // DOMContentLoaded fires synchronously when addEventListener is called
+        let result = eval(&mut rt,
+            "var fired = false; document.addEventListener('DOMContentLoaded', function() { fired = true; }); fired");
+        assert_eq!(result, "true");
+    }
+
+    #[test]
+    fn test_selector_matches_class() {
+        let mut rt = make_runtime("<html><body><div class='hero'>content</div></body></html>");
+        let result = eval(&mut rt, "document.querySelector('.hero') !== null ? 'found' : 'null'");
+        assert_eq!(result, "found");
+    }
+
+    #[test]
+    fn test_selector_matches_id() {
+        let mut rt = make_runtime("<html><body><section id='about'>text</section></body></html>");
+        let result = eval(&mut rt, "document.querySelector('#about') !== null ? 'found' : 'null'");
+        assert_eq!(result, "found");
+    }
+
+    #[test]
+    fn test_inner_html_getter() {
+        let mut rt = make_runtime("<html><body><div id='app'><p>hello</p></div></body></html>");
+        let result = eval(&mut rt, "document.getElementById('app').innerHTML");
+        assert!(result.contains("hello"), "Expected innerHTML to contain 'hello', got: {:?}", result);
+    }
+
+    #[test]
+    fn test_parse_html_fragment_text_content() {
+        // Test that parse_html_fragment preserves text content
+        let nodes = parse_html_fragment("<p>hello world</p>", "div");
+        assert_eq!(nodes.len(), 1, "Expected 1 fragment node");
+
+        if let NodeData::Element { ref name, .. } = nodes[0].data {
+            assert_eq!(name.local.to_string(), "p");
+        }
+
+        let text = collect_text_content(&nodes[0]);
+        assert_eq!(text, "hello world", "Text content should be preserved after fragment parse");
+    }
+
+    #[test]
+    fn test_inner_html_setter() {
+        let mut rt = make_runtime("<html><body><div id='app'></div></body></html>");
+        // Set innerHTML
+        eval(&mut rt, "document.getElementById('app').innerHTML = '<p>hello</p>';");
+        // Check via the getter that the p is now there
+        let result = eval(&mut rt, "document.getElementById('app').innerHTML");
+        assert!(result.contains("hello"), "Expected innerHTML to contain 'hello', got: {:?}", result);
+        // Also check querySelector works after mutation
+        let found = eval(&mut rt, "document.querySelector('#app p') !== null ? 'found' : 'null'");
+        assert_eq!(found, "found", "Expected querySelector('#app p') to find element after innerHTML set");
+    }
 }
