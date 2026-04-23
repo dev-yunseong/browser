@@ -317,7 +317,13 @@ pub fn compute_min_content_width(sn: &StyledNode, vw: f32, vh: f32) -> f32 {
 fn is_shrink_wrap(d: DisplayType) -> bool {
     matches!(
         d,
-        DisplayType::InlineBlock | DisplayType::Table | DisplayType::TableCell | DisplayType::Image
+        DisplayType::InlineBlock
+            | DisplayType::Table
+            | DisplayType::TableCell
+            | DisplayType::Image
+            // Form controls without an explicit CSS width shrink-wrap to content.
+            // Buttons in particular must size to their label text.
+            | DisplayType::Input
     )
 }
 
