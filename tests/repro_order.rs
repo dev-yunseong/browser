@@ -3,7 +3,7 @@ use boa_engine::{Source, JsValue};
 
 #[test]
 fn test_repro_order() {
-    let mut js = JsRuntime::new(None, None, None);
+    let mut js = JsRuntime::new(None, None, None, browser::js::new_console_buffer());
     
     js.execute(r#"
         globalThis.order = [];

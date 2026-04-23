@@ -8,7 +8,6 @@ use crate::matrix::Matrix4x4;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use lazy_static::lazy_static;
-use rayon::prelude::*;
 use std::time::Instant;
 
 const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/NanumGothic.ttf");
@@ -114,122 +113,78 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap, image_cache: 
     let layer_gen_elapsed = start.elapsed();
 
     let start_render = Instant::now();
-
-    let tile_size = 256.0;
-    let tiles_x = (viewport.width / tile_size).ceil() as u32;
-    let tiles_y = (viewport.height / tile_size).ceil() as u32;
-
-    let mut viewport_tiles = Vec::new();
-    for y in 0..tiles_y {
-        for x in 0..tiles_x {
-            let rect = LayoutRect {
-                x: x as f32 * tile_size,
-                y: y as f32 * tile_size,
-                width: tile_size.min(viewport.width - x as f32 * tile_size),
-                height: tile_size.min(viewport.height - y as f32 * tile_size),
-            };
-            if rect.width > 0.1 && rect.height > 0.1 {
-                viewport_tiles.push(rect);
-            }
-        }
-    }
-
-    // Parallel rendering of viewport tiles
-    let rendered_tiles: Vec<(LayoutRect, Pixmap)> = viewport_tiles.into_par_iter().map(|tile_rect| {
-        let mut tile_pixmap = Pixmap::new(tile_rect.width as u32, tile_rect.height as u32).unwrap();
-        tile_pixmap.fill(tiny_skia::Color::TRANSPARENT);
-
-        composite_layer_to_tile(0, &tree, &mut tile_pixmap, tile_rect, image_cache, LayoutRect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 });
-
-        (tile_rect, tile_pixmap)
-    }).collect();
-
-    // Composite all tiles onto the final pixmap (on main thread)
-    for (rect, tile_pixmap) in rendered_tiles {
-        pixmap.draw_pixmap(
-            rect.x as i32, rect.y as i32,
-            tile_pixmap.as_ref(),
-            &PixmapPaint::default(),
-            Transform::identity(),
-            None
-        );
-    }
+    composite_layer_to_surface(0, &tree, pixmap, viewport, image_cache);
 
     let render_elapsed = start_render.elapsed();
-    println!("[Perf] render_layout_tree (Tiled): Layer gen: {:?}, Actual render: {:?}", layer_gen_elapsed, render_elapsed);
+    println!("[Perf] render_layout_tree (Surface): Layer gen: {:?}, Actual render: {:?}", layer_gen_elapsed, render_elapsed);
 }
 
-fn composite_layer_to_tile(
-    layer_id: usize, 
-    tree: &LayerTree, 
-    target: &mut Pixmap, 
-    tile_rect: LayoutRect, 
-    image_cache: &HashMap<String, Vec<u8>>, 
-    parent_bounds: LayoutRect
+fn composite_layer_to_surface(
+    layer_id: usize,
+    tree: &LayerTree,
+    target: &mut Pixmap,
+    surface_rect: LayoutRect,
+    image_cache: &HashMap<String, Vec<u8>>,
 ) {
     let layer = &tree.layers[layer_id];
-    if layer.opacity <= 0.0 { return; }
-
-    // Optimization: only process layer if it intersects with this viewport tile
-    if !layer.bounds.intersects(&tile_rect) { return; }
+    if layer.opacity <= 0.0 {
+        return;
+    }
 
     let has_effect = layer.opacity < 1.0 || layer.transform != Matrix4x4::identity();
-
-    let mut layer_pixmap = if has_effect {
-        let mut p = Pixmap::new(tile_rect.width as u32, tile_rect.height as u32).unwrap();
-        p.fill(tiny_skia::Color::TRANSPARENT);
-        Some(p)
+    let mut effect_pixmap = if has_effect {
+        let width = layer.bounds.width.max(1.0).ceil() as u32;
+        let height = layer.bounds.height.max(1.0).ceil() as u32;
+        let mut pixmap = Pixmap::new(width, height).expect("Failed to allocate layer pixmap");
+        pixmap.fill(tiny_skia::Color::TRANSPARENT);
+        Some(pixmap)
     } else {
         None
     };
 
     let (negative, zero, positive) = tree.categorize_children(layer_id);
 
-    let mut bg_cmds = Vec::new();
-    let mut ct_cmds = Vec::new();
-    for tile in &layer.tiles {
-        if tile.rect.intersects(&tile_rect) {
-            bg_cmds.extend(tile.background_commands.iter().cloned());
-            ct_cmds.extend(tile.content_commands.iter().cloned());
-        }
-    }
+    if let Some(ref mut pixmap) = effect_pixmap {
+        execute_commands_on_tile(&layer.background_commands, pixmap, layer.bounds, image_cache);
 
-    {
-        let draw_target = if let Some(ref mut p) = layer_pixmap { p } else { &mut *target };
-
-        // ── CSS 7-Layer Painting Order ──
-
-        // 1. Background
-        execute_commands_on_tile(&bg_cmds, draw_target, tile_rect, image_cache);
-
-        // 2. Negative Z
         for &child_id in &negative {
-            composite_layer_to_tile(child_id, tree, draw_target, tile_rect, image_cache, layer.bounds);
+            composite_layer_to_surface(child_id, tree, pixmap, layer.bounds, image_cache);
         }
 
-        // 3. Content
-        execute_commands_on_tile(&ct_cmds, draw_target, tile_rect, image_cache);
+        execute_commands_on_tile(&layer.content_commands, pixmap, layer.bounds, image_cache);
 
-        // 4. Zero and positive Z
         for &child_id in &zero {
-            composite_layer_to_tile(child_id, tree, draw_target, tile_rect, image_cache, layer.bounds);
+            composite_layer_to_surface(child_id, tree, pixmap, layer.bounds, image_cache);
         }
         for &child_id in &positive {
-            composite_layer_to_tile(child_id, tree, draw_target, tile_rect, image_cache, layer.bounds);
+            composite_layer_to_surface(child_id, tree, pixmap, layer.bounds, image_cache);
+        }
+    } else {
+        execute_commands_on_tile(&layer.background_commands, target, surface_rect, image_cache);
+
+        for &child_id in &negative {
+            composite_layer_to_surface(child_id, tree, target, surface_rect, image_cache);
+        }
+
+        execute_commands_on_tile(&layer.content_commands, target, surface_rect, image_cache);
+
+        for &child_id in &zero {
+            composite_layer_to_surface(child_id, tree, target, surface_rect, image_cache);
+        }
+        for &child_id in &positive {
+            composite_layer_to_surface(child_id, tree, target, surface_rect, image_cache);
         }
     }
 
-    if let Some(p) = layer_pixmap {
+    if let Some(pixmap) = effect_pixmap {
         let mut paint = PixmapPaint::default();
         paint.opacity = layer.opacity;
 
-        let local_x = layer.bounds.x - parent_bounds.x;
-        let local_y = layer.bounds.y - parent_bounds.y;
+        let local_x = layer.bounds.x - surface_rect.x;
+        let local_y = layer.bounds.y - surface_rect.y;
+        let transform = Transform::from_translate(local_x, local_y).pre_concat(layer.transform.to_skia());
 
-        let transform = layer.transform.to_skia();
-        let final_transform = Transform::from_translate(local_x - tile_rect.x, local_y - tile_rect.y).pre_concat(transform);
-
-        target.draw_pixmap(0, 0, p.as_ref(), &paint, final_transform, None);
+        target.draw_pixmap(0, 0, pixmap.as_ref(), &paint, transform, None);
     }
 }
 

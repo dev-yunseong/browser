@@ -674,6 +674,7 @@ pub struct BrowserEngine {
     pub css_cache: HashMap<String, String>,
     pub last_stylesheet: Option<css::Stylesheet>,
     pub js_runtime: js::JsRuntime,
+    pub console_buffer: js::ConsoleBuffer,
     pub current_csp_policy: Option<js::CspPolicy>,
     pub js_style_overrides: HashMap<String, HashMap<String, String>>,
     /// The most recently rendered page result.
@@ -682,16 +683,21 @@ pub struct BrowserEngine {
 
 impl BrowserEngine {
     /// Create a new engine with empty caches and a fresh JS runtime.
-    pub fn new() -> Self {
+    pub fn new_with_console(console_buffer: js::ConsoleBuffer) -> Self {
         Self {
             image_cache: HashMap::new(),
             css_cache: HashMap::new(),
             last_stylesheet: None,
-            js_runtime: js::JsRuntime::new(None, None, None),
+            js_runtime: js::JsRuntime::new(None, None, None, console_buffer.clone()),
+            console_buffer,
             current_csp_policy: None,
             js_style_overrides: HashMap::new(),
             last_page: None,
         }
+    }
+
+    pub fn new() -> Self {
+        Self::new_with_console(js::new_console_buffer())
     }
 
     /// Synchronously navigate to a URL.
@@ -858,6 +864,14 @@ impl BrowserEngine {
         HashMap::new()
     }
 
+    pub fn console_entries(&self) -> Vec<js::ConsoleEntry> {
+        js::console_entries(&self.console_buffer)
+    }
+
+    pub fn clear_console(&self) {
+        js::clear_console_buffer(&self.console_buffer);
+    }
+
     /// Re-initialize the JS runtime for the current page.
     /// Parses the DOM from `body`, runs all page scripts (CSP-gated),
     /// and collects any immediate JS style overrides.
@@ -868,6 +882,7 @@ impl BrowserEngine {
             Some(dom.document.clone()),
             base_url,
             self.current_csp_policy.clone(),
+            self.console_buffer.clone(),
         );
 
         let scripts = js::extract_scripts_from_dom(&dom.document);
@@ -896,7 +911,8 @@ impl BrowserEngine {
     /// Reset all state in preparation for navigating to a new URL.
     pub fn clear_for_new_url(&mut self) {
         self.js_style_overrides.clear();
-        self.js_runtime = js::JsRuntime::new(None, None, None);
+        self.clear_console();
+        self.js_runtime = js::JsRuntime::new(None, None, None, self.console_buffer.clone());
         self.current_csp_policy = None;
         self.last_stylesheet = None;
         self.last_page = None;
@@ -990,6 +1006,10 @@ pub enum EngineCmd {
 /// are confined to a single thread.
 pub fn run_engine_actor(rx: mpsc::Receiver<EngineCmd>) {
     let mut eng = BrowserEngine::new();
+    run_engine_actor_with_engine(rx, &mut eng);
+}
+
+fn run_engine_actor_with_engine(rx: mpsc::Receiver<EngineCmd>, eng: &mut BrowserEngine) {
     for cmd in rx {
         match cmd {
             EngineCmd::Navigate { url, width, reply } => {
@@ -1056,17 +1076,23 @@ pub fn run_engine_actor(rx: mpsc::Receiver<EngineCmd>) {
 #[derive(Clone)]
 pub struct EngineHandle {
     pub tx: mpsc::SyncSender<EngineCmd>,
+    pub console_buffer: js::ConsoleBuffer,
 }
 
 impl EngineHandle {
     /// Create a new engine actor and return a handle to it.
     pub fn spawn() -> Self {
         let (tx, rx) = mpsc::sync_channel::<EngineCmd>(64);
+        let console_buffer = js::new_console_buffer();
+        let actor_console = console_buffer.clone();
         std::thread::Builder::new()
             .name("engine-actor".into())
-            .spawn(move || run_engine_actor(rx))
+            .spawn(move || {
+                let mut eng = BrowserEngine::new_with_console(actor_console);
+                run_engine_actor_with_engine(rx, &mut eng);
+            })
             .expect("failed to start engine actor thread");
-        Self { tx }
+        Self { tx, console_buffer }
     }
 
     pub fn send_navigate(&self, url: String, width: f32) -> Result<PageResult, String> {
@@ -1094,6 +1120,18 @@ impl EngineHandle {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.tx.send(EngineCmd::GetPage { reply: reply_tx }).ok()?;
         reply_rx.recv().ok()?
+    }
+
+    pub fn send_get_console(&self) -> Vec<js::ConsoleEntry> {
+        js::console_entries(&self.console_buffer)
+    }
+
+    pub fn console_version(&self) -> u64 {
+        js::console_version(&self.console_buffer)
+    }
+
+    pub fn send_clear_console(&self) {
+        js::clear_console_buffer(&self.console_buffer);
     }
 
     pub fn send_get_elements(&self) -> Vec<ApiElement> {
@@ -1177,6 +1215,16 @@ mod tests {
         assert!(engine.js_style_overrides.is_empty());
         assert!(engine.last_stylesheet.is_none());
         assert!(engine.current_csp_policy.is_none());
+        assert!(engine.console_entries().is_empty());
+    }
+
+    #[test]
+    fn test_clear_console_empties_buffer() {
+        let mut engine = BrowserEngine::new();
+        engine.evaluate_js("console.log('hello')");
+        assert_eq!(engine.console_entries().len(), 1);
+        engine.clear_console();
+        assert!(engine.console_entries().is_empty());
     }
 
     #[test]
