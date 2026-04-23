@@ -9,13 +9,59 @@ function __aura_set_style(id, prop, value) {
     __aura_style_log.push(id + '||||' + prop + '||||' + value);
 }
 
+function __aura_url_parts(href) {
+    var value = String(href || '');
+    var parts = value.match(/^(([^:/?#]+):)?(\/\/([^/?#]*))?([^?#]*)(\?([^#]*))?(#(.*))?/);
+    if (!parts) return null;
+    var host = parts[4] || '';
+    var hostParts = host.split(':');
+    var protocol = (parts[2] || 'http') + ':';
+    return {
+        href: value,
+        protocol: protocol,
+        host: host,
+        hostname: hostParts[0] || '',
+        port: hostParts[1] || '',
+        pathname: parts[5] || '/',
+        search: parts[6] || '',
+        hash: parts[8] || '',
+        origin: protocol + '//' + host,
+    };
+}
+
+function __aura_apply_location_href(href) {
+    var parts = __aura_url_parts(href);
+    if (!parts) return false;
+    var loc = document.location;
+    loc.href = parts.href;
+    loc.protocol = parts.protocol;
+    loc.host = parts.host;
+    loc.hostname = parts.hostname;
+    loc.port = parts.port;
+    loc.pathname = parts.pathname;
+    loc.search = parts.search;
+    loc.hash = parts.hash;
+    loc.origin = parts.origin;
+    document.URL = parts.href;
+    document.documentURI = parts.href;
+    document.baseURI = parts.href;
+    return true;
+}
+
 // -- Node Registry (Ensures stable objects for events) -----------------------
 var __node_registry = new Map();
 
-function __get_or_create_node(id, tag, string_id) {
+function __get_or_create_node(id, tag, string_id, kind) {
     if (!id) return null;
     if (__node_registry.has(id)) return __node_registry.get(id);
-    let node = tag ? new Element(id, tag, string_id) : new Node(id);
+    let node;
+    if (kind === 'text') {
+        node = new TextNode(id);
+    } else if (tag) {
+        node = new Element(id, tag, string_id);
+    } else {
+        node = new Node(id);
+    }
     __node_registry.set(id, node);
     return node;
 }
@@ -154,10 +200,16 @@ class DOMTokenList {
 // -- NodeList / HTMLCollection ------------------------------------------------
 class NodeList {
     constructor(nids, tag) {
-        this._nids = nids;
+        this._nids = nids.map(item => typeof item === 'object' ? item.nid : item);
         this._tag = tag;
         for (let i = 0; i < nids.length; i++) {
-            this[i] = __get_or_create_node(nids[i], null, null);
+            let item = nids[i];
+            if (typeof item === 'object') {
+                this[i] = __get_or_create_node(item.nid, item.tag, item.id, item.kind);
+            } else {
+                let info = __aura_get_node_info(item);
+                this[i] = info ? __get_or_create_node(item, info.tag, info.id, info.kind) : __get_or_create_node(item);
+            }
         }
         this.length = nids.length;
     }
@@ -173,34 +225,35 @@ class NodeList {
 
 // Node type constants (static properties added after class definition)
 class Node extends EventTarget {
-    constructor(id) {
+    constructor(id, kind = 'element') {
         super();
         this._id = id;
+        this._kind = kind;
     }
     get nodeType() {
-        return 1; // ELEMENT_NODE by default for Node instances used as elements
+        return this._kind === 'text' ? 3 : 1;
     }
     get parentNode() {
         let pid = __aura_get_parent_id(this._id);
         if (!pid) return null;
         let info = __aura_get_node_info(pid);
-        return info ? __get_or_create_node(pid, info.tag, info.id) : __get_or_create_node(pid);
+        return info ? __get_or_create_node(pid, info.tag, info.id, info.kind) : __get_or_create_node(pid);
     }
     get childNodes() {
         let arr = JSON.parse(__aura_get_children(this._id));
-        return new NodeList(arr.map(c => c.nid));
+        return new NodeList(arr);
     }
     get firstChild() {
         let arr = JSON.parse(__aura_get_children(this._id));
         if (arr.length === 0) return null;
         let c = arr[0];
-        return __get_or_create_node(c.nid, c.tag, c.id);
+        return __get_or_create_node(c.nid, c.tag, c.id, c.kind);
     }
     get lastChild() {
         let arr = JSON.parse(__aura_get_children(this._id));
         if (arr.length === 0) return null;
         let c = arr[arr.length - 1];
-        return __get_or_create_node(c.nid, c.tag, c.id);
+        return __get_or_create_node(c.nid, c.tag, c.id, c.kind);
     }
     get textContent() {
         return __aura_get_text_content(this._id);
@@ -209,25 +262,25 @@ class Node extends EventTarget {
         __aura_set_text_content(this._id, String(val));
     }
     appendChild(child) {
-        if (child && child._id) {
+        if (child && child._id !== undefined && child._id !== null) {
             __aura_append_child(this._id, child._id);
         }
         return child;
     }
     removeChild(child) {
-        if (child && child._id) {
+        if (child && child._id !== undefined && child._id !== null) {
             __aura_remove_child(this._id, child._id);
         }
         return child;
     }
     insertBefore(newChild, refChild) {
-        if (newChild && newChild._id) {
+        if (newChild && newChild._id !== undefined && newChild._id !== null) {
             __aura_insert_before(this._id, newChild._id, refChild ? refChild._id : null);
         }
         return newChild;
     }
     replaceChild(newChild, oldChild) {
-        if (newChild && newChild._id && oldChild && oldChild._id) {
+        if (newChild && newChild._id !== undefined && newChild._id !== null && oldChild && oldChild._id !== undefined && oldChild._id !== null) {
             __aura_insert_before(this._id, newChild._id, oldChild._id);
             __aura_remove_child(this._id, oldChild._id);
         }
@@ -246,7 +299,7 @@ class Node extends EventTarget {
         if (other._id === this._id) return true;
         let children = JSON.parse(__aura_get_children(this._id));
         for (let c of children) {
-            let child_node = __get_or_create_node(c.nid, c.tag, c.id);
+            let child_node = __get_or_create_node(c.nid, c.tag, c.id, c.kind);
             if (child_node.contains(other)) return true;
         }
         return false;
@@ -255,7 +308,7 @@ class Node extends EventTarget {
 
 class Element extends Node {
     constructor(id, tag, string_id) {
-        super(id);
+        super(id, 'element');
         this.tagName = (tag || '').toUpperCase();
         this.id = string_id || '';
         this._classList = null;
@@ -340,14 +393,14 @@ class Element extends Node {
         let nid = __aura_query_selector(this._id, selector);
         if (!nid) return null;
         let info = __aura_get_node_info(nid);
-        return info ? __get_or_create_node(nid, info.tag, info.id) : __get_or_create_node(nid);
+        return info ? __get_or_create_node(nid, info.tag, info.id, info.kind) : __get_or_create_node(nid);
     }
     querySelectorAll(selector) {
         let nids_json = __aura_query_selector_all(this._id, selector);
         let nids = JSON.parse(nids_json);
         return new NodeList(nids.map(nid => {
             let info = __aura_get_node_info(nid);
-            return __get_or_create_node(nid, info ? info.tag : null, info ? info.id : null);
+            return __get_or_create_node(nid, info ? info.tag : null, info ? info.id : null, info ? info.kind : null);
         }).map(el => el._id));
     }
     getElementsByClassName(cls) {
@@ -362,26 +415,24 @@ class Element extends Node {
     }
     get children() {
         let arr = JSON.parse(__aura_get_children(this._id));
-        return new NodeList(arr.map(c => {
-            __get_or_create_node(c.nid, c.tag, c.id);
-            return c.nid;
-        }));
+        return new NodeList(arr.filter(c => c.kind !== 'text'));
     }
     get childElementCount() {
         let arr = JSON.parse(__aura_get_children(this._id));
-        return arr.length;
+        return arr.filter(c => c.kind !== 'text').length;
     }
     get firstElementChild() {
         let arr = JSON.parse(__aura_get_children(this._id));
-        if (arr.length === 0) return null;
-        let c = arr[0];
-        return __get_or_create_node(c.nid, c.tag, c.id);
+        let c = arr.find(c => c.kind !== 'text');
+        return c ? __get_or_create_node(c.nid, c.tag, c.id, c.kind) : null;
     }
     get lastElementChild() {
         let arr = JSON.parse(__aura_get_children(this._id));
-        if (arr.length === 0) return null;
-        let c = arr[arr.length - 1];
-        return __get_or_create_node(c.nid, c.tag, c.id);
+        var c = null;
+        for (let i = arr.length - 1; i >= 0; i--) {
+            if (arr[i].kind !== 'text') { c = arr[i]; break; }
+        }
+        return c ? __get_or_create_node(c.nid, c.tag, c.id, c.kind) : null;
     }
     // getBoundingClientRect stub — returns zeros (layout info not available in JS)
     getBoundingClientRect() {
@@ -409,7 +460,7 @@ class Element extends Node {
             frag.innerHTML = html;
             var children = JSON.parse(__aura_get_children(frag._id));
             for (var i = 0; i < children.length; i++) {
-                var child = __get_or_create_node(children[i].nid, children[i].tag, children[i].id);
+                var child = __get_or_create_node(children[i].nid, children[i].tag, children[i].id, children[i].kind);
                 if (position === 'beforeend') {
                     this.appendChild(child);
                 } else {
@@ -514,6 +565,24 @@ class Element extends Node {
     }
 }
 
+class TextNode extends Node {
+    constructor(id) {
+        super(id, 'text');
+    }
+    get data() {
+        return this.textContent;
+    }
+    set data(val) {
+        this.textContent = val;
+    }
+    get nodeValue() {
+        return this.textContent;
+    }
+    set nodeValue(val) {
+        this.textContent = val;
+    }
+}
+
 // -- Node static constants ---------------------------------------------------
 Node.ELEMENT_NODE = 1;
 Node.ATTRIBUTE_NODE = 2;
@@ -570,15 +639,15 @@ var document = {
 
     getElementById: function(id) {
         let res = __aura_get_element_by_id(id);
-        return res ? __get_or_create_node(res.nid, res.tag, id) : null;
+        return res ? __get_or_create_node(res.nid, res.tag, id, res.kind) : null;
     },
     createElement: function(tag) {
         let nativeId = __aura_create_element(tag);
-        return __get_or_create_node(nativeId, tag);
+        return __get_or_create_node(nativeId, tag, null, 'element');
     },
     createTextNode: function(text) {
-        // Create a text node — for now return a minimal node-like object
-        return { _id: 0, _text: text, nodeType: 3, textContent: text };
+        let nativeId = __aura_create_text_node(String(text));
+        return __get_or_create_node(nativeId, null, null, 'text');
     },
     createDocumentFragment: function() {
         return document.createElement('div');
@@ -588,14 +657,14 @@ var document = {
         let nid = __aura_query_selector(0, selector);
         if (!nid) return null;
         let info = __aura_get_node_info(nid);
-        return info ? __get_or_create_node(nid, info.tag, info.id) : __get_or_create_node(nid);
+        return info ? __get_or_create_node(nid, info.tag, info.id, info.kind) : __get_or_create_node(nid);
     },
     querySelectorAll: function(selector) {
         let nids_json = __aura_query_selector_all(0, selector);
         let nids = JSON.parse(nids_json);
         let nodes = nids.map(nid => {
             let info = __aura_get_node_info(nid);
-            return __get_or_create_node(nid, info ? info.tag : null, info ? info.id : null);
+            return __get_or_create_node(nid, info ? info.tag : null, info ? info.id : null, info ? info.kind : null);
         });
         return new NodeList(nodes.map(n => n._id));
     },
@@ -612,19 +681,19 @@ var document = {
 
     get body() {
         let nativeId = __aura_get_body();
-        return nativeId ? __get_or_create_node(nativeId, 'body') : null;
+        return nativeId ? __get_or_create_node(nativeId, 'body', null, 'element') : null;
     },
     get head() {
         let nids_json = __aura_get_elements_by_tag(0, 'head');
         let nids = JSON.parse(nids_json);
         if (nids.length === 0) return null;
-        return __get_or_create_node(nids[0], 'head');
+        return __get_or_create_node(nids[0], 'head', null, 'element');
     },
     get documentElement() {
         let nids_json = __aura_get_elements_by_tag(0, 'html');
         let nids = JSON.parse(nids_json);
         if (nids.length === 0) return null;
-        return __get_or_create_node(nids[0], 'html');
+        return __get_or_create_node(nids[0], 'html', null, 'element');
     },
     activeElement: null,
     location: { href: '', hostname: '', pathname: '/', search: '', hash: '', protocol: 'https:', host: '', port: '', origin: '' },
@@ -649,7 +718,7 @@ var document = {
             nodes.push(node);
             var arr = JSON.parse(__aura_get_children(node._id));
             for (var c of arr) {
-                var child = __get_or_create_node(c.nid, c.tag, c.id);
+                var child = __get_or_create_node(c.nid, c.tag, c.id, c.kind);
                 collect(child);
             }
         }
@@ -680,7 +749,7 @@ var document = {
             nodes.push(node);
             var arr = JSON.parse(__aura_get_children(node._id));
             for (var c of arr) {
-                var child = __get_or_create_node(c.nid, c.tag, c.id);
+                var child = __get_or_create_node(c.nid, c.tag, c.id, c.kind);
                 collect(child);
             }
         }
@@ -814,8 +883,38 @@ window.visualViewport = {
 window.history = {
     length: 1,
     state: null,
-    pushState: function(state, title, url) {},
-    replaceState: function(state, title, url) {},
+    _entries: [location.href],
+    _index: 0,
+    pushState: function(state, title, url) {
+        this.state = state;
+        var nextHref = location.href;
+        if (url !== undefined && url !== null) {
+            try {
+                nextHref = new URL(String(url), location.href).href;
+            } catch (e) {
+                nextHref = location.href;
+            }
+            __aura_apply_location_href(nextHref);
+        }
+        this._entries = this._entries.slice(0, this._index + 1);
+        this._entries.push(nextHref);
+        this._index = this._entries.length - 1;
+        this.length = this._entries.length;
+    },
+    replaceState: function(state, title, url) {
+        this.state = state;
+        if (url !== undefined && url !== null) {
+            var resolved;
+            try {
+                resolved = new URL(String(url), location.href).href;
+            } catch (e) {
+                resolved = location.href;
+            }
+            if (__aura_apply_location_href(resolved)) {
+                this._entries[this._index] = location.href;
+            }
+        }
+    },
     back: function() {},
     forward: function() {},
     go: function() {},
@@ -934,7 +1033,8 @@ document.createComment = function(data) {
 
 // Override createTextNode to return a proper node-like object with nodeType
 document.createTextNode = function(text) {
-    return { _id: 0, _text: text, nodeType: 3, textContent: text, data: text };
+    let nativeId = __aura_create_text_node(String(text));
+    return __get_or_create_node(nativeId, null, null, 'text');
 };
 
 // -- window.matchMedia -------------------------------------------------------
@@ -1219,26 +1319,22 @@ window.dispatchEvent = function(event) {
 // -- URL class stub ----------------------------------------------------------
 class URL {
     constructor(url, base) {
-        try {
-            // Very simplified URL parsing
-            this.href = url;
-            var parts = url.match(/^(([^:/?#]+):)?(\/\/([^/?#]*))?([^?#]*)(\?([^#]*))?(#(.*))?/);
-            if (parts) {
-                this.protocol = (parts[2] || 'http') + ':';
-                this.host = parts[4] || '';
-                var hostParts = this.host.split(':');
-                this.hostname = hostParts[0] || '';
-                this.port = hostParts[1] || '';
-                this.pathname = parts[5] || '/';
-                this.search = parts[6] || '';
-                this.hash = parts[8] || '';
-                this.origin = this.protocol + '//' + this.host;
-                this.username = '';
-                this.password = '';
-            }
-        } catch(e) {
-            this.href = url;
-        }
+        var parsed = __aura_parse_url(
+            String(url),
+            base === undefined || base === null || base === '' ? null : String(base)
+        );
+        if (!parsed) throw new TypeError('Invalid URL');
+        this.href = parsed.href || '';
+        this.protocol = parsed.protocol || '';
+        this.host = parsed.host || '';
+        this.hostname = parsed.hostname || '';
+        this.port = parsed.port || '';
+        this.pathname = parsed.pathname || '/';
+        this.search = parsed.search || '';
+        this.hash = parsed.hash || '';
+        this.origin = parsed.origin || '';
+        this.username = '';
+        this.password = '';
     }
     toString() { return this.href; }
     static createObjectURL(blob) { return 'blob:'; }
