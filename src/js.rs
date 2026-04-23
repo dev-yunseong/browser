@@ -875,6 +875,59 @@ impl JsRuntime {
         let bootstrap = include_str!("js_bootstrap.js");
         let _ = context.eval(Source::from_bytes(bootstrap.as_bytes()));
 
+        // Inject the base URL into the JS location and document.location objects
+        let url_init = CURRENT_ORIGIN.with(|origin| {
+            if let Some(ref url) = *origin.borrow() {
+                let href = url.to_string();
+                let hostname = url.host_str().unwrap_or("").to_string();
+                let pathname = url.path().to_string();
+                let search = url.query().map(|q| format!("?{}", q)).unwrap_or_default();
+                let hash = url.fragment().map(|f| format!("#{}", f)).unwrap_or_default();
+                let protocol = url.scheme().to_string() + ":";
+                let host = url.host_str().map(|h| {
+                    if let Some(port) = url.port() {
+                        format!("{}:{}", h, port)
+                    } else {
+                        h.to_string()
+                    }
+                }).unwrap_or_default();
+                let port = url.port().map(|p| p.to_string()).unwrap_or_default();
+                let origin = if url.scheme() == "null" || url.scheme() == "about" {
+                    "null".to_string()
+                } else {
+                    format!("{}://{}", url.scheme(), url.host_str().unwrap_or(""))
+                };
+                format!(
+                    r#"(function() {{
+                        var _loc = {{
+                            href: {href:?},
+                            hostname: {hostname:?},
+                            pathname: {pathname:?},
+                            search: {search:?},
+                            hash: {hash:?},
+                            protocol: {protocol:?},
+                            host: {host:?},
+                            port: {port:?},
+                            origin: {origin:?},
+                        }};
+                        document.location = _loc;
+                        document.URL = {href:?};
+                        document.documentURI = {href:?};
+                        document.baseURI = {href:?};
+                        window.location = _loc;
+                        location = _loc;
+                    }})();"#
+                )
+            } else {
+                String::new()
+            }
+        });
+        if !url_init.is_empty() {
+            if let Err(e) = context.eval(Source::from_bytes(url_init.as_bytes())) {
+                println!("[JS Bootstrap] URL init error: {:?}", e);
+            }
+        }
+
         Self { context, task_receiver }
     }
 
@@ -1693,5 +1746,174 @@ mod tests {
         // Also check querySelector works after mutation
         let found = eval(&mut rt, "document.querySelector('#app p') !== null ? 'found' : 'null'");
         assert_eq!(found, "found", "Expected querySelector('#app p') to find element after innerHTML set");
+    }
+
+    // ── New runtime parity tests (#113) ──────────────────────────────────────
+
+    #[test]
+    fn test_window_inner_dimensions() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let w = eval(&mut rt, "window.innerWidth");
+        let h = eval(&mut rt, "window.innerHeight");
+        assert_eq!(w, "800");
+        assert_eq!(h, "600");
+    }
+
+    #[test]
+    fn test_navigator_user_agent_chrome() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let ua = eval(&mut rt, "navigator.userAgent");
+        assert!(ua.contains("Mozilla"), "Expected Chrome-like UA, got: {}", ua);
+        assert!(ua.contains("AppleWebKit"), "Expected WebKit UA, got: {}", ua);
+    }
+
+    #[test]
+    fn test_navigator_platform() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let platform = eval(&mut rt, "navigator.platform");
+        assert!(!platform.is_empty(), "Expected non-empty platform");
+    }
+
+    #[test]
+    fn test_history_object() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let result = eval(&mut rt, "typeof window.history");
+        assert_eq!(result, "object");
+        let push = eval(&mut rt, "typeof window.history.pushState");
+        assert_eq!(push, "function");
+        // pushState should not throw
+        let ok = eval(&mut rt, "(function() { try { history.pushState(null,'','/path'); return 'ok'; } catch(e) { return 'err:'+e; } })()");
+        assert_eq!(ok, "ok");
+    }
+
+    #[test]
+    fn test_performance_now() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let result = eval(&mut rt, "typeof window.performance.now()");
+        assert_eq!(result, "number");
+    }
+
+    #[test]
+    fn test_document_cookie_empty_string() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let cookie = eval(&mut rt, "document.cookie");
+        assert_eq!(cookie, "", "Expected empty cookie string");
+        // Writing should not throw
+        let ok = eval(&mut rt, "(function() { try { document.cookie = 'test=1'; return 'ok'; } catch(e) { return 'err'; } })()");
+        assert_eq!(ok, "ok");
+    }
+
+    #[test]
+    fn test_session_storage_get_set() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        eval(&mut rt, "sessionStorage.setItem('k', 'v')");
+        let val = eval(&mut rt, "sessionStorage.getItem('k')");
+        assert_eq!(val, "v");
+    }
+
+    #[test]
+    fn test_get_computed_style_stub() {
+        let mut rt = make_runtime("<html><body><div id='el'>x</div></body></html>");
+        let result = eval(&mut rt, "(function() { var el = document.getElementById('el'); var s = window.getComputedStyle(el); return typeof s; })()");
+        assert_eq!(result, "object");
+    }
+
+    #[test]
+    fn test_node_constants() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let elem = eval(&mut rt, "Node.ELEMENT_NODE");
+        assert_eq!(elem, "1");
+        let text = eval(&mut rt, "Node.TEXT_NODE");
+        assert_eq!(text, "3");
+        let comment = eval(&mut rt, "Node.COMMENT_NODE");
+        assert_eq!(comment, "8");
+    }
+
+    #[test]
+    fn test_element_node_type() {
+        let mut rt = make_runtime("<html><body><div id='el'>x</div></body></html>");
+        let result = eval(&mut rt, "document.getElementById('el').nodeType");
+        assert_eq!(result, "1");
+    }
+
+    #[test]
+    fn test_image_constructor() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        // new Image() should not throw
+        let result = eval(&mut rt, "(function() { try { var img = new Image(100,50); return typeof img; } catch(e) { return 'err:'+e; } })()");
+        assert_eq!(result, "object");
+    }
+
+    #[test]
+    fn test_xml_http_request_stub() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let result = eval(&mut rt, "(function() { try { var xhr = new XMLHttpRequest(); xhr.open('GET', '/test'); return 'ok'; } catch(e) { return 'err:'+e; } })()");
+        assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn test_match_media_returns_object() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let result = eval(&mut rt, "(function() { var mm = window.matchMedia('(max-width: 800px)'); return typeof mm.matches; })()");
+        assert_eq!(result, "boolean");
+    }
+
+    #[test]
+    fn test_window_screen_properties() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let w = eval(&mut rt, "window.screen.width");
+        let h = eval(&mut rt, "window.screen.height");
+        assert_eq!(w, "800");
+        assert_eq!(h, "600");
+    }
+
+    #[test]
+    fn test_device_pixel_ratio() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let dpr = eval(&mut rt, "window.devicePixelRatio");
+        assert_eq!(dpr, "1");
+    }
+
+    #[test]
+    fn test_window_location_set_from_url() {
+        let url = url::Url::parse("https://www.example.com/path?q=1#hash").unwrap();
+        let dom = crate::dom::parse_html("<html><body></body></html>");
+        let mut rt = JsRuntime::new(Some(dom.document), Some(url), None);
+        let href = if let Ok(val) = rt.context.eval(Source::from_bytes(b"window.location.href")) {
+            if let Ok(s) = val.to_string(&mut rt.context) { s.to_std_string_escaped() } else { String::new() }
+        } else { String::new() };
+        assert_eq!(href, "https://www.example.com/path?q=1#hash");
+        let hostname = if let Ok(val) = rt.context.eval(Source::from_bytes(b"window.location.hostname")) {
+            if let Ok(s) = val.to_string(&mut rt.context) { s.to_std_string_escaped() } else { String::new() }
+        } else { String::new() };
+        assert_eq!(hostname, "www.example.com");
+    }
+
+    #[test]
+    fn test_keyboard_event_constructor() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let result = eval(&mut rt, "(function() { var e = new KeyboardEvent('keydown', {key: 'Enter', keyCode: 13}); return e.key + ':' + e.keyCode; })()");
+        assert_eq!(result, "Enter:13");
+    }
+
+    #[test]
+    fn test_url_constructor() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let result = eval(&mut rt, "(function() { var u = new URL('https://example.com/path?q=1'); return u.hostname + ':' + u.pathname; })()");
+        assert_eq!(result, "example.com:/path");
+    }
+
+    #[test]
+    fn test_abort_controller() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let result = eval(&mut rt, "(function() { var ctrl = new AbortController(); ctrl.abort(); return ctrl.signal.aborted ? 'aborted' : 'not'; })()");
+        assert_eq!(result, "aborted");
+    }
+
+    #[test]
+    fn test_window_crypto_get_random_values() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let result = eval(&mut rt, "(function() { try { var arr = new Uint8Array(4); window.crypto.getRandomValues(arr); return 'ok'; } catch(e) { return 'err:'+e; } })()");
+        assert_eq!(result, "ok");
     }
 }
