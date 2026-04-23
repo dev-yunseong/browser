@@ -1069,9 +1069,18 @@ impl<'a> LayoutBox<'a> {
             }
 
             let mut raw_items: Vec<FlexItem<'_>> = Vec::new();
+            // Absolute/fixed children are out-of-flow in flex containers too.
+            let mut flex_positioned_entries: Vec<&StyledNode> = Vec::new();
 
             for child_node in &self.style_node.children {
                 if should_skip(child_node) {
+                    continue;
+                }
+                // Absolute and fixed children are out of flex flow — collect for
+                // deferred positioning after the container size is finalized.
+                let child_pos = get_position_type(child_node);
+                if matches!(child_pos, PositionType::Absolute | PositionType::Fixed) {
+                    flex_positioned_entries.push(child_node);
                     continue;
                 }
                 // For row flex containers, block-level items must not stretch to fill the
@@ -1499,6 +1508,101 @@ impl<'a> LayoutBox<'a> {
                 self.dimensions.height = if is_row { total_cross } else { column_main };
             }
 
+            // ── Layout absolutely/fixedly positioned children inside flex container ──
+            // Same logic as the block layout path: position after container size is known.
+            if !flex_positioned_entries.is_empty() {
+                let final_self_cb = Rect {
+                    x: self.dimensions.x + self.padding.left + self.border.left,
+                    y: self.dimensions.y + self.padding.top + self.border.top,
+                    width: (self.dimensions.width
+                        - self.padding.left
+                        - self.padding.right
+                        - self.border.left
+                        - self.border.right)
+                        .max(0.0),
+                    height: (self.dimensions.height
+                        - self.padding.top
+                        - self.padding.bottom
+                        - self.border.top
+                        - self.border.bottom)
+                        .max(0.0),
+                };
+
+                for pos_node in flex_positioned_entries {
+                    let child_pos_type = get_position_type(pos_node);
+                    let cb_for_child = if child_pos_type == PositionType::Fixed {
+                        viewport_rect
+                    } else if self_establishes_cb {
+                        final_self_cb
+                    } else {
+                        containing_block.unwrap_or(viewport_rect)
+                    };
+
+                    let left_off =
+                        resolve_offset(pos_node, "left", cb_for_child.width, vw, vh);
+                    let right_off =
+                        resolve_offset(pos_node, "right", cb_for_child.width, vw, vh);
+                    let top_off =
+                        resolve_offset(pos_node, "top", cb_for_child.height, vw, vh);
+                    let bottom_off =
+                        resolve_offset(pos_node, "bottom", cb_for_child.height, vw, vh);
+
+                    let child_explicit_width =
+                        pos_node.specified_values.get(&crate::css::intern("width"));
+                    let child_layout_width = match child_explicit_width {
+                        Some(Value::Length(v, Unit::Px)) => *v,
+                        Some(Value::Length(v, Unit::Percent)) => cb_for_child.width * (v / 100.0),
+                        _ => {
+                            if let (Some(l), Some(r)) = (left_off, right_off) {
+                                (cb_for_child.width - l - r).max(0.0)
+                            } else {
+                                let max_c = intrinsic_cache.max_content_width(pos_node, vw, vh);
+                                max_c.min(cb_for_child.width)
+                            }
+                        }
+                    };
+
+                    let (pc_opt, _, _) = build_layout_tree_with_cb_cached(
+                        pos_node,
+                        0.0,
+                        0.0,
+                        0.0,
+                        child_layout_width.max(1.0),
+                        vw,
+                        vh,
+                        Some(cb_for_child),
+                        intrinsic_cache,
+                    );
+                    if let Some(mut pc) = pc_opt {
+                        let target_x = match (left_off, right_off) {
+                            (Some(l), _) => cb_for_child.x + l + pc.margin.left,
+                            (None, Some(r)) => {
+                                cb_for_child.x + cb_for_child.width
+                                    - r
+                                    - pc.dimensions.width
+                                    - pc.margin.right
+                            }
+                            (None, None) => cb_for_child.x + pc.margin.left,
+                        };
+                        let target_y = match (top_off, bottom_off) {
+                            (Some(t), _) => cb_for_child.y + t + pc.margin.top,
+                            (None, Some(b)) => {
+                                cb_for_child.y + cb_for_child.height
+                                    - b
+                                    - pc.dimensions.height
+                                    - pc.margin.bottom
+                            }
+                            (None, None) => cb_for_child.y + pc.margin.top,
+                        };
+
+                        let dx = target_x - pc.dimensions.x;
+                        let dy = target_y - pc.dimensions.y;
+                        offset_layout_box(&mut pc, dx, dy);
+                        self.children.push(pc);
+                    }
+                }
+            }
+
             let final_x = if is_block {
                 container_start_x
             } else {
@@ -1893,16 +1997,28 @@ impl<'a> LayoutBox<'a> {
                     }
                 };
 
-                // Intrinsic width for the positioned child: explicit CSS width or shrink-wrap.
+                // Intrinsic width for the positioned child.
+                // If both left and right are specified and no explicit width, the element
+                // stretches to fill the space between them (CSS spec §10.3.7).
+                let left_offset = resolve_offset(pos_node, "left", cb_for_child.width, vw, vh);
+                let right_offset = resolve_offset(pos_node, "right", cb_for_child.width, vw, vh);
+                let top_offset = resolve_offset(pos_node, "top", cb_for_child.height, vw, vh);
+                let bottom_offset = resolve_offset(pos_node, "bottom", cb_for_child.height, vw, vh);
+
                 let child_explicit_width =
                     pos_node.specified_values.get(&crate::css::intern("width"));
                 let child_layout_width = match child_explicit_width {
                     Some(Value::Length(v, Unit::Px)) => *v,
                     Some(Value::Length(v, Unit::Percent)) => cb_for_child.width * (v / 100.0),
                     _ => {
-                        // Shrink-wrap: lay out at max-content width bounded by cb width.
-                        let max_c = intrinsic_cache.max_content_width(pos_node, vw, vh);
-                        max_c.min(cb_for_child.width)
+                        // Both left and right specified without explicit width → stretch.
+                        if let (Some(l), Some(r)) = (left_offset, right_offset) {
+                            (cb_for_child.width - l - r).max(0.0)
+                        } else {
+                            // Shrink-wrap: lay out at max-content width bounded by cb width.
+                            let max_c = intrinsic_cache.max_content_width(pos_node, vw, vh);
+                            max_c.min(cb_for_child.width)
+                        }
                     }
                 };
 
@@ -1919,14 +2035,8 @@ impl<'a> LayoutBox<'a> {
                     intrinsic_cache,
                 );
                 if let Some(mut pc) = pc_opt {
-                    // Resolve top / right / bottom / left against the containing block.
-                    let top = resolve_offset(pos_node, "top", cb_for_child.height, vw, vh);
-                    let right = resolve_offset(pos_node, "right", cb_for_child.width, vw, vh);
-                    let bottom = resolve_offset(pos_node, "bottom", cb_for_child.height, vw, vh);
-                    let left = resolve_offset(pos_node, "left", cb_for_child.width, vw, vh);
-
                     // Determine final x.
-                    let target_x = match (left, right) {
+                    let target_x = match (left_offset, right_offset) {
                         (Some(l), _) => cb_for_child.x + l + pc.margin.left,
                         (None, Some(r)) => {
                             cb_for_child.x + cb_for_child.width
@@ -1937,7 +2047,7 @@ impl<'a> LayoutBox<'a> {
                         (None, None) => cb_for_child.x + pc.margin.left, // default to CB origin
                     };
                     // Determine final y.
-                    let target_y = match (top, bottom) {
+                    let target_y = match (top_offset, bottom_offset) {
                         (Some(t), _) => cb_for_child.y + t + pc.margin.top,
                         (None, Some(b)) => {
                             cb_for_child.y + cb_for_child.height
@@ -2098,6 +2208,8 @@ fn resolve_offset(
         Some(Value::Length(v, Unit::Percent)) => Some(container_size * (v / 100.0)),
         Some(Value::Length(v, Unit::Vw)) => Some(vw * (v / 100.0)),
         Some(Value::Length(v, Unit::Vh)) => Some(vh * (v / 100.0)),
+        // Unitless 0 is a valid <length> in CSS (the only unitless length allowed).
+        Some(Value::Number(v)) if *v == 0.0 => Some(0.0),
         Some(Value::Keyword(k)) if **k == *"auto" => None,
         _ => None,
     }
@@ -3831,5 +3943,119 @@ mod tests {
         assert!(items[5].dimensions.x > items[0].dimensions.x + 250.0,
             "login item should remain on the same horizontal navbar row, not collapse into the left cluster: x1={}, x6={}",
             items[0].dimensions.x, items[5].dimensions.x);
+    }
+
+    #[test]
+    fn test_absolute_child_in_flex_container_is_out_of_flow() {
+        // An absolute child inside a flex row should NOT participate in flex layout.
+        // The two normal-flow flex items should be placed side-by-side; the absolute
+        // child should appear at the top-left of the flex container (its CB), not
+        // between or after the flex items.
+        let html = r#"<div style="display:flex;flex-direction:row;position:relative;width:400px;height:50px;">
+            <span style="width:80px;height:50px;">A</span>
+            <span style="position:absolute;top:0;left:0;width:40px;height:40px;">B</span>
+            <span style="width:80px;height:50px;">C</span>
+        </div>"#;
+        let dom = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree =
+            style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let (layout_opt, _, _) =
+            build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout tree");
+
+        let flex_div = find_element_by_tag(&layout, "div").expect("flex div");
+
+        // Find the absolute child.
+        let abs_child = find_child_with_position(flex_div, PositionType::Absolute)
+            .expect("absolute child in flex container");
+        // It should be positioned at top-left of the flex container (0, 0) because
+        // left:0; top:0 relative to the positioned flex container.
+        assert!(
+            abs_child.dimensions.x < 5.0,
+            "absolute child in flex should be at left:0 of its CB, got x={}",
+            abs_child.dimensions.x
+        );
+        assert!(
+            abs_child.dimensions.y < 5.0,
+            "absolute child in flex should be at top:0 of its CB, got y={}",
+            abs_child.dimensions.y
+        );
+
+        // The two normal-flow flex items should both be present and at y≈0.
+        let normal_flow_items: Vec<&LayoutBox> = flex_div
+            .children
+            .iter()
+            .filter(|c| c.position == PositionType::Static)
+            .collect();
+        assert_eq!(
+            normal_flow_items.len(),
+            2,
+            "flex container should have 2 normal-flow items (A and C), got {}",
+            normal_flow_items.len()
+        );
+        // Both items should be on the same row (y ≈ same).
+        let y0 = normal_flow_items[0].dimensions.y;
+        assert!(
+            (normal_flow_items[1].dimensions.y - y0).abs() < 2.0,
+            "both flex items should be on the same row, got y0={} y1={}",
+            y0,
+            normal_flow_items[1].dimensions.y
+        );
+        // Second item should be to the right of the first.
+        assert!(
+            normal_flow_items[1].dimensions.x > normal_flow_items[0].dimensions.x,
+            "C should be to the right of A in flex row"
+        );
+    }
+
+    #[test]
+    fn test_position_fixed_right_zero_anchors_to_viewport_right() {
+        // A fixed element with right:0 should land so its right edge equals the viewport right.
+        // viewport width = 800, element width = 120 → x = 800 - 0 - 120 = 680.
+        let html = r#"<div style="position:fixed;top:0;right:0;width:120px;height:40px;"></div>"#;
+        let dom = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree =
+            style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let (layout_opt, _, _) =
+            build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout tree");
+        let fixed_box =
+            find_child_with_position(&layout, PositionType::Fixed).expect("fixed element");
+        let expected_x = 800.0 - 120.0; // right:0, no margin
+        assert!(
+            (fixed_box.dimensions.x - expected_x).abs() < 2.0,
+            "fixed element with right:0 and width:120px should have x≈{}, got {}",
+            expected_x,
+            fixed_box.dimensions.x
+        );
+    }
+
+    #[test]
+    fn test_inset_shorthand_expands_to_trbl() {
+        // inset: 10px should set top/right/bottom/left all to 10px.
+        let html = r#"<div style="position:absolute;inset:10px;width:50px;height:30px;"></div>"#;
+        let dom = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree =
+            style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let (layout_opt, _, _) =
+            build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout tree");
+        let abs_box =
+            find_child_with_position(&layout, PositionType::Absolute).expect("absolute element");
+        // With inset:10px the element is offset 10px from viewport origin.
+        // top:10px → y = 10; left:10px → x = 10.
+        assert!(
+            (abs_box.dimensions.x - 10.0).abs() < 2.0,
+            "inset:10px should place element at x≈10, got {}",
+            abs_box.dimensions.x
+        );
+        assert!(
+            (abs_box.dimensions.y - 10.0).abs() < 2.0,
+            "inset:10px should place element at y≈10, got {}",
+            abs_box.dimensions.y
+        );
     }
 }

@@ -348,6 +348,22 @@ pub fn parse_css(source: &str) -> Stylesheet {
                     declarations.push(Declaration { name: intern("row-gap"),    value: row_val,  important });
                     declarations.push(Declaration { name: intern("column-gap"), value: col_val,  important });
                 }
+                // inset shorthand: "inset: <top> [<right> [<bottom> [<left>]]]"
+                // Same quad syntax as margin/padding, maps to top/right/bottom/left.
+                "inset" => {
+                    let parts: Vec<&str> = val_raw.split_whitespace().collect();
+                    let (top, right, bottom, left) = match parts.len() {
+                        1 => (parts[0], parts[0], parts[0], parts[0]),
+                        2 => (parts[0], parts[1], parts[0], parts[1]),
+                        3 => (parts[0], parts[1], parts[2], parts[1]),
+                        4 => (parts[0], parts[1], parts[2], parts[3]),
+                        _ => ("0", "0", "0", "0"),
+                    };
+                    declarations.push(Declaration { name: intern("top"),    value: parse_value(top),    important });
+                    declarations.push(Declaration { name: intern("right"),  value: parse_value(right),  important });
+                    declarations.push(Declaration { name: intern("bottom"), value: parse_value(bottom), important });
+                    declarations.push(Declaration { name: intern("left"),   value: parse_value(left),   important });
+                }
                 _ => {
                     // CSS custom properties (--foo) store their raw value so that
                     // var() references can re-parse them at resolution time.
