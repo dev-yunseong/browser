@@ -1074,6 +1074,22 @@ pub fn parse_inline_style_into_vec(style_str: &str, list: &mut Vec<crate::css::D
                     list.push(crate::css::Declaration { name: intern(&k), value: v, important });
                 }
             }
+            "inset" => {
+                // inset shorthand maps to top/right/bottom/left (same quad syntax).
+                let parts: Vec<&str> = val.split_whitespace().collect();
+                let (top, right, bottom, left) = match parts.len() {
+                    1 => (parts[0], parts[0], parts[0], parts[0]),
+                    2 => (parts[0], parts[1], parts[0], parts[1]),
+                    3 => (parts[0], parts[1], parts[2], parts[1]),
+                    4 => (parts[0], parts[1], parts[2], parts[3]),
+                    _ => ("0", "0", "0", "0"),
+                };
+                use crate::css::parse_value;
+                list.push(crate::css::Declaration { name: intern("top"),    value: parse_value(top),    important });
+                list.push(crate::css::Declaration { name: intern("right"),  value: parse_value(right),  important });
+                list.push(crate::css::Declaration { name: intern("bottom"), value: parse_value(bottom), important });
+                list.push(crate::css::Declaration { name: intern("left"),   value: parse_value(left),   important });
+            }
             _ => {
                 // CSS custom properties (--foo) in inline styles keep their raw string value.
                 let value = if key.starts_with("--") {
