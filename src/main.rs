@@ -38,6 +38,16 @@ struct BrowserApp {
     start_time: std::time::Instant,
     console_entries: Vec<js::ConsoleEntry>,
     console_panel_open: bool,
+    /// Current text in the REPL input field.
+    console_input: String,
+    /// History of previously evaluated expressions (for arrow-key navigation).
+    console_history: Vec<String>,
+    /// Index into `console_history` while navigating with arrow keys; `None` means fresh input.
+    console_history_index: Option<usize>,
+    /// In-flight promise for a console REPL evaluation.
+    console_eval_promise: Option<Promise<js::EvalOutcome>>,
+    /// True once a page has been successfully rendered (needed to decide whether to re-render after eval).
+    has_page: bool,
 
     /// Engine actor handle — all pipeline work is delegated through this.
     engine: engine::EngineHandle,
@@ -85,6 +95,11 @@ impl BrowserApp {
             start_time: std::time::Instant::now(),
             console_entries: vec![],
             console_panel_open: true,
+            console_input: String::new(),
+            console_history: vec![],
+            console_history_index: None,
+            console_eval_promise: None,
+            has_page: false,
             engine: engine::EngineHandle::spawn(),
         }
     }
@@ -120,6 +135,7 @@ impl BrowserApp {
         self.image_promises.clear();
         self.hovered_id = None;
         self.is_loading = true;
+        self.has_page = false;
 
         // Evict the glyph rasterization cache so that memory freed between
         // navigations and does not grow without bound across many page loads.
@@ -155,6 +171,7 @@ impl BrowserApp {
         self.current_event_handlers = page_data.event_handlers.clone();
         self.current_element_ids = page_data.element_ids.clone();
         self.current_focusable_elements = page_data.focusable_elements.clone();
+        self.has_page = true;
     }
 }
 
@@ -181,6 +198,21 @@ impl eframe::App for BrowserApp {
         }
 
         self.console_entries = self.engine.send_get_console();
+
+        // Poll console eval promise; trigger re-render if a page is loaded
+        if let Some(eval_promise) = &self.console_eval_promise {
+            if eval_promise.ready().is_some() {
+                self.console_eval_promise = None;
+                if self.has_page
+                    && self.re_render_promise.is_none()
+                    && self.content_promise.is_none()
+                {
+                    self.trigger_re_render(ctx, 800.0);
+                } else {
+                    ctx.request_repaint();
+                }
+            }
+        }
 
         // Handle Tab navigation
         if ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
@@ -300,7 +332,19 @@ impl eframe::App for BrowserApp {
             ctx,
             &mut self.console_panel_open,
             &mut self.console_entries,
+            &mut self.console_input,
+            &mut self.console_history,
+            &mut self.console_history_index,
             || self.engine.send_clear_console(),
+            |code| {
+                if self.console_eval_promise.is_none() {
+                    let handle = self.engine.clone();
+                    self.console_eval_promise =
+                        Some(Promise::spawn_thread("console_eval", move || {
+                            handle.send_console_eval_result(code)
+                        }));
+                }
+            },
         );
 
         // ── Content area ─────────────────────────────────────────────────────────
@@ -348,6 +392,7 @@ impl eframe::App for BrowserApp {
                             self.error = Some(e.clone());
                             self.content_promise = None;
                             self.is_loading = false;
+                            self.has_page = false;
                         }
                         Some(Ok(page_data)) => {
                             // Clone everything we need before releasing the borrow on content_promise
@@ -534,11 +579,48 @@ fn console_level_label(level: js::ConsoleLevel) -> (&'static str, egui::Color32)
     }
 }
 
+fn apply_console_history_navigation(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    input: &mut String,
+    history: &[String],
+    history_index: &mut Option<usize>,
+) {
+    if !response.has_focus() || history.is_empty() {
+        return;
+    }
+
+    if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+        let next_index = history_index
+            .map(|index| index.saturating_sub(1))
+            .unwrap_or(history.len() - 1);
+        *history_index = Some(next_index);
+        *input = history[next_index].clone();
+    }
+
+    if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+        if let Some(index) = *history_index {
+            if index + 1 < history.len() {
+                let next_index = index + 1;
+                *history_index = Some(next_index);
+                *input = history[next_index].clone();
+            } else {
+                *history_index = None;
+                input.clear();
+            }
+        }
+    }
+}
+
 fn render_console_panel(
     ctx: &egui::Context,
     open: &mut bool,
     entries: &mut Vec<js::ConsoleEntry>,
+    input: &mut String,
+    history: &mut Vec<String>,
+    history_index: &mut Option<usize>,
     mut clear_console: impl FnMut(),
+    mut evaluate_console: impl FnMut(String),
 ) {
     let default_height = if *open { 180.0 } else { 32.0 };
     egui::TopBottomPanel::bottom("browser_console_panel")
@@ -587,6 +669,10 @@ fn render_console_panel(
 
                     for entry in entries.iter() {
                         let (label, color) = console_level_label(entry.level);
+                        let message_color = match entry.level {
+                            js::ConsoleLevel::Error => color,
+                            _ => egui::Color32::WHITE,
+                        };
                         ui.horizontal_wrapped(|ui| {
                             ui.label(
                                 egui::RichText::new(format!("[{}]", label))
@@ -601,12 +687,37 @@ fn render_console_panel(
                             );
                             ui.label(
                                 egui::RichText::new(&entry.message)
-                                    .color(egui::Color32::WHITE)
+                                    .color(message_color)
                                     .monospace(),
                             );
                         });
                     }
                 });
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(">")
+                        .color(egui::Color32::from_rgb(140, 190, 255))
+                        .monospace(),
+                );
+                let response = ui.add(
+                    egui::TextEdit::singleline(input)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Evaluate JavaScript"),
+                );
+                apply_console_history_navigation(ui, &response, input, history, history_index);
+
+                if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    let code = input.trim().to_string();
+                    if !code.is_empty() {
+                        history.push(code.clone());
+                        *history_index = None;
+                        input.clear();
+                        evaluate_console(code);
+                    }
+                }
+            });
         });
 }
 

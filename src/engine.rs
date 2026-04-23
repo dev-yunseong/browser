@@ -816,16 +816,47 @@ impl BrowserEngine {
         println!("[BrowserEngine] type_text: not yet implemented");
     }
 
-    /// Execute JavaScript in the current page's runtime.
-    pub fn evaluate_js(&mut self, script: &str) -> String {
-        self.js_runtime.execute(script);
-        // Return any queued style override info as a simple diagnostic string
+    /// Execute JavaScript in the current page's runtime and return a result/error.
+    pub fn evaluate_js_with_result(&mut self, script: &str) -> js::EvalOutcome {
+        let outcome = self.js_runtime.execute_with_result(script);
         let overrides = self.js_runtime.get_style_overrides();
-        if overrides.is_empty() {
-            String::new()
-        } else {
-            format!("style_overrides: {:?}", overrides)
+        if !overrides.is_empty() {
+            for (id, props) in overrides {
+                self.js_style_overrides.entry(id).or_default().extend(props);
+            }
         }
+        outcome
+    }
+
+    /// Execute JavaScript in the current page's runtime (fire-and-forget).
+    pub fn evaluate_js(&mut self, script: &str) -> String {
+        let outcome = self.evaluate_js_with_result(script);
+        outcome.result.or(outcome.error).unwrap_or_default()
+    }
+
+    /// Execute JavaScript from the DevTools console REPL.
+    /// Echoes the input as `> code` and the result/error as `< value` in the console buffer.
+    pub fn evaluate_console_repl(&mut self, script: &str) -> js::EvalOutcome {
+        js::append_console_entry(
+            &self.console_buffer,
+            js::ConsoleLevel::Log,
+            format!("> {}", script),
+        );
+        let outcome = self.evaluate_js_with_result(script);
+        if let Some(error) = &outcome.error {
+            js::append_console_entry(
+                &self.console_buffer,
+                js::ConsoleLevel::Error,
+                format!("< {}", error),
+            );
+        } else if let Some(result) = &outcome.result {
+            js::append_console_entry(
+                &self.console_buffer,
+                js::ConsoleLevel::Log,
+                format!("< {}", result),
+            );
+        }
+        outcome
     }
 
     /// Reconstruct a `Pixmap` from the last rendered page's pixel data.
@@ -968,6 +999,11 @@ pub enum EngineCmd {
         script: String,
         reply: mpsc::Sender<String>,
     },
+    /// Evaluate JS from the DevTools console REPL; echoes input/output into the console buffer.
+    EvaluateConsole {
+        script: String,
+        reply: mpsc::Sender<js::EvalOutcome>,
+    },
     Screenshot {
         reply: mpsc::Sender<Option<Vec<u8>>>,
     },
@@ -1030,6 +1066,10 @@ fn run_engine_actor_with_engine(rx: mpsc::Receiver<EngineCmd>, eng: &mut Browser
             EngineCmd::EvaluateJs { script, reply } => {
                 let result = eng.evaluate_js(&script);
                 let _ = reply.send(result);
+            }
+            EngineCmd::EvaluateConsole { script, reply } => {
+                let outcome = eng.evaluate_console_repl(&script);
+                let _ = reply.send(outcome);
             }
             EngineCmd::Screenshot { reply } => {
                 let png = eng.screenshot().and_then(|pm| pm.encode_png().ok());
@@ -1158,6 +1198,17 @@ impl EngineHandle {
         reply_rx.recv().unwrap_or_default()
     }
 
+    pub fn send_console_eval_result(&self, script: String) -> js::EvalOutcome {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if self.tx.send(EngineCmd::EvaluateConsole { script, reply: reply_tx }).is_err() {
+            return js::EvalOutcome {
+                result: None,
+                error: Some("engine disconnected".to_string()),
+            };
+        }
+        reply_rx.recv().unwrap_or_default()
+    }
+
     pub fn send_screenshot(&self) -> Option<Vec<u8>> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.tx.send(EngineCmd::Screenshot { reply: reply_tx }).ok()?;
@@ -1225,6 +1276,33 @@ mod tests {
         assert_eq!(engine.console_entries().len(), 1);
         engine.clear_console();
         assert!(engine.console_entries().is_empty());
+    }
+
+    #[test]
+    fn test_console_repl_returns_result_and_console_entries() {
+        let mut engine = BrowserEngine::new();
+        let outcome = engine.evaluate_console_repl("1 + 1");
+        assert_eq!(outcome.result.as_deref(), Some("2"));
+        assert_eq!(outcome.error, None);
+
+        let entries = engine.console_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].message, "> 1 + 1");
+        assert_eq!(entries[1].message, "< 2");
+    }
+
+    #[test]
+    fn test_console_repl_returns_error_and_console_entries() {
+        let mut engine = BrowserEngine::new();
+        let outcome = engine.evaluate_console_repl("missingVariable");
+        assert!(outcome.result.is_none());
+        assert!(outcome.error.is_some());
+
+        let entries = engine.console_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].message, "> missingVariable");
+        assert!(entries[1].message.starts_with("< "));
+        assert_eq!(entries[1].level, js::ConsoleLevel::Error);
     }
 
     #[test]
