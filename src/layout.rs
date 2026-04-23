@@ -1682,6 +1682,15 @@ impl<'a> LayoutBox<'a> {
         let parent_open_bottom = self.padding.bottom == 0.0 && self.border.bottom == 0.0;
         let mut result: Vec<LayoutBox<'a>> = Vec::new();
 
+        // Read text-align for this container (used by flush_line! to position inline lines).
+        let text_align = self
+            .style_node
+            .specified_values
+            .get(&crate::css::intern("text-align"))
+            .and_then(|v| if let Value::Keyword(k) = v { Some(&**k as &str) } else { None })
+            .unwrap_or("left")
+            .to_string();
+
         // Inline line accumulator
         struct InlineLine<'a> {
             members: Vec<LayoutBox<'a>>,
@@ -1696,12 +1705,19 @@ impl<'a> LayoutBox<'a> {
         let mut line_start_y = cursor_y;
 
         // Flush the current inline line into `result`, advancing cursor_y.
+        // Applies text-align: center/right by shifting the line's starting x offset.
         macro_rules! flush_line {
             () => {
                 if !cur_line.members.is_empty() {
-                    let (_, left_indent) =
+                    let (avail_w, left_indent) =
                         float_ctx.available_at(line_start_y, cur_line.height.max(1.0));
-                    let mut lx = container_x + left_indent;
+                    // Compute text-align offset within the available width.
+                    let align_offset = match text_align.as_str() {
+                        "center" => ((avail_w - cur_line.width) / 2.0).max(0.0),
+                        "right" => (avail_w - cur_line.width).max(0.0),
+                        _ => 0.0, // left / default
+                    };
+                    let mut lx = container_x + left_indent + align_offset;
                     for mut m in cur_line.members.drain(..) {
                         let dx = lx - (m.dimensions.x - m.margin.left);
                         let dy = cursor_y - (m.dimensions.y - m.margin.top);
@@ -2278,7 +2294,9 @@ fn get_display_type(sn: &StyledNode) -> DisplayType {
             "html" | "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "body" | "header"
             | "footer" | "nav" | "section" | "article" | "ul" | "ol" | "li" | "main" | "aside"
             | "form" | "details" | "summary" | "figure" | "figcaption" | "address"
-            | "blockquote" | "pre" | "hr" | "fieldset" | "legend" => DisplayType::Block,
+            | "blockquote" | "pre" | "hr" | "fieldset" | "legend"
+            // <center> is a legacy block element with implicit text-align:center
+            | "center" => DisplayType::Block,
             // table and its sub-elements: use TableRow/TableCell so they shrink-wrap
             // rather than expand to full container width like block elements do.
             "table" => DisplayType::Table,
@@ -2312,12 +2330,30 @@ fn is_none_display(sn: &StyledNode) -> bool {
 }
 
 fn should_skip(child: &StyledNode) -> bool {
-    if let NodeData::Element { ref name, .. } = child.node.data {
+    // First check the CSS display property — display:none always hides the element.
+    if is_none_display(child) {
+        return true;
+    }
+    if let NodeData::Element { ref name, ref attrs, .. } = child.node.data {
         let t = name.local.to_string();
-        matches!(
+        if matches!(
             t.as_str(),
             "head" | "style" | "meta" | "title" | "script" | "link" | "noscript"
-        )
+        ) {
+            return true;
+        }
+        // <input type="hidden"> never renders, regardless of CSS.
+        // Browsers treat this as a UA-level hardcoded rule that CSS cannot override.
+        if t == "input" {
+            let is_hidden = attrs.borrow().iter().any(|a| {
+                a.name.local.to_string() == "type"
+                    && a.value.to_string().eq_ignore_ascii_case("hidden")
+            });
+            if is_hidden {
+                return true;
+            }
+        }
+        false
     } else {
         false
     }
@@ -4056,6 +4092,84 @@ mod tests {
             (abs_box.dimensions.y - 10.0).abs() < 2.0,
             "inset:10px should place element at y≈10, got {}",
             abs_box.dimensions.y
+        );
+    }
+
+    // ── Issue #112: Google fidelity fixes ────────────────────────────────────
+
+    /// `<input type="hidden">` must not produce a visible layout box.
+    #[test]
+    fn test_hidden_input_not_rendered() {
+        let html = r#"<form><input type="hidden" name="hl" value="en"><input type="text" name="q"></form>"#;
+        let dom = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree =
+            style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let (layout_opt, _, _) =
+            build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout tree");
+
+        // Walk the tree: collect all Input display boxes.
+        fn collect_inputs<'a>(b: &'a LayoutBox<'a>, out: &mut Vec<&'a LayoutBox<'a>>) {
+            if b.display == DisplayType::Input {
+                if let NodeData::Element { ref attrs, .. } = b.style_node.node.data {
+                    out.push(b);
+                }
+            }
+            for c in &b.children {
+                collect_inputs(c, out);
+            }
+        }
+        let mut inputs = Vec::new();
+        collect_inputs(&layout, &mut inputs);
+
+        // Only the text input should appear; the hidden input must be absent.
+        assert_eq!(inputs.len(), 1, "only 1 visible input expected (the text one), got {}", inputs.len());
+    }
+
+    /// `<center>` must render as a block and center its inline content.
+    #[test]
+    fn test_center_tag_produces_block() {
+        let html = r#"<center>Hello</center>"#;
+        let dom = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree =
+            style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let (layout_opt, _, _) =
+            build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout tree");
+
+        let center_box = find_element_by_tag(&layout, "center").expect("center element in tree");
+        // Must be block-level (fills the container).
+        assert_eq!(
+            center_box.display,
+            DisplayType::Block,
+            "<center> should have DisplayType::Block, got {:?}",
+            center_box.display
+        );
+    }
+
+    /// `text-align: center` must shift inline children toward the horizontal midpoint.
+    #[test]
+    fn test_text_align_center_shifts_inline_content() {
+        // A 800px container with text-align:center containing a short text span.
+        let html = r#"<div style="width:800px; text-align:center;"><span>Hi</span></div>"#;
+        let dom = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree =
+            style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let (layout_opt, _, _) =
+            build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout tree");
+
+        let div = find_element_by_tag(&layout, "div").expect("div");
+        // The span (or text node inside it) should be positioned past 200px
+        // (i.e., not at x=0 as left-aligned would be).
+        let first_child_x = div.children.first().map(|c| c.dimensions.x).unwrap_or(0.0);
+        assert!(
+            first_child_x > 100.0,
+            "text-align:center should shift content to roughly midpoint; got x={}",
+            first_child_x
         );
     }
 }

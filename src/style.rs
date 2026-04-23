@@ -322,6 +322,15 @@ fn apply_attribute_styles_arena(node: &NodeDataSend, map: &mut HashMap<Arc<str>,
                 }
             }
         }
+        // <input type="hidden"> must not render — set display:none.
+        "input" => {
+            for (k, v) in &node.attrs {
+                if k == "type" && v.eq_ignore_ascii_case("hidden") {
+                    map.insert(intern("display"), Value::Keyword(intern("none")));
+                    break;
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -810,6 +819,12 @@ fn apply_default_styles(tag: &str, map: &mut HashMap<Arc<str>, Value>) {
             map.entry(intern("padding")).or_insert(Value::Length(4.0, crate::css::Unit::Px));
             // Width is content-driven (shrink-wrap in layout); enforce a minimum height.
             map.entry(intern("min-height")).or_insert(Value::Length(24.0, crate::css::Unit::Px));
+        }
+        // <center> is a legacy presentational element — UA default maps it to a block
+        // with text-align: center, matching browsers' built-in stylesheet.
+        "center" => {
+            map.entry(intern("display")).or_insert(Value::Keyword(intern("block")));
+            map.entry(intern("text-align")).or_insert(Value::Keyword(intern("center")));
         }
         "ul" | "ol" => {
             map.entry(intern("padding-left")).or_insert(Value::Length(24.0, crate::css::Unit::Px));

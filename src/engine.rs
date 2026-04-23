@@ -312,8 +312,17 @@ pub fn extract_form_controls_from_html(html: &str) -> Vec<(String, String)> {
             } else if !in_script {
                 let (verb, _) = tag_lower_trimmed.split_once(' ').unwrap_or((tag_lower_trimmed, ""));
                 if matches!(verb, "input" | "textarea" | "select") {
-                    let name = extract_attr(&tag_str, "name").unwrap_or_default();
-                    results.push((name, verb.to_string()));
+                    // Skip hidden inputs — they are excluded from the layout tree and
+                    // must not be included here to keep the index-based zip in sync.
+                    let input_type = extract_attr(&tag_str, "type")
+                        .unwrap_or_default()
+                        .to_lowercase();
+                    if input_type == "hidden" {
+                        // skip
+                    } else {
+                        let name = extract_attr(&tag_str, "name").unwrap_or_default();
+                        results.push((name, verb.to_string()));
+                    }
                 }
             }
         } else if in_tag {
