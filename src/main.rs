@@ -36,6 +36,8 @@ struct BrowserApp {
     image_promises: HashMap<String, Promise<Result<(String, Vec<u8>), String>>>,
     is_loading: bool,
     start_time: std::time::Instant,
+    console_entries: Vec<js::ConsoleEntry>,
+    console_panel_open: bool,
 
     /// Engine actor handle — all pipeline work is delegated through this.
     engine: engine::EngineHandle,
@@ -81,6 +83,8 @@ impl BrowserApp {
             image_promises: HashMap::new(),
             is_loading: false,
             start_time: std::time::Instant::now(),
+            console_entries: vec![],
+            console_panel_open: true,
             engine: engine::EngineHandle::spawn(),
         }
     }
@@ -175,6 +179,8 @@ impl eframe::App for BrowserApp {
                 self.tick_promise = None;
             }
         }
+
+        self.console_entries = self.engine.send_get_console();
 
         // Handle Tab navigation
         if ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
@@ -289,6 +295,13 @@ impl eframe::App for BrowserApp {
                     ui.add(progress);
                 }
             });
+
+        render_console_panel(
+            ctx,
+            &mut self.console_panel_open,
+            &mut self.console_entries,
+            || self.engine.send_clear_console(),
+        );
 
         // ── Content area ─────────────────────────────────────────────────────────
         egui::CentralPanel::default()
@@ -509,6 +522,92 @@ impl eframe::App for BrowserApp {
 #[inline]
 fn hit(rel: egui::Vec2, r: &layout::Rect) -> bool {
     rel.x >= r.x && rel.x <= r.x + r.width && rel.y >= r.y && rel.y <= r.y + r.height
+}
+
+fn console_level_label(level: js::ConsoleLevel) -> (&'static str, egui::Color32) {
+    match level {
+        js::ConsoleLevel::Log => ("LOG", egui::Color32::from_rgb(210, 210, 210)),
+        js::ConsoleLevel::Info => ("INFO", egui::Color32::from_rgb(140, 190, 255)),
+        js::ConsoleLevel::Warn => ("WARN", egui::Color32::from_rgb(255, 210, 120)),
+        js::ConsoleLevel::Error => ("ERR", egui::Color32::from_rgb(255, 120, 120)),
+        js::ConsoleLevel::Debug => ("DBG", egui::Color32::from_rgb(180, 180, 180)),
+    }
+}
+
+fn render_console_panel(
+    ctx: &egui::Context,
+    open: &mut bool,
+    entries: &mut Vec<js::ConsoleEntry>,
+    mut clear_console: impl FnMut(),
+) {
+    let default_height = if *open { 180.0 } else { 32.0 };
+    egui::TopBottomPanel::bottom("browser_console_panel")
+        .resizable(*open)
+        .default_height(default_height)
+        .min_height(default_height)
+        .max_height(if *open { 260.0 } else { 32.0 })
+        .frame(
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(24, 26, 31))
+                .inner_margin(egui::Margin::symmetric(8.0, 6.0)),
+        )
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let toggle = if *open { "▾ Console" } else { "▸ Console" };
+                if ui.button(toggle).clicked() {
+                    *open = !*open;
+                }
+                ui.label(
+                    egui::RichText::new(format!("{} entries", entries.len()))
+                        .color(egui::Color32::GRAY)
+                        .small(),
+                );
+                if ui.button("Clear").clicked() {
+                    clear_console();
+                    entries.clear();
+                }
+            });
+
+            if !*open {
+                return;
+            }
+
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical()
+                .stick_to_bottom(true)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if entries.is_empty() {
+                        ui.label(
+                            egui::RichText::new("No console output")
+                                .color(egui::Color32::GRAY),
+                        );
+                        return;
+                    }
+
+                    for entry in entries.iter() {
+                        let (label, color) = console_level_label(entry.level);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("[{}]", label))
+                                    .color(color)
+                                    .monospace(),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("@{}", entry.timestamp))
+                                    .color(egui::Color32::GRAY)
+                                    .monospace()
+                                    .small(),
+                            );
+                            ui.label(
+                                egui::RichText::new(&entry.message)
+                                    .color(egui::Color32::WHITE)
+                                    .monospace(),
+                            );
+                        });
+                    }
+                });
+        });
 }
 
 fn main() -> eframe::Result {

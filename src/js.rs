@@ -3,6 +3,8 @@ use std::collections::{HashMap, VecDeque};
 use markup5ever_rcdom::{NodeData, Handle};
 use std::cell::RefCell;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 use serde::{Serialize, Deserialize};
 use std::sync::Mutex;
@@ -51,6 +53,88 @@ thread_local! {
     static PREVIOUS_FOCUSED_NODE: RefCell<Option<String>> = RefCell::new(None);
     static CURRENT_ORIGIN: RefCell<Option<Url>> = RefCell::new(None);
     static CSP_POLICY: RefCell<Option<CspPolicy>> = RefCell::new(None);
+    static CONSOLE_BUFFER: RefCell<Option<ConsoleBuffer>> = const { RefCell::new(None) };
+}
+
+const MAX_CONSOLE_ENTRIES: usize = 200;
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ConsoleLevel {
+    Log,
+    Warn,
+    Error,
+    Info,
+    Debug,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConsoleEntry {
+    pub level: ConsoleLevel,
+    pub message: String,
+    pub timestamp: u64,
+}
+
+pub type ConsoleBuffer = Arc<Mutex<VecDeque<ConsoleEntry>>>;
+
+fn now_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+pub fn new_console_buffer() -> ConsoleBuffer {
+    Arc::new(Mutex::new(VecDeque::with_capacity(MAX_CONSOLE_ENTRIES)))
+}
+
+pub fn clear_console_buffer(buffer: &ConsoleBuffer) {
+    if let Ok(mut entries) = buffer.lock() {
+        entries.clear();
+    }
+}
+
+pub fn console_entries(buffer: &ConsoleBuffer) -> Vec<ConsoleEntry> {
+    buffer
+        .lock()
+        .map(|entries| entries.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn push_console_entry(level: ConsoleLevel, message: String) {
+    CONSOLE_BUFFER.with(|cell| {
+        if let Some(buffer) = cell.borrow().as_ref() {
+            if let Ok(mut entries) = buffer.lock() {
+                if entries.len() >= MAX_CONSOLE_ENTRIES {
+                    entries.pop_front();
+                }
+                entries.push_back(ConsoleEntry {
+                    level,
+                    message,
+                    timestamp: now_timestamp_ms(),
+                });
+            }
+        }
+    });
+}
+
+fn register_console_callable(context: &mut Context, name: &'static str, level: ConsoleLevel) {
+    let func = NativeFunction::from_copy_closure(move |_this, args, context| {
+        let mut output = String::new();
+        for (i, arg) in args.iter().enumerate() {
+            if i > 0 {
+                output.push(' ');
+            }
+            if let Ok(s) = arg.to_string(context) {
+                output.push_str(&s.to_std_string_escaped());
+            }
+        }
+        push_console_entry(level.clone(), output);
+        Ok(JsValue::undefined())
+    });
+    context
+        .register_global_callable(js_string!(name), 1, func)
+        .unwrap();
 }
 
 #[derive(Clone, Debug, Default)]
@@ -112,27 +196,25 @@ pub struct JsRuntime {
 }
 
 impl JsRuntime {
-    pub fn new(dom: Option<Handle>, base_url: Option<Url>, policy: Option<CspPolicy>) -> Self {
+    pub fn new(
+        dom: Option<Handle>,
+        base_url: Option<Url>,
+        policy: Option<CspPolicy>,
+        console_buffer: ConsoleBuffer,
+    ) -> Self {
         DOM_ROOT.with(|root| *root.borrow_mut() = dom);
         CURRENT_ORIGIN.with(|origin| *origin.borrow_mut() = base_url);
         CSP_POLICY.with(|p| *p.borrow_mut() = policy);
+        CONSOLE_BUFFER.with(|cell| *cell.borrow_mut() = Some(console_buffer));
         let mut context = Context::default();
         let (task_sender, task_receiver) = channel();
         TASK_SENDER.with(|s| *s.borrow_mut() = Some(task_sender));
 
-        // Register native console.log
-        let log = NativeFunction::from_copy_closure(|_this, args, context| {
-            let mut output = String::new();
-            for (i, arg) in args.iter().enumerate() {
-                if i > 0 { output.push(' '); }
-                if let Ok(s) = arg.to_string(context) {
-                    output.push_str(&s.to_std_string_escaped());
-                }
-            }
-            println!("[Aura JS] {}", output);
-            Ok(JsValue::undefined())
-        });
-        context.register_global_callable(js_string!("log"), 1, log).unwrap();
+        register_console_callable(&mut context, "log", ConsoleLevel::Log);
+        register_console_callable(&mut context, "warn", ConsoleLevel::Warn);
+        register_console_callable(&mut context, "error", ConsoleLevel::Error);
+        register_console_callable(&mut context, "info", ConsoleLevel::Info);
+        register_console_callable(&mut context, "debug", ConsoleLevel::Debug);
 
         // Register native setTimeout
         let set_timeout = NativeFunction::from_copy_closure(|_this, args, _context| {
@@ -1689,7 +1771,7 @@ mod tests {
 
     fn make_runtime(html: &str) -> JsRuntime {
         let dom = dom::parse_html(html);
-        JsRuntime::new(Some(dom.document), None, None)
+        JsRuntime::new(Some(dom.document), None, None, new_console_buffer())
     }
 
     fn eval(rt: &mut JsRuntime, code: &str) -> String {
@@ -1699,6 +1781,24 @@ mod tests {
             }
         }
         String::new()
+    }
+
+    #[test]
+    fn test_console_methods_are_captured_with_levels() {
+        let buffer = new_console_buffer();
+        let dom = dom::parse_html("<html><body></body></html>");
+        let mut rt = JsRuntime::new(Some(dom.document), None, None, buffer.clone());
+
+        rt.execute("console.log('hello', 1); console.warn('careful'); console.error('boom');");
+
+        let entries = console_entries(&buffer);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].level, ConsoleLevel::Log);
+        assert_eq!(entries[0].message, "hello 1");
+        assert_eq!(entries[1].level, ConsoleLevel::Warn);
+        assert_eq!(entries[1].message, "careful");
+        assert_eq!(entries[2].level, ConsoleLevel::Error);
+        assert_eq!(entries[2].message, "boom");
     }
 
     #[test]
@@ -1904,7 +2004,7 @@ mod tests {
     fn test_history_push_and_replace_state_updates_location() {
         let url = url::Url::parse("https://example.com:8443/app/index.html").unwrap();
         let dom = crate::dom::parse_html("<html><body></body></html>");
-        let mut rt = JsRuntime::new(Some(dom.document), Some(url), None);
+        let mut rt = JsRuntime::new(Some(dom.document), Some(url), None, new_console_buffer());
 
         let result = eval(&mut rt, r#"
             (function() {
@@ -2052,7 +2152,7 @@ mod tests {
     fn test_window_location_set_from_url() {
         let url = url::Url::parse("https://www.example.com:8443/path?q=1#hash").unwrap();
         let dom = crate::dom::parse_html("<html><body></body></html>");
-        let mut rt = JsRuntime::new(Some(dom.document), Some(url), None);
+        let mut rt = JsRuntime::new(Some(dom.document), Some(url), None, new_console_buffer());
         let href = if let Ok(val) = rt.context.eval(Source::from_bytes(b"window.location.href")) {
             if let Ok(s) = val.to_string(&mut rt.context) { s.to_std_string_escaped() } else { String::new() }
         } else { String::new() };

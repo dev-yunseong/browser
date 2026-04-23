@@ -674,6 +674,7 @@ pub struct BrowserEngine {
     pub css_cache: HashMap<String, String>,
     pub last_stylesheet: Option<css::Stylesheet>,
     pub js_runtime: js::JsRuntime,
+    pub console_buffer: js::ConsoleBuffer,
     pub current_csp_policy: Option<js::CspPolicy>,
     pub js_style_overrides: HashMap<String, HashMap<String, String>>,
     /// The most recently rendered page result.
@@ -683,11 +684,13 @@ pub struct BrowserEngine {
 impl BrowserEngine {
     /// Create a new engine with empty caches and a fresh JS runtime.
     pub fn new() -> Self {
+        let console_buffer = js::new_console_buffer();
         Self {
             image_cache: HashMap::new(),
             css_cache: HashMap::new(),
             last_stylesheet: None,
-            js_runtime: js::JsRuntime::new(None, None, None),
+            js_runtime: js::JsRuntime::new(None, None, None, console_buffer.clone()),
+            console_buffer,
             current_csp_policy: None,
             js_style_overrides: HashMap::new(),
             last_page: None,
@@ -858,6 +861,14 @@ impl BrowserEngine {
         HashMap::new()
     }
 
+    pub fn console_entries(&self) -> Vec<js::ConsoleEntry> {
+        js::console_entries(&self.console_buffer)
+    }
+
+    pub fn clear_console(&self) {
+        js::clear_console_buffer(&self.console_buffer);
+    }
+
     /// Re-initialize the JS runtime for the current page.
     /// Parses the DOM from `body`, runs all page scripts (CSP-gated),
     /// and collects any immediate JS style overrides.
@@ -868,6 +879,7 @@ impl BrowserEngine {
             Some(dom.document.clone()),
             base_url,
             self.current_csp_policy.clone(),
+            self.console_buffer.clone(),
         );
 
         let scripts = js::extract_scripts_from_dom(&dom.document);
@@ -896,7 +908,8 @@ impl BrowserEngine {
     /// Reset all state in preparation for navigating to a new URL.
     pub fn clear_for_new_url(&mut self) {
         self.js_style_overrides.clear();
-        self.js_runtime = js::JsRuntime::new(None, None, None);
+        self.clear_console();
+        self.js_runtime = js::JsRuntime::new(None, None, None, self.console_buffer.clone());
         self.current_csp_policy = None;
         self.last_stylesheet = None;
         self.last_page = None;
@@ -965,6 +978,12 @@ pub enum EngineCmd {
         selector: String,
         reply: mpsc::Sender<HashMap<String, String>>,
     },
+    GetConsole {
+        reply: mpsc::Sender<Vec<js::ConsoleEntry>>,
+    },
+    ClearConsole {
+        reply: mpsc::Sender<()>,
+    },
     GetPage {
         reply: mpsc::Sender<Option<ApiPageResponse>>,
     },
@@ -1023,6 +1042,13 @@ pub fn run_engine_actor(rx: mpsc::Receiver<EngineCmd>) {
             }
             EngineCmd::ComputedStyle { selector, reply } => {
                 let _ = reply.send(eng.computed_style(&selector));
+            }
+            EngineCmd::GetConsole { reply } => {
+                let _ = reply.send(eng.console_entries());
+            }
+            EngineCmd::ClearConsole { reply } => {
+                eng.clear_console();
+                let _ = reply.send(());
             }
             EngineCmd::GetPage { reply } => {
                 let resp = eng.last_page.as_ref().map(|p| {
@@ -1094,6 +1120,21 @@ impl EngineHandle {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.tx.send(EngineCmd::GetPage { reply: reply_tx }).ok()?;
         reply_rx.recv().ok()?
+    }
+
+    pub fn send_get_console(&self) -> Vec<js::ConsoleEntry> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if self.tx.send(EngineCmd::GetConsole { reply: reply_tx }).is_err() {
+            return vec![];
+        }
+        reply_rx.recv().unwrap_or_default()
+    }
+
+    pub fn send_clear_console(&self) {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if self.tx.send(EngineCmd::ClearConsole { reply: reply_tx }).is_ok() {
+            let _ = reply_rx.recv();
+        }
     }
 
     pub fn send_get_elements(&self) -> Vec<ApiElement> {
@@ -1177,6 +1218,16 @@ mod tests {
         assert!(engine.js_style_overrides.is_empty());
         assert!(engine.last_stylesheet.is_none());
         assert!(engine.current_csp_policy.is_none());
+        assert!(engine.console_entries().is_empty());
+    }
+
+    #[test]
+    fn test_clear_console_empties_buffer() {
+        let mut engine = BrowserEngine::new();
+        engine.evaluate_js("console.log('hello')");
+        assert_eq!(engine.console_entries().len(), 1);
+        engine.clear_console();
+        assert!(engine.console_entries().is_empty());
     }
 
     #[test]

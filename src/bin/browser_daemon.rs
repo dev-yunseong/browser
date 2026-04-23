@@ -206,6 +206,11 @@ async fn elements_handler(State(handle): State<EngineHandle>) -> impl IntoRespon
     (StatusCode::OK, Json(elems)).into_response()
 }
 
+async fn console_handler(State(handle): State<EngineHandle>) -> impl IntoResponse {
+    let entries = blocking!(move || handle.send_get_console());
+    (StatusCode::OK, Json(entries)).into_response()
+}
+
 /// Submit the first form on the current page by evaluating `document.forms[0].submit()`.
 ///
 /// Note: the JS runtime is a mock, so this is a best-effort stub.
@@ -231,6 +236,7 @@ pub fn build_router(handle: EngineHandle) -> Router {
         .route("/layout", get(layout_handler))
         .route("/style", get(style_handler))
         .route("/elements", get(elements_handler))
+        .route("/console", get(console_handler))
         .route("/submit", post(submit_handler))
         .with_state(handle)
 }
@@ -268,6 +274,8 @@ struct DaemonBrowserApp {
     image_promises: HashMap<String, Promise<Result<(String, Vec<u8>), String>>>,
     form_values: HashMap<String, String>,
     start_time: std::time::Instant,
+    console_entries: Vec<browser::js::ConsoleEntry>,
+    console_panel_open: bool,
 }
 
 impl DaemonBrowserApp {
@@ -313,6 +321,8 @@ impl DaemonBrowserApp {
             image_promises: HashMap::new(),
             form_values: HashMap::new(),
             start_time: std::time::Instant::now(),
+            console_entries: vec![],
+            console_panel_open: true,
         }
     }
 
@@ -400,6 +410,8 @@ impl eframe::App for DaemonBrowserApp {
                 self.tick_promise = None;
             }
         }
+
+        self.console_entries = self.handle.send_get_console();
 
         // Tab navigation
         if ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
@@ -525,6 +537,13 @@ impl eframe::App for DaemonBrowserApp {
                     ui.add(progress);
                 }
             });
+
+        render_console_panel(
+            ctx,
+            &mut self.console_panel_open,
+            &mut self.console_entries,
+            || self.handle.send_clear_console(),
+        );
 
         // Content area
         egui::CentralPanel::default()
@@ -745,6 +764,92 @@ impl eframe::App for DaemonBrowserApp {
 #[inline]
 fn daemon_hit(rel: egui::Vec2, r: &layout::Rect) -> bool {
     rel.x >= r.x && rel.x <= r.x + r.width && rel.y >= r.y && rel.y <= r.y + r.height
+}
+
+fn console_level_label(level: browser::js::ConsoleLevel) -> (&'static str, egui::Color32) {
+    match level {
+        browser::js::ConsoleLevel::Log => ("LOG", egui::Color32::from_rgb(210, 210, 210)),
+        browser::js::ConsoleLevel::Info => ("INFO", egui::Color32::from_rgb(140, 190, 255)),
+        browser::js::ConsoleLevel::Warn => ("WARN", egui::Color32::from_rgb(255, 210, 120)),
+        browser::js::ConsoleLevel::Error => ("ERR", egui::Color32::from_rgb(255, 120, 120)),
+        browser::js::ConsoleLevel::Debug => ("DBG", egui::Color32::from_rgb(180, 180, 180)),
+    }
+}
+
+fn render_console_panel(
+    ctx: &egui::Context,
+    open: &mut bool,
+    entries: &mut Vec<browser::js::ConsoleEntry>,
+    mut clear_console: impl FnMut(),
+) {
+    let default_height = if *open { 180.0 } else { 32.0 };
+    egui::TopBottomPanel::bottom("daemon_console_panel")
+        .resizable(*open)
+        .default_height(default_height)
+        .min_height(default_height)
+        .max_height(if *open { 260.0 } else { 32.0 })
+        .frame(
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(24, 26, 31))
+                .inner_margin(egui::Margin::symmetric(8.0, 6.0)),
+        )
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let toggle = if *open { "▾ Console" } else { "▸ Console" };
+                if ui.button(toggle).clicked() {
+                    *open = !*open;
+                }
+                ui.label(
+                    egui::RichText::new(format!("{} entries", entries.len()))
+                        .color(egui::Color32::GRAY)
+                        .small(),
+                );
+                if ui.button("Clear").clicked() {
+                    clear_console();
+                    entries.clear();
+                }
+            });
+
+            if !*open {
+                return;
+            }
+
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical()
+                .stick_to_bottom(true)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if entries.is_empty() {
+                        ui.label(
+                            egui::RichText::new("No console output")
+                                .color(egui::Color32::GRAY),
+                        );
+                        return;
+                    }
+
+                    for entry in entries.iter() {
+                        let (label, color) = console_level_label(entry.level);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("[{}]", label))
+                                    .color(color)
+                                    .monospace(),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("@{}", entry.timestamp))
+                                    .color(egui::Color32::GRAY)
+                                    .monospace()
+                                    .small(),
+                            );
+                            ui.label(
+                                egui::RichText::new(&entry.message)
+                                    .color(egui::Color32::WHITE)
+                                    .monospace(),
+                            );
+                        });
+                    }
+                });
+        });
 }
 
 // ── Main entry point ──────────────────────────────────────────────────────────
@@ -980,6 +1085,27 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_http_console_returns_entries() {
+        let handle = make_test_handle();
+        handle.send_evaluate_js("console.warn('watch out')".to_string());
+
+        let app = build_router(handle);
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/console")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entries = json.as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["level"], "warn");
+        assert_eq!(entries[0]["message"], "watch out");
     }
 
     #[tokio::test]

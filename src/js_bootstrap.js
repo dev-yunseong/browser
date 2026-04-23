@@ -832,7 +832,7 @@ var document = {
 var window = globalThis;
 window.document = document;
 window.localStorage = localStorage;
-var console = { log: log, warn: log, error: log, info: log, debug: log };
+var console = { log: log, warn: warn, error: error, info: info, debug: debug };
 var navigator = {
     userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     language: 'en-US',

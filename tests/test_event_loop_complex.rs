@@ -15,7 +15,7 @@ fn get_array_results(js: &mut JsRuntime, var_name: &str) -> Vec<String> {
 
 #[test]
 fn test_event_loop_interleaving() {
-    let mut js = JsRuntime::new(None, None, None);
+    let mut js = JsRuntime::new(None, None, None, browser::js::new_console_buffer());
     
     js.execute(r#"
         var results = [];
@@ -47,7 +47,7 @@ fn test_event_loop_interleaving() {
 
 #[test]
 fn test_raf_interleaving() {
-    let mut js = JsRuntime::new(None, None, None);
+    let mut js = JsRuntime::new(None, None, None, browser::js::new_console_buffer());
     
     js.execute(r#"
         var results = [];
