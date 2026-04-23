@@ -683,8 +683,7 @@ pub struct BrowserEngine {
 
 impl BrowserEngine {
     /// Create a new engine with empty caches and a fresh JS runtime.
-    pub fn new() -> Self {
-        let console_buffer = js::new_console_buffer();
+    pub fn new_with_console(console_buffer: js::ConsoleBuffer) -> Self {
         Self {
             image_cache: HashMap::new(),
             css_cache: HashMap::new(),
@@ -695,6 +694,10 @@ impl BrowserEngine {
             js_style_overrides: HashMap::new(),
             last_page: None,
         }
+    }
+
+    pub fn new() -> Self {
+        Self::new_with_console(js::new_console_buffer())
     }
 
     /// Synchronously navigate to a URL.
@@ -978,12 +981,6 @@ pub enum EngineCmd {
         selector: String,
         reply: mpsc::Sender<HashMap<String, String>>,
     },
-    GetConsole {
-        reply: mpsc::Sender<Vec<js::ConsoleEntry>>,
-    },
-    ClearConsole {
-        reply: mpsc::Sender<()>,
-    },
     GetPage {
         reply: mpsc::Sender<Option<ApiPageResponse>>,
     },
@@ -1009,6 +1006,10 @@ pub enum EngineCmd {
 /// are confined to a single thread.
 pub fn run_engine_actor(rx: mpsc::Receiver<EngineCmd>) {
     let mut eng = BrowserEngine::new();
+    run_engine_actor_with_engine(rx, &mut eng);
+}
+
+fn run_engine_actor_with_engine(rx: mpsc::Receiver<EngineCmd>, eng: &mut BrowserEngine) {
     for cmd in rx {
         match cmd {
             EngineCmd::Navigate { url, width, reply } => {
@@ -1043,13 +1044,6 @@ pub fn run_engine_actor(rx: mpsc::Receiver<EngineCmd>) {
             EngineCmd::ComputedStyle { selector, reply } => {
                 let _ = reply.send(eng.computed_style(&selector));
             }
-            EngineCmd::GetConsole { reply } => {
-                let _ = reply.send(eng.console_entries());
-            }
-            EngineCmd::ClearConsole { reply } => {
-                eng.clear_console();
-                let _ = reply.send(());
-            }
             EngineCmd::GetPage { reply } => {
                 let resp = eng.last_page.as_ref().map(|p| {
                     page_to_api_response(p, &p.base_url.clone())
@@ -1082,17 +1076,23 @@ pub fn run_engine_actor(rx: mpsc::Receiver<EngineCmd>) {
 #[derive(Clone)]
 pub struct EngineHandle {
     pub tx: mpsc::SyncSender<EngineCmd>,
+    pub console_buffer: js::ConsoleBuffer,
 }
 
 impl EngineHandle {
     /// Create a new engine actor and return a handle to it.
     pub fn spawn() -> Self {
         let (tx, rx) = mpsc::sync_channel::<EngineCmd>(64);
+        let console_buffer = js::new_console_buffer();
+        let actor_console = console_buffer.clone();
         std::thread::Builder::new()
             .name("engine-actor".into())
-            .spawn(move || run_engine_actor(rx))
+            .spawn(move || {
+                let mut eng = BrowserEngine::new_with_console(actor_console);
+                run_engine_actor_with_engine(rx, &mut eng);
+            })
             .expect("failed to start engine actor thread");
-        Self { tx }
+        Self { tx, console_buffer }
     }
 
     pub fn send_navigate(&self, url: String, width: f32) -> Result<PageResult, String> {
@@ -1123,18 +1123,15 @@ impl EngineHandle {
     }
 
     pub fn send_get_console(&self) -> Vec<js::ConsoleEntry> {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        if self.tx.send(EngineCmd::GetConsole { reply: reply_tx }).is_err() {
-            return vec![];
-        }
-        reply_rx.recv().unwrap_or_default()
+        js::console_entries(&self.console_buffer)
+    }
+
+    pub fn console_version(&self) -> u64 {
+        js::console_version(&self.console_buffer)
     }
 
     pub fn send_clear_console(&self) {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        if self.tx.send(EngineCmd::ClearConsole { reply: reply_tx }).is_ok() {
-            let _ = reply_rx.recv();
-        }
+        js::clear_console_buffer(&self.console_buffer);
     }
 
     pub fn send_get_elements(&self) -> Vec<ApiElement> {

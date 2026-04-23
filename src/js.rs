@@ -3,6 +3,7 @@ use std::collections::{HashMap, VecDeque};
 use markup5ever_rcdom::{NodeData, Handle};
 use std::cell::RefCell;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
@@ -75,7 +76,12 @@ pub struct ConsoleEntry {
     pub timestamp: u64,
 }
 
-pub type ConsoleBuffer = Arc<Mutex<VecDeque<ConsoleEntry>>>;
+pub struct ConsoleState {
+    entries: Mutex<VecDeque<ConsoleEntry>>,
+    version: AtomicU64,
+}
+
+pub type ConsoleBuffer = Arc<ConsoleState>;
 
 fn now_timestamp_ms() -> u64 {
     SystemTime::now()
@@ -85,26 +91,35 @@ fn now_timestamp_ms() -> u64 {
 }
 
 pub fn new_console_buffer() -> ConsoleBuffer {
-    Arc::new(Mutex::new(VecDeque::with_capacity(MAX_CONSOLE_ENTRIES)))
+    Arc::new(ConsoleState {
+        entries: Mutex::new(VecDeque::with_capacity(MAX_CONSOLE_ENTRIES)),
+        version: AtomicU64::new(0),
+    })
 }
 
 pub fn clear_console_buffer(buffer: &ConsoleBuffer) {
-    if let Ok(mut entries) = buffer.lock() {
+    if let Ok(mut entries) = buffer.entries.lock() {
         entries.clear();
+        buffer.version.fetch_add(1, Ordering::Relaxed);
     }
 }
 
 pub fn console_entries(buffer: &ConsoleBuffer) -> Vec<ConsoleEntry> {
     buffer
+        .entries
         .lock()
         .map(|entries| entries.iter().cloned().collect())
         .unwrap_or_default()
 }
 
+pub fn console_version(buffer: &ConsoleBuffer) -> u64 {
+    buffer.version.load(Ordering::Relaxed)
+}
+
 fn push_console_entry(level: ConsoleLevel, message: String) {
     CONSOLE_BUFFER.with(|cell| {
         if let Some(buffer) = cell.borrow().as_ref() {
-            if let Ok(mut entries) = buffer.lock() {
+            if let Ok(mut entries) = buffer.entries.lock() {
                 if entries.len() >= MAX_CONSOLE_ENTRIES {
                     entries.pop_front();
                 }
@@ -113,6 +128,7 @@ fn push_console_entry(level: ConsoleLevel, message: String) {
                     message,
                     timestamp: now_timestamp_ms(),
                 });
+                buffer.version.fetch_add(1, Ordering::Relaxed);
             }
         }
     });
