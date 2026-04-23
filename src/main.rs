@@ -622,12 +622,13 @@ fn render_console_panel(
     mut clear_console: impl FnMut(),
     mut evaluate_console: impl FnMut(String),
 ) {
-    let default_height = if *open { 180.0 } else { 32.0 };
+    let max_open_height = (ctx.available_rect().height() * 0.45).clamp(180.0, 360.0);
+    let default_height = if *open { 200.0 } else { 34.0 };
     egui::TopBottomPanel::bottom("browser_console_panel")
         .resizable(*open)
         .default_height(default_height)
-        .min_height(default_height)
-        .max_height(if *open { 260.0 } else { 32.0 })
+        .min_height(if *open { 120.0 } else { 34.0 })
+        .max_height(if *open { max_open_height } else { 34.0 })
         .frame(
             egui::Frame::none()
                 .fill(egui::Color32::from_rgb(24, 26, 31))
@@ -644,7 +645,7 @@ fn render_console_panel(
                         .color(egui::Color32::GRAY)
                         .small(),
                 );
-                if ui.button("Clear").clicked() {
+                if ui.add_enabled(!entries.is_empty(), egui::Button::new("Clear")).clicked() {
                     clear_console();
                     entries.clear();
                 }
@@ -655,8 +656,10 @@ fn render_console_panel(
             }
 
             ui.add_space(4.0);
+            let scroll_height = (ui.available_height() - 34.0).max(48.0);
             egui::ScrollArea::vertical()
                 .stick_to_bottom(true)
+                .max_height(scroll_height)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     if entries.is_empty() {
@@ -697,7 +700,7 @@ fn render_console_panel(
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new(">")
+                    egui::RichText::new("JS >")
                         .color(egui::Color32::from_rgb(140, 190, 255))
                         .monospace(),
                 );
