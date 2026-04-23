@@ -246,6 +246,7 @@ impl JsRuntime {
                 let mut obj = ObjectInitializer::new(_context);
                 obj.property(js_string!("nid"), JsValue::from(nid), boa_engine::property::Attribute::all());
                 obj.property(js_string!("tag"), JsValue::from(js_string!(tag)), boa_engine::property::Attribute::all());
+                obj.property(js_string!("kind"), JsValue::from(js_string!("element")), boa_engine::property::Attribute::all());
                 Ok(obj.build().into())
             } else {
                 Ok(JsValue::null())
@@ -375,6 +376,23 @@ impl JsRuntime {
             Ok(JsValue::undefined())
         });
         context.register_global_callable(js_string!("__aura_queue_task"), 1, queue_task).unwrap();
+
+        // Register native __aura_resolve_url
+        let resolve_url = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let input = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            let base = args.get(1).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            let resolved = if !base.is_empty() {
+                Url::parse(&base)
+                    .ok()
+                    .and_then(|b| b.join(&input).ok())
+                    .or_else(|| Url::parse(&input).ok())
+            } else {
+                Url::parse(&input).ok()
+            };
+            let out = resolved.map(|u| u.to_string()).unwrap_or(input);
+            Ok(JsValue::from(js_string!(out)))
+        });
+        context.register_global_callable(js_string!("__aura_resolve_url"), 2, resolve_url).unwrap();
 
         // Register native __aura_fetch
         let aura_fetch = NativeFunction::from_copy_closure(|_this, args, _context| {
@@ -595,6 +613,22 @@ impl JsRuntime {
         });
         context.register_global_callable(js_string!("__aura_create_element"), 1, create_element).unwrap();
 
+        // __aura_create_text_node(text) -> nid
+        let create_text_node = NativeFunction::from_copy_closure(|_this, args, _context| {
+            use html5ever::tendril::StrTendril;
+            use markup5ever_rcdom::{Node, NodeData};
+
+            let text = args.get(0)
+                .and_then(|v| v.as_string())
+                .map(|s| s.to_std_string_escaped())
+                .unwrap_or_default();
+            let node = Node::new(NodeData::Text {
+                contents: std::cell::RefCell::new(StrTendril::from(text.as_str())),
+            });
+            Ok(JsValue::from(register_node(node)))
+        });
+        context.register_global_callable(js_string!("__aura_create_text_node"), 1, create_text_node).unwrap();
+
         // __aura_append_child(parent_nid, child_nid) → void
         let append_child = NativeFunction::from_copy_closure(|_this, args, _context| {
             let parent_nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
@@ -747,15 +781,23 @@ impl JsRuntime {
             NODE_REGISTRY.with(|reg| {
                 let reg = reg.borrow();
                 if let Some(node) = reg.get(&nid) {
-                    use markup5ever_rcdom::Node;
-                    use html5ever::tendril::StrTendril;
-                    let text_node = Node::new(NodeData::Text {
-                        contents: std::cell::RefCell::new(StrTendril::from(text.as_str())),
-                    });
-                    text_node.parent.set(Some(Rc::downgrade(node)));
-                    let mut children = node.children.borrow_mut();
-                    children.clear();
-                    children.push(text_node);
+                    match &node.data {
+                        NodeData::Text { contents } => {
+                            *contents.borrow_mut() = text.as_str().into();
+                        }
+                        _ => {
+                            use html5ever::tendril::StrTendril;
+                            use markup5ever_rcdom::Node;
+
+                            let text_node = Node::new(NodeData::Text {
+                                contents: std::cell::RefCell::new(StrTendril::from(text.as_str())),
+                            });
+                            text_node.parent.set(Some(Rc::downgrade(node)));
+                            let mut children = node.children.borrow_mut();
+                            children.clear();
+                            children.push(text_node);
+                        }
+                    }
                 }
             });
             Ok(JsValue::undefined())
@@ -823,14 +865,20 @@ impl JsRuntime {
                 if let Some(node) = reg.get(&nid) {
                     let mut items = Vec::new();
                     for child in node.children.borrow().iter() {
-                        if let NodeData::Element { ref name, ref attrs, .. } = child.data {
-                            let tag = name.local.to_string();
-                            let id_attr = attrs.borrow().iter()
-                                .find(|a| a.name.local.to_string() == "id")
-                                .map(|a| a.value.to_string())
-                                .unwrap_or_default();
-                            let child_nid = register_node(child.clone());
-                            items.push(format!("{{\"nid\":{},\"tag\":\"{}\",\"id\":\"{}\"}}", child_nid, tag, id_attr));
+                        let child_nid = register_node(child.clone());
+                        match &child.data {
+                            NodeData::Element { ref name, ref attrs, .. } => {
+                                let tag = name.local.to_string();
+                                let id_attr = attrs.borrow().iter()
+                                    .find(|a| a.name.local.to_string() == "id")
+                                    .map(|a| a.value.to_string())
+                                    .unwrap_or_default();
+                                items.push(format!("{{\"nid\":{},\"tag\":\"{}\",\"id\":\"{}\",\"kind\":\"element\"}}", child_nid, tag, id_attr));
+                            }
+                            NodeData::Text { .. } => {
+                                items.push(format!("{{\"nid\":{},\"tag\":\"\",\"id\":\"\",\"kind\":\"text\"}}", child_nid));
+                            }
+                            _ => {}
                         }
                     }
                     items.join(",")
@@ -853,17 +901,20 @@ impl JsRuntime {
                         let attrs_b = attrs.borrow();
                         let id = attrs_b.iter().find(|a| a.name.local.to_string() == "id").map(|a| a.value.to_string()).unwrap_or_default();
                         let class = attrs_b.iter().find(|a| a.name.local.to_string() == "class").map(|a| a.value.to_string()).unwrap_or_default();
-                        return Some((tag, id, class));
+                        return Some((tag, id, class, "element".to_string()));
+                    } else if let NodeData::Text { .. } = node.data {
+                        return Some((String::new(), String::new(), String::new(), "text".to_string()));
                     }
                 }
                 None
             });
-            if let Some((tag, id, class)) = info {
+            if let Some((tag, id, class, kind)) = info {
                 use boa_engine::object::ObjectInitializer;
                 let mut obj = ObjectInitializer::new(context);
                 obj.property(js_string!("tag"), JsValue::from(js_string!(tag)), boa_engine::property::Attribute::all());
                 obj.property(js_string!("id"), JsValue::from(js_string!(id)), boa_engine::property::Attribute::all());
                 obj.property(js_string!("class"), JsValue::from(js_string!(class)), boa_engine::property::Attribute::all());
+                obj.property(js_string!("kind"), JsValue::from(js_string!(kind)), boa_engine::property::Attribute::all());
                 Ok(obj.build().into())
             } else {
                 Ok(JsValue::null())
@@ -871,9 +922,125 @@ impl JsRuntime {
         });
         context.register_global_callable(js_string!("__aura_get_node_info"), 1, get_node_info).unwrap();
 
+        // __aura_get_node_type(nid) -> DOM nodeType integer
+        let get_node_type = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let node_type = NODE_REGISTRY.with(|reg| {
+                reg.borrow().get(&nid).map(|node| match node.data {
+                    NodeData::Element { .. } => 1,
+                    NodeData::Text { .. } => 3,
+                    NodeData::Comment { .. } => 8,
+                    NodeData::Document => 9,
+                    _ => 0,
+                }).unwrap_or(0)
+            });
+            Ok(JsValue::from(node_type))
+        });
+        context.register_global_callable(js_string!("__aura_get_node_type"), 1, get_node_type).unwrap();
+
+        // __aura_parse_url(url, base) -> object|null
+        let parse_url = NativeFunction::from_copy_closure(|_this, args, context| {
+            let url_input = args.get(0)
+                .and_then(|v| v.as_string())
+                .map(|s| s.to_std_string_escaped())
+                .unwrap_or_default();
+            let base_input = args.get(1)
+                .and_then(|v| v.as_string())
+                .map(|s| s.to_std_string_escaped());
+
+            let parsed = if let Some(base) = base_input.as_deref() {
+                Url::parse(base).ok().and_then(|base_url| base_url.join(&url_input).ok())
+            } else {
+                Url::parse(&url_input).ok()
+            };
+
+            if let Some(url) = parsed {
+                use boa_engine::object::ObjectInitializer;
+                let href = url.to_string();
+                let hostname = url.host_str().unwrap_or("").to_string();
+                let pathname = url.path().to_string();
+                let search = url.query().map(|q| format!("?{}", q)).unwrap_or_default();
+                let hash = url.fragment().map(|f| format!("#{}", f)).unwrap_or_default();
+                let protocol = format!("{}:", url.scheme());
+                let host = url.host_str().map(|h| {
+                    if let Some(port) = url.port() {
+                        format!("{}:{}", h, port)
+                    } else {
+                        h.to_string()
+                    }
+                }).unwrap_or_default();
+                let port = url.port().map(|p| p.to_string()).unwrap_or_default();
+                let origin = url.origin().unicode_serialization();
+
+                let mut obj = ObjectInitializer::new(context);
+                obj.property(js_string!("href"), JsValue::from(js_string!(href)), boa_engine::property::Attribute::all());
+                obj.property(js_string!("hostname"), JsValue::from(js_string!(hostname)), boa_engine::property::Attribute::all());
+                obj.property(js_string!("pathname"), JsValue::from(js_string!(pathname)), boa_engine::property::Attribute::all());
+                obj.property(js_string!("search"), JsValue::from(js_string!(search)), boa_engine::property::Attribute::all());
+                obj.property(js_string!("hash"), JsValue::from(js_string!(hash)), boa_engine::property::Attribute::all());
+                obj.property(js_string!("protocol"), JsValue::from(js_string!(protocol)), boa_engine::property::Attribute::all());
+                obj.property(js_string!("host"), JsValue::from(js_string!(host)), boa_engine::property::Attribute::all());
+                obj.property(js_string!("port"), JsValue::from(js_string!(port)), boa_engine::property::Attribute::all());
+                obj.property(js_string!("origin"), JsValue::from(js_string!(origin)), boa_engine::property::Attribute::all());
+                Ok(obj.build().into())
+            } else {
+                Ok(JsValue::null())
+            }
+        });
+        context.register_global_callable(js_string!("__aura_parse_url"), 2, parse_url).unwrap();
+
         // Load bootstrap
         let bootstrap = include_str!("js_bootstrap.js");
         let _ = context.eval(Source::from_bytes(bootstrap.as_bytes()));
+
+        // Inject the base URL into the JS location and document.location objects
+        let url_init = CURRENT_ORIGIN.with(|origin| {
+            if let Some(ref url) = *origin.borrow() {
+                let href = url.to_string();
+                let hostname = url.host_str().unwrap_or("").to_string();
+                let pathname = url.path().to_string();
+                let search = url.query().map(|q| format!("?{}", q)).unwrap_or_default();
+                let hash = url.fragment().map(|f| format!("#{}", f)).unwrap_or_default();
+                let protocol = url.scheme().to_string() + ":";
+                let host = url.host_str().map(|h| {
+                    if let Some(port) = url.port() {
+                        format!("{}:{}", h, port)
+                    } else {
+                        h.to_string()
+                    }
+                }).unwrap_or_default();
+                let port = url.port().map(|p| p.to_string()).unwrap_or_default();
+                let origin = url.origin().unicode_serialization();
+                format!(
+                    r#"(function() {{
+                        var _loc = {{
+                            href: {href:?},
+                            hostname: {hostname:?},
+                            pathname: {pathname:?},
+                            search: {search:?},
+                            hash: {hash:?},
+                            protocol: {protocol:?},
+                            host: {host:?},
+                            port: {port:?},
+                            origin: {origin:?},
+                        }};
+                        document.location = _loc;
+                        document.URL = {href:?};
+                        document.documentURI = {href:?};
+                        document.baseURI = {href:?};
+                        window.location = _loc;
+                        location = _loc;
+                    }})();"#
+                )
+            } else {
+                String::new()
+            }
+        });
+        if !url_init.is_empty() {
+            if let Err(e) = context.eval(Source::from_bytes(url_init.as_bytes())) {
+                println!("[JS Bootstrap] URL init error: {:?}", e);
+            }
+        }
 
         Self { context, task_receiver }
     }
@@ -1693,5 +1860,238 @@ mod tests {
         // Also check querySelector works after mutation
         let found = eval(&mut rt, "document.querySelector('#app p') !== null ? 'found' : 'null'");
         assert_eq!(found, "found", "Expected querySelector('#app p') to find element after innerHTML set");
+    }
+
+    // ── New runtime parity tests (#113) ──────────────────────────────────────
+
+    #[test]
+    fn test_window_inner_dimensions() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let w = eval(&mut rt, "window.innerWidth");
+        let h = eval(&mut rt, "window.innerHeight");
+        assert_eq!(w, "800");
+        assert_eq!(h, "600");
+    }
+
+    #[test]
+    fn test_navigator_user_agent_chrome() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let ua = eval(&mut rt, "navigator.userAgent");
+        assert!(ua.contains("Mozilla"), "Expected Chrome-like UA, got: {}", ua);
+        assert!(ua.contains("AppleWebKit"), "Expected WebKit UA, got: {}", ua);
+    }
+
+    #[test]
+    fn test_navigator_platform() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let platform = eval(&mut rt, "navigator.platform");
+        assert!(!platform.is_empty(), "Expected non-empty platform");
+    }
+
+    #[test]
+    fn test_history_object() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let result = eval(&mut rt, "typeof window.history");
+        assert_eq!(result, "object");
+        let push = eval(&mut rt, "typeof window.history.pushState");
+        assert_eq!(push, "function");
+        // pushState should not throw
+        let ok = eval(&mut rt, "(function() { try { history.pushState(null,'','/path'); return 'ok'; } catch(e) { return 'err:'+e; } })()");
+        assert_eq!(ok, "ok");
+    }
+
+    #[test]
+    fn test_history_push_and_replace_state_updates_location() {
+        let url = url::Url::parse("https://example.com:8443/app/index.html").unwrap();
+        let dom = crate::dom::parse_html("<html><body></body></html>");
+        let mut rt = JsRuntime::new(Some(dom.document), Some(url), None);
+
+        let result = eval(&mut rt, r#"
+            (function() {
+                history.pushState({page: 1}, '', '/dashboard?tab=home#top');
+                var afterPush = [
+                    history.length,
+                    JSON.stringify(history.state),
+                    location.href,
+                    location.origin,
+                    document.URL
+                ].join('|');
+
+                history.replaceState({page: 2}, '', 'settings');
+                var afterReplace = [
+                    history.length,
+                    JSON.stringify(history.state),
+                    location.href,
+                    location.origin,
+                    document.baseURI
+                ].join('|');
+
+                return afterPush + '||' + afterReplace;
+            })()
+        "#);
+
+        assert_eq!(
+            result,
+            "2|{\"page\":1}|https://example.com:8443/dashboard?tab=home#top|https://example.com:8443|https://example.com:8443/dashboard?tab=home#top||2|{\"page\":2}|https://example.com:8443/settings|https://example.com:8443|https://example.com:8443/settings"
+        );
+    }
+
+    #[test]
+    fn test_create_text_node_append_and_insert() {
+        let mut rt = make_runtime("<html><body><div id='app'></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var app = document.getElementById('app');
+                var tail = document.createElement('span');
+                tail.textContent = 'tail';
+                app.appendChild(tail);
+                var head = document.createTextNode('head');
+                app.insertBefore(head, tail);
+                return [
+                    app.childNodes.length,
+                    app.firstChild.nodeType,
+                    app.lastChild.nodeType,
+                    app.textContent,
+                    app.children.length
+                ].join(':');
+            })()
+        "#);
+
+        assert_eq!(result, "2:3:1:headtail:1");
+    }
+
+    #[test]
+    fn test_performance_now() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let result = eval(&mut rt, "typeof window.performance.now()");
+        assert_eq!(result, "number");
+    }
+
+    #[test]
+    fn test_document_cookie_empty_string() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let cookie = eval(&mut rt, "document.cookie");
+        assert_eq!(cookie, "", "Expected empty cookie string");
+        // Writing should not throw
+        let ok = eval(&mut rt, "(function() { try { document.cookie = 'test=1'; return 'ok'; } catch(e) { return 'err'; } })()");
+        assert_eq!(ok, "ok");
+    }
+
+    #[test]
+    fn test_session_storage_get_set() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        eval(&mut rt, "sessionStorage.setItem('k', 'v')");
+        let val = eval(&mut rt, "sessionStorage.getItem('k')");
+        assert_eq!(val, "v");
+    }
+
+    #[test]
+    fn test_get_computed_style_stub() {
+        let mut rt = make_runtime("<html><body><div id='el'>x</div></body></html>");
+        let result = eval(&mut rt, "(function() { var el = document.getElementById('el'); var s = window.getComputedStyle(el); return typeof s; })()");
+        assert_eq!(result, "object");
+    }
+
+    #[test]
+    fn test_node_constants() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let elem = eval(&mut rt, "Node.ELEMENT_NODE");
+        assert_eq!(elem, "1");
+        let text = eval(&mut rt, "Node.TEXT_NODE");
+        assert_eq!(text, "3");
+        let comment = eval(&mut rt, "Node.COMMENT_NODE");
+        assert_eq!(comment, "8");
+    }
+
+    #[test]
+    fn test_element_node_type() {
+        let mut rt = make_runtime("<html><body><div id='el'>x</div></body></html>");
+        let result = eval(&mut rt, "document.getElementById('el').nodeType");
+        assert_eq!(result, "1");
+    }
+
+    #[test]
+    fn test_image_constructor() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        // new Image() should not throw
+        let result = eval(&mut rt, "(function() { try { var img = new Image(100,50); return typeof img; } catch(e) { return 'err:'+e; } })()");
+        assert_eq!(result, "object");
+    }
+
+    #[test]
+    fn test_xml_http_request_stub() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let result = eval(&mut rt, "(function() { try { var xhr = new XMLHttpRequest(); xhr.open('GET', '/test'); return 'ok'; } catch(e) { return 'err:'+e; } })()");
+        assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn test_match_media_returns_object() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let result = eval(&mut rt, "(function() { var mm = window.matchMedia('(max-width: 800px)'); return typeof mm.matches; })()");
+        assert_eq!(result, "boolean");
+    }
+
+    #[test]
+    fn test_window_screen_properties() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let w = eval(&mut rt, "window.screen.width");
+        let h = eval(&mut rt, "window.screen.height");
+        assert_eq!(w, "800");
+        assert_eq!(h, "600");
+    }
+
+    #[test]
+    fn test_device_pixel_ratio() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let dpr = eval(&mut rt, "window.devicePixelRatio");
+        assert_eq!(dpr, "1");
+    }
+
+    #[test]
+    fn test_window_location_set_from_url() {
+        let url = url::Url::parse("https://www.example.com:8443/path?q=1#hash").unwrap();
+        let dom = crate::dom::parse_html("<html><body></body></html>");
+        let mut rt = JsRuntime::new(Some(dom.document), Some(url), None);
+        let href = if let Ok(val) = rt.context.eval(Source::from_bytes(b"window.location.href")) {
+            if let Ok(s) = val.to_string(&mut rt.context) { s.to_std_string_escaped() } else { String::new() }
+        } else { String::new() };
+        assert_eq!(href, "https://www.example.com:8443/path?q=1#hash");
+        let hostname = if let Ok(val) = rt.context.eval(Source::from_bytes(b"window.location.hostname")) {
+            if let Ok(s) = val.to_string(&mut rt.context) { s.to_std_string_escaped() } else { String::new() }
+        } else { String::new() };
+        assert_eq!(hostname, "www.example.com");
+        let origin = if let Ok(val) = rt.context.eval(Source::from_bytes(b"window.location.origin")) {
+            if let Ok(s) = val.to_string(&mut rt.context) { s.to_std_string_escaped() } else { String::new() }
+        } else { String::new() };
+        assert_eq!(origin, "https://www.example.com:8443");
+    }
+
+    #[test]
+    fn test_keyboard_event_constructor() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let result = eval(&mut rt, "(function() { var e = new KeyboardEvent('keydown', {key: 'Enter', keyCode: 13}); return e.key + ':' + e.keyCode; })()");
+        assert_eq!(result, "Enter:13");
+    }
+
+    #[test]
+    fn test_url_constructor() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let result = eval(&mut rt, "(function() { var u = new URL('/path?q=1', 'https://example.com:8443/base/index.html'); return u.href + '|' + u.origin; })()");
+        assert_eq!(result, "https://example.com:8443/path?q=1|https://example.com:8443");
+    }
+
+    #[test]
+    fn test_abort_controller() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let result = eval(&mut rt, "(function() { var ctrl = new AbortController(); ctrl.abort(); return ctrl.signal.aborted ? 'aborted' : 'not'; })()");
+        assert_eq!(result, "aborted");
+    }
+
+    #[test]
+    fn test_window_crypto_get_random_values() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let result = eval(&mut rt, "(function() { try { var arr = new Uint8Array(4); window.crypto.getRandomValues(arr); return 'ok'; } catch(e) { return 'err:'+e; } })()");
+        assert_eq!(result, "ok");
     }
 }
