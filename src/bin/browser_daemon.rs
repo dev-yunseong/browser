@@ -79,6 +79,11 @@ struct JsRequest {
 }
 
 #[derive(serde::Deserialize)]
+struct ConsoleEvalRequest {
+    code: String,
+}
+
+#[derive(serde::Deserialize)]
 struct StyleQuery {
     selector: Option<String>,
 }
@@ -92,6 +97,12 @@ struct StatusResponse {
 #[derive(serde::Serialize)]
 struct JsResponse {
     result: String,
+}
+
+#[derive(serde::Serialize)]
+struct ConsoleEvalResponse {
+    result: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -169,6 +180,21 @@ async fn js_handler(
     (StatusCode::OK, Json(JsResponse { result })).into_response()
 }
 
+async fn console_eval_handler(
+    State(handle): State<EngineHandle>,
+    Json(req): Json<ConsoleEvalRequest>,
+) -> impl IntoResponse {
+    let outcome = blocking!(move || handle.send_console_eval_result(req.code));
+    (
+        StatusCode::OK,
+        Json(ConsoleEvalResponse {
+            result: outcome.result,
+            error: outcome.error,
+        }),
+    )
+        .into_response()
+}
+
 async fn screenshot_handler(State(handle): State<EngineHandle>) -> impl IntoResponse {
     let png_opt = blocking!(move || handle.send_screenshot());
     match png_opt {
@@ -231,6 +257,7 @@ pub fn build_router(handle: EngineHandle) -> Router {
         .route("/click", post(click_handler))
         .route("/type", post(type_handler))
         .route("/js", post(js_handler))
+        .route("/console/eval", post(console_eval_handler))
         .route("/screenshot", get(screenshot_handler))
         .route("/dom", get(dom_handler))
         .route("/layout", get(layout_handler))
@@ -276,6 +303,11 @@ struct DaemonBrowserApp {
     start_time: std::time::Instant,
     console_entries: Vec<browser::js::ConsoleEntry>,
     console_panel_open: bool,
+    console_input: String,
+    console_history: Vec<String>,
+    console_history_index: Option<usize>,
+    console_eval_promise: Option<Promise<browser::js::EvalOutcome>>,
+    has_page: bool,
 }
 
 impl DaemonBrowserApp {
@@ -323,6 +355,11 @@ impl DaemonBrowserApp {
             start_time: std::time::Instant::now(),
             console_entries: vec![],
             console_panel_open: true,
+            console_input: String::new(),
+            console_history: vec![],
+            console_history_index: None,
+            console_eval_promise: None,
+            has_page: false,
         }
     }
 
@@ -357,6 +394,7 @@ impl DaemonBrowserApp {
         self.image_promises.clear();
         self.hovered_id = None;
         self.is_loading = true;
+        self.has_page = false;
 
         let handle = self.handle.clone();
         self.content_promise = Some(Promise::spawn_thread("daemon-navigate", move || {
@@ -386,6 +424,7 @@ impl DaemonBrowserApp {
         self.current_event_handlers = page.event_handlers;
         self.current_element_ids = page.element_ids;
         self.current_focusable_elements = page.focusable_elements;
+        self.has_page = true;
     }
 }
 
@@ -412,6 +451,16 @@ impl eframe::App for DaemonBrowserApp {
         }
 
         self.console_entries = self.handle.send_get_console();
+        if let Some(eval_promise) = &self.console_eval_promise {
+            if eval_promise.ready().is_some() {
+                self.console_eval_promise = None;
+                if self.has_page && self.re_render_promise.is_none() && self.content_promise.is_none() {
+                    self.trigger_re_render(ctx, 800.0);
+                } else {
+                    ctx.request_repaint();
+                }
+            }
+        }
 
         // Tab navigation
         if ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
@@ -542,7 +591,18 @@ impl eframe::App for DaemonBrowserApp {
             ctx,
             &mut self.console_panel_open,
             &mut self.console_entries,
+            &mut self.console_input,
+            &mut self.console_history,
+            &mut self.console_history_index,
             || self.handle.send_clear_console(),
+            |code| {
+                if self.console_eval_promise.is_none() {
+                    let handle = self.handle.clone();
+                    self.console_eval_promise = Some(Promise::spawn_thread("daemon-console-eval", move || {
+                        handle.send_console_eval_result(code)
+                    }));
+                }
+            },
         );
 
         // Content area
@@ -586,6 +646,7 @@ impl eframe::App for DaemonBrowserApp {
                             self.error = Some(e.clone());
                             self.content_promise = None;
                             self.is_loading = false;
+                            self.has_page = false;
                         }
                         Some(Ok(page)) => {
                             let page = page.clone();
@@ -776,11 +837,48 @@ fn console_level_label(level: browser::js::ConsoleLevel) -> (&'static str, egui:
     }
 }
 
+fn apply_console_history_navigation(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    input: &mut String,
+    history: &[String],
+    history_index: &mut Option<usize>,
+) {
+    if !response.has_focus() || history.is_empty() {
+        return;
+    }
+
+    if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+        let next_index = history_index
+            .map(|index| index.saturating_sub(1))
+            .unwrap_or(history.len() - 1);
+        *history_index = Some(next_index);
+        *input = history[next_index].clone();
+    }
+
+    if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+        if let Some(index) = *history_index {
+            if index + 1 < history.len() {
+                let next_index = index + 1;
+                *history_index = Some(next_index);
+                *input = history[next_index].clone();
+            } else {
+                *history_index = None;
+                input.clear();
+            }
+        }
+    }
+}
+
 fn render_console_panel(
     ctx: &egui::Context,
     open: &mut bool,
     entries: &mut Vec<browser::js::ConsoleEntry>,
+    input: &mut String,
+    history: &mut Vec<String>,
+    history_index: &mut Option<usize>,
     mut clear_console: impl FnMut(),
+    mut evaluate_console: impl FnMut(String),
 ) {
     let default_height = if *open { 180.0 } else { 32.0 };
     egui::TopBottomPanel::bottom("daemon_console_panel")
@@ -829,6 +927,10 @@ fn render_console_panel(
 
                     for entry in entries.iter() {
                         let (label, color) = console_level_label(entry.level);
+                        let message_color = match entry.level {
+                            browser::js::ConsoleLevel::Error => color,
+                            _ => egui::Color32::WHITE,
+                        };
                         ui.horizontal_wrapped(|ui| {
                             ui.label(
                                 egui::RichText::new(format!("[{}]", label))
@@ -843,12 +945,37 @@ fn render_console_panel(
                             );
                             ui.label(
                                 egui::RichText::new(&entry.message)
-                                    .color(egui::Color32::WHITE)
+                                    .color(message_color)
                                     .monospace(),
                             );
                         });
                     }
                 });
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(">")
+                        .color(egui::Color32::from_rgb(140, 190, 255))
+                        .monospace(),
+                );
+                let response = ui.add(
+                    egui::TextEdit::singleline(input)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Evaluate JavaScript"),
+                );
+                apply_console_history_navigation(ui, &response, input, history, history_index);
+
+                if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    let code = input.trim().to_string();
+                    if !code.is_empty() {
+                        history.push(code.clone());
+                        *history_index = None;
+                        input.clear();
+                        evaluate_console(code);
+                    }
+                }
+            });
         });
 }
 
@@ -901,7 +1028,6 @@ fn main() {
 mod tests {
     use super::*;
     use std::sync::mpsc;
-    use browser::engine::run_engine_actor;
     use tower::ServiceExt;
 
     // ── Arg parsing ──────────────────────────────────────────────────────────
@@ -1106,6 +1232,42 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["level"], "warn");
         assert_eq!(entries[0]["message"], "watch out");
+    }
+
+    #[tokio::test]
+    async fn test_http_console_eval_returns_result() {
+        let handle = make_test_handle();
+        let app = build_router(handle);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/console/eval")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(r#"{"code":"1+1"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["result"], "2");
+        assert!(json["error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_http_console_eval_returns_error() {
+        let handle = make_test_handle();
+        let app = build_router(handle);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/console/eval")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(r#"{"code":"missingVariable"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["result"].is_null());
+        assert!(json["error"].is_string());
     }
 
     #[tokio::test]

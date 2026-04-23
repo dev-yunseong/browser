@@ -83,6 +83,12 @@ pub struct ConsoleState {
 
 pub type ConsoleBuffer = Arc<ConsoleState>;
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvalOutcome {
+    pub result: Option<String>,
+    pub error: Option<String>,
+}
+
 fn now_timestamp_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -95,6 +101,20 @@ pub fn new_console_buffer() -> ConsoleBuffer {
         entries: Mutex::new(VecDeque::with_capacity(MAX_CONSOLE_ENTRIES)),
         version: AtomicU64::new(0),
     })
+}
+
+pub fn append_console_entry(buffer: &ConsoleBuffer, level: ConsoleLevel, message: String) {
+    if let Ok(mut entries) = buffer.entries.lock() {
+        if entries.len() >= MAX_CONSOLE_ENTRIES {
+            entries.pop_front();
+        }
+        entries.push_back(ConsoleEntry {
+            level,
+            message,
+            timestamp: now_timestamp_ms(),
+        });
+        buffer.version.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 pub fn clear_console_buffer(buffer: &ConsoleBuffer) {
@@ -119,17 +139,7 @@ pub fn console_version(buffer: &ConsoleBuffer) -> u64 {
 fn push_console_entry(level: ConsoleLevel, message: String) {
     CONSOLE_BUFFER.with(|cell| {
         if let Some(buffer) = cell.borrow().as_ref() {
-            if let Ok(mut entries) = buffer.entries.lock() {
-                if entries.len() >= MAX_CONSOLE_ENTRIES {
-                    entries.pop_front();
-                }
-                entries.push_back(ConsoleEntry {
-                    level,
-                    message,
-                    timestamp: now_timestamp_ms(),
-                });
-                buffer.version.fetch_add(1, Ordering::Relaxed);
-            }
+            append_console_entry(buffer, level, message);
         }
     });
 }
@@ -1230,11 +1240,49 @@ impl JsRuntime {
     }
 
     pub fn execute(&mut self, source: &str) {
-        if source.contains("import.meta") || (source.contains("import ") && source.contains(" from ")) { return; }
-        if let Err(e) = self.context.eval(Source::from_bytes(source.as_bytes())) {
-            println!("[JS Error] execute: {:?}", e);
+        let outcome = self.execute_with_result(source);
+        if let Some(error) = outcome.error {
+            println!("[JS Error] execute: {}", error);
         }
+    }
+
+    pub fn execute_with_result(&mut self, source: &str) -> EvalOutcome {
+        if source.contains("import.meta") || (source.contains("import ") && source.contains(" from ")) {
+            return EvalOutcome {
+                result: None,
+                error: Some("ES module syntax is not supported".to_string()),
+            };
+        }
+
+        let outcome = match self.context.eval(Source::from_bytes(source.as_bytes())) {
+            Ok(value) => {
+                let result = if value.is_undefined() {
+                    Some("undefined".to_string())
+                } else if value.is_null() {
+                    Some("null".to_string())
+                } else {
+                    value
+                        .to_string(&mut self.context)
+                        .ok()
+                        .map(|s| s.to_std_string_escaped())
+                        .or_else(|| Some(String::new()))
+                };
+                EvalOutcome { result, error: None }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                EvalOutcome {
+                    result: None,
+                    error: Some(if message.is_empty() {
+                        format!("{:?}", error)
+                    } else {
+                        message
+                    }),
+                }
+            }
+        };
         self.run_microtasks();
+        outcome
     }
 
     pub fn get_style_overrides(&mut self) -> HashMap<String, HashMap<String, String>> {
@@ -1815,6 +1863,22 @@ mod tests {
         assert_eq!(entries[1].message, "careful");
         assert_eq!(entries[2].level, ConsoleLevel::Error);
         assert_eq!(entries[2].message, "boom");
+    }
+
+    #[test]
+    fn test_execute_with_result_returns_value() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let outcome = rt.execute_with_result("1 + 2");
+        assert_eq!(outcome.result.as_deref(), Some("3"));
+        assert_eq!(outcome.error, None);
+    }
+
+    #[test]
+    fn test_execute_with_result_returns_error() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let outcome = rt.execute_with_result("missingVariable");
+        assert!(outcome.result.is_none());
+        assert!(outcome.error.is_some());
     }
 
     #[test]

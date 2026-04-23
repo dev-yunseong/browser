@@ -219,6 +219,24 @@ impl DaemonClient {
         Ok(v["result"].as_str().unwrap_or("").to_string())
     }
 
+    /// POST /console/eval — evaluate JS in the DevTools console REPL.
+    /// The result/error is echoed into the daemon console buffer (visible via GET /console).
+    /// Returns `(result, error)` where exactly one is `Some`.
+    fn console_eval(&self, code: &str) -> Result<(Option<String>, Option<String>), CliError> {
+        let resp = self
+            .client
+            .post(format!("{}/console/eval", self.base_url))
+            .json(&serde_json::json!({ "code": code }))
+            .send()
+            .map_err(Self::check_error)?;
+        let v: serde_json::Value = resp
+            .json()
+            .map_err(|e| CliError::Parse(e.to_string()))?;
+        let result = v["result"].as_str().map(|s| s.to_string());
+        let error = v["error"].as_str().map(|s| s.to_string());
+        Ok((result, error))
+    }
+
     /// GET /style?selector=<sel> — returns computed CSS styles as pretty-printed JSON.
     fn get_style(&self, selector: Option<&str>) -> Result<String, CliError> {
         let url = if let Some(sel) = selector {
@@ -494,6 +512,8 @@ enum Command {
     Forward,
     Screenshot(Option<String>),
     Js(String),
+    /// Evaluate JS via the DevTools console REPL — result/error is echoed into the console buffer.
+    Console(String),
     Style { selector: Option<String> },
     Layout,
     Help,
@@ -578,6 +598,13 @@ fn parse_command(line: &str) -> Command {
                 Command::Js(rest.to_string())
             }
         }
+        "console" | "repl" => {
+            if rest.is_empty() {
+                Command::Unknown("console requires a JS expression".to_string())
+            } else {
+                Command::Console(rest.to_string())
+            }
+        }
         "style" => Command::Style {
             selector: if rest.is_empty() {
                 None
@@ -605,6 +632,7 @@ fn print_help() {
     println!("  forward                 Go forward in history");
     println!("  screenshot [<file>]     Save a PNG screenshot (default: screenshot.png)");
     println!("  js <script>             Evaluate JavaScript and print the result");
+    println!("  console <expr>          Evaluate JS via DevTools console REPL (echoes in console buffer)");
     println!("  style [<selector>]      Print computed CSS styles (optionally filtered by selector)");
     println!("  layout                  Print the current layout tree");
     println!("  help                    Show this help");
@@ -673,6 +701,14 @@ fn dispatch_command(cmd: Command, state: &mut CliState) -> bool {
         Command::Js(script) => {
             match state.client.evaluate_js(&script) {
                 Ok(result) => println!("js result: {}", result),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+        Command::Console(code) => {
+            match state.client.console_eval(&code) {
+                Ok((Some(result), _)) => println!("< {}", result),
+                Ok((_, Some(error))) => eprintln!("< [error] {}", error),
+                Ok((None, None)) => {}
                 Err(e) => eprintln!("Error: {}", e),
             }
         }
@@ -996,6 +1032,24 @@ mod tests {
     #[test]
     fn test_parse_command_js_no_script() {
         let cmd = parse_command("js");
+        assert!(matches!(cmd, Command::Unknown(_)));
+    }
+
+    #[test]
+    fn test_parse_command_console() {
+        let cmd = parse_command("console 1 + 1");
+        assert_eq!(cmd, Command::Console("1 + 1".to_string()));
+    }
+
+    #[test]
+    fn test_parse_command_console_alias() {
+        let cmd = parse_command("repl document.title");
+        assert_eq!(cmd, Command::Console("document.title".to_string()));
+    }
+
+    #[test]
+    fn test_parse_command_console_no_expr() {
+        let cmd = parse_command("console");
         assert!(matches!(cmd, Command::Unknown(_)));
     }
 
