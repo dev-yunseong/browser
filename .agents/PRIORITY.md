@@ -88,6 +88,28 @@ Addresses severe crashes (OOM/Stack overflow) and massive rendering latency (>1.
 
 ---
 
+## Priority 7 - Google.com Layout Fidelity
+
+Sub-issues of #103. Fix in order — each builds on previous layer of correctness.
+
+| # | Issue | Why this order |
+|---|---|---|
+| #110 | [Layout] google.com — form control intrinsic sizing | Most foundational. Search input collapsed = nothing else matters. No deps. |
+| #111 | [Layout] google.com — absolute/fixed header positioning | Affects nav placement. Depends on baseline sizing from #110. |
+| #112 | [Layout] google.com — spacing and line-box alignment in dense header | Refinement after positioning is correct. |
+| #113 | [Runtime] google.com — pre-layout DOM/runtime parity gaps | JS-level pre-layout mutations. Best addressed after visual structure is correct. |
+
+---
+
+## Priority 8 - DevTools
+
+| # | Issue | Why this order |
+|---|---|---|
+| #107 | [DevTools] Developer console panel — display JS console output | Foundation for DevTools. #108 depends on this. |
+| #108 | [DevTools] Console REPL — execute JS from developer console | Depends on #107 console panel. |
+
+---
+
 ## Dependency graph
 
 ```

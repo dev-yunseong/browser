@@ -776,11 +776,40 @@ fn apply_default_styles(tag: &str, map: &mut HashMap<Arc<str>, Value>) {
             map.entry(intern("font-family")).or_insert(Value::Keyword(intern("monospace")));
             map.entry(intern("background-color")).or_insert(Value::Color(crate::css::Color { r: 240, g: 240, b: 240, a: 255 }));
         }
-        "button" | "input" | "select" | "textarea" => {
+        "input" => {
             map.entry(intern("border-width")).or_insert(Value::Length(1.0, crate::css::Unit::Px));
             map.entry(intern("border-color")).or_insert(Value::Color(crate::css::Color { r: 180, g: 180, b: 180, a: 255 }));
             map.entry(intern("background-color")).or_insert(Value::Color(crate::css::Color { r: 255, g: 255, b: 255, a: 255 }));
             map.entry(intern("padding")).or_insert(Value::Length(4.0, crate::css::Unit::Px));
+            // UA defaults: HTML spec §14.3 — <input> default size = 20 chars ≈ 160 px at 13 px font.
+            map.entry(intern("width")).or_insert(Value::Length(160.0, crate::css::Unit::Px));
+            // Real browsers render single-line inputs at ~21 px; use 24 for legibility.
+            map.entry(intern("height")).or_insert(Value::Length(24.0, crate::css::Unit::Px));
+        }
+        "textarea" => {
+            map.entry(intern("border-width")).or_insert(Value::Length(1.0, crate::css::Unit::Px));
+            map.entry(intern("border-color")).or_insert(Value::Color(crate::css::Color { r: 180, g: 180, b: 180, a: 255 }));
+            map.entry(intern("background-color")).or_insert(Value::Color(crate::css::Color { r: 255, g: 255, b: 255, a: 255 }));
+            map.entry(intern("padding")).or_insert(Value::Length(4.0, crate::css::Unit::Px));
+            // UA defaults: cols=20, rows=2 → ~160 × 48 px.
+            map.entry(intern("width")).or_insert(Value::Length(160.0, crate::css::Unit::Px));
+            map.entry(intern("height")).or_insert(Value::Length(48.0, crate::css::Unit::Px));
+        }
+        "select" => {
+            map.entry(intern("border-width")).or_insert(Value::Length(1.0, crate::css::Unit::Px));
+            map.entry(intern("border-color")).or_insert(Value::Color(crate::css::Color { r: 180, g: 180, b: 180, a: 255 }));
+            map.entry(intern("background-color")).or_insert(Value::Color(crate::css::Color { r: 255, g: 255, b: 255, a: 255 }));
+            map.entry(intern("padding")).or_insert(Value::Length(4.0, crate::css::Unit::Px));
+            map.entry(intern("width")).or_insert(Value::Length(120.0, crate::css::Unit::Px));
+            map.entry(intern("height")).or_insert(Value::Length(24.0, crate::css::Unit::Px));
+        }
+        "button" => {
+            map.entry(intern("border-width")).or_insert(Value::Length(1.0, crate::css::Unit::Px));
+            map.entry(intern("border-color")).or_insert(Value::Color(crate::css::Color { r: 180, g: 180, b: 180, a: 255 }));
+            map.entry(intern("background-color")).or_insert(Value::Color(crate::css::Color { r: 240, g: 240, b: 240, a: 255 }));
+            map.entry(intern("padding")).or_insert(Value::Length(4.0, crate::css::Unit::Px));
+            // Width is content-driven (shrink-wrap in layout); enforce a minimum height.
+            map.entry(intern("min-height")).or_insert(Value::Length(24.0, crate::css::Unit::Px));
         }
         "ul" | "ol" => {
             map.entry(intern("padding-left")).or_insert(Value::Length(24.0, crate::css::Unit::Px));
