@@ -141,6 +141,10 @@ async fn status_handler(State(handle): State<EngineHandle>) -> impl IntoResponse
     (StatusCode::OK, Json(StatusResponse { url, loading: false })).into_response()
 }
 
+async fn health_handler() -> impl IntoResponse {
+    (StatusCode::OK, "ok").into_response()
+}
+
 async fn click_handler(
     State(handle): State<EngineHandle>,
     Json(req): Json<ClickRequest>,
@@ -218,6 +222,7 @@ pub fn build_router(handle: EngineHandle) -> Router {
         .route("/navigate", post(navigate_handler))
         .route("/page", get(page_handler))
         .route("/status", get(status_handler))
+        .route("/health", get(health_handler))
         .route("/click", post(click_handler))
         .route("/type", post(type_handler))
         .route("/js", post(js_handler))
@@ -918,6 +923,21 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["loading"], false);
+    }
+
+    #[tokio::test]
+    async fn test_http_health_returns_ok() {
+        let handle = make_test_handle();
+        let app = build_router(handle);
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/health")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"ok");
     }
 
     #[tokio::test]

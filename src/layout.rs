@@ -1721,18 +1721,31 @@ impl<'a> LayoutBox<'a> {
                 ChildKind::Inline => {
                     let (avail_w, left_indent) =
                         float_ctx.available_at(line_start_y, cur_line.height.max(16.0));
+                    let remaining_w = (avail_w - cur_line.width).max(0.0);
+                    let child_is_text = matches!(entry.node.node.data, NodeData::Text { .. });
+                    let child_container_width = if child_is_text {
+                        remaining_w
+                    } else {
+                        avail_w
+                    };
                     let (cb_opt, _, _) = build_layout_tree_with_cb_cached(
                         entry.node,
                         container_x + left_indent,
                         container_x + left_indent + cur_line.width,
                         0.0,
-                        avail_w,
+                        child_container_width,
                         vw,
                         vh,
                         child_cb,
                         intrinsic_cache,
                     );
                     if let Some(mut cb) = cb_opt {
+                        if cb.dimensions.width == 0.0
+                            && !matches!(entry.node.node.data, NodeData::Text { .. })
+                        {
+                            let fallback_w = intrinsic_cache.max_content_width(entry.node, vw, vh);
+                            cb.dimensions.width = fallback_w.min(child_container_width).max(0.0);
+                        }
                         // Only reset prev_margin_bottom when a visible inline element is
                         // actually placed.  Empty/whitespace-only text nodes return None and
                         // must NOT interrupt adjacent-block margin collapsing.
@@ -1742,18 +1755,32 @@ impl<'a> LayoutBox<'a> {
                             flush_line!();
                             // Re-lay out for new line with updated float-aware width
                             let (aw2, li2) = float_ctx.available_at(line_start_y, 16.0);
+                            let remaining_w2 = (aw2 - cur_line.width).max(0.0);
+                            let child_container_width2 = if child_is_text {
+                                remaining_w2
+                            } else {
+                                aw2
+                            };
                             let (cb2_opt, _, _) = build_layout_tree_with_cb_cached(
                                 entry.node,
                                 container_x + li2,
                                 container_x + li2,
                                 0.0,
-                                aw2,
+                                child_container_width2,
                                 vw,
                                 vh,
                                 child_cb,
                                 intrinsic_cache,
                             );
                             if let Some(mut cb2) = cb2_opt {
+                                if cb2.dimensions.width == 0.0
+                                    && !matches!(entry.node.node.data, NodeData::Text { .. })
+                                {
+                                    let fallback_w =
+                                        intrinsic_cache.max_content_width(entry.node, vw, vh);
+                                    cb2.dimensions.width =
+                                        fallback_w.min(child_container_width2).max(0.0);
+                                }
                                 // Apply relative offset after line flush positioning.
                                 if cb2.position == PositionType::Relative {
                                     apply_relative_offset(&mut cb2, vw, vh);
@@ -2631,6 +2658,22 @@ mod tests {
         None
     }
 
+    fn find_element_by_id<'a>(layout: &'a LayoutBox<'a>, id: &str) -> Option<&'a LayoutBox<'a>> {
+        if let NodeData::Element { ref attrs, .. } = layout.style_node.node.data {
+            for attr in attrs.borrow().iter() {
+                if attr.name.local.to_string() == "id" && attr.value.to_string() == id {
+                    return Some(layout);
+                }
+            }
+        }
+        for child in &layout.children {
+            if let Some(found) = find_element_by_id(child, id) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
     #[test]
     fn test_inline_element_shrinks_to_content() {
         // An inline <span> should derive its width from text content,
@@ -2711,6 +2754,132 @@ mod tests {
         assert!(text.dimensions.height > 24.0,
             "inline text should wrap onto multiple lines when the prefix consumes horizontal space, got height={}",
             text.dimensions.height);
+    }
+
+    #[test]
+    fn test_inline_block_wraps_when_remaining_line_width_is_insufficient() {
+        let html = r#"
+            <form style="width: 600px;">
+                <span id="prefix" style="display: inline-block; width: 360px;">prefix</span>
+                <span id="middle" style="display: inline-block;">
+                    search controls should shrink against the remaining row width
+                </span>
+                <span id="tail">tail</span>
+            </form>
+        "#;
+        let dom = dom::parse_html(html);
+        let stylesheet = css::parse_css("");
+        let style_tree = style::build_style_tree(
+            &dom.document,
+            &stylesheet,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+        );
+
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 600.0, 600.0, 768.0);
+        let layout = layout_opt.expect("layout");
+        let prefix = find_element_by_id(&layout, "prefix").expect("prefix not found");
+        let middle = find_element_by_id(&layout, "middle").expect("middle not found");
+        let tail = find_element_by_id(&layout, "tail").expect("tail not found");
+
+        assert!(
+            middle.dimensions.y > prefix.dimensions.y,
+            "middle inline-block should wrap when remaining row width is insufficient: prefix.y={}, middle.y={}",
+            prefix.dimensions.y,
+            middle.dimensions.y
+        );
+        assert!(
+            middle.dimensions.width <= 600.0 + 1.0,
+            "middle inline-block width must remain bounded by container width, got {}",
+            middle.dimensions.width
+        );
+        assert!(
+            tail.dimensions.y >= middle.dimensions.y,
+            "tail should remain in stable flow after middle: middle.y={}, tail.y={}",
+            middle.dimensions.y,
+            tail.dimensions.y
+        );
+    }
+
+    #[test]
+    fn test_inline_link_wraps_instead_of_shrinking_to_tiny_remaining_width() {
+        let html = r#"
+            <div style="width: 200px;">
+                <span style="display: inline-block; width: 180px;">prefix</span>
+                <a id="tail-link">고급검색</a>
+            </div>
+        "#;
+        let dom = dom::parse_html(html);
+        let stylesheet = css::parse_css("");
+        let style_tree = style::build_style_tree(
+            &dom.document,
+            &stylesheet,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+        );
+
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 200.0, 200.0, 768.0);
+        let layout = layout_opt.expect("layout");
+        let prefix = find_text_box_containing(&layout, "prefix").expect("prefix text not found");
+        let link = find_element_by_id(&layout, "tail-link").expect("tail link not found");
+
+        assert!(
+            link.dimensions.y > prefix.dimensions.y,
+            "link should wrap to next line when only tiny remaining width is left: prefix.y={}, link.y={}",
+            prefix.dimensions.y,
+            link.dimensions.y
+        );
+        assert!(
+            link.dimensions.width > 20.0,
+            "wrapped link should retain sane intrinsic width instead of shrinking to the tiny leftover width, got {}",
+            link.dimensions.width
+        );
+    }
+
+    #[test]
+    fn test_inline_zero_width_falls_back_to_intrinsic_for_positioned_children() {
+        let html = r#"
+            <div style="width: 160px;">
+                <a id="login-link" style="display: inline-block;">
+                    <span style="position: absolute;">로그인</span>
+                </a>
+                <span id="after">after</span>
+            </div>
+        "#;
+        let dom = dom::parse_html(html);
+        let stylesheet = css::parse_css("");
+        let style_tree = style::build_style_tree(
+            &dom.document,
+            &stylesheet,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+        );
+
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 160.0, 160.0, 768.0);
+        let layout = layout_opt.expect("layout");
+        let link = find_element_by_id(&layout, "login-link").expect("login-link not found");
+        let after = find_element_by_id(&layout, "after").expect("after not found");
+
+        assert!(
+            link.dimensions.width > 20.0,
+            "inline box with positioned descendants should get intrinsic fallback width, got {}",
+            link.dimensions.width
+        );
+        assert!(
+            after.dimensions.x >= link.dimensions.x + link.dimensions.width - 1.0,
+            "following inline content should flow after fallback-width element: link.right={}, after.x={}",
+            link.dimensions.x + link.dimensions.width,
+            after.dimensions.x
+        );
     }
 
     // ── Float layout tests ────────────────────────────────────────────────────
