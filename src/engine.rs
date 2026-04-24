@@ -471,6 +471,7 @@ pub fn fetch_and_process(
     width: f32,
 ) -> Result<(PageResult, css::Stylesheet), Box<dyn std::error::Error + Send + Sync>> {
     let response = reqwest::blocking::get(url_str)?;
+    let base_url = response.url().clone();
     let csp_header = response
         .headers()
         .get("content-security-policy")
@@ -478,7 +479,6 @@ pub fn fetch_and_process(
         .map(|s| js::CspPolicy::parse(s));
 
     let body = response.text()?;
-    let base_url = Url::parse(url_str)?;
     process_html_with_cache(
         &body,
         &base_url,
@@ -594,7 +594,7 @@ pub fn process_html_with_cache(
     let mut focusable_elements = Vec::new();
     let image_urls: Vec<String>;
 
-    render::render_layout_tree(&layout_tree, &mut pixmap, image_cache);
+    render::render_layout_tree(&layout_tree, &mut pixmap, image_cache, &base_url);
 
     layout_tree.collect_links(&mut links);
     layout_tree.collect_event_handlers(&mut event_handlers);
@@ -719,7 +719,7 @@ impl BrowserEngine {
         self.current_csp_policy = page.csp_policy.clone();
         self.last_page = Some(page.clone());
         self.init_js_for_page(&page.body);
-        Ok(page)
+        self.refresh_after_image_loads(page, width)
     }
 
     /// Re-render the current page (e.g. after JS style changes or hover state).
@@ -753,7 +753,7 @@ impl BrowserEngine {
         let (page, stylesheet) = result;
         self.last_stylesheet = Some(stylesheet);
         self.last_page = Some(page.clone());
-        Ok(page)
+        self.refresh_after_image_loads(page, width)
     }
 
     /// Hit-test a click at `(x, y)` against the last rendered page.
@@ -814,6 +814,44 @@ impl BrowserEngine {
     /// Full implementation deferred to follow-up issue.
     pub fn type_text(&mut self, _text: &str) {
         println!("[BrowserEngine] type_text: not yet implemented");
+    }
+
+    fn cache_missing_images_with<F>(&mut self, image_urls: &[String], mut fetch: F) -> bool
+    where
+        F: FnMut(&str) -> Result<Vec<u8>, String>,
+    {
+        let mut loaded_any = false;
+        for url in image_urls {
+            if self.image_cache.contains_key(url) {
+                continue;
+            }
+            if let Ok(bytes) = fetch(url) {
+                self.image_cache.insert(url.clone(), bytes);
+                loaded_any = true;
+            }
+        }
+        loaded_any
+    }
+
+    fn cache_missing_images(&mut self, image_urls: &[String]) -> bool {
+        self.cache_missing_images_with(image_urls, |url| {
+            let response = reqwest::blocking::get(url).map_err(|e| e.to_string())?;
+            let bytes = response.bytes().map_err(|e| e.to_string())?;
+            Ok(bytes.to_vec())
+        })
+    }
+
+    fn refresh_after_image_loads(
+        &mut self,
+        page: PageResult,
+        width: f32,
+    ) -> Result<PageResult, String> {
+        if !self.cache_missing_images(&page.image_urls) {
+            return Ok(page);
+        }
+
+        let refreshed = self.re_render(None, None, width)?;
+        Ok(refreshed)
     }
 
     /// Execute JavaScript in the current page's runtime and return a result/error.
@@ -1267,6 +1305,46 @@ mod tests {
         assert!(engine.last_stylesheet.is_none());
         assert!(engine.current_csp_policy.is_none());
         assert!(engine.console_entries().is_empty());
+    }
+
+    #[test]
+    fn test_cache_missing_images_with_inserts_only_uncached_urls() {
+        let mut engine = BrowserEngine::new();
+        engine
+            .image_cache
+            .insert("https://example.com/already.png".into(), vec![1, 2, 3]);
+        let urls = vec![
+            "https://example.com/already.png".to_string(),
+            "https://example.com/new.png".to_string(),
+        ];
+
+        let mut fetched = Vec::new();
+        let loaded = engine.cache_missing_images_with(&urls, |url| {
+            fetched.push(url.to_string());
+            Ok(vec![9, 9, 9])
+        });
+
+        assert!(loaded);
+        assert_eq!(fetched, vec!["https://example.com/new.png".to_string()]);
+        assert_eq!(
+            engine.image_cache.get("https://example.com/already.png"),
+            Some(&vec![1, 2, 3])
+        );
+        assert_eq!(
+            engine.image_cache.get("https://example.com/new.png"),
+            Some(&vec![9, 9, 9])
+        );
+    }
+
+    #[test]
+    fn test_cache_missing_images_with_ignores_fetch_errors() {
+        let mut engine = BrowserEngine::new();
+        let urls = vec!["https://example.com/missing.png".to_string()];
+
+        let loaded = engine.cache_missing_images_with(&urls, |_url| Err("boom".into()));
+
+        assert!(!loaded);
+        assert!(engine.image_cache.is_empty());
     }
 
     #[test]

@@ -90,14 +90,19 @@ Addresses severe crashes (OOM/Stack overflow) and massive rendering latency (>1.
 
 ## Priority 7 - Google.com Layout Fidelity
 
-Sub-issues of #103. Fix in order — each builds on previous layer of correctness.
+Sub-issues of #103. Fix in order — each builds on the previous layer of visible correctness.
 
 | # | Issue | Why this order |
 |---|---|---|
-| #110 | [Layout] google.com — form control intrinsic sizing | Most foundational. Search input collapsed = nothing else matters. No deps. |
-| #111 | [Layout] google.com — absolute/fixed header positioning | Affects nav placement. Depends on baseline sizing from #110. |
-| #112 | [Layout] google.com — spacing and line-box alignment in dense header | Refinement after positioning is correct. |
-| #113 | [Runtime] google.com — pre-layout DOM/runtime parity gaps | JS-level pre-layout mutations. Best addressed after visual structure is correct. |
+| #103 | [Layout] google.com search page layout fidelity | Umbrella tracker for the remaining Google layout work. |
+| #110 | ~~[Layout] google.com — form control intrinsic sizing~~ ✓ | Most foundational. Search input collapsed = nothing else matters. |
+| #111 | ~~[Layout] google.com — absolute/fixed header positioning~~ ✓ | Affects nav placement after baseline sizing is correct. |
+| #112 | ~~[Layout] google.com — spacing and line-box alignment in dense header~~ ✓ | Refinement after positioning is correct. |
+| #113 | ~~[Runtime] google.com — pre-layout DOM/runtime parity gaps~~ ✓ | Runtime parity layer completed before the remaining visual follow-ups. |
+| #124 | ~~[Layout] google.com — hero/logo and search cluster composition~~ ✓ | Fixed the missing top-center Google logo/hero composition in headless rendering. |
+| #127 | [Layout] google.com — search row control sizing and inline alignment | Depends on the hero/search cluster being composed as one coherent region. |
+| #126 | [Layout] google.com — stray right-edge overflow artifact | Isolated visual overflow cleanup after the primary structure is corrected. |
+| #125 | [Layout] google.com — footer anchoring and link grouping | Lowest user-impact remaining defect once the hero/search region is stable. |
 
 ---
 
