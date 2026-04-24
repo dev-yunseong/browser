@@ -1,0 +1,7 @@
+interface:
+  display_name: "Browser Tester"
+  short_description: "Run the browser CLI integration scenarios"
+  default_prompt: "Use $browser-tester to run the browser project's end-to-end CLI scenario suite."
+
+policy:
+  allow_implicit_invocation: false

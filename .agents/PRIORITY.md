@@ -99,14 +99,27 @@ Sub-issues of #103. Fix in order — each builds on the previous layer of visibl
 | #111 | ~~[Layout] google.com — absolute/fixed header positioning~~ ✓ | Affects nav placement after baseline sizing is correct. |
 | #112 | ~~[Layout] google.com — spacing and line-box alignment in dense header~~ ✓ | Refinement after positioning is correct. |
 | #113 | ~~[Runtime] google.com — pre-layout DOM/runtime parity gaps~~ ✓ | Runtime parity layer completed before the remaining visual follow-ups. |
+| #119 | [Runtime] issue #113 follow-up — stateful history, text node mutation, URL/base correctness (in progress by claude-sonnet-4-6) | Follow-up to #113 — fixes incoherent history/location state, silent DOM mutation failure, and URL resolution bugs. |
 | #124 | ~~[Layout] google.com — hero/logo and search cluster composition~~ ✓ | Fixed the missing top-center Google logo/hero composition in headless rendering. |
 | #127 | ~~[Layout] google.com — search row control sizing and inline alignment~~ ✓ | Fixed the `<br>`-driven button row break so the search controls stay grouped below the input. |
 | #126 | ~~[Layout] google.com — stray right-edge overflow artifact~~ ✓ | Isolated visual overflow cleanup after the primary structure is corrected. |
 | #125 | ~~[Layout] google.com — footer anchoring and link grouping~~ ✓ | Lowest user-impact remaining defect once the hero/search region is stable. |
+| #134 | [Layout] google.com — header utility cluster anchoring and right-edge clipping (in progress by codex:gpt-5.4) | Most visible remaining defect in the current screenshot; clipped header controls break the page structure at first glance. |
+| #133 | [Layout] google.com — advanced search link escapes the centered hero controls (in progress by codex:gpt-5.4) | Next most visible hero-structure bug after the header cluster is anchored. |
+| #132 | [Render] google.com — search action button labels not painted | Control text rendering after layout positions are stable. |
+| #131 | [Layout] google.com — footer legal copy spacing and line grouping | Lowest-impact remaining cleanup after header/hero/button fidelity is restored. |
+
+## Priority 8 - GUI Render Stability
+
+Stabilizes same-page rendering so hover/focus/image-triggered updates do not relayout the page with inconsistent viewport widths.
+
+| # | Issue | Why this order |
+|---|---|---|
+| #137 | [Runtime] stabilize viewport width across re-renders to prevent layout jitter | Fixes visible component size jitter and removes unnecessary full-page relayouts caused by mixed re-render widths. |
 
 ---
 
-## Priority 8 - DevTools
+## Priority 9 - DevTools
 
 | # | Issue | Why this order |
 |---|---|---|

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Browser Project"
+  short_description: "Browser repo commands, architecture, and rules"
+  default_prompt: "Use $browser-project when working in /home/yunseong/dev/browser so the repo-specific guidance is applied."
+
+policy:
+  allow_implicit_invocation: true
