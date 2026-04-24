@@ -100,7 +100,7 @@ Sub-issues of #103. Fix in order — each builds on the previous layer of visibl
 | #112 | ~~[Layout] google.com — spacing and line-box alignment in dense header~~ ✓ | Refinement after positioning is correct. |
 | #113 | ~~[Runtime] google.com — pre-layout DOM/runtime parity gaps~~ ✓ | Runtime parity layer completed before the remaining visual follow-ups. |
 | #124 | ~~[Layout] google.com — hero/logo and search cluster composition~~ ✓ | Fixed the missing top-center Google logo/hero composition in headless rendering. |
-| #127 | [Layout] google.com — search row control sizing and inline alignment | Depends on the hero/search cluster being composed as one coherent region. |
+| #127 | ~~[Layout] google.com — search row control sizing and inline alignment~~ ✓ | Fixed the `<br>`-driven button row break so the search controls stay grouped below the input. |
 | #126 | [Layout] google.com — stray right-edge overflow artifact | Isolated visual overflow cleanup after the primary structure is corrected. |
 | #125 | [Layout] google.com — footer anchoring and link grouping | Lowest user-impact remaining defect once the hero/search region is stable. |
 

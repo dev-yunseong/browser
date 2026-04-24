@@ -1627,6 +1627,7 @@ impl<'a> LayoutBox<'a> {
             Float(FloatSide),
             Block,
             Inline,
+            LineBreak,
             Positioned,
         }
         struct ChildEntry<'entry> {
@@ -1638,6 +1639,14 @@ impl<'a> LayoutBox<'a> {
         let mut entries: Vec<ChildEntry<'a>> = Vec::new();
         for child_node in &self.style_node.children {
             if should_skip(child_node) {
+                continue;
+            }
+            if is_line_break_element(child_node) {
+                entries.push(ChildEntry {
+                    node: child_node,
+                    kind: ChildKind::LineBreak,
+                    clear: None,
+                });
                 continue;
             }
             let child_pos = get_position_type(child_node);
@@ -1743,6 +1752,13 @@ impl<'a> LayoutBox<'a> {
                 ChildKind::Positioned => {
                     // Collect for deferred layout after normal-flow finalisation.
                     positioned_entries.push(entry.node);
+                }
+
+                // ── Forced line break (`<br>`) ───────────────────────────────
+                ChildKind::LineBreak => {
+                    flush_line!();
+                    prev_margin_bottom = 0.0;
+                    line_start_y = cursor_y;
                 }
 
                 // ── Float child ───────────────────────────────────────────────
@@ -2357,6 +2373,13 @@ fn should_skip(child: &StyledNode) -> bool {
     } else {
         false
     }
+}
+
+fn is_line_break_element(child: &StyledNode) -> bool {
+    matches!(
+        &child.node.data,
+        NodeData::Element { name, .. } if name.local.to_string() == "br"
+    )
 }
 
 /// Iterative replacement for the formerly recursive offset_layout_box.
@@ -2993,6 +3016,48 @@ mod tests {
             link.dimensions.width > 20.0,
             "wrapped link should retain sane intrinsic width instead of shrinking to the tiny leftover width, got {}",
             link.dimensions.width
+        );
+    }
+
+    #[test]
+    fn test_br_forces_following_inline_content_onto_next_line() {
+        let html = r#"
+            <div style="width: 600px;">
+                <span id="search" style="display:inline-block; width: 458px; height: 25px;">search</span>
+                <br>
+                <span id="btn-g" style="display:inline-block; width: 160px; height: 30px;">Google Search</span>
+                <span id="btn-i" style="display:inline-block; width: 160px; height: 30px;">I'm Feeling Lucky</span>
+            </div>
+        "#;
+        let dom = dom::parse_html(html);
+        let stylesheet = css::parse_css("");
+        let style_tree = style::build_style_tree(
+            &dom.document,
+            &stylesheet,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+        );
+
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 600.0, 600.0, 768.0);
+        let layout = layout_opt.expect("layout");
+        let search = find_element_by_id(&layout, "search").expect("search not found");
+        let btn_g = find_element_by_id(&layout, "btn-g").expect("btn-g not found");
+        let btn_i = find_element_by_id(&layout, "btn-i").expect("btn-i not found");
+
+        assert!(
+            btn_g.dimensions.y > search.dimensions.y,
+            "content after <br> must start on a later line: search.y={}, btn_g.y={}",
+            search.dimensions.y,
+            btn_g.dimensions.y
+        );
+        assert!(
+            btn_i.dimensions.y >= btn_g.dimensions.y,
+            "following inline content should remain on the post-<br> line: btn_g.y={}, btn_i.y={}",
+            btn_g.dimensions.y,
+            btn_i.dimensions.y
         );
     }
 
