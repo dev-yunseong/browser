@@ -762,11 +762,14 @@ impl<'a> LayoutBox<'a> {
             current_y += 5.0; // Break line before block
         }
 
-        let mut width = match self
+        let is_floated = get_float(self.style_node).is_some();
+        let specified_width = self
             .style_node
             .specified_values
-            .get(&crate::css::intern("width"))
-        {
+            .get(&crate::css::intern("width"));
+        let auto_width = specified_width.is_none();
+
+        let mut width = match specified_width {
             Some(Value::Length(v, Unit::Px)) => *v,
             Some(Value::Length(v, Unit::Percent)) => container_width * (v / 100.0),
             Some(Value::Length(v, Unit::Vw)) => vw * (v / 100.0),
@@ -793,10 +796,10 @@ impl<'a> LayoutBox<'a> {
                 max_c.min(available).max(min_c)
             }
             _ => {
-                if is_shrink_wrap(self.display) {
+                if is_floated || is_shrink_wrap(self.display) {
                     let max_c = intrinsic_cache.max_content_width(self.style_node, vw, vh);
                     let min_c = intrinsic_cache.min_content_width(self.style_node, vw, vh);
-                    // Shrink-wrap: min(max-content, max(min-content, available))
+                    // Auto-width floats use shrink-to-fit sizing instead of filling the line.
                     max_c.min(container_width).max(min_c)
                 } else if is_block {
                     (container_width - self.margin.left - self.margin.right).max(0.0)
@@ -1645,7 +1648,7 @@ impl<'a> LayoutBox<'a> {
                 entries.push(ChildEntry {
                     node: child_node,
                     kind: ChildKind::LineBreak,
-                    clear: None,
+                    clear: get_line_break_clear(child_node),
                 });
                 continue;
             }
@@ -1692,6 +1695,9 @@ impl<'a> LayoutBox<'a> {
         let mut result: Vec<LayoutBox<'a>> = Vec::new();
 
         // Read text-align for this container (used by flush_line! to position inline lines).
+        // Only block containers should align their inline contents. Applying inherited
+        // `text-align` inside inline boxes like <a> makes short links behave like wide
+        // centered containers, which breaks grouping in legacy centered footers.
         let text_align = self
             .style_node
             .specified_values
@@ -1699,6 +1705,10 @@ impl<'a> LayoutBox<'a> {
             .and_then(|v| if let Value::Keyword(k) = v { Some(&**k as &str) } else { None })
             .unwrap_or("left")
             .to_string();
+        let applies_text_align = matches!(
+            self.display,
+            DisplayType::Block | DisplayType::Flex | DisplayType::InlineBlock | DisplayType::TableCell
+        );
 
         // Inline line accumulator
         struct InlineLine<'a> {
@@ -1721,10 +1731,14 @@ impl<'a> LayoutBox<'a> {
                     let (avail_w, left_indent) =
                         float_ctx.available_at(line_start_y, cur_line.height.max(1.0));
                     // Compute text-align offset within the available width.
-                    let align_offset = match text_align.as_str() {
-                        "center" => ((avail_w - cur_line.width) / 2.0).max(0.0),
-                        "right" => (avail_w - cur_line.width).max(0.0),
-                        _ => 0.0, // left / default
+                    let align_offset = if applies_text_align {
+                        match text_align.as_str() {
+                            "center" => ((avail_w - cur_line.width) / 2.0).max(0.0),
+                            "right" => (avail_w - cur_line.width).max(0.0),
+                            _ => 0.0, // left / default
+                        }
+                    } else {
+                        0.0
                     };
                     let mut lx = container_x + left_indent + align_offset;
                     for mut m in cur_line.members.drain(..) {
@@ -1756,7 +1770,15 @@ impl<'a> LayoutBox<'a> {
 
                 // ── Forced line break (`<br>`) ───────────────────────────────
                 ChildKind::LineBreak => {
+                    if let Some(cv) = entry.clear {
+                        cursor_y = float_ctx.clear_y(cv).max(cursor_y);
+                    }
+                    let had_inline_content = !cur_line.members.is_empty();
+                    let break_height = resolved_line_height_px(entry.node);
                     flush_line!();
+                    if !had_inline_content {
+                        cursor_y += break_height;
+                    }
                     prev_margin_bottom = 0.0;
                     line_start_y = cursor_y;
                 }
@@ -1965,7 +1987,7 @@ impl<'a> LayoutBox<'a> {
         // Now safe to mutably assign self.children (immutable borrow of self.style_node ended above).
         self.children = result;
 
-        if self.dimensions.width <= 0.0 {
+        if self.dimensions.width <= 0.0 || (is_floated && auto_width) {
             let derived = max_child_x - self.dimensions.x + self.padding.right + self.border.right;
             self.dimensions.width = if container_width.is_finite() {
                 derived.min(container_width)
@@ -2275,6 +2297,44 @@ fn apply_relative_offset(layout: &mut LayoutBox, vw: f32, vh: f32) {
     if dx != 0.0 || dy != 0.0 {
         offset_layout_box(layout, dx, dy);
     }
+}
+
+fn resolved_font_size_px(sn: &StyledNode) -> f32 {
+    match sn.specified_values.get(&crate::css::intern("font-size")) {
+        Some(Value::Length(v, Unit::Px)) => (*v).max(1.0),
+        _ => 16.0,
+    }
+}
+
+fn resolved_line_height_px(sn: &StyledNode) -> f32 {
+    let font_size = resolved_font_size_px(sn);
+    match sn.specified_values.get(&crate::css::intern("line-height")) {
+        Some(Value::Length(v, Unit::Px)) => (*v).max(0.0),
+        Some(Value::Number(v)) => (font_size * *v).max(0.0),
+        _ => font_size * 1.4,
+    }
+}
+
+fn get_line_break_clear(sn: &StyledNode) -> Option<ClearValue> {
+    if let Some(clear) = get_clear(sn) {
+        return Some(clear);
+    }
+
+    if let NodeData::Element { ref attrs, .. } = sn.node.data {
+        for attr in attrs.borrow().iter() {
+            if attr.name.local.as_ref() != "clear" {
+                continue;
+            }
+            return match attr.value.as_ref() {
+                "left" => Some(ClearValue::Left),
+                "right" => Some(ClearValue::Right),
+                "all" | "both" => Some(ClearValue::Both),
+                _ => None,
+            };
+        }
+    }
+
+    None
 }
 
 fn get_prop(sn: &StyledNode, p1: &str, p2: &str, cw: f32, vw: f32, vh: f32) -> f32 {
@@ -3062,6 +3122,75 @@ mod tests {
     }
 
     #[test]
+    fn test_consecutive_br_adds_blank_line_height() {
+        let html = r#"
+            <div style="width: 400px;">
+                first
+                <br>
+                <br>
+                <span id="second">second</span>
+            </div>
+        "#;
+        let dom = dom::parse_html(html);
+        let stylesheet = css::parse_css("");
+        let style_tree = style::build_style_tree(
+            &dom.document,
+            &stylesheet,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+        );
+
+        let (layout_opt, _, _) =
+            build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 400.0, 400.0, 600.0);
+        let layout = layout_opt.expect("layout");
+        let first = find_text_box_containing(&layout, "first").expect("first text");
+        let second = find_element_by_id(&layout, "second").expect("second span");
+
+        assert!(
+            second.dimensions.y >= first.dimensions.y + 40.0,
+            "consecutive <br> should create a blank line of vertical space: first.y={}, second.y={}",
+            first.dimensions.y,
+            second.dimensions.y
+        );
+    }
+
+    #[test]
+    fn test_br_clear_all_pushes_content_below_float() {
+        let html = r#"
+            <div style="width: 800px;">
+                <div style="float:right; width:120px; height:60px;">header</div>
+                <br clear="all">
+                <span id="after">after</span>
+            </div>
+        "#;
+        let dom = dom::parse_html(html);
+        let stylesheet = css::parse_css("");
+        let style_tree = style::build_style_tree(
+            &dom.document,
+            &stylesheet,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+        );
+
+        let (layout_opt, _, _) =
+            build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout");
+        let after = find_element_by_id(&layout, "after").expect("after span");
+
+        assert!(
+            after.dimensions.y >= 60.0,
+            "<br clear=\"all\"> should push following content below the float, got y={}",
+            after.dimensions.y
+        );
+    }
+
+    #[test]
     fn test_inline_zero_width_falls_back_to_intrinsic_for_positioned_children() {
         let html = r#"
             <div style="width: 160px;">
@@ -3205,6 +3334,44 @@ mod tests {
             float_child.dimensions.x, 700.0,
             "float:right child (width 100px) in 800px container should have x=700.0, got {}",
             float_child.dimensions.x
+        );
+    }
+
+    #[test]
+    fn test_float_right_auto_width_shrink_wraps_contents() {
+        let html = r#"
+            <div style="width:800px;">
+                <div id="header-actions" style="float:right; position:relative;">
+                    <a id="apps" style="display:inline-block; width:24px; height:40px;">A</a>
+                    <a id="login" style="display:inline-block; min-width:85px; min-height:40px; margin:12px 16px 12px 10px; padding:10px 12px; background:#0b57d0; border-radius:100px; color:#fff;">Login</a>
+                </div>
+            </div>
+        "#;
+        let dom_tree = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree = style::build_style_tree(
+            &dom_tree.document,
+            &ss,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+        );
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout");
+        let actions = find_element_by_id(&layout, "header-actions").expect("header-actions not found");
+        let login = find_element_by_id(&layout, "login").expect("login not found");
+
+        assert!(
+            actions.dimensions.width < 300.0,
+            "auto-width float should shrink-wrap its contents instead of expanding to the full line, got {}",
+            actions.dimensions.width
+        );
+        assert!(
+            login.dimensions.x + login.dimensions.width <= 800.0,
+            "shrink-wrapped float contents should stay within the viewport, got right edge {}",
+            login.dimensions.x + login.dimensions.width
         );
     }
 
@@ -4235,6 +4402,53 @@ mod tests {
             first_child_x > 100.0,
             "text-align:center should shift content to roughly midpoint; got x={}",
             first_child_x
+        );
+    }
+
+    #[test]
+    fn test_centered_inline_links_keep_intrinsic_width() {
+        let html = r#"
+            <center>
+                <p style="font-size:8pt;color:#636363">
+                    &copy; 2026 -
+                    <a id="privacy" href="/privacy">개인정보처리방침</a>
+                    -
+                    <a id="terms" href="/terms">약관</a>
+                </p>
+            </center>
+        "#;
+        let dom = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree =
+            style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let (layout_opt, _, _) =
+            build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout tree");
+
+        let copyright = find_text_box_containing(&layout, "2026").expect("copyright text");
+        let privacy = find_element_by_id(&layout, "privacy").expect("privacy link");
+        let terms = find_element_by_id(&layout, "terms").expect("terms link");
+
+        assert!(
+            privacy.dimensions.width < 220.0,
+            "center-inherited inline link should keep intrinsic width, got {}",
+            privacy.dimensions.width
+        );
+        assert!(
+            (privacy.dimensions.y - copyright.dimensions.y).abs() < 2.0,
+            "privacy link should stay grouped on the same policy line: copyright.y={}, privacy.y={}",
+            copyright.dimensions.y,
+            privacy.dimensions.y
+        );
+        assert!(
+            (terms.dimensions.y - privacy.dimensions.y).abs() < 2.0,
+            "terms link should stay on the same policy line as privacy: privacy.y={}, terms.y={}",
+            privacy.dimensions.y,
+            terms.dimensions.y
+        );
+        assert!(
+            terms.dimensions.x > privacy.dimensions.x,
+            "terms link should remain to the right of privacy on the shared line"
         );
     }
 }
