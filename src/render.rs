@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use lazy_static::lazy_static;
 use std::time::Instant;
+use url::Url;
 
 const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/NanumGothic.ttf");
 
@@ -99,7 +100,12 @@ impl TexturePool {
 
 /// Entry point for rendering. Builds a `LayerTree` from the layout, then
 /// composites all layers onto `pixmap` in a parallel viewport-tiled approach.
-pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap, image_cache: &HashMap<String, Vec<u8>>) {
+pub fn render_layout_tree(
+    layout: &LayoutBox,
+    pixmap: &mut Pixmap,
+    image_cache: &HashMap<String, Vec<u8>>,
+    base_url: &Url,
+) {
     let start = Instant::now();
 
     let viewport = LayoutRect {
@@ -113,7 +119,7 @@ pub fn render_layout_tree(layout: &LayoutBox, pixmap: &mut Pixmap, image_cache: 
     let layer_gen_elapsed = start.elapsed();
 
     let start_render = Instant::now();
-    composite_layer_to_surface(0, &tree, pixmap, viewport, image_cache);
+    composite_layer_to_surface(0, &tree, pixmap, viewport, image_cache, base_url);
 
     let render_elapsed = start_render.elapsed();
     println!("[Perf] render_layout_tree (Surface): Layer gen: {:?}, Actual render: {:?}", layer_gen_elapsed, render_elapsed);
@@ -125,6 +131,7 @@ fn composite_layer_to_surface(
     target: &mut Pixmap,
     surface_rect: LayoutRect,
     image_cache: &HashMap<String, Vec<u8>>,
+    base_url: &Url,
 ) {
     let layer = &tree.layers[layer_id];
     if layer.opacity <= 0.0 {
@@ -145,34 +152,34 @@ fn composite_layer_to_surface(
     let (negative, zero, positive) = tree.categorize_children(layer_id);
 
     if let Some(ref mut pixmap) = effect_pixmap {
-        execute_commands_on_tile(&layer.background_commands, pixmap, layer.bounds, image_cache);
+        execute_commands_on_tile(&layer.background_commands, pixmap, layer.bounds, image_cache, base_url);
 
         for &child_id in &negative {
-            composite_layer_to_surface(child_id, tree, pixmap, layer.bounds, image_cache);
+            composite_layer_to_surface(child_id, tree, pixmap, layer.bounds, image_cache, base_url);
         }
 
-        execute_commands_on_tile(&layer.content_commands, pixmap, layer.bounds, image_cache);
+        execute_commands_on_tile(&layer.content_commands, pixmap, layer.bounds, image_cache, base_url);
 
         for &child_id in &zero {
-            composite_layer_to_surface(child_id, tree, pixmap, layer.bounds, image_cache);
+            composite_layer_to_surface(child_id, tree, pixmap, layer.bounds, image_cache, base_url);
         }
         for &child_id in &positive {
-            composite_layer_to_surface(child_id, tree, pixmap, layer.bounds, image_cache);
+            composite_layer_to_surface(child_id, tree, pixmap, layer.bounds, image_cache, base_url);
         }
     } else {
-        execute_commands_on_tile(&layer.background_commands, target, surface_rect, image_cache);
+        execute_commands_on_tile(&layer.background_commands, target, surface_rect, image_cache, base_url);
 
         for &child_id in &negative {
-            composite_layer_to_surface(child_id, tree, target, surface_rect, image_cache);
+            composite_layer_to_surface(child_id, tree, target, surface_rect, image_cache, base_url);
         }
 
-        execute_commands_on_tile(&layer.content_commands, target, surface_rect, image_cache);
+        execute_commands_on_tile(&layer.content_commands, target, surface_rect, image_cache, base_url);
 
         for &child_id in &zero {
-            composite_layer_to_surface(child_id, tree, target, surface_rect, image_cache);
+            composite_layer_to_surface(child_id, tree, target, surface_rect, image_cache, base_url);
         }
         for &child_id in &positive {
-            composite_layer_to_surface(child_id, tree, target, surface_rect, image_cache);
+            composite_layer_to_surface(child_id, tree, target, surface_rect, image_cache, base_url);
         }
     }
 
@@ -225,7 +232,13 @@ fn build_clip_mask(
     Some(m)
 }
 
-fn execute_commands_on_tile(commands: &[PaintCommand], pixmap: &mut Pixmap, tile_rect: LayoutRect, image_cache: &HashMap<String, Vec<u8>>) {
+fn execute_commands_on_tile(
+    commands: &[PaintCommand],
+    pixmap: &mut Pixmap,
+    tile_rect: LayoutRect,
+    image_cache: &HashMap<String, Vec<u8>>,
+    base_url: &Url,
+) {
     let tx = -tile_rect.x;
     let ty = -tile_rect.y;
     let transform = Transform::from_translate(tx, ty);
@@ -316,7 +329,15 @@ fn execute_commands_on_tile(commands: &[PaintCommand], pixmap: &mut Pixmap, tile
                 }
             }
             PaintCommand::Image { rect: r, url, object_fit, alt } => {
-                let drawn = if let Some(data) = image_cache.get(url) {
+                let resolved_url = if image_cache.contains_key(url) {
+                    None
+                } else {
+                    base_url.join(url).ok().map(|u| u.to_string())
+                };
+                let drawn = if let Some(data) = image_cache
+                    .get(url)
+                    .or_else(|| resolved_url.as_ref().and_then(|u| image_cache.get(u)))
+                {
                     if let Ok(img) = image::load_from_memory(data) {
                         let rgba = img.to_rgba8();
                         let img_w = rgba.width() as f32;
@@ -1170,6 +1191,7 @@ mod tests {
     fn test_shadow_zero_blur_renders_rect() {
         use crate::css::{BoxShadow, OrderedFloat};
         use crate::layer_tree::PaintCommand;
+        use url::Url;
 
         let mut pixmap = Pixmap::new(100, 100).unwrap();
         let shadow = BoxShadow {
@@ -1185,7 +1207,8 @@ mod tests {
 
         let tile_rect = LayoutRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
         let cmds = vec![PaintCommand::Shadow(rect, shadow)];
-        execute_commands_on_tile(&cmds, &mut pixmap, tile_rect, &HashMap::new());
+        let base_url = Url::parse("https://example.com/").unwrap();
+        execute_commands_on_tile(&cmds, &mut pixmap, tile_rect, &HashMap::new(), &base_url);
 
         assert_ne!(pixmap.data(), before.as_slice(), "zero-blur shadow must modify the pixmap");
     }
@@ -1196,6 +1219,7 @@ mod tests {
     fn test_shadow_with_blur_produces_halo() {
         use crate::css::{BoxShadow, OrderedFloat};
         use crate::layer_tree::PaintCommand;
+        use url::Url;
 
         let mut pixmap = Pixmap::new(100, 100).unwrap();
         let shadow = BoxShadow {
@@ -1210,12 +1234,46 @@ mod tests {
 
         let tile_rect = LayoutRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
         let cmds = vec![PaintCommand::Shadow(rect, shadow)];
-        execute_commands_on_tile(&cmds, &mut pixmap, tile_rect, &HashMap::new());
+        let base_url = Url::parse("https://example.com/").unwrap();
+        execute_commands_on_tile(&cmds, &mut pixmap, tile_rect, &HashMap::new(), &base_url);
 
         // The pixel several pixels outside the shadow rect should have non-zero alpha
         // due to the blur halo.  Shadow at (40,40) size (20,20); check pixel at (34,40).
         let halo_alpha = pixmap.data()[(40 * 100 + 34) * 4 + 3];
         assert!(halo_alpha > 0, "blurred shadow halo pixel should be non-zero alpha, got {}", halo_alpha);
+    }
+
+    #[test]
+    fn test_relative_image_url_uses_absolute_cached_bytes() {
+        use crate::layer_tree::{ObjectFit, PaintCommand};
+        use url::Url;
+
+        let png_1x1_red: Vec<u8> = vec![
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0,
+            0, 0, 1, 8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120,
+            156, 99, 248, 207, 192, 240, 31, 0, 5, 0, 1, 255, 137, 153, 61, 29, 0, 0, 0,
+            0, 73, 69, 78, 68, 174, 66, 96, 130,
+        ];
+
+        let mut pixmap = Pixmap::new(8, 8).unwrap();
+        let tile_rect = LayoutRect { x: 0.0, y: 0.0, width: 8.0, height: 8.0 };
+        let rect = LayoutRect { x: 0.0, y: 0.0, width: 8.0, height: 8.0 };
+        let cmds = vec![PaintCommand::Image {
+            rect,
+            url: "/tiny.png".to_string(),
+            object_fit: ObjectFit::Fill,
+            alt: String::new(),
+        }];
+        let base_url = Url::parse("https://example.com/path").unwrap();
+        let mut image_cache = HashMap::new();
+        image_cache.insert("https://example.com/tiny.png".to_string(), png_1x1_red);
+
+        execute_commands_on_tile(&cmds, &mut pixmap, tile_rect, &image_cache, &base_url);
+
+        assert!(
+            pixmap.data().chunks_exact(4).any(|px| px[0] != 0 || px[1] != 0 || px[2] != 0 || px[3] != 0),
+            "relative image paint command should render using absolute cached bytes"
+        );
     }
 
     /// Text rendered via the cache must respect the clip rectangle (pixels outside
