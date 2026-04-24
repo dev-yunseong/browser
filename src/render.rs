@@ -622,6 +622,9 @@ fn draw_broken_image(pixmap: &mut Pixmap, r: LayoutRect, alt: &str, transform: T
 fn create_rounded_rect_path(r: LayoutRect, radius: f32) -> Option<tiny_skia::Path> {
     let mut pb = PathBuilder::new();
     let rect = tiny_skia::Rect::from_xywh(r.x, r.y, r.width, r.height)?;
+    let radius = radius
+        .max(0.0)
+        .min(rect.width().min(rect.height()) / 2.0);
     pb.move_to(rect.left() + radius, rect.top());
     pb.line_to(rect.right() - radius, rect.top());
     pb.quad_to(rect.right(), rect.top(), rect.right(), rect.top() + radius);
@@ -1310,5 +1313,19 @@ mod tests {
                     "pixel at ({}, {}) must remain white under right-half clip", col, row);
             }
         }
+    }
+
+    #[test]
+    fn test_create_rounded_rect_path_clamps_large_radius() {
+        let path = create_rounded_rect_path(
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 85.0,
+                height: 40.0,
+            },
+            100.0,
+        );
+        assert!(path.is_some(), "large border radius should still produce a valid path");
     }
 }

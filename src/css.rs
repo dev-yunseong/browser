@@ -301,6 +301,53 @@ pub fn parse_css(source: &str) -> Stylesheet {
                         declarations.push(Declaration { name: key, value: Value::BoxShadow(shadow), important });
                     }
                 }
+                // font shorthand: "font: <style> <variant> <weight> <size>/<line-height> <family>"
+                // We only extract the size / line-height / family pieces that affect layout.
+                "font" => {
+                    let parts: Vec<&str> = val_raw.split_whitespace().collect();
+                    let size_idx = parts.iter().position(|part| {
+                        let size_part = part.split_once('/').map(|(sz, _)| sz).unwrap_or(part);
+                        matches!(parse_value(size_part), Value::Length(_, _))
+                    });
+
+                    if let Some(idx) = size_idx {
+                        let size_token = parts[idx];
+                        let (size_str, line_height_str) =
+                            size_token.split_once('/').map_or((size_token, None), |(size, line)| {
+                                (size, Some(line))
+                            });
+
+                        if let Value::Length(v, unit) = parse_value(size_str) {
+                            declarations.push(Declaration {
+                                name: intern("font-size"),
+                                value: Value::Length(v, unit),
+                                important,
+                            });
+                        }
+
+                        if let Some(line) = line_height_str {
+                            let line = line.trim();
+                            if !line.is_empty() && line != "normal" {
+                                declarations.push(Declaration {
+                                    name: intern("line-height"),
+                                    value: parse_value(line),
+                                    important,
+                                });
+                            }
+                        }
+
+                        if idx + 1 < parts.len() {
+                            let family = parts[idx + 1..].join(" ");
+                            if !family.is_empty() {
+                                declarations.push(Declaration {
+                                    name: intern("font-family"),
+                                    value: Value::Keyword(intern(&family)),
+                                    important,
+                                });
+                            }
+                        }
+                    }
+                }
                 // flex shorthand: "flex: <grow> [<shrink> [<basis>]]" or keyword
                 "flex" => {
                     let parts: Vec<&str> = val_raw.split_whitespace().collect();
@@ -1174,6 +1221,23 @@ mod tests {
     fn test_parse_percent() {
         let v = parse_value("50%");
         assert_eq!(v, Value::Length(50.0, Unit::Percent));
+    }
+
+    #[test]
+    fn test_parse_font_shorthand_extracts_size_and_line_height() {
+        let ss = parse_css("a { font: 13px/27px Roboto,Arial,sans-serif; }");
+        let rule = match &ss.items[0] {
+            RuleOrAtRule::Rule(rule) => rule,
+            _ => panic!("expected rule"),
+        };
+        assert!(rule.declarations.iter().any(|d| {
+            d.name.as_ref() == "font-size"
+                && matches!(d.value, Value::Length(v, Unit::Px) if (v - 13.0).abs() < 1e-5)
+        }));
+        assert!(rule.declarations.iter().any(|d| {
+            d.name.as_ref() == "line-height"
+                && matches!(d.value, Value::Length(v, Unit::Px) if (v - 27.0).abs() < 1e-5)
+        }));
     }
 
     #[test]

@@ -125,18 +125,24 @@ impl IntrinsicSizeCache {
 
                     let mut inline_run_width: f32 = 0.0;
                     let mut max_w: f32 = 0.0;
+                    let mut float_width: f32 = 0.0;
                     for (child_val, child) in child_vals.into_iter().zip(non_skip_children.iter()) {
+                        let child_total = child_val + horiz_margin(child);
+                        if get_float(child).is_some() {
+                            float_width += child_total;
+                            continue;
+                        }
                         let child_disp = get_display_type(child);
                         if is_block_level(child_disp) {
                             max_w = max_w.max(inline_run_width);
                             inline_run_width = 0.0;
-                            max_w = max_w.max(child_val);
+                            max_w = max_w.max(child_total);
                         } else {
-                            inline_run_width += child_val;
+                            inline_run_width += child_total;
                         }
                     }
                     max_w = max_w.max(inline_run_width);
-                    let width = max_w + pad_border;
+                    let width = max_w + float_width + pad_border;
                     self.max_content.insert(key, width);
                     val_stack.push(width);
                 }
@@ -289,6 +295,26 @@ fn horiz_padding_border(sn: &StyledNode) -> f32 {
     read_px_direct(sn, "padding-left")
         + read_px_direct(sn, "padding-right")
         + read_px_direct(sn, "border-width") * 2.0
+}
+
+fn horiz_margin(sn: &StyledNode) -> f32 {
+    read_px_direct(sn, "margin-left") + read_px_direct(sn, "margin-right")
+}
+
+fn border_box_width(cb: &LayoutBox<'_>) -> f32 {
+    cb.dimensions.width + cb.padding.left + cb.padding.right + cb.border.left + cb.border.right
+}
+
+fn border_box_height(cb: &LayoutBox<'_>) -> f32 {
+    cb.dimensions.height + cb.padding.top + cb.padding.bottom + cb.border.top + cb.border.bottom
+}
+
+fn margin_box_width(cb: &LayoutBox<'_>) -> f32 {
+    border_box_width(cb) + cb.margin.left + cb.margin.right
+}
+
+fn margin_box_height(cb: &LayoutBox<'_>) -> f32 {
+    border_box_height(cb) + cb.margin.top + cb.margin.bottom
 }
 
 /// Compute the **max-content** width of a `StyledNode` subtree.
@@ -836,14 +862,26 @@ impl<'a> LayoutBox<'a> {
             .specified_values
             .get(&crate::css::intern("max-width"))
         {
-            width = width.min(*v);
+            let max_w = if box_sizing == "border-box" {
+                (*v - self.padding.left - self.padding.right - self.border.left - self.border.right)
+                    .max(0.0)
+            } else {
+                *v
+            };
+            width = width.min(max_w);
         }
         if let Some(Value::Length(v, Unit::Px)) = self
             .style_node
             .specified_values
             .get(&crate::css::intern("min-width"))
         {
-            width = width.max(*v);
+            let min_w = if box_sizing == "border-box" {
+                (*v - self.padding.left - self.padding.right - self.border.left - self.border.right)
+                    .max(0.0)
+            } else {
+                *v
+            };
+            width = width.max(min_w);
         }
 
         if is_block && width < container_width {
@@ -1191,16 +1229,16 @@ impl<'a> LayoutBox<'a> {
             // ── Helper: compute main/cross size of a laid-out box ─────────────
             let main_size = |cb: &LayoutBox<'_>| -> f32 {
                 if is_row {
-                    cb.dimensions.width + cb.margin.left + cb.margin.right
+                    margin_box_width(cb)
                 } else {
-                    cb.dimensions.height + cb.margin.top + cb.margin.bottom
+                    margin_box_height(cb)
                 }
             };
             let cross_size = |cb: &LayoutBox<'_>| -> f32 {
                 if is_row {
-                    cb.dimensions.height + cb.margin.top + cb.margin.bottom
+                    margin_box_height(cb)
                 } else {
-                    cb.dimensions.width + cb.margin.left + cb.margin.right
+                    margin_box_width(cb)
                 }
             };
 
@@ -1462,16 +1500,16 @@ impl<'a> LayoutBox<'a> {
                     offset_layout_box(&mut item.cb, dx, dy);
 
                     main_cursor += if is_row {
-                        item.cb.dimensions.width + item.cb.margin.left + item.cb.margin.right
+                        margin_box_width(&item.cb)
                     } else {
-                        item.cb.dimensions.height + item.cb.margin.top + item.cb.margin.bottom
+                        margin_box_height(&item.cb)
                     };
 
                     max_child_x = max_child_x.max(
-                        item.cb.dimensions.x + item.cb.dimensions.width + item.cb.margin.right,
+                        item.cb.dimensions.x + border_box_width(&item.cb) + item.cb.margin.right,
                     );
                     child_y = child_y.max(
-                        item.cb.dimensions.y + item.cb.dimensions.height + item.cb.margin.bottom,
+                        item.cb.dimensions.y + border_box_height(&item.cb) + item.cb.margin.bottom,
                     );
                 }
 
@@ -1500,9 +1538,14 @@ impl<'a> LayoutBox<'a> {
             } else {
                 0.0
             };
-            if self.dimensions.width <= 0.0 {
+            if self.dimensions.width <= 0.0 || (is_floated && auto_width) {
+                let derived = max_child_x - self.dimensions.x + self.padding.right + self.border.right;
                 self.dimensions.width = if is_row {
-                    main_container_size
+                    if container_width.is_finite() {
+                        derived.min(container_width)
+                    } else {
+                        derived
+                    }
                 } else {
                     total_cross
                 };
@@ -1746,8 +1789,8 @@ impl<'a> LayoutBox<'a> {
                         let dy = cursor_y - (m.dimensions.y - m.margin.top);
                         offset_layout_box(&mut m, dx, dy);
                         max_child_x =
-                            max_child_x.max(m.dimensions.x + m.dimensions.width + m.margin.right);
-                        lx += m.dimensions.width + m.margin.left + m.margin.right;
+                            max_child_x.max(m.dimensions.x + border_box_width(&m) + m.margin.right);
+                        lx += margin_box_width(&m);
                         result.push(m);
                     }
                     cursor_y += cur_line.height;
@@ -1800,8 +1843,8 @@ impl<'a> LayoutBox<'a> {
                         intrinsic_cache,
                     );
                     if let Some(mut cb) = cb_opt {
-                        let float_w = cb.dimensions.width + cb.margin.left + cb.margin.right;
-                        let float_h = cb.dimensions.height + cb.margin.top + cb.margin.bottom;
+                        let float_w = margin_box_width(&cb);
+                        let float_h = margin_box_height(&cb);
                         let (avail_w, left_indent) = float_ctx.available_at(cursor_y, float_h);
                         let fx = match side {
                             FloatSide::Left => container_x + left_indent,
@@ -1817,7 +1860,7 @@ impl<'a> LayoutBox<'a> {
                             side,
                         });
                         max_child_x = max_child_x
-                            .max(cb.dimensions.x + cb.dimensions.width + cb.margin.right);
+                            .max(cb.dimensions.x + border_box_width(&cb) + cb.margin.right);
                         result.push(cb);
                     }
                     // cursor_y does NOT advance for floats
@@ -1875,7 +1918,7 @@ impl<'a> LayoutBox<'a> {
                         cursor_y = normal_flow_bottom;
                         prev_margin_bottom = cb.margin.bottom;
                         max_child_x = max_child_x
-                            .max(cb.dimensions.x + cb.dimensions.width + cb.margin.right);
+                            .max(cb.dimensions.x + border_box_width(&cb) + cb.margin.right);
                         result.push(cb);
                     }
                     line_start_y = cursor_y; // keep line_start_y in sync after block advances cursor_y
@@ -1914,7 +1957,7 @@ impl<'a> LayoutBox<'a> {
                         // actually placed.  Empty/whitespace-only text nodes return None and
                         // must NOT interrupt adjacent-block margin collapsing.
                         prev_margin_bottom = 0.0;
-                        let item_w = cb.dimensions.width + cb.margin.left + cb.margin.right;
+                        let item_w = margin_box_width(&cb);
                         if cur_line.width + item_w > avail_w && !cur_line.members.is_empty() {
                             flush_line!();
                             // Re-lay out for new line with updated float-aware width
@@ -1950,9 +1993,9 @@ impl<'a> LayoutBox<'a> {
                                     apply_relative_offset(&mut cb2, vw, vh);
                                 }
                                 cur_line.width =
-                                    cb2.dimensions.width + cb2.margin.left + cb2.margin.right;
+                                    margin_box_width(&cb2);
                                 cur_line.height =
-                                    cb2.dimensions.height + cb2.margin.top + cb2.margin.bottom;
+                                    margin_box_height(&cb2);
                                 cur_line.members.push(cb2);
                             }
                         } else {
@@ -1964,7 +2007,7 @@ impl<'a> LayoutBox<'a> {
                             cur_line.width += item_w;
                             cur_line.height = cur_line
                                 .height
-                                .max(cb.dimensions.height + cb.margin.top + cb.margin.bottom);
+                                .max(margin_box_height(&cb));
                             cur_line.members.push(cb);
                         }
                     }
@@ -2004,14 +2047,26 @@ impl<'a> LayoutBox<'a> {
             .specified_values
             .get(&crate::css::intern("max-height"))
         {
-            final_h = final_h.min(*v);
+            let max_h = if box_sizing == "border-box" {
+                (*v - self.padding.top - self.padding.bottom - self.border.top - self.border.bottom)
+                    .max(0.0)
+            } else {
+                *v
+            };
+            final_h = final_h.min(max_h);
         }
         if let Some(Value::Length(v, Unit::Px)) = self
             .style_node
             .specified_values
             .get(&crate::css::intern("min-height"))
         {
-            final_h = final_h.max(*v);
+            let min_h = if box_sizing == "border-box" {
+                (*v - self.padding.top - self.padding.bottom - self.border.top - self.border.bottom)
+                    .max(0.0)
+            } else {
+                *v
+            };
+            final_h = final_h.max(min_h);
         }
         self.dimensions.height = final_h;
 
@@ -2416,6 +2471,12 @@ fn should_skip(child: &StyledNode) -> bool {
             t.as_str(),
             "head" | "style" | "meta" | "title" | "script" | "link" | "noscript"
         ) {
+            return true;
+        }
+        if t == "svg" {
+            // This engine does not rasterize SVG content yet.
+            // Skipping the subtree avoids malformed icon blobs and keeps the
+            // surrounding layout box size driven by CSS width/height.
             return true;
         }
         // <input type="hidden"> never renders, regardless of CSS.
@@ -3373,6 +3434,107 @@ mod tests {
             "shrink-wrapped float contents should stay within the viewport, got right edge {}",
             login.dimensions.x + login.dimensions.width
         );
+    }
+
+    #[test]
+    fn test_float_right_header_with_nested_utility_cluster_stays_in_viewport() {
+        let html = r#"
+            <style>
+                .gb_Xd { height:48px; vertical-align:middle; white-space:nowrap; align-items:center; display:flex; }
+                .gb_7d { box-sizing:border-box; height:48px; padding:0 4px; padding-left:5px; flex:0 0 auto; justify-content:flex-end; }
+                .gb_Jd .gb_7d { float:right; padding-left:32px; }
+                .gb_Q { line-height:normal; padding-right:15px; }
+                .gb_5 { display:inline-block; padding-left:15px; }
+                .gb_5 .gb_4 { display:inline-block; line-height:24px; vertical-align:middle; }
+                .gb_Id { position:relative; float:right; }
+                .gb_od { display:inline; }
+                .gb_Ad { display:inline-block; vertical-align:middle; padding:4px; }
+                .gb_C { display:inline-block; height:40px; width:40px; padding:8px; box-sizing:border-box; }
+                .gb_Td { display:inline-block; padding:10px 12px; margin:12px 16px 12px 10px; min-width:85px; min-height:40px; }
+            </style>
+            <div style="width:800px; padding:6px;">
+                <div class="gb_Jd">
+                    <div id="actions" class="gb_7d gb_Xd">
+                        <div>
+                            <div class="gb_Q">
+                                <div class="gb_5"><a id="gmail" class="gb_4">Gmail</a></div>
+                                <div class="gb_5"><a id="images" class="gb_4">Images</a></div>
+                            </div>
+                        </div>
+                        <div class="gb_Id">
+                            <div class="gb_od">
+                                <div class="gb_Ad"><a id="apps" class="gb_C">A</a></div>
+                            </div>
+                            <a id="login" class="gb_Td">Login</a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        "#;
+        let dom_tree = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree = style::build_style_tree(
+            &dom_tree.document,
+            &ss,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+        );
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout");
+        let apps = find_element_by_id(&layout, "apps").expect("apps not found");
+        let login = find_element_by_id(&layout, "login").expect("login not found");
+
+        assert!(
+            apps.dimensions.x >= 0.0,
+            "app launcher should not be pushed off the left edge, got x={}",
+            apps.dimensions.x
+        );
+        assert!(
+            apps.dimensions.x + border_box_width(apps) <= 800.0,
+            "app launcher should stay inside the viewport, got right edge {}",
+            apps.dimensions.x + border_box_width(apps)
+        );
+        assert!(
+            login.dimensions.x + border_box_width(login) <= 800.0,
+            "login button should stay inside the viewport, got right edge {}",
+            login.dimensions.x + border_box_width(login)
+        );
+    }
+
+    #[test]
+    fn test_border_box_min_size_includes_padding() {
+        let html = r#"
+            <div style="width:800px;">
+                <a id="login" style="display:inline-block; box-sizing:border-box; min-width:85px; min-height:40px; padding:10px 12px;">Login</a>
+            </div>
+        "#;
+        let dom_tree = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree = style::build_style_tree(
+            &dom_tree.document,
+            &ss,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+        );
+        let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout");
+        let login = find_element_by_id(&layout, "login").expect("login not found");
+
+        let border_w = login.dimensions.width + login.padding.left + login.padding.right + login.border.left + login.border.right;
+        let border_h = login.dimensions.height + login.padding.top + login.padding.bottom + login.border.top + login.border.bottom;
+
+        assert!(
+            (border_w - 85.0).abs() < 2.0,
+            "border-box min-width should include padding: got border width {}",
+            border_w
+        );
+        assert!(border_h >= 40.0, "border-box min-height should not shrink below 40px, got {}", border_h);
     }
 
     #[test]
