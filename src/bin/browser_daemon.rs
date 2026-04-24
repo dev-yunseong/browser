@@ -870,6 +870,15 @@ fn apply_console_history_navigation(
     }
 }
 
+fn console_submit_requested_flags(has_focus: bool, lost_focus: bool) -> bool {
+    has_focus || lost_focus
+}
+
+fn console_submit_requested(ui: &egui::Ui, response: &egui::Response) -> bool {
+    ui.input(|i| i.key_pressed(egui::Key::Enter))
+        && console_submit_requested_flags(response.has_focus(), response.lost_focus())
+}
+
 fn render_console_panel(
     ctx: &egui::Context,
     open: &mut bool,
@@ -969,7 +978,7 @@ fn render_console_panel(
                 );
                 apply_console_history_navigation(ui, &response, input, history, history_index);
 
-                if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                if console_submit_requested(ui, &response) {
                     let code = input.trim().to_string();
                     if !code.is_empty() {
                         history.push(code.clone());
