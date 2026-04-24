@@ -126,7 +126,19 @@ impl IntrinsicSizeCache {
                     let mut inline_run_width: f32 = 0.0;
                     let mut max_w: f32 = 0.0;
                     let mut float_width: f32 = 0.0;
+                    let mut percent_width_sum: f32 = 0.0;
                     for (child_val, child) in child_vals.into_iter().zip(non_skip_children.iter()) {
+                        if is_line_break_element(child) {
+                            max_w = max_w.max(inline_run_width);
+                            inline_run_width = 0.0;
+                            continue;
+                        }
+                        if get_display_type(node_ref) == DisplayType::TableRow {
+                            if let Some(percent) = specified_width_percent(child) {
+                                percent_width_sum += percent;
+                                continue;
+                            }
+                        }
                         let child_total = child_val + horiz_margin(child);
                         if get_float(child).is_some() {
                             float_width += child_total;
@@ -142,7 +154,15 @@ impl IntrinsicSizeCache {
                         }
                     }
                     max_w = max_w.max(inline_run_width);
-                    let width = max_w + float_width + pad_border;
+                    let fixed_width = max_w + float_width;
+                    let width = if get_display_type(node_ref) == DisplayType::TableRow
+                        && percent_width_sum > 0.0
+                        && percent_width_sum < 100.0
+                    {
+                        fixed_width / (1.0 - percent_width_sum / 100.0) + pad_border
+                    } else {
+                        fixed_width + pad_border
+                    };
                     self.max_content.insert(key, width);
                     val_stack.push(width);
                 }
@@ -1776,8 +1796,8 @@ impl<'a> LayoutBox<'a> {
                     // Compute text-align offset within the available width.
                     let align_offset = if applies_text_align {
                         match text_align.as_str() {
-                            "center" => ((avail_w - cur_line.width) / 2.0).max(0.0),
-                            "right" => (avail_w - cur_line.width).max(0.0),
+                            "center" => (avail_w - cur_line.width) / 2.0,
+                            "right" => avail_w - cur_line.width,
                             _ => 0.0, // left / default
                         }
                     } else {
@@ -1958,7 +1978,12 @@ impl<'a> LayoutBox<'a> {
                         // must NOT interrupt adjacent-block margin collapsing.
                         prev_margin_bottom = 0.0;
                         let item_w = margin_box_width(&cb);
-                        if cur_line.width + item_w > avail_w && !cur_line.members.is_empty() {
+                        let keep_table_cells_on_row =
+                            self.display == DisplayType::TableRow && cb.display == DisplayType::TableCell;
+                        if !keep_table_cells_on_row
+                            && cur_line.width + item_w > avail_w
+                            && !cur_line.members.is_empty()
+                        {
                             flush_line!();
                             // Re-lay out for new line with updated float-aware width
                             let (aw2, li2) = float_ctx.available_at(line_start_y, 16.0);
@@ -2403,6 +2428,13 @@ fn get_prop(sn: &StyledNode, p1: &str, p2: &str, cw: f32, vw: f32, vh: f32) -> f
         Some(Value::Length(v, Unit::Vw)) => vw * (v / 100.0),
         Some(Value::Length(v, Unit::Vh)) => vh * (v / 100.0),
         _ => 0.0,
+    }
+}
+
+fn specified_width_percent(sn: &StyledNode) -> Option<f32> {
+    match sn.specified_values.get(&crate::css::intern("width")) {
+        Some(Value::Length(v, Unit::Percent)) => Some(*v),
+        _ => None,
     }
 }
 
@@ -4611,6 +4643,70 @@ mod tests {
         assert!(
             terms.dimensions.x > privacy.dimensions.x,
             "terms link should remain to the right of privacy on the shared line"
+        );
+    }
+
+    #[test]
+    fn test_inline_utility_link_after_centered_controls_stays_grouped() {
+        let html = r#"
+            <center>
+                <form style="margin-top: 80px;">
+                    <table cellpadding="0" cellspacing="0">
+                        <tr valign="top">
+                            <td id="left-cell" width="25%">&nbsp;</td>
+                            <td id="controls-cell" align="center" nowrap="">
+                                <input id="search" style="width: 496px; height: 25px;">
+                                <br>
+                                <input id="primary" type="submit" value="Google Search" style="width: 160px; height: 30px;">
+                                <input id="secondary" type="submit" value="I'm Feeling Lucky" style="width: 160px; height: 30px;">
+                            </td>
+                            <td id="utility-cell" class="fl sblc" align="left" nowrap="" width="25%">
+                                <a id="advanced" href="/advanced_search">고급검색</a>
+                            </td>
+                        </tr>
+                    </table>
+                </form>
+            </center>
+        "#;
+        let dom = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree =
+            style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let (layout_opt, _, _) =
+            build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout tree");
+
+        let search = find_element_by_id(&layout, "search").expect("search input");
+        let primary = find_element_by_id(&layout, "primary").expect("primary button");
+        let secondary = find_element_by_id(&layout, "secondary").expect("secondary button");
+        let advanced = find_element_by_id(&layout, "advanced").expect("advanced link");
+
+        let search_center = search.dimensions.x + search.dimensions.width / 2.0;
+        let button_cluster_center =
+            (primary.dimensions.x + secondary.dimensions.x + secondary.dimensions.width) / 2.0;
+        let advanced_center = advanced.dimensions.x + advanced.dimensions.width / 2.0;
+
+        assert!(
+            (advanced_center - search_center).abs() < 340.0,
+            "utility link should stay near the centered search input: link_center={}, search_center={}",
+            advanced_center,
+            search_center
+        );
+        assert!(
+            (advanced_center - button_cluster_center).abs() < 340.0,
+            "utility link should stay grouped with action buttons: link_center={}, buttons_center={}",
+            advanced_center,
+            button_cluster_center
+        );
+        assert!(
+            advanced.dimensions.x > 500.0,
+            "utility link should not escape to the far-left edge, got x={}",
+            advanced.dimensions.x
+        );
+        assert!(
+            advanced.dimensions.x + advanced.dimensions.width < 800.0,
+            "utility link should remain visible inside the viewport, got right edge {}",
+            advanced.dimensions.x + advanced.dimensions.width
         );
     }
 }

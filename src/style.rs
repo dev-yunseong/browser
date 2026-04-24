@@ -305,6 +305,21 @@ fn matches_selector_arena(selector: &Selector, idx: usize, arena: &[NodeDataSend
 
 fn apply_attribute_styles_arena(node: &NodeDataSend, map: &mut HashMap<Arc<str>, Value>) {
     match node.tag.as_str() {
+        "table" | "td" | "th" => {
+            for (k, v) in &node.attrs {
+                if k == "width" {
+                    if let Some(width) = parse_legacy_length_attr(v) {
+                        map.insert(intern("width"), width);
+                    }
+                }
+                if k == "align" {
+                    let align = v.to_ascii_lowercase();
+                    if matches!(align.as_str(), "left" | "center" | "right") {
+                        map.insert(intern("text-align"), Value::Keyword(intern(&align)));
+                    }
+                }
+            }
+        }
         "img" => {
             for (k, v) in &node.attrs {
                 if k == "width" { if let Ok(val) = v.trim_end_matches("px").parse::<f32>() { map.insert(intern("width"), Value::Length(val, crate::css::Unit::Px)); } }
@@ -835,6 +850,26 @@ fn apply_default_styles(tag: &str, map: &mut HashMap<Arc<str>, Value>) {
         }
         _ => {}
     }
+}
+
+fn parse_legacy_length_attr(value: &str) -> Option<Value> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(percent) = trimmed.strip_suffix('%') {
+        return percent
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|n| Value::Length(n, crate::css::Unit::Percent));
+    }
+    trimmed
+        .trim_end_matches("px")
+        .trim()
+        .parse::<f32>()
+        .ok()
+        .map(|n| Value::Length(n, crate::css::Unit::Px))
 }
 
 #[cfg(test)]
