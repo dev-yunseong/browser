@@ -51,6 +51,14 @@ struct BrowserApp {
 
     /// Engine actor handle — all pipeline work is delegated through this.
     engine: engine::EngineHandle,
+
+    /// The single authoritative viewport width for all layout and re-render operations.
+    ///
+    /// Set once on each navigation (to 800.0 px) and reused verbatim for every
+    /// subsequent re-render triggered by hover, focus, image-load, or JS eval.
+    /// This prevents layout jitter caused by measuring `ui.available_width()` from
+    /// different egui containers, which varies slightly frame-to-frame.
+    viewport_width: f32,
 }
 
 impl BrowserApp {
@@ -101,35 +109,42 @@ impl BrowserApp {
             console_eval_promise: None,
             has_page: false,
             engine: engine::EngineHandle::spawn(),
+            viewport_width: 800.0,
         }
     }
 
-    fn load_url(&mut self, url: String, width: f32) {
+    fn load_url(&mut self, url: String) {
         if self.history.is_empty() || self.history[self.history_index] != url {
             self.history.truncate(self.history_index + 1);
             self.history.push(url.clone());
             self.history_index = self.history.len() - 1;
         }
-        self.load_url_direct(url, width);
+        self.load_url_direct(url);
     }
 
-    fn navigate_back(&mut self, width: f32) {
+    fn navigate_back(&mut self) {
         if self.history_index > 0 {
             self.history_index -= 1;
             let url = self.history[self.history_index].clone();
-            self.load_url_direct(url, width);
+            self.load_url_direct(url);
         }
     }
 
-    fn navigate_forward(&mut self, width: f32) {
+    fn navigate_forward(&mut self) {
         if self.history_index + 1 < self.history.len() {
             self.history_index += 1;
             let url = self.history[self.history_index].clone();
-            self.load_url_direct(url, width);
+            self.load_url_direct(url);
         }
     }
 
-    fn load_url_direct(&mut self, url: String, width: f32) {
+    fn load_url_direct(&mut self, url: String) {
+        // Fix viewport_width at 800.0 on every navigation so all subsequent
+        // re-renders (hover, focus, image-load, JS eval) use the exact same width
+        // and never cause layout jitter.
+        self.viewport_width = 800.0;
+        println!("[Viewport] navigate width={:.1}", self.viewport_width);
+
         self.url = url.clone();
         self.error = None;
         self.image_promises.clear();
@@ -137,10 +152,11 @@ impl BrowserApp {
         self.is_loading = true;
         self.has_page = false;
 
-        // Evict the glyph rasterization cache so that memory freed between
+        // Evict the glyph rasterization cache so that memory is freed between
         // navigations and does not grow without bound across many page loads.
         render::clear_glyph_cache();
 
+        let width = self.viewport_width;
         let handle = self.engine.clone();
         self.content_promise = Some(Promise::spawn_thread("fetcher", move || {
             handle.send_navigate(url, width)
@@ -148,7 +164,13 @@ impl BrowserApp {
     }
 
     /// Re-render the current page (e.g. after hover/focus state change).
-    fn trigger_re_render(&mut self, ctx: &egui::Context, width: f32) {
+    ///
+    /// Always uses `self.viewport_width` — the single authoritative width set at
+    /// navigate time — so that layout is bit-identical across all re-render triggers.
+    fn trigger_re_render(&mut self, ctx: &egui::Context, trigger: &str) {
+        let width = self.viewport_width;
+        println!("[Viewport] re-render trigger={} width={:.1}", trigger, width);
+
         let handle = self.engine.clone();
         let hovered_id = self.hovered_id.clone();
         let focused_id = self.focused_id.clone();
@@ -207,7 +229,7 @@ impl eframe::App for BrowserApp {
                     && self.re_render_promise.is_none()
                     && self.content_promise.is_none()
                 {
-                    self.trigger_re_render(ctx, 800.0);
+                    self.trigger_re_render(ctx, "console-eval");
                 } else {
                     ctx.request_repaint();
                 }
@@ -236,7 +258,7 @@ impl eframe::App for BrowserApp {
                 };
 
                 self.focused_id = Some(focusables[next_index].1.clone());
-                self.trigger_re_render(ctx, 800.0);
+                self.trigger_re_render(ctx, "tab-focus");
             }
         }
 
@@ -268,14 +290,14 @@ impl eframe::App for BrowserApp {
                     };
 
                     if btn_style(ui, "←", self.history_index > 0).clicked() {
-                        self.navigate_back(ui.available_width());
+                        self.navigate_back();
                     }
                     if btn_style(ui, "→", self.history_index + 1 < self.history.len()).clicked() {
-                        self.navigate_forward(ui.available_width());
+                        self.navigate_forward();
                     }
                     if btn_style(ui, "⟳", true).clicked() {
                         let url = self.url.clone();
-                        self.load_url_direct(url, ui.available_width());
+                        self.load_url_direct(url);
                     }
 
                     ui.spacing_mut().item_spacing.x = 8.0;
@@ -295,10 +317,7 @@ impl eframe::App for BrowserApp {
                         let resp = ui.add(edit);
                         if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             let url = self.url.clone();
-                            let width = ui.available_width();
-                            if width >= 1.0 {
-                                self.load_url(url, width);
-                            }
+                            self.load_url(url);
                         }
                     });
 
@@ -311,10 +330,7 @@ impl eframe::App for BrowserApp {
                         .min_size(egui::vec2(50.0, 28.0)),
                     ).clicked() {
                         let url = self.url.clone();
-                        let width = ui.available_width();
-                        if width >= 1.0 {
-                            self.load_url(url, width);
-                        }
+                        self.load_url(url);
                     }
                 });
 
@@ -357,7 +373,7 @@ impl eframe::App for BrowserApp {
                         let had_script = results.iter().any(|r| matches!(r, engine::ClickResult::ScriptExecuted));
                         self.click_promise = None;
                         if had_script {
-                            self.trigger_re_render(ctx, 800.0);
+                            self.trigger_re_render(ctx, "click-script");
                         }
                     }
                 }
@@ -446,8 +462,7 @@ impl eframe::App for BrowserApp {
                     }
                 });
                 if newly_loaded {
-                    let width = ui.available_width();
-                    self.trigger_re_render(ctx, width);
+                    self.trigger_re_render(ctx, "image-load");
                 }
 
                 // Error message
@@ -512,7 +527,7 @@ impl eframe::App for BrowserApp {
                                 }
                                 if new_focus != self.focused_id {
                                     self.focused_id = new_focus;
-                                    self.trigger_re_render(ctx, ui.available_width());
+                                    self.trigger_re_render(ctx, "click-focus");
                                 }
 
                                 for (l_rect, link) in &self.current_links {
@@ -544,19 +559,16 @@ impl eframe::App for BrowserApp {
                             }
                             if new_hovered_id != self.hovered_id {
                                 self.hovered_id = new_hovered_id;
-                                let width = ui.available_width();
-                                self.trigger_re_render(ctx, width);
+                                self.trigger_re_render(ctx, "hover-enter");
                             }
                         } else if self.hovered_id.is_some() {
                             self.hovered_id = None;
-                            let width = ui.available_width();
-                            self.trigger_re_render(ctx, width);
+                            self.trigger_re_render(ctx, "hover-leave");
                         }
                     });
 
                     if let Some(url) = url_to_load {
-                        let width = ui.available_width();
-                        self.load_url(url, width);
+                        self.load_url(url);
                     }
                 }
             });

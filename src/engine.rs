@@ -1540,4 +1540,106 @@ mod tests {
         let tag = "input type=text name=user";
         assert_eq!(extract_attr(tag, "type"), Some("text".to_string()));
     }
+
+    // ── Viewport width stability regression tests ────────────────────────────────
+
+    /// Verify that `process_html_with_cache` uses the exact width passed in and
+    /// returns a `PageResult` whose `width` field matches that value.
+    /// This ensures that navigate and re-render paths produce bit-identical layout
+    /// when given the same width.
+    #[test]
+    fn test_process_html_stable_width() {
+        use url::Url;
+        let html = "<html><body><p>hello</p></body></html>";
+        let base = Url::parse("https://example.com").unwrap();
+        let mut cache = HashMap::new();
+
+        let navigate_width = 800.0_f32;
+        let (page, _ss) = process_html_with_cache(
+            html,
+            &base,
+            &HashMap::new(),
+            &mut cache,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            navigate_width,
+        )
+        .expect("process_html_with_cache failed");
+
+        assert_eq!(
+            page.width, navigate_width as u32,
+            "page.width should equal the navigate width"
+        );
+
+        // Re-render with the same width: result must be identical.
+        let (re_rendered, _) = process_html_with_cache(
+            html,
+            &base,
+            &HashMap::new(),
+            &mut cache,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            navigate_width, // same width — no drift
+        )
+        .expect("re-render failed");
+
+        assert_eq!(
+            page.width, re_rendered.width,
+            "re-render width must match navigate width — no viewport drift"
+        );
+        assert_eq!(
+            page.height, re_rendered.height,
+            "re-render height must match — no layout churn from width drift"
+        );
+    }
+
+    /// Verify that a different width produces a different layout, confirming that
+    /// the test above is not trivially true.
+    #[test]
+    fn test_process_html_different_widths_differ() {
+        use url::Url;
+        // Use enough content that a width difference is likely to change final_y or width.
+        let html = "<html><body><p>some content</p></body></html>";
+        let base = Url::parse("https://example.com").unwrap();
+        let mut cache = HashMap::new();
+
+        let (page_800, _) = process_html_with_cache(
+            html,
+            &base,
+            &HashMap::new(),
+            &mut cache,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            800.0,
+        )
+        .expect("800 failed");
+
+        let (page_400, _) = process_html_with_cache(
+            html,
+            &base,
+            &HashMap::new(),
+            &mut cache,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            400.0,
+        )
+        .expect("400 failed");
+
+        assert_ne!(
+            page_800.width, page_400.width,
+            "different widths must produce different page.width values"
+        );
+    }
 }
