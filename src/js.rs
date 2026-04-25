@@ -2141,6 +2141,80 @@ mod tests {
     }
 
     #[test]
+    fn test_create_text_node_append_changes_inner_html() {
+        let mut rt = make_runtime("<html><body><div id='app'></div></body></html>");
+        // appendChild(createTextNode) should be reflected in textContent and innerHTML
+        let result = eval(&mut rt, r#"
+            (function() {
+                var app = document.getElementById('app');
+                var tn = document.createTextNode('hello world');
+                app.appendChild(tn);
+                return app.textContent + '|' + (app.innerHTML.indexOf('hello') >= 0 ? 'yes' : 'no');
+            })()
+        "#);
+        assert_eq!(result, "hello world|yes");
+    }
+
+    #[test]
+    fn test_history_push_state_updates_pathname_search_hash() {
+        let url = url::Url::parse("https://example.com/start").unwrap();
+        let dom = crate::dom::parse_html("<html><body></body></html>");
+        let mut rt = JsRuntime::new(Some(dom.document), Some(url), None, new_console_buffer());
+
+        let result = eval(&mut rt, r#"
+            (function() {
+                history.pushState({x: 42}, '', '/new-path?foo=bar#section');
+                return [
+                    location.pathname,
+                    location.search,
+                    location.hash,
+                    JSON.stringify(history.state)
+                ].join('|');
+            })()
+        "#);
+        assert_eq!(result, "/new-path|?foo=bar|#section|{\"x\":42}");
+    }
+
+    #[test]
+    fn test_history_replace_state_overwrites_url_and_state() {
+        let url = url::Url::parse("https://example.com/page").unwrap();
+        let dom = crate::dom::parse_html("<html><body></body></html>");
+        let mut rt = JsRuntime::new(Some(dom.document), Some(url), None, new_console_buffer());
+
+        let result = eval(&mut rt, r#"
+            (function() {
+                history.pushState({a: 1}, '', '/step1');
+                history.replaceState({b: 2}, '', '/step2');
+                return [
+                    history.length,
+                    location.pathname,
+                    JSON.stringify(history.state)
+                ].join('|');
+            })()
+        "#);
+        // length stays 2 (replace does not add to history), pathname and state updated
+        assert_eq!(result, "2|/step2|{\"b\":2}");
+    }
+
+    #[test]
+    fn test_new_url_relative_resolution() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        // Relative path '/x' against base with port
+        let result = eval(&mut rt,
+            "(function() { var u = new URL('/x', 'https://example.com:8443/base'); return u.href; })()");
+        assert_eq!(result, "https://example.com:8443/x");
+    }
+
+    #[test]
+    fn test_location_origin_preserves_port() {
+        let url = url::Url::parse("https://example.com:9000/path").unwrap();
+        let dom = crate::dom::parse_html("<html><body></body></html>");
+        let mut rt = JsRuntime::new(Some(dom.document), Some(url), None, new_console_buffer());
+        let origin = eval(&mut rt, "window.location.origin");
+        assert_eq!(origin, "https://example.com:9000");
+    }
+
+    #[test]
     fn test_performance_now() {
         let mut rt = make_runtime("<html><body></body></html>");
         let result = eval(&mut rt, "typeof window.performance.now()");
