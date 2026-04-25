@@ -959,6 +959,7 @@ impl<'a> LayoutBox<'a> {
             };
             return self.layout_text(
                 contents.borrow().to_string(),
+                container_start_x,
                 initial_x,
                 current_y,
                 available_width,
@@ -2217,14 +2218,12 @@ impl<'a> LayoutBox<'a> {
     fn layout_text(
         mut self,
         text: String,
+        container_start_x: f32,
         current_x: f32,
         current_y: f32,
         container_width: f32,
     ) -> (Option<LayoutBox<'a>>, f32, f32) {
         let trimmed = text.trim();
-        if trimmed.is_empty() {
-            return (None, current_x, current_y);
-        }
         let font_size = match self
             .style_node
             .specified_values
@@ -2236,11 +2235,34 @@ impl<'a> LayoutBox<'a> {
         let font = FontRef::try_from_slice(FONT_DATA).unwrap();
         let scale = PxScale::from(font_size);
         let units = font.units_per_em().unwrap_or(1000.0) as f32;
+        let line_height = font_size * 1.4;
+        let space_w = font.h_advance_unscaled(font.glyph_id(' ')) * (scale.x / units);
+
+        // CSS white-space: normal — whitespace-only text nodes between inline
+        // elements collapse to a single inter-element space.  We only insert
+        // that space when we are NOT at the start of a line (i.e. there is
+        // already inline content to our left).
+        let at_line_start = current_x <= container_start_x + 0.5;
+
+        if trimmed.is_empty() {
+            // Whitespace-only node: emit a single-space-wide invisible box so
+            // the next inline sibling is separated from the previous one.
+            if !at_line_start && text.contains(|c: char| c.is_whitespace()) {
+                let w = space_w.min(container_width.max(0.0));
+                self.dimensions.x = current_x + self.margin.left;
+                self.dimensions.y = current_y + self.margin.top;
+                self.dimensions.width = w;
+                self.dimensions.height = line_height;
+                let final_x = self.dimensions.x + w + self.margin.right;
+                let final_y = self.dimensions.y + line_height + self.margin.bottom;
+                return (Some(self), final_x, final_y);
+            }
+            return (None, current_x, current_y);
+        }
 
         let mut lines_count = 1;
         let mut line_w: f32 = 0.0;
         let mut max_w: f32 = 0.0;
-        let space_w = font.h_advance_unscaled(font.glyph_id(' ')) * (scale.x / units);
 
         for word in trimmed.split_whitespace() {
             let mut word_w = 0.0;
@@ -2283,7 +2305,6 @@ impl<'a> LayoutBox<'a> {
             max_w
         };
 
-        let line_height = font_size * 1.4;
         self.dimensions.height = lines_count as f32 * line_height;
 
         let final_x = self.dimensions.x + self.dimensions.width + self.margin.right;
@@ -4707,6 +4728,63 @@ mod tests {
             advanced.dimensions.x + advanced.dimensions.width < 800.0,
             "utility link should remain visible inside the viewport, got right edge {}",
             advanced.dimensions.x + advanced.dimensions.width
+        );
+    }
+
+    /// Adjacent inline links separated only by whitespace-only text nodes must
+    /// keep a visible gap.  This reproduces the Google footer bug where
+    /// whitespace-only text nodes between `<a>` tags were collapsed to nothing,
+    /// causing `© 2026 -개인정보처리방침약관` instead of proper spaced text.
+    #[test]
+    fn test_inline_whitespace_text_node_creates_space_between_links() {
+        let html = r##"<!DOCTYPE html>
+<html><body>
+<div style="width:800px">
+  <span id="copy">copyright</span>
+  <a id="link1" href="#">Privacy</a>
+  <a id="link2" href="#">Terms</a>
+</div>
+</body></html>"##;
+        let dom = dom::parse_html(html);
+        let ss = css::parse_css("");
+        let style_tree =
+            style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
+        let (layout_opt, _, _) =
+            build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout_opt.expect("layout tree");
+
+        let copy = find_element_by_id(&layout, "copy").expect("copyright span");
+        let link1 = find_element_by_id(&layout, "link1").expect("first link");
+        let link2 = find_element_by_id(&layout, "link2").expect("second link");
+
+        let copy_right_edge = copy.dimensions.x + copy.dimensions.width;
+        let link1_left_edge = link1.dimensions.x;
+        let link1_right_edge = link1.dimensions.x + link1.dimensions.width;
+        let link2_left_edge = link2.dimensions.x;
+
+        assert!(
+            link1_left_edge > copy_right_edge,
+            "link1 must not overlap with copyright span: copy_right={}, link1_left={}",
+            copy_right_edge,
+            link1_left_edge
+        );
+        assert!(
+            link2_left_edge > link1_right_edge,
+            "link2 must not overlap with link1: link1_right={}, link2_left={}",
+            link1_right_edge,
+            link2_left_edge
+        );
+        assert!(
+            (copy.dimensions.y - link1.dimensions.y).abs() < 2.0,
+            "copy and link1 should be on the same line: copy.y={}, link1.y={}",
+            copy.dimensions.y,
+            link1.dimensions.y
+        );
+        assert!(
+            (link1.dimensions.y - link2.dimensions.y).abs() < 2.0,
+            "link1 and link2 should be on the same line: link1.y={}, link2.y={}",
+            link1.dimensions.y,
+            link2.dimensions.y
         );
     }
 }
