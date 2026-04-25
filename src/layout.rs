@@ -498,6 +498,10 @@ pub struct LayoutBox<'a> {
     pub link_url: Option<String>,
     pub image_url: Option<String>,
     pub alt_text: Option<String>,
+    /// Label text for button/submit/reset input elements.
+    /// Sourced from the `value` attribute of `<input type="submit|button|reset">`.
+    /// Rendered centered inside the button rect by the paint pass.
+    pub input_label: Option<String>,
     pub event_handlers: HashMap<String, String>,
     pub display: DisplayType,
     pub z_index: i32,
@@ -546,6 +550,7 @@ impl<'a> Clone for LayoutBox<'a> {
                         link_url: src.link_url.clone(),
                         image_url: src.image_url.clone(),
                         alt_text: src.alt_text.clone(),
+                        input_label: src.input_label.clone(),
                         event_handlers: src.event_handlers.clone(),
                         display: src.display,
                         z_index: src.z_index,
@@ -731,6 +736,7 @@ impl<'a> LayoutBox<'a> {
             link_url: None,
             image_url: None,
             alt_text: None,
+            input_label: None,
             event_handlers: HashMap::new(),
             display,
             z_index,
@@ -744,6 +750,8 @@ impl<'a> LayoutBox<'a> {
         } = style_node.node.data
         {
             let tag = name.local.to_string();
+            let mut input_type = String::new();
+            let mut input_value: Option<String> = None;
             for attr in attrs.borrow().iter() {
                 let name = attr.name.local.to_string();
                 let value = attr.value.to_string();
@@ -754,8 +762,23 @@ impl<'a> LayoutBox<'a> {
                     "onclick" => {
                         layout.event_handlers.insert("click".to_string(), value);
                     }
+                    "type" if tag == "input" => input_type = value.to_ascii_lowercase(),
+                    "value" if tag == "input" => input_value = Some(value),
                     _ => {}
                 }
+            }
+            // Populate input_label for button-like input elements.
+            // <input type="submit"> defaults to "Submit" if no value attribute is present.
+            // <input type="button"> and <input type="reset"> use value or a blank label.
+            if tag == "input" && matches!(input_type.as_str(), "submit" | "button" | "reset") {
+                layout.input_label = Some(match input_value {
+                    Some(v) => v,
+                    None => match input_type.as_str() {
+                        "submit" => "Submit".to_string(),
+                        "reset"  => "Reset".to_string(),
+                        _        => String::new(),
+                    },
+                });
             }
         }
         layout
@@ -2260,9 +2283,21 @@ impl<'a> LayoutBox<'a> {
             return (None, current_x, current_y);
         }
 
+        // Detect leading / trailing whitespace in the original text node.
+        // CSS spec collapses each run of whitespace to a single space; we
+        // model that by prepending / appending one space_w when not at line start.
+        let has_leading_space =
+            !at_line_start && text.starts_with(|c: char| c.is_whitespace());
+        let has_trailing_space = text.ends_with(|c: char| c.is_whitespace());
+
         let mut lines_count = 1;
         let mut line_w: f32 = 0.0;
         let mut max_w: f32 = 0.0;
+
+        // Leading inter-element space (counts toward width but is invisible).
+        if has_leading_space {
+            line_w += space_w;
+        }
 
         for word in trimmed.split_whitespace() {
             let mut word_w = 0.0;
@@ -2295,6 +2330,13 @@ impl<'a> LayoutBox<'a> {
                 line_w += word_w;
             }
         }
+
+        // Trailing inter-element space: allows the following inline sibling to
+        // start with a visible gap even though it has no leading whitespace itself.
+        if has_trailing_space && line_w > 0.0 {
+            line_w += space_w;
+        }
+
         max_w = max_w.max(line_w);
 
         self.dimensions.x = current_x + self.margin.left;
@@ -4731,27 +4773,21 @@ mod tests {
         );
     }
 
-    /// Adjacent inline links separated only by whitespace-only text nodes must
-    /// keep a visible gap.  This reproduces the Google footer bug where
-    /// whitespace-only text nodes between `<a>` tags were collapsed to nothing,
-    /// causing `© 2026 -개인정보처리방침약관` instead of proper spaced text.
+    /// Adjacent inline text runs separated only by whitespace-only text nodes must
+    /// keep a visible gap between them.  This reproduces the Google footer bug where
+    /// `© 2026` ran directly into `개인정보처리방침약관` with no space between them.
     #[test]
     fn test_inline_whitespace_text_node_creates_space_between_links() {
         let html = r##"<!DOCTYPE html>
 <html><body>
 <div style="width:800px">
-  <span id="copy">copyright</span>
+  <span id="copy">&#169; 2026</span>
   <a id="link1" href="#">Privacy</a>
   <a id="link2" href="#">Terms</a>
 </div>
 </body></html>"##;
-        let dom = dom::parse_html(html);
-        let ss = css::parse_css("");
-        let style_tree =
-            style::build_style_tree(&dom.document, &ss, None, &HashMap::new(), None, None, None);
-        let (layout_opt, _, _) =
-            build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
-        let layout = layout_opt.expect("layout tree");
+
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
 
         let copy = find_element_by_id(&layout, "copy").expect("copyright span");
         let link1 = find_element_by_id(&layout, "link1").expect("first link");
@@ -4785,6 +4821,32 @@ mod tests {
             "link1 and link2 should be on the same line: link1.y={}, link2.y={}",
             link1.dimensions.y,
             link2.dimensions.y
+        );
+    }
+
+    /// A text node that starts with whitespace and is preceded by a non-empty
+    /// inline element must preserve a leading inter-element space.
+    #[test]
+    fn test_inline_text_node_with_leading_space_preserves_gap() {
+        let html = r##"<!DOCTYPE html>
+<html><body>
+<div style="width:800px">
+  <a id="link1" href="#">Privacy</a><span id="sep"> · Terms</span>
+</div>
+</body></html>"##;
+
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let link1 = find_element_by_id(&layout, "link1").expect("first link");
+        let sep = find_element_by_id(&layout, "sep").expect("separator span");
+
+        let link1_right = link1.dimensions.x + link1.dimensions.width;
+
+        assert!(
+            sep.dimensions.x > link1_right,
+            "separator should start after link1 with a space gap: link1_right={}, sep.x={}",
+            link1_right,
+            sep.dimensions.x
         );
     }
 }
