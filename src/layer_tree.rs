@@ -601,6 +601,45 @@ impl LayerTreeBuilder {
             });
         }
 
+        // Input button label
+        // <input type="submit|button|reset"> carries its visible label in the
+        // `input_label` field (populated in LayoutBox::new from the `value` attribute).
+        // The label is rendered centered inside the button rect.
+        if let Some(ref label) = layout.input_label {
+            if !label.is_empty() {
+                let font_size = match sv.get(&crate::css::intern("font-size")) {
+                    Some(Value::Length(v, _)) => *v,
+                    _ => 13.0, // browser default for buttons
+                };
+                let color = match sv.get(&crate::css::intern("color")) {
+                    Some(Value::Color(c)) => c.clone(),
+                    _ => Color { r: 0, g: 0, b: 0, a: 255 },
+                };
+                // Center the text vertically by offsetting the rect so the baseline
+                // lands near the mid-point.  The text renderer places the baseline at
+                // rect.y + font_size * 0.85, so shift rect.y so that baseline falls
+                // at d.y + d.height / 2.0.
+                // baseline = rect_y + font_size * 0.85  =>  rect_y = mid - font_size * 0.85
+                let mid_y = d.y + d.height / 2.0;
+                let text_rect = crate::layout::Rect {
+                    x: d.x + layout.padding.left,
+                    y: mid_y - font_size * 0.85,
+                    width: (d.width - layout.padding.left - layout.padding.right).max(0.0),
+                    height: font_size,
+                };
+                commands.push(PaintCommand::Text {
+                    rect: text_rect,
+                    text: label.clone(),
+                    font_size,
+                    color,
+                    clip: d, // clip to the button bounds
+                    bold: false,
+                    italic: false,
+                    text_decoration: 0,
+                });
+            }
+        }
+
         // Distribute commands to correct list
         if is_root_of_layer {
             layer.background_commands.extend(commands.clone());
@@ -945,5 +984,59 @@ mod tests {
             .filter(|c| matches!(c, PaintCommand::PushClip { .. }))
             .count();
         assert_eq!(push_count, 1, "only the overflow:hidden div should emit PushClip; got {}", push_count);
+    }
+
+    /// `<input type="submit" value="Google Search">` must produce a Text paint command
+    /// whose text matches the value attribute.
+    #[test]
+    fn test_input_submit_emits_label_text_command() {
+        let tree = build_tree_from_html(
+            r#"<form><input type="submit" value="Google Search" style="width:160px;height:30px;"></form>"#,
+            "",
+        );
+        let label_cmd = tree.layers.iter()
+            .flat_map(|l| l.content_commands.iter().chain(l.background_commands.iter()))
+            .find(|cmd| matches!(cmd, PaintCommand::Text { text, .. } if text == "Google Search"));
+        assert!(label_cmd.is_some(), "input[type=submit] must emit a Text paint command with 'Google Search'");
+    }
+
+    /// `<input type="button" value="Click me">` must produce a Text paint command.
+    #[test]
+    fn test_input_button_emits_label_text_command() {
+        let tree = build_tree_from_html(
+            r#"<input type="button" value="Click me" style="width:100px;height:30px;">"#,
+            "",
+        );
+        let label_cmd = tree.layers.iter()
+            .flat_map(|l| l.content_commands.iter().chain(l.background_commands.iter()))
+            .find(|cmd| matches!(cmd, PaintCommand::Text { text, .. } if text == "Click me"));
+        assert!(label_cmd.is_some(), "input[type=button] must emit a Text paint command with 'Click me'");
+    }
+
+    /// `<input type="submit">` without a value attribute must default to "Submit".
+    #[test]
+    fn test_input_submit_default_label() {
+        let tree = build_tree_from_html(
+            r#"<input type="submit" style="width:100px;height:30px;">"#,
+            "",
+        );
+        let label_cmd = tree.layers.iter()
+            .flat_map(|l| l.content_commands.iter().chain(l.background_commands.iter()))
+            .find(|cmd| matches!(cmd, PaintCommand::Text { text, .. } if text == "Submit"));
+        assert!(label_cmd.is_some(), "input[type=submit] without value must default to 'Submit' label");
+    }
+
+    /// `<input type="text">` must NOT emit an extra Text command (only the egui overlay handles it).
+    #[test]
+    fn test_input_text_does_not_emit_label_command() {
+        let tree = build_tree_from_html(
+            r#"<input type="text" value="user input" style="width:200px;height:30px;">"#,
+            "",
+        );
+        // The "user input" text must NOT appear as a Text paint command.
+        let found = tree.layers.iter()
+            .flat_map(|l| l.content_commands.iter().chain(l.background_commands.iter()))
+            .any(|cmd| matches!(cmd, PaintCommand::Text { text, .. } if text == "user input"));
+        assert!(!found, "input[type=text] must not emit a Text paint command for value");
     }
 }
