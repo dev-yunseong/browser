@@ -1063,6 +1063,32 @@ mod tests {
         let _c = get_color(p, "color"); // May be None or red — just must not panic
     }
 
+    #[test]
+    fn test_var_font_size_from_parent_div() {
+        // `div { --size: 20px } span { font-size: var(--size) }` — the custom property
+        // defined on div must be inherited by span via normal CSS inheritance.
+        let tree = make_tree(
+            r#"<html><body><div><span>text</span></div></body></html>"#,
+            "div { --size: 20px; } span { font-size: var(--size); }",
+        );
+        let span = find_node(&tree, "span").expect("span not found");
+        let fs = get_length_px(span, "font-size").expect("font-size not found");
+        assert!((fs - 20.0).abs() < 0.1, "expected 20px, got {}", fs);
+    }
+
+    #[test]
+    fn test_var_inherited_from_ancestor() {
+        // Custom properties inherit through the element tree.
+        // Grandparent defines --brand, grandchild uses it via var().
+        let tree = make_tree(
+            r#"<html><body><div><p><span>text</span></p></div></body></html>"#,
+            "div { --brand: #1a73e8; } span { color: var(--brand); }",
+        );
+        let span = find_node(&tree, "span").expect("span not found");
+        let c = get_color(span, "color").expect("color not found");
+        assert_eq!(c, Color { r: 0x1a, g: 0x73, b: 0xe8, a: 255 });
+    }
+
     // --- cascade ordering: !important ---
 
     #[test]
