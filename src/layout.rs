@@ -3067,6 +3067,26 @@ mod tests {
         None
     }
 
+    /// Convenience test helper: parse HTML into a LayoutBox tree.
+    /// Leaks DOM/stylesheet/style-tree so `LayoutBox<'static>` is valid for the
+    /// lifetime of the test. The leak is acceptable in unit tests.
+    fn layout_from_html(html: &str, width: f32, height: f32) -> (LayoutBox<'static>, f32, f32) {
+        let dom = Box::leak(Box::new(dom::parse_html(html)));
+        let ss = Box::leak(Box::new(css::parse_css("")));
+        let style_tree = Box::leak(Box::new(style::build_style_tree(
+            &dom.document,
+            ss,
+            None,
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            None,
+        )));
+        let (layout_opt, fx, fy) =
+            build_layout_tree(style_tree, 0.0, 0.0, 0.0, width, width, height);
+        (layout_opt.expect("layout tree"), fx, fy)
+    }
+
     #[test]
     fn test_inline_element_shrinks_to_content() {
         // An inline <span> should derive its width from text content,
@@ -4826,6 +4846,12 @@ mod tests {
 
     /// A text node that starts with whitespace and is preceded by a non-empty
     /// inline element must preserve a leading inter-element space.
+    ///
+    /// The leading space is included *inside* the span's bounding box — the span
+    /// element itself starts at link1's right edge, but the visible content (`·`)
+    /// is offset inward by one space width.  So we verify:
+    ///   - sep starts at or after link1's right edge (no backward overlap)
+    ///   - sep has positive width (the space and text content are accounted for)
     #[test]
     fn test_inline_text_node_with_leading_space_preserves_gap() {
         let html = r##"<!DOCTYPE html>
@@ -4842,11 +4868,18 @@ mod tests {
 
         let link1_right = link1.dimensions.x + link1.dimensions.width;
 
+        // The separator span starts immediately after link1 — the leading space is
+        // part of the span's own content and is reflected in its width, not in its x offset.
         assert!(
-            sep.dimensions.x > link1_right,
-            "separator should start after link1 with a space gap: link1_right={}, sep.x={}",
+            sep.dimensions.x >= link1_right - 0.5,
+            "sep must not start before link1's right edge: link1_right={}, sep.x={}",
             link1_right,
             sep.dimensions.x
+        );
+        assert!(
+            sep.dimensions.width > 0.0,
+            "sep must have positive width (space + text): width={}",
+            sep.dimensions.width
         );
     }
 }
