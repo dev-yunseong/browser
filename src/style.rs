@@ -624,7 +624,17 @@ fn build_final_tree(
 
                 // --- Step 2: Inherit inheritable properties (unless explicitly set) ---
                 if let Some(ref p) = parent_pm {
-                    let inheritable = ["color", "font-size", "font-family", "font-weight", "font-style", "line-height", "text-align", "list-style-type"];
+                    let inheritable = [
+                        "color",
+                        "font-size",
+                        "font-family",
+                        "font-weight",
+                        "font-style",
+                        "line-height",
+                        "text-align",
+                        "list-style-type",
+                        "white-space",
+                    ];
                     for prop in inheritable {
                         let prop_arc = intern(prop);
                         if let Some(v) = p.get(&prop_arc) {
