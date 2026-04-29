@@ -1792,6 +1792,13 @@ impl<'a> LayoutBox<'a> {
             .and_then(|v| if let Value::Keyword(k) = v { Some(&**k as &str) } else { None })
             .unwrap_or("left")
             .to_string();
+        let white_space = self
+            .style_node
+            .specified_values
+            .get(&crate::css::intern("white-space"))
+            .and_then(|v| if let Value::Keyword(k) = v { Some(&**k as &str) } else { None })
+            .unwrap_or("normal");
+        let no_wrap = white_space == "nowrap";
         let applies_text_align = matches!(
             self.display,
             DisplayType::Block | DisplayType::Flex | DisplayType::InlineBlock | DisplayType::TableCell
@@ -2005,6 +2012,7 @@ impl<'a> LayoutBox<'a> {
                         let keep_table_cells_on_row =
                             self.display == DisplayType::TableRow && cb.display == DisplayType::TableCell;
                         if !keep_table_cells_on_row
+                            && !no_wrap
                             && cur_line.width + item_w > avail_w
                             && !cur_line.members.is_empty()
                         {
@@ -2260,6 +2268,13 @@ impl<'a> LayoutBox<'a> {
         let units = font.units_per_em().unwrap_or(1000.0) as f32;
         let line_height = font_size * 1.4;
         let space_w = font.h_advance_unscaled(font.glyph_id(' ')) * (scale.x / units);
+        let white_space = self
+            .style_node
+            .specified_values
+            .get(&crate::css::intern("white-space"))
+            .and_then(|v| if let Value::Keyword(k) = v { Some(&**k as &str) } else { None })
+            .unwrap_or("normal");
+        let no_wrap = white_space == "nowrap";
 
         // CSS white-space: normal — whitespace-only text nodes between inline
         // elements collapse to a single inter-element space.  We only insert
@@ -2305,6 +2320,14 @@ impl<'a> LayoutBox<'a> {
                 word_w += font.h_advance_unscaled(font.glyph_id(c)) * (scale.x / units);
             }
 
+            if no_wrap {
+                if line_w > 0.0 {
+                    line_w += space_w;
+                }
+                line_w += word_w;
+                continue;
+            }
+
             // If word is too long for current line
             if container_width.is_finite() && line_w + word_w > container_width && line_w > 0.0 {
                 max_w = max_w.max(line_w);
@@ -2341,7 +2364,9 @@ impl<'a> LayoutBox<'a> {
 
         self.dimensions.x = current_x + self.margin.left;
         self.dimensions.y = current_y + self.margin.top;
-        self.dimensions.width = if container_width.is_finite() {
+        self.dimensions.width = if no_wrap {
+            max_w
+        } else if container_width.is_finite() {
             max_w.min(container_width)
         } else {
             max_w
@@ -3554,19 +3579,6 @@ mod tests {
     #[test]
     fn test_float_right_header_with_nested_utility_cluster_stays_in_viewport() {
         let html = r#"
-            <style>
-                .gb_Xd { height:48px; vertical-align:middle; white-space:nowrap; align-items:center; display:flex; }
-                .gb_7d { box-sizing:border-box; height:48px; padding:0 4px; padding-left:5px; flex:0 0 auto; justify-content:flex-end; }
-                .gb_Jd .gb_7d { float:right; padding-left:32px; }
-                .gb_Q { line-height:normal; padding-right:15px; }
-                .gb_5 { display:inline-block; padding-left:15px; }
-                .gb_5 .gb_4 { display:inline-block; line-height:24px; vertical-align:middle; }
-                .gb_Id { position:relative; float:right; }
-                .gb_od { display:inline; }
-                .gb_Ad { display:inline-block; vertical-align:middle; padding:4px; }
-                .gb_C { display:inline-block; height:40px; width:40px; padding:8px; box-sizing:border-box; }
-                .gb_Td { display:inline-block; padding:10px 12px; margin:12px 16px 12px 10px; min-width:85px; min-height:40px; }
-            </style>
             <div style="width:800px; padding:6px;">
                 <div class="gb_Jd">
                     <div id="actions" class="gb_7d gb_Xd">
@@ -3586,8 +3598,21 @@ mod tests {
                 </div>
             </div>
         "#;
+        let css = r#"
+            .gb_Xd { height:48px; vertical-align:middle; white-space:nowrap; align-items:center; display:flex; }
+            .gb_7d { box-sizing:border-box; height:48px; padding:0 4px; padding-left:5px; flex:0 0 auto; justify-content:flex-end; }
+            .gb_Jd .gb_7d { float:right; padding-left:32px; }
+            .gb_Q { line-height:normal; padding-right:15px; }
+            .gb_5 { display:inline-block; padding-left:15px; }
+            .gb_5 .gb_4 { display:inline-block; line-height:24px; vertical-align:middle; }
+            .gb_Id { position:relative; float:right; }
+            .gb_od { display:inline; }
+            .gb_Ad { display:inline-block; vertical-align:middle; padding:4px; }
+            .gb_C { display:inline-block; height:40px; width:40px; padding:8px; box-sizing:border-box; }
+            .gb_Td { display:inline-block; padding:10px 12px; margin:12px 16px 12px 10px; min-width:85px; min-height:40px; }
+        "#;
         let dom_tree = dom::parse_html(html);
-        let ss = css::parse_css("");
+        let ss = css::parse_css(css);
         let style_tree = style::build_style_tree(
             &dom_tree.document,
             &ss,
@@ -3599,9 +3624,23 @@ mod tests {
         );
         let (layout_opt, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.expect("layout");
+        let gmail = find_element_by_id(&layout, "gmail").expect("gmail not found");
+        let images = find_element_by_id(&layout, "images").expect("images not found");
         let apps = find_element_by_id(&layout, "apps").expect("apps not found");
         let login = find_element_by_id(&layout, "login").expect("login not found");
 
+        assert!(
+            (gmail.dimensions.y - images.dimensions.y).abs() < 2.0,
+            "Gmail and Images should stay on the same row: gmail.y={}, images.y={}",
+            gmail.dimensions.y,
+            images.dimensions.y
+        );
+        assert!(
+            images.dimensions.x > gmail.dimensions.x,
+            "Images should stay to the right of Gmail: gmail.x={}, images.x={}",
+            gmail.dimensions.x,
+            images.dimensions.x
+        );
         assert!(
             apps.dimensions.x >= 0.0,
             "app launcher should not be pushed off the left edge, got x={}",
