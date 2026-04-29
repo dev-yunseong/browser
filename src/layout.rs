@@ -1183,8 +1183,27 @@ impl<'a> LayoutBox<'a> {
                         | Some(Value::FitContent(_))
                 );
                 let child_display = get_display_type(child_node);
+                let flex_basis = child_node
+                    .specified_values
+                    .get(&crate::css::intern("flex-basis"))
+                    .and_then(|v| {
+                        if !is_row {
+                            return None;
+                        }
+                        match v {
+                            Value::Length(px, Unit::Px) => Some((*px).max(0.0)),
+                            Value::Length(pct, Unit::Percent) => {
+                                Some((inner_width * (*pct / 100.0)).max(0.0))
+                            }
+                            Value::Number(n) => Some((*n).max(0.0)),
+                            Value::Keyword(k) if &**k == "auto" => None,
+                            _ => None,
+                        }
+                    });
                 let measure_width =
-                    if is_row && is_block_level(child_display) && !child_has_explicit_width {
+                    if let Some(basis) = flex_basis {
+                        basis.min(inner_width).max(0.0)
+                    } else if is_row && is_block_level(child_display) && !child_has_explicit_width {
                         // Shrink-wrap: use max-content so block items don't fill the flex container.
                         intrinsic_cache
                             .max_content_width(child_node, vw, vh)
@@ -1205,6 +1224,9 @@ impl<'a> LayoutBox<'a> {
                     intrinsic_cache,
                 );
                 if let Some(mut cb) = cb_opt {
+                    if let Some(basis) = flex_basis {
+                        cb.dimensions.width = basis.min(inner_width).max(0.0);
+                    }
                     if cb.dimensions.width > inner_width {
                         cb.dimensions.width = inner_width;
                     }
@@ -4919,6 +4941,215 @@ mod tests {
             sep.dimensions.width > 0.0,
             "sep must have positive width (space + text): width={}",
             sep.dimensions.width
+        );
+    }
+
+    // ── Flexbox row layout tests (issue #142) ─────────────────────────────────
+
+    /// `display:flex` children must lay out in a row (left-to-right) instead of
+    /// stacking vertically like block children.
+    #[test]
+    fn test_flex_row_children_are_placed_horizontally() {
+        let html = r#"<div style="display:flex;flex-direction:row;width:300px;height:50px;">
+            <div id="a" style="width:80px;height:50px;">A</div>
+            <div id="b" style="width:80px;height:50px;">B</div>
+            <div id="c" style="width:80px;height:50px;">C</div>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let a = find_element_by_id(&layout, "a").expect("child A");
+        let b = find_element_by_id(&layout, "b").expect("child B");
+        let c = find_element_by_id(&layout, "c").expect("child C");
+
+        // All children should be on the same row (same y coordinate).
+        assert!(
+            (a.dimensions.y - b.dimensions.y).abs() < 2.0,
+            "A and B should be on the same row: a.y={}, b.y={}",
+            a.dimensions.y, b.dimensions.y
+        );
+        assert!(
+            (b.dimensions.y - c.dimensions.y).abs() < 2.0,
+            "B and C should be on the same row: b.y={}, c.y={}",
+            b.dimensions.y, c.dimensions.y
+        );
+        // Children should be ordered left-to-right.
+        assert!(
+            a.dimensions.x < b.dimensions.x,
+            "A should be to the left of B: a.x={}, b.x={}",
+            a.dimensions.x, b.dimensions.x
+        );
+        assert!(
+            b.dimensions.x < c.dimensions.x,
+            "B should be to the left of C: b.x={}, c.x={}",
+            b.dimensions.x, c.dimensions.x
+        );
+    }
+
+    /// `justify-content: center` must center flex children horizontally within
+    /// the flex container.
+    #[test]
+    fn test_flex_justify_content_center() {
+        let html = r#"<div style="display:flex;justify-content:center;width:400px;height:50px;">
+            <div id="a" style="width:80px;height:50px;">A</div>
+            <div id="b" style="width:80px;height:50px;">B</div>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let a = find_element_by_id(&layout, "a").expect("child A");
+        let b = find_element_by_id(&layout, "b").expect("child B");
+
+        // Total child width = 80 + 80 = 160px; container = 400px; free = 240px.
+        // With justify-content:center, the left offset should be ~120px.
+        assert!(
+            a.dimensions.x > 80.0,
+            "justify-content:center should offset children from the left: a.x={}",
+            a.dimensions.x
+        );
+        // Right edge of last child should not reach the container's right edge.
+        let b_right = b.dimensions.x + b.dimensions.width;
+        assert!(
+            b_right < 380.0,
+            "justify-content:center should leave space on the right: b_right={}",
+            b_right
+        );
+        // The gap on the left and right should be roughly equal (±10px tolerance).
+        let flex_div = find_element_by_tag(&layout, "div").expect("flex container");
+        let left_gap = a.dimensions.x - flex_div.dimensions.x;
+        let right_gap = (flex_div.dimensions.x + flex_div.dimensions.width) - b_right;
+        assert!(
+            (left_gap - right_gap).abs() < 10.0,
+            "left and right gaps should be roughly equal: left={}, right={}",
+            left_gap, right_gap
+        );
+    }
+
+    /// `align-items: center` must center flex children vertically within the
+    /// cross axis of the flex container.
+    #[test]
+    fn test_flex_align_items_center() {
+        let html = r#"<div style="display:flex;align-items:center;width:300px;height:100px;">
+            <div id="a" style="width:80px;height:30px;">A</div>
+            <div id="b" style="width:80px;height:60px;">B</div>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let flex_div = find_element_by_tag(&layout, "div").expect("flex container");
+        let a = find_element_by_id(&layout, "a").expect("child A");
+        let b = find_element_by_id(&layout, "b").expect("child B");
+
+        let container_top = flex_div.dimensions.y;
+        let container_height = flex_div.dimensions.height;
+
+        // Child A (30px tall) should be vertically centered in the line height (60px max).
+        // Expected center offset: (60 - 30) / 2 = 15px from the container top.
+        let a_center = a.dimensions.y + a.dimensions.height / 2.0;
+        let container_center = container_top + container_height / 2.0;
+        assert!(
+            (a_center - container_center).abs() < 10.0,
+            "align-items:center should center child A vertically: a_center={}, container_center={}",
+            a_center, container_center
+        );
+
+        // Child B (60px tall) should also be centered (which means it starts near container top).
+        let b_center = b.dimensions.y + b.dimensions.height / 2.0;
+        assert!(
+            (b_center - container_center).abs() < 10.0,
+            "align-items:center should center child B vertically: b_center={}, container_center={}",
+            b_center, container_center
+        );
+    }
+
+    /// `flex: 1` shorthand sets flex-grow:1 so that children with `flex:1` each
+    /// receive an equal share of the remaining space in the flex container.
+    #[test]
+    fn test_flex_one_distributes_space_equally() {
+        let html = r#"<div style="display:flex;width:300px;height:50px;">
+            <div id="a" style="flex:1;">A</div>
+            <div id="b" style="flex:1;">B</div>
+            <div id="c" style="flex:1;">C</div>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let a = find_element_by_id(&layout, "a").expect("child A");
+        let b = find_element_by_id(&layout, "b").expect("child B");
+        let c = find_element_by_id(&layout, "c").expect("child C");
+
+        // Each child should get ~100px (300px / 3).
+        assert!(
+            (a.dimensions.width - 100.0).abs() < 5.0,
+            "flex:1 child A should get ~100px, got {}",
+            a.dimensions.width
+        );
+        assert!(
+            (b.dimensions.width - 100.0).abs() < 5.0,
+            "flex:1 child B should get ~100px, got {}",
+            b.dimensions.width
+        );
+        assert!(
+            (c.dimensions.width - 100.0).abs() < 5.0,
+            "flex:1 child C should get ~100px, got {}",
+            c.dimensions.width
+        );
+        // All three children should be on the same row.
+        assert!(
+            (a.dimensions.y - b.dimensions.y).abs() < 2.0,
+            "all flex:1 children should be on the same row"
+        );
+    }
+
+    #[test]
+    fn test_flex_basis_sets_initial_main_size() {
+        let html = r#"<div style="display:flex;width:300px;height:50px;">
+            <div id="a" style="flex:0 0 120px;">A</div>
+            <div id="b" style="flex:0 0 80px;">B</div>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let a = find_element_by_id(&layout, "a").expect("child A");
+        let b = find_element_by_id(&layout, "b").expect("child B");
+
+        assert!(
+            (a.dimensions.width - 120.0).abs() < 2.0,
+            "flex-basis should drive child A width, got {}",
+            a.dimensions.width
+        );
+        assert!(
+            (b.dimensions.width - 80.0).abs() < 2.0,
+            "flex-basis should drive child B width, got {}",
+            b.dimensions.width
+        );
+        assert!(
+            b.dimensions.x >= a.dimensions.x + a.dimensions.width - 1.0,
+            "child B should be placed after child A in the row: a_right={}, b.x={}",
+            a.dimensions.x + a.dimensions.width,
+            b.dimensions.x
+        );
+    }
+
+    /// Google header cluster: a `.gb_Xd` flex container (display:flex, align-items:center)
+    /// must lay out its children (Gmail link and image link) side by side on a single row.
+    #[test]
+    fn test_flex_google_header_cluster_gmail_and_images_on_same_row() {
+        let html = r#"<div style="display:flex;align-items:center;height:48px;">
+            <a id="gmail" href="https://mail.google.com">Gmail</a>
+            <a id="images" href="/imghp">Images</a>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let gmail = find_element_by_id(&layout, "gmail").expect("Gmail link");
+        let images = find_element_by_id(&layout, "images").expect("Images link");
+
+        // Both links must be on the same horizontal row (same y ± 2px).
+        assert!(
+            (gmail.dimensions.y - images.dimensions.y).abs() < 2.0,
+            "Gmail and Images must be on the same row: gmail.y={}, images.y={}",
+            gmail.dimensions.y, images.dimensions.y
+        );
+        // Images link must be to the right of Gmail.
+        assert!(
+            images.dimensions.x > gmail.dimensions.x,
+            "Images must be to the right of Gmail: gmail.x={}, images.x={}",
+            gmail.dimensions.x, images.dimensions.x
         );
     }
 }
