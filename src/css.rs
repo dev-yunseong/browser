@@ -358,16 +358,19 @@ pub fn parse_css(source: &str) -> Stylesheet {
                                 "none"    => {
                                     declarations.push(Declaration { name: intern("flex-grow"),   value: Value::Number(0.0), important });
                                     declarations.push(Declaration { name: intern("flex-shrink"), value: Value::Number(0.0), important });
+                                    declarations.push(Declaration { name: intern("flex-basis"),  value: Value::Keyword(intern("auto")), important });
                                 }
                                 "auto"    => {
                                     declarations.push(Declaration { name: intern("flex-grow"),   value: Value::Number(1.0), important });
                                     declarations.push(Declaration { name: intern("flex-shrink"), value: Value::Number(1.0), important });
+                                    declarations.push(Declaration { name: intern("flex-basis"),  value: Value::Keyword(intern("auto")), important });
                                 }
                                 _ => {
-                                    // single unitless number → flex-grow
+                                    // Single unitless number expands to `flex: <n> 1 0%`.
                                     if let Ok(n) = parts[0].parse::<f32>() {
                                         declarations.push(Declaration { name: intern("flex-grow"),   value: Value::Number(n),   important });
                                         declarations.push(Declaration { name: intern("flex-shrink"), value: Value::Number(1.0), important });
+                                        declarations.push(Declaration { name: intern("flex-basis"),  value: Value::Length(0.0, Unit::Percent), important });
                                     }
                                 }
                             }
@@ -376,6 +379,10 @@ pub fn parse_css(source: &str) -> Stylesheet {
                             if let (Ok(g), Ok(s)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>()) {
                                 declarations.push(Declaration { name: intern("flex-grow"),   value: Value::Number(g), important });
                                 declarations.push(Declaration { name: intern("flex-shrink"), value: Value::Number(s), important });
+                            } else if let Ok(g) = parts[0].parse::<f32>() {
+                                declarations.push(Declaration { name: intern("flex-grow"),   value: Value::Number(g), important });
+                                declarations.push(Declaration { name: intern("flex-shrink"), value: Value::Number(1.0), important });
+                                declarations.push(Declaration { name: intern("flex-basis"),  value: parse_value(parts[1]), important });
                             }
                         }
                         _ => {

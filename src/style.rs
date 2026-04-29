@@ -1124,6 +1124,29 @@ mod tests {
         let c = get_color(p, "color").expect("color not found");
         assert_eq!(c, Color { r: 0, g: 128, b: 0, a: 255 });
     }
+
+    #[test]
+    fn test_inline_flex_shorthand_expands_to_longhands() {
+        let mut decls = Vec::new();
+        parse_inline_style_into_vec("flex: 1;", &mut decls);
+
+        let grow = decls
+            .iter()
+            .find(|d| d.name.as_ref() == "flex-grow")
+            .map(|d| d.value.clone());
+        let shrink = decls
+            .iter()
+            .find(|d| d.name.as_ref() == "flex-shrink")
+            .map(|d| d.value.clone());
+        let basis = decls
+            .iter()
+            .find(|d| d.name.as_ref() == "flex-basis")
+            .map(|d| d.value.clone());
+
+        assert_eq!(grow, Some(Value::Number(1.0)));
+        assert_eq!(shrink, Some(Value::Number(1.0)));
+        assert_eq!(basis, Some(Value::Length(0.0, crate::css::Unit::Percent)));
+    }
 }
 
 pub fn parse_inline_style_into_vec(style_str: &str, list: &mut Vec<crate::css::Declaration>) {
@@ -1175,6 +1198,69 @@ pub fn parse_inline_style_into_vec(style_str: &str, list: &mut Vec<crate::css::D
                 list.push(crate::css::Declaration { name: intern("right"),  value: parse_value(right),  important });
                 list.push(crate::css::Declaration { name: intern("bottom"), value: parse_value(bottom), important });
                 list.push(crate::css::Declaration { name: intern("left"),   value: parse_value(left),   important });
+            }
+            "flex" => {
+                let parts: Vec<&str> = val.split_whitespace().collect();
+                match parts.len() {
+                    0 => {}
+                    1 => match parts[0] {
+                        "none" => {
+                            list.push(crate::css::Declaration { name: intern("flex-grow"), value: crate::css::Value::Number(0.0), important });
+                            list.push(crate::css::Declaration { name: intern("flex-shrink"), value: crate::css::Value::Number(0.0), important });
+                            list.push(crate::css::Declaration { name: intern("flex-basis"), value: crate::css::Value::Keyword(intern("auto")), important });
+                        }
+                        "auto" => {
+                            list.push(crate::css::Declaration { name: intern("flex-grow"), value: crate::css::Value::Number(1.0), important });
+                            list.push(crate::css::Declaration { name: intern("flex-shrink"), value: crate::css::Value::Number(1.0), important });
+                            list.push(crate::css::Declaration { name: intern("flex-basis"), value: crate::css::Value::Keyword(intern("auto")), important });
+                        }
+                        _ => {
+                            if let Ok(n) = parts[0].parse::<f32>() {
+                                list.push(crate::css::Declaration { name: intern("flex-grow"), value: crate::css::Value::Number(n), important });
+                                list.push(crate::css::Declaration { name: intern("flex-shrink"), value: crate::css::Value::Number(1.0), important });
+                                list.push(crate::css::Declaration { name: intern("flex-basis"), value: crate::css::Value::Length(0.0, crate::css::Unit::Percent), important });
+                            }
+                        }
+                    },
+                    2 => {
+                        if let (Ok(g), Ok(s)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>()) {
+                            list.push(crate::css::Declaration { name: intern("flex-grow"), value: crate::css::Value::Number(g), important });
+                            list.push(crate::css::Declaration { name: intern("flex-shrink"), value: crate::css::Value::Number(s), important });
+                        } else if let Ok(g) = parts[0].parse::<f32>() {
+                            list.push(crate::css::Declaration { name: intern("flex-grow"), value: crate::css::Value::Number(g), important });
+                            list.push(crate::css::Declaration { name: intern("flex-shrink"), value: crate::css::Value::Number(1.0), important });
+                            list.push(crate::css::Declaration {
+                                name: intern("flex-basis"),
+                                value: crate::css::parse_value(parts[1]),
+                                important,
+                            });
+                        }
+                    }
+                    _ => {
+                        if let (Ok(g), Ok(s)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>()) {
+                            list.push(crate::css::Declaration { name: intern("flex-grow"), value: crate::css::Value::Number(g), important });
+                            list.push(crate::css::Declaration { name: intern("flex-shrink"), value: crate::css::Value::Number(s), important });
+                            list.push(crate::css::Declaration {
+                                name: intern("flex-basis"),
+                                value: crate::css::parse_value(parts[2]),
+                                important,
+                            });
+                        }
+                    }
+                }
+            }
+            "gap" => {
+                let parts: Vec<&str> = val.split_whitespace().collect();
+                let row_val = parts
+                    .first()
+                    .map(|s| crate::css::parse_value(s))
+                    .unwrap_or(crate::css::Value::Number(0.0));
+                let col_val = parts
+                    .get(1)
+                    .map(|s| crate::css::parse_value(s))
+                    .unwrap_or_else(|| row_val.clone());
+                list.push(crate::css::Declaration { name: intern("row-gap"), value: row_val, important });
+                list.push(crate::css::Declaration { name: intern("column-gap"), value: col_val, important });
             }
             _ => {
                 // CSS custom properties (--foo) in inline styles keep their raw string value.
