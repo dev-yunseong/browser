@@ -118,11 +118,32 @@ impl Hash for Value {
     }
 }
 
+/// A length value for CSS transform translate functions: either px or percent.
+///
+/// Percentages are relative to the element's own width (for translateX) or
+/// height (for translateY) at paint time, so they must be stored unevaluated
+/// and resolved when the element dimensions are known.
+#[derive(Debug, Clone, Copy, PartialEq, Hash, Eq)]
+pub enum TranslateLength {
+    Px(OrderedFloat),
+    Percent(OrderedFloat),
+}
+
+impl TranslateLength {
+    /// Resolve the length against `element_size` (width for X, height for Y).
+    pub fn resolve(&self, element_size: f32) -> f32 {
+        match self {
+            TranslateLength::Px(v) => v.0,
+            TranslateLength::Percent(v) => v.0 / 100.0 * element_size,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Hash, Eq)]
 pub enum TransformOp {
-    Translate(OrderedFloat, OrderedFloat), // px
-    Scale(OrderedFloat, OrderedFloat),     // factor
-    Rotate(OrderedFloat),                  // radians
+    Translate(TranslateLength, TranslateLength),
+    Scale(OrderedFloat, OrderedFloat),
+    Rotate(OrderedFloat),
     Matrix(OrderedFloat, OrderedFloat, OrderedFloat, OrderedFloat, OrderedFloat, OrderedFloat),
 }
 
@@ -281,6 +302,17 @@ pub fn parse_css(source: &str) -> Stylesheet {
                     for (k, v) in temp_map {
                         declarations.push(Declaration { name: intern(&k), value: v, important });
                     }
+                }
+                // border-radius shorthand: "border-radius: <tl> [<tr> [<br> [<bl>]]]"
+                // CSS allows up to 4 corner values.  We use the top-left (first) value as a
+                // uniform radius for all corners — sufficient for the rounded-input / button
+                // use-case (Google search bar, etc.).  The "/" elliptical syntax is not supported.
+                "border-radius" => {
+                    let first = val_raw.split_whitespace().next().unwrap_or("0");
+                    // Strip the "/" elliptical part if present (e.g. "8px / 4px")
+                    let first = first.split('/').next().unwrap_or("0").trim();
+                    let value = parse_value(first);
+                    declarations.push(Declaration { name: key, value, important });
                 }
                 "padding" => {
                     let mut temp_map = HashMap::new();
@@ -1361,6 +1393,60 @@ mod tests {
             other => panic!("expected linear gradient, got {:?}", other),
         }
     }
+
+    #[test]
+    fn test_translate_y_percent_parses_correctly() {
+        let v = parse_value("translateY(-50%)");
+        match v {
+            Value::Transform(ops) => {
+                assert_eq!(ops.len(), 1);
+                match &ops[0] {
+                    TransformOp::Translate(x, y) => {
+                        assert_eq!(*x, TranslateLength::Px(OrderedFloat(0.0)));
+                        assert_eq!(*y, TranslateLength::Percent(OrderedFloat(-50.0)));
+                    }
+                    other => panic!("expected Translate, got {:?}", other),
+                }
+            }
+            other => panic!("expected Transform, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_translate_xy_px_parses_correctly() {
+        let v = parse_value("translate(10px, 20px)");
+        match v {
+            Value::Transform(ops) => {
+                assert_eq!(ops.len(), 1);
+                match &ops[0] {
+                    TransformOp::Translate(x, y) => {
+                        assert_eq!(*x, TranslateLength::Px(OrderedFloat(10.0)));
+                        assert_eq!(*y, TranslateLength::Px(OrderedFloat(20.0)));
+                    }
+                    other => panic!("expected Translate, got {:?}", other),
+                }
+            }
+            other => panic!("expected Transform, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_translate_x_percent_parses_correctly() {
+        let v = parse_value("translateX(50%)");
+        match v {
+            Value::Transform(ops) => {
+                assert_eq!(ops.len(), 1);
+                match &ops[0] {
+                    TransformOp::Translate(x, y) => {
+                        assert_eq!(*x, TranslateLength::Percent(OrderedFloat(50.0)));
+                        assert_eq!(*y, TranslateLength::Px(OrderedFloat(0.0)));
+                    }
+                    other => panic!("expected Translate, got {:?}", other),
+                }
+            }
+            other => panic!("expected Transform, got {:?}", other),
+        }
+    }
 }
 
 fn parse_transform_list(val: &str) -> Vec<TransformOp> {
@@ -1369,17 +1455,25 @@ fn parse_transform_list(val: &str) -> Vec<TransformOp> {
     for part in parts {
         let part = part.trim();
         if part.is_empty() { continue; }
-        
+
         if let Some(open) = part.find('(') {
             let name = &part[..open].to_lowercase();
             let args_str = &part[open + 1..part.len() - 1];
             let args: Vec<&str> = args_str.split(',').map(|s| s.trim()).collect();
-            
+
             match name.as_str() {
                 "translate" => {
-                    let x = parse_px_or_zero(args.get(0).copied().unwrap_or("0"));
-                    let y = parse_px_or_zero(args.get(1).copied().unwrap_or("0"));
-                    ops.push(TransformOp::Translate(OrderedFloat(x), OrderedFloat(y)));
+                    let x = parse_translate_length(args.get(0).copied().unwrap_or("0"));
+                    let y = parse_translate_length(args.get(1).copied().unwrap_or("0"));
+                    ops.push(TransformOp::Translate(x, y));
+                }
+                "translatex" => {
+                    let x = parse_translate_length(args.get(0).copied().unwrap_or("0"));
+                    ops.push(TransformOp::Translate(x, TranslateLength::Px(OrderedFloat(0.0))));
+                }
+                "translatey" => {
+                    let y = parse_translate_length(args.get(0).copied().unwrap_or("0"));
+                    ops.push(TransformOp::Translate(TranslateLength::Px(OrderedFloat(0.0)), y));
                 }
                 "scale" => {
                     let x = args.get(0).and_then(|s| s.parse::<f32>().ok()).unwrap_or(1.0);
@@ -1417,6 +1511,17 @@ fn parse_transform_list(val: &str) -> Vec<TransformOp> {
     ops
 }
 
-fn parse_px_or_zero(s: &str) -> f32 {
-    s.trim_end_matches("px").parse::<f32>().unwrap_or(0.0)
+fn parse_translate_length(s: &str) -> TranslateLength {
+    let s = s.trim();
+    if s.ends_with('%') {
+        let v = s.trim_end_matches('%').parse::<f32>().unwrap_or(0.0);
+        TranslateLength::Percent(OrderedFloat(v))
+    } else {
+        let v = s.trim_end_matches("px")
+                  .trim_end_matches("rem")
+                  .trim_end_matches("em")
+                  .parse::<f32>()
+                  .unwrap_or(0.0);
+        TranslateLength::Px(OrderedFloat(v))
+    }
 }
