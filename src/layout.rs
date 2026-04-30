@@ -4492,7 +4492,7 @@ mod tests {
             .nav-link { display: block; padding: 8px; }
             .w-100 { width: 100%; }
             .ms-auto { margin-left: auto; }
-            @media (min-width: 992px) {
+            @media (min-width: 600px) {
                 .navbar-expand-lg .navbar-nav { flex-direction: row; }
                 .navbar-expand-lg .navbar-collapse { display: flex; flex-basis: auto; }
             }
