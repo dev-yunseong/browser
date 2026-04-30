@@ -494,6 +494,10 @@ fn media_query_matches(query: &str) -> bool {
         if let Ok(max) = val_str.parse::<f32>() {
             return VIEWPORT_WIDTH_PX <= max;
         }
+    } else if let Some(rest) = q.strip_prefix("prefers-color-scheme:") {
+        // Headless renderer defaults to dark preference.
+        let scheme = rest.trim();
+        return scheme == "dark";
     }
     false
 }
@@ -1438,6 +1442,32 @@ mod tests {
         let ss = parse_css("@media screen and (min-width: 600px) { p { color: green; } }");
         let rules = ss.all_rules();
         assert!(!rules.is_empty(), "@media screen and (min-width: 600px) should apply at 800px");
+    }
+
+    #[test]
+    fn test_media_prefers_color_scheme_dark_activates() {
+        // @media (prefers-color-scheme: dark) must activate (headless renderer is dark).
+        let ss = parse_css("@media (prefers-color-scheme: dark) { body { background: black; } }");
+        let rules = ss.all_rules();
+        assert!(
+            !rules.is_empty(),
+            "@media (prefers-color-scheme: dark) should be included"
+        );
+        assert!(rules.iter().any(|r| r.declarations.iter().any(|d| {
+            d.name.as_ref() == "background"
+        })));
+    }
+
+    #[test]
+    fn test_media_prefers_color_scheme_light_does_not_activate() {
+        // @media (prefers-color-scheme: light) must NOT activate.
+        let ss = parse_css("@media (prefers-color-scheme: light) { body { background: white; } }");
+        let rules = ss.all_rules();
+        assert!(
+            rules.is_empty(),
+            "@media (prefers-color-scheme: light) should be excluded, got {} rules",
+            rules.len()
+        );
     }
 
     #[test]
