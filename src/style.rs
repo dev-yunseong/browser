@@ -1262,6 +1262,16 @@ pub fn parse_inline_style_into_vec(style_str: &str, list: &mut Vec<crate::css::D
                 list.push(crate::css::Declaration { name: intern("row-gap"), value: row_val, important });
                 list.push(crate::css::Declaration { name: intern("column-gap"), value: col_val, important });
             }
+            // border-radius shorthand: "border-radius: <tl> [<tr> [<br> [<bl>]]]"
+            // Use the first (top-left) value as a uniform radius.  The "/" elliptical syntax
+            // is not supported; we take the text before any "/" as the horizontal radii list
+            // and use the first token from that.
+            "border-radius" => {
+                let first = val.split_whitespace().next().unwrap_or("0");
+                let first = first.split('/').next().unwrap_or("0").trim();
+                let value = crate::css::parse_value(first);
+                list.push(crate::css::Declaration { name: key, value, important });
+            }
             _ => {
                 // CSS custom properties (--foo) in inline styles keep their raw string value.
                 let value = if key.starts_with("--") {

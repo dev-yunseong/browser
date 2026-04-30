@@ -433,7 +433,9 @@ impl LayerTreeBuilder {
         }
 
         if let Some(Value::Transform(ops)) = sv.get(&crate::css::intern("transform")) {
-            matrix = Self::compute_transform_matrix(ops);
+            let w = layout.dimensions.width;
+            let h = layout.dimensions.height;
+            matrix = Self::compute_transform_matrix(ops, w, h);
             triggers.push(CompositingTrigger::Transform(matrix));
         }
 
@@ -452,11 +454,13 @@ impl LayerTreeBuilder {
         (triggers, matrix)
     }
 
-    fn compute_transform_matrix(ops: &[TransformOp]) -> Matrix4x4 {
+    fn compute_transform_matrix(ops: &[TransformOp], elem_width: f32, elem_height: f32) -> Matrix4x4 {
         let mut result = Matrix4x4::identity();
         for op in ops {
             let m = match op {
-                TransformOp::Translate(x, y) => Matrix4x4::translate(x.0, y.0, 0.0),
+                TransformOp::Translate(x, y) => {
+                    Matrix4x4::translate(x.resolve(elem_width), y.resolve(elem_height), 0.0)
+                }
                 TransformOp::Scale(x, y) => Matrix4x4::from_2d(Matrix3x3::scale(x.0, y.0)),
                 TransformOp::Rotate(rad) => Matrix4x4::from_2d(Matrix3x3::rotate(rad.0)),
                 TransformOp::Matrix(a, b, c, d, e, f) => Matrix4x4::from_2d(Matrix3x3([a.0, c.0, e.0, b.0, d.0, f.0, 0.0, 0.0, 1.0])),
@@ -804,6 +808,69 @@ mod tests {
     }
 
     #[test]
+    fn test_transform_translate_y_percent_resolves_against_element_height() {
+        // translateY(-50%) on a 100px-tall element should produce ty = -50px in the matrix.
+        let tree = build_tree_from_html(
+            r#"<div style="width:200px; height:100px; transform:translateY(-50%);">Content</div>"#,
+            "",
+        );
+        assert!(tree.layers.len() >= 2, "element with transform should create a new layer");
+        let t_layer = tree.layers.iter().find(|l| l.id != 0).expect("child layer");
+        // Matrix row-major: translation is at indices [3] (tx) and [7] (ty).
+        // translateY(-50%) on height=100 should resolve to ty = -50.
+        let ty = t_layer.transform.0[7];
+        assert!((ty - (-50.0)).abs() < 1.0,
+            "translateY(-50%) on height:100px should produce ty=-50, got {}", ty);
+    }
+
+    #[test]
+    fn test_transform_translate_x_percent_resolves_against_element_width() {
+        // translateX(50%) on a 200px-wide element should produce tx = 100px in the matrix.
+        let tree = build_tree_from_html(
+            r#"<div style="width:200px; height:100px; transform:translateX(50%);">Content</div>"#,
+            "",
+        );
+        assert!(tree.layers.len() >= 2, "element with transform should create a new layer");
+        let t_layer = tree.layers.iter().find(|l| l.id != 0).expect("child layer");
+        let tx = t_layer.transform.0[3];
+        assert!((tx - 100.0).abs() < 1.0,
+            "translateX(50%) on width:200px should produce tx=100, got {}", tx);
+    }
+
+    #[test]
+    fn test_transform_translate_px_both_axes() {
+        // translate(10px, 20px) should produce tx=10, ty=20 in the matrix.
+        let tree = build_tree_from_html(
+            r#"<div style="width:100px; height:50px; transform:translate(10px, 20px);">Content</div>"#,
+            "",
+        );
+        assert!(tree.layers.len() >= 2, "element with transform should create a new layer");
+        let t_layer = tree.layers.iter().find(|l| l.id != 0).expect("child layer");
+        let tx = t_layer.transform.0[3];
+        let ty = t_layer.transform.0[7];
+        assert!((tx - 10.0).abs() < 0.5,
+            "translate(10px, 20px) should produce tx=10, got {}", tx);
+        assert!((ty - 20.0).abs() < 0.5,
+            "translate(10px, 20px) should produce ty=20, got {}", ty);
+    }
+
+    #[test]
+    fn test_transform_scale_creates_matrix() {
+        // scale(1.5) should produce a scale matrix with sx=sy=1.5.
+        let tree = build_tree_from_html(
+            r#"<div style="width:100px; height:50px; transform:scale(1.5);">Content</div>"#,
+            "",
+        );
+        assert!(tree.layers.len() >= 2, "element with transform should create a new layer");
+        let t_layer = tree.layers.iter().find(|l| l.id != 0).expect("child layer");
+        // For a scale matrix, indices [0] and [5] hold sx and sy respectively.
+        let sx = t_layer.transform.0[0];
+        let sy = t_layer.transform.0[5];
+        assert!((sx - 1.5).abs() < 0.01, "scale(1.5) should produce sx=1.5, got {}", sx);
+        assert!((sy - 1.5).abs() < 0.01, "scale(1.5) should produce sy=1.5, got {}", sy);
+    }
+
+    #[test]
     fn test_image_paint_command_carries_object_fit_and_alt() {
         let tree = build_tree_from_html(
             r#"<img src="x.png" alt="test" style="width:100px;height:100px;object-fit:cover;">"#,
@@ -1038,5 +1105,83 @@ mod tests {
             .flat_map(|l| l.content_commands.iter().chain(l.background_commands.iter()))
             .any(|cmd| matches!(cmd, PaintCommand::Text { text, .. } if text == "user input"));
         assert!(!found, "input[type=text] must not emit a Text paint command for value");
+    }
+
+    /// `<input style="border-radius: 24px">` must emit a Rect command with radius > 0.
+    #[test]
+    fn test_input_border_radius_emits_rounded_rect() {
+        let tree = build_tree_from_html(
+            r#"<input type="text" style="border-radius: 24px; width: 200px; height: 40px;">"#,
+            "",
+        );
+        let has_rounded = tree.layers.iter()
+            .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
+            .any(|cmd| matches!(cmd, PaintCommand::Rect(_, _, r) if *r > 0.0));
+        assert!(has_rounded, "input with border-radius:24px must emit Rect with radius > 0");
+    }
+
+    /// `<input style="border-radius: 0">` must NOT emit a rounded Rect.
+    #[test]
+    fn test_input_no_border_radius_emits_flat_rect() {
+        let tree = build_tree_from_html(
+            r#"<input type="text" style="border-radius: 0px; width: 200px; height: 40px;">"#,
+            "",
+        );
+        let has_rounded = tree.layers.iter()
+            .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
+            .any(|cmd| matches!(cmd, PaintCommand::Rect(_, _, r) if *r > 0.0));
+        assert!(!has_rounded, "input with border-radius:0 must not emit Rect with radius > 0");
+    }
+
+    /// `<button style="border-radius: 8px">` must emit a Rect command with radius > 0.
+    #[test]
+    fn test_button_border_radius_emits_rounded_rect() {
+        let tree = build_tree_from_html(
+            r#"<button style="border-radius: 8px; width: 100px; height: 36px;">Click</button>"#,
+            "",
+        );
+        let has_rounded = tree.layers.iter()
+            .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
+            .any(|cmd| matches!(cmd, PaintCommand::Rect(_, _, r) if *r > 0.0));
+        assert!(has_rounded, "button with border-radius:8px must emit Rect with radius > 0");
+    }
+
+    /// `border-radius` applied via an external stylesheet (not inline) must also round the input.
+    #[test]
+    fn test_input_border_radius_from_stylesheet() {
+        let tree = build_tree_from_html(
+            r#"<input type="text" style="width: 200px; height: 40px;">"#,
+            "input { border-radius: 24px; }",
+        );
+        let has_rounded = tree.layers.iter()
+            .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
+            .any(|cmd| matches!(cmd, PaintCommand::Rect(_, _, r) if *r > 0.0));
+        assert!(has_rounded, "input with stylesheet border-radius:24px must emit Rect with radius > 0");
+    }
+
+    /// `border-radius` applied via attribute selector `input[name=q]` must round the input.
+    #[test]
+    fn test_input_border_radius_from_attr_selector() {
+        let tree = build_tree_from_html(
+            r#"<input type="text" name="q" style="width: 200px; height: 40px;">"#,
+            r#"input[name="q"] { border-radius: 24px; }"#,
+        );
+        let has_rounded = tree.layers.iter()
+            .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
+            .any(|cmd| matches!(cmd, PaintCommand::Rect(_, _, r) if *r > 0.0));
+        assert!(has_rounded, "input matched by attr selector with border-radius:24px must emit Rect with radius > 0");
+    }
+
+    /// `border-radius: 24px 24px 24px 24px` (four values) must still produce a rounded rect.
+    #[test]
+    fn test_input_border_radius_multi_value() {
+        let tree = build_tree_from_html(
+            r#"<input type="text" style="border-radius: 24px 24px 24px 24px; width: 200px; height: 40px;">"#,
+            "",
+        );
+        let has_rounded = tree.layers.iter()
+            .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
+            .any(|cmd| matches!(cmd, PaintCommand::Rect(_, _, r) if *r > 0.0));
+        assert!(has_rounded, "input with border-radius:24px 24px 24px 24px must emit Rect with radius > 0");
     }
 }
