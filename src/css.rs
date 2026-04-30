@@ -471,11 +471,10 @@ pub fn parse_css(source: &str) -> Stylesheet {
 
 /// Viewport width used for `@media` query evaluation.
 ///
-/// The browser currently renders into a relatively narrow fixed canvas, but most
-/// real pages we inspect in the desktop app are authored around desktop breakpoints.
-/// Using a desktop viewport here keeps Bootstrap-style navigation bars in their
-/// expanded horizontal layout instead of forcing the collapsed mobile rules.
-const VIEWPORT_WIDTH_PX: f32 = 1200.0;
+/// The render canvas is fixed at 800 px (see `src/main.rs`). All `@media`
+/// conditions are evaluated against this value so that responsive stylesheets
+/// activate the rules that were authored for an ~800 px viewport.
+const VIEWPORT_WIDTH_PX: f32 = 800.0;
 
 /// Parse a single media condition string like "(min-width: 992px)" or
 /// "(max-width: 768px)".  Returns `true` if the VIEWPORT_WIDTH_PX satisfies
@@ -1392,6 +1391,53 @@ mod tests {
             }
             other => panic!("expected linear gradient, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_media_query_max_width_applies_at_800px() {
+        // @media (max-width: 900px) must apply at the 800px viewport.
+        let ss = parse_css("@media (max-width: 900px) { p { color: red; } }");
+        let rules = ss.all_rules();
+        assert!(!rules.is_empty(), "@media (max-width: 900px) should be included at 800px viewport");
+        assert!(rules.iter().any(|r| r.declarations.iter().any(|d| {
+            d.name.as_ref() == "color"
+        })));
+    }
+
+    #[test]
+    fn test_media_query_min_width_does_not_apply_at_800px() {
+        // @media (min-width: 900px) must NOT apply at the 800px viewport.
+        let ss = parse_css("@media (min-width: 900px) { p { color: red; } }");
+        let rules = ss.all_rules();
+        assert!(
+            rules.is_empty(),
+            "@media (min-width: 900px) should be excluded at 800px viewport, got {} rules",
+            rules.len()
+        );
+    }
+
+    #[test]
+    fn test_media_screen_always_matches() {
+        // @media screen without a condition must always match.
+        let ss = parse_css("@media screen { p { color: blue; } }");
+        let rules = ss.all_rules();
+        assert!(!rules.is_empty(), "@media screen should always match");
+    }
+
+    #[test]
+    fn test_media_print_never_matches() {
+        // @media print must never match for screen rendering.
+        let ss = parse_css("@media print { p { color: blue; } }");
+        let rules = ss.all_rules();
+        assert!(rules.is_empty(), "@media print should never match for screen rendering");
+    }
+
+    #[test]
+    fn test_media_screen_and_min_width_applies_at_800px() {
+        // @media screen and (min-width: 600px) must apply when viewport >= 600px.
+        let ss = parse_css("@media screen and (min-width: 600px) { p { color: green; } }");
+        let rules = ss.all_rules();
+        assert!(!rules.is_empty(), "@media screen and (min-width: 600px) should apply at 800px");
     }
 
     #[test]

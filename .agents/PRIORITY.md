@@ -119,7 +119,21 @@ Stabilizes same-page rendering so hover/focus/image-triggered updates do not rel
 
 ---
 
-## Priority 9 - DevTools
+## Priority 9 - CSS Engine Completeness
+
+| # | Issue | Why this order |
+|---|---|---|
+| #143 | ~~[CSS] CSS custom properties (CSS variables) support~~ ✓ | Already implemented; PR added tests. |
+| #142 | ~~[Layout] Basic flexbox row layout~~ ✓ | Gmail/이미지 now inline. Full flex support with align/justify/gap/order. |
+| #145 | ~~[CSS] border-radius on form controls~~ ✓ | Fixed CSS parser — shorthand was parsed as keyword. |
+| #144 | ~~[CSS] CSS transform property support~~ ✓ | Already in #153; PR closed issue + fixed flaky render test. |
+| #150 | ~~[CSS] @media query parsing and evaluation~~ ✓ | Responsive CSS activation. yunseong.dev dark navbar/hero needs this. |
+| #151 | [Render] box-shadow support | Card depth/elevation. yunseong.dev content card flat without it. |
+| #152 | [Layout] list-style-type and list indentation | Bullet markers missing on yunseong.dev project lists. |
+
+---
+
+## Priority 10 - DevTools
 
 | # | Issue | Why this order |
 |---|---|---|
