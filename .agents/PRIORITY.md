@@ -128,6 +128,7 @@ Stabilizes same-page rendering so hover/focus/image-triggered updates do not rel
 | #145 | ~~[CSS] border-radius on form controls~~ ✓ | Fixed CSS parser — shorthand was parsed as keyword. |
 | #144 | ~~[CSS] CSS transform property support~~ ✓ | Already in #153; PR closed issue + fixed flaky render test. |
 | #150 | ~~[CSS] @media query parsing and evaluation~~ ✓ | Responsive CSS activation. yunseong.dev dark navbar/hero needs this. |
+| #156 | ~~[CSS] @media (prefers-color-scheme: dark) support~~ ✓ | Headless renderer defaults to dark; dark-scheme rules now activate. |
 | #151 | [Render] box-shadow support | Card depth/elevation. yunseong.dev content card flat without it. |
 | #152 | [Layout] list-style-type and list indentation | Bullet markers missing on yunseong.dev project lists. |
 
