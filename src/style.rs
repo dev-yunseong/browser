@@ -1272,6 +1272,16 @@ pub fn parse_inline_style_into_vec(style_str: &str, list: &mut Vec<crate::css::D
                 let value = crate::css::parse_value(first);
                 list.push(crate::css::Declaration { name: key, value, important });
             }
+            "box-shadow" => {
+                if let Some(shadow) = crate::css::parse_box_shadow(val) {
+                    list.push(crate::css::Declaration {
+                        name: key,
+                        value: crate::css::Value::BoxShadow(shadow),
+                        important,
+                    });
+                }
+                // box-shadow: none → no declaration (no shadow rendered)
+            }
             _ => {
                 // CSS custom properties (--foo) in inline styles keep their raw string value.
                 let value = if key.starts_with("--") {
