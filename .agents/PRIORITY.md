@@ -129,6 +129,7 @@ Stabilizes same-page rendering so hover/focus/image-triggered updates do not rel
 | #144 | ~~[CSS] CSS transform property support~~ ✓ | Already in #153; PR closed issue + fixed flaky render test. |
 | #150 | ~~[CSS] @media query parsing and evaluation~~ ✓ | Responsive CSS activation. yunseong.dev dark navbar/hero needs this. |
 | #156 | ~~[CSS] @media (prefers-color-scheme: dark) support~~ ✓ | Headless renderer defaults to dark; dark-scheme rules now activate. |
+| #157 | ~~[Layout] CSS Grid layout support~~ ✓ | display:grid with fr/repeat/gap. PR #164. |
 | #151 | [Render] box-shadow support | Card depth/elevation. yunseong.dev content card flat without it. |
 | #152 | [Layout] list-style-type and list indentation | Bullet markers missing on yunseong.dev project lists. |
 | #158 | ~~[CSS] ::before and ::after pseudo-element support~~ ✓ | Clearfix and decorative content. Closed by PR #162. |
