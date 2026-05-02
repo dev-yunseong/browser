@@ -1259,6 +1259,77 @@ mod tests {
         assert_eq!(s.blur, OrderedFloat(8.0));
     }
 
+    /// `box-shadow: none` must parse to `None` (no shadow rendered).
+    #[test]
+    fn test_parse_box_shadow_none_returns_none() {
+        let s = parse_box_shadow("none");
+        assert!(s.is_none(), "box-shadow: none must return None");
+    }
+
+    /// `box-shadow: 2px 2px 4px #888` must parse with correct offset and hex color.
+    #[test]
+    fn test_parse_box_shadow_hex_color_with_offset() {
+        let s = parse_box_shadow("2px 2px 4px #888");
+        assert!(s.is_some(), "box-shadow with hex color must parse successfully");
+        let s = s.unwrap();
+        assert_eq!(s.offset_x, OrderedFloat(2.0));
+        assert_eq!(s.offset_y, OrderedFloat(2.0));
+        assert_eq!(s.blur, OrderedFloat(4.0));
+        assert!(!s.inset, "shadow without inset keyword must not be inset");
+    }
+
+    /// `box-shadow: inset 0 1px 3px rgba(0,0,0,0.2)` must parse with inset=true.
+    #[test]
+    fn test_parse_box_shadow_inset() {
+        let s = parse_box_shadow("inset 0 1px 3px rgba(0,0,0,0.2)");
+        assert!(s.is_some(), "inset box-shadow must parse successfully");
+        let s = s.unwrap();
+        assert!(s.inset, "shadow with inset keyword must have inset=true");
+        assert_eq!(s.offset_x, OrderedFloat(0.0));
+        assert_eq!(s.offset_y, OrderedFloat(1.0));
+        assert_eq!(s.blur, OrderedFloat(3.0));
+    }
+
+    /// `box-shadow: 0 2px 8px rgba(0,0,0,0.15)` with spread must parse spread correctly.
+    #[test]
+    fn test_parse_box_shadow_with_spread() {
+        let s = parse_box_shadow("0 2px 4px 2px #000");
+        assert!(s.is_some(), "box-shadow with spread must parse");
+        let s = s.unwrap();
+        assert_eq!(s.offset_x, OrderedFloat(0.0));
+        assert_eq!(s.offset_y, OrderedFloat(2.0));
+        assert_eq!(s.blur, OrderedFloat(4.0));
+        assert_eq!(s.spread, OrderedFloat(2.0));
+    }
+
+    /// The `box-shadow` CSS property in a stylesheet must produce a `Value::BoxShadow`.
+    #[test]
+    fn test_css_box_shadow_property_parses_to_value() {
+        let ss = parse_css("div { box-shadow: 0 2px 8px rgba(0,0,0,0.15); }");
+        let rule = match &ss.items[0] {
+            RuleOrAtRule::Rule(r) => r,
+            _ => panic!("expected rule"),
+        };
+        let has_shadow = rule.declarations.iter().any(|d| {
+            d.name.as_ref() == "box-shadow" && matches!(d.value, Value::BoxShadow(_))
+        });
+        assert!(has_shadow, "box-shadow property must produce Value::BoxShadow");
+    }
+
+    /// `box-shadow: none` in a stylesheet must produce NO `Value::BoxShadow` declaration.
+    #[test]
+    fn test_css_box_shadow_none_produces_no_declaration() {
+        let ss = parse_css("div { box-shadow: none; }");
+        let rule = match &ss.items[0] {
+            RuleOrAtRule::Rule(r) => r,
+            _ => panic!("expected rule"),
+        };
+        let has_shadow = rule.declarations.iter().any(|d| {
+            d.name.as_ref() == "box-shadow"
+        });
+        assert!(!has_shadow, "box-shadow: none must not produce a box-shadow declaration");
+    }
+
     #[test]
     fn test_parse_percent() {
         let v = parse_value("50%");

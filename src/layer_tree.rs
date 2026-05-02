@@ -1184,4 +1184,54 @@ mod tests {
             .any(|cmd| matches!(cmd, PaintCommand::Rect(_, _, r) if *r > 0.0));
         assert!(has_rounded, "input with border-radius:24px 24px 24px 24px must emit Rect with radius > 0");
     }
+
+    /// An element with `box-shadow` must emit a `PaintCommand::Shadow` before the background rect.
+    #[test]
+    fn test_box_shadow_emits_shadow_command() {
+        let tree = build_tree_from_html(
+            r#"<div style="width:100px;height:50px;background-color:white;box-shadow:0 2px 8px rgba(0,0,0,0.15);">Content</div>"#,
+            "",
+        );
+        let has_shadow = tree.layers.iter()
+            .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
+            .any(|cmd| matches!(cmd, PaintCommand::Shadow(..)));
+        assert!(has_shadow, "element with box-shadow must emit a PaintCommand::Shadow");
+    }
+
+    /// An element with `box-shadow: none` must NOT emit a `PaintCommand::Shadow`.
+    #[test]
+    fn test_box_shadow_none_does_not_emit_shadow_command() {
+        let tree = build_tree_from_html(
+            r#"<div style="width:100px;height:50px;background-color:white;box-shadow:none;">Content</div>"#,
+            "",
+        );
+        let has_shadow = tree.layers.iter()
+            .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
+            .any(|cmd| matches!(cmd, PaintCommand::Shadow(..)));
+        assert!(!has_shadow, "element with box-shadow:none must not emit PaintCommand::Shadow");
+    }
+
+    /// Shadow command must appear BEFORE the background rect command (painter's algorithm).
+    #[test]
+    fn test_box_shadow_command_appears_before_background() {
+        let tree = build_tree_from_html(
+            r#"<div style="width:100px;height:50px;background-color:red;box-shadow:2px 2px 4px #888;">Content</div>"#,
+            "",
+        );
+        // Collect all commands from one layer into a flat ordered list.
+        let cmds: Vec<&PaintCommand> = tree.layers.iter()
+            .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
+            .collect();
+
+        let shadow_idx = cmds.iter().position(|c| matches!(c, PaintCommand::Shadow(..)));
+        let rect_idx   = cmds.iter().position(|c| matches!(c, PaintCommand::Rect(..)));
+
+        assert!(shadow_idx.is_some(), "must have a Shadow command");
+        assert!(rect_idx.is_some(),   "must have a Rect (background) command");
+        assert!(
+            shadow_idx.unwrap() < rect_idx.unwrap(),
+            "Shadow command (idx {}) must come before background Rect (idx {})",
+            shadow_idx.unwrap(), rect_idx.unwrap()
+        );
+    }
 }
