@@ -851,8 +851,13 @@ fn apply_default_styles(tag: &str, map: &mut HashMap<Arc<str>, Value>) {
             map.entry(intern("display")).or_insert(Value::Keyword(intern("block")));
             map.entry(intern("text-align")).or_insert(Value::Keyword(intern("center")));
         }
-        "ul" | "ol" => {
-            map.entry(intern("padding-left")).or_insert(Value::Length(24.0, crate::css::Unit::Px));
+        "ul" => {
+            map.entry(intern("padding-left")).or_insert(Value::Length(40.0, crate::css::Unit::Px));
+            map.entry(intern("list-style-type")).or_insert(Value::Keyword(intern("disc")));
+        }
+        "ol" => {
+            map.entry(intern("padding-left")).or_insert(Value::Length(40.0, crate::css::Unit::Px));
+            map.entry(intern("list-style-type")).or_insert(Value::Keyword(intern("decimal")));
         }
         "p" => {
             map.entry(intern("margin-top")).or_insert(Value::Length(8.0, crate::css::Unit::Px));
