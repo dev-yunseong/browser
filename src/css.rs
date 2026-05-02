@@ -199,6 +199,8 @@ pub enum Unit {
     Vh,
     Em,
     Percent,
+    /// CSS Grid fractional unit (flexible tracks).
+    Fr,
 }
 
 #[derive(Debug, Clone)]
@@ -463,6 +465,16 @@ pub fn parse_css(source: &str) -> Stylesheet {
                     declarations.push(Declaration { name: intern("right"),  value: parse_value(right),  important });
                     declarations.push(Declaration { name: intern("bottom"), value: parse_value(bottom), important });
                     declarations.push(Declaration { name: intern("left"),   value: parse_value(left),   important });
+                }
+                // CSS Grid track lists: store the raw value string as a Keyword so that
+                // layout can later call parse_track_list() on it to expand repeat() etc.
+                // parse_value() would incorrectly interpret "1fr 1fr" as a single Fr value.
+                "grid-template-columns" | "grid-template-rows" => {
+                    declarations.push(Declaration {
+                        name: key,
+                        value: Value::Keyword(intern(&val_raw)),
+                        important,
+                    });
                 }
                 _ => {
                     // CSS custom properties (--foo) store their raw value so that
@@ -1142,6 +1154,8 @@ pub fn parse_value(val: &str) -> Value {
         Value::Length(num.parse().unwrap_or(1.0), Unit::Em)
     } else if val.ends_with('%') {
         Value::Length(val.trim_end_matches('%').parse().unwrap_or(0.0), Unit::Percent)
+    } else if val.ends_with("fr") {
+        Value::Length(val.trim_end_matches("fr").parse().unwrap_or(1.0), Unit::Fr)
     } else if let Some(color) = parse_color(val) {
         Value::Color(color)
     } else if let Ok(num) = val.parse::<f32>() {
@@ -1635,6 +1649,68 @@ mod tests {
             other => panic!("expected Transform, got {:?}", other),
         }
     }
+
+    /// `1fr` must parse as `Value::Length(1.0, Unit::Fr)`.
+    #[test]
+    fn test_parse_fr_unit() {
+        let v = parse_value("1fr");
+        assert_eq!(v, Value::Length(1.0, Unit::Fr));
+        let v2 = parse_value("2.5fr");
+        assert_eq!(v2, Value::Length(2.5, Unit::Fr));
+    }
+
+    /// `grid-template-columns: 1fr 1fr` should be stored as a raw Keyword.
+    #[test]
+    fn test_grid_template_columns_stored_as_keyword() {
+        let ss = parse_css("div { grid-template-columns: 1fr 1fr; }");
+        let rule = match &ss.items[0] {
+            RuleOrAtRule::Rule(r) => r,
+            _ => panic!("expected rule"),
+        };
+        let decl = rule.declarations.iter()
+            .find(|d| d.name.as_ref() == "grid-template-columns")
+            .expect("grid-template-columns declaration");
+        assert!(matches!(&decl.value, Value::Keyword(k) if k.as_ref() == "1fr 1fr"),
+            "expected Keyword(\"1fr 1fr\"), got {:?}", decl.value);
+    }
+
+    /// `parse_track_list("1fr 1fr")` → two Fr tracks.
+    #[test]
+    fn test_parse_track_list_two_fr() {
+        let tracks = parse_track_list("1fr 1fr");
+        assert_eq!(tracks.len(), 2);
+        assert!(matches!(&tracks[0], Value::Length(v, Unit::Fr) if (*v - 1.0).abs() < 1e-5));
+        assert!(matches!(&tracks[1], Value::Length(v, Unit::Fr) if (*v - 1.0).abs() < 1e-5));
+    }
+
+    /// `parse_track_list("200px 1fr")` → fixed + fractional.
+    #[test]
+    fn test_parse_track_list_mixed_px_fr() {
+        let tracks = parse_track_list("200px 1fr");
+        assert_eq!(tracks.len(), 2);
+        assert!(matches!(&tracks[0], Value::Length(v, Unit::Px) if (*v - 200.0).abs() < 1e-5));
+        assert!(matches!(&tracks[1], Value::Length(v, Unit::Fr) if (*v - 1.0).abs() < 1e-5));
+    }
+
+    /// `parse_track_list("repeat(3, 1fr)")` → three equal fr tracks.
+    #[test]
+    fn test_parse_track_list_repeat_three_fr() {
+        let tracks = parse_track_list("repeat(3, 1fr)");
+        assert_eq!(tracks.len(), 3,
+            "repeat(3, 1fr) should produce 3 tracks, got {}", tracks.len());
+        for t in &tracks {
+            assert!(matches!(t, Value::Length(v, Unit::Fr) if (*v - 1.0).abs() < 1e-5),
+                "each track should be 1fr, got {:?}", t);
+        }
+    }
+
+    /// `parse_track_list("auto")` → single auto track.
+    #[test]
+    fn test_parse_track_list_auto() {
+        let tracks = parse_track_list("auto");
+        assert_eq!(tracks.len(), 1);
+        assert!(matches!(&tracks[0], Value::Keyword(k) if k.as_ref() == "auto"));
+    }
 }
 
 fn parse_transform_list(val: &str) -> Vec<TransformOp> {
@@ -1711,5 +1787,101 @@ fn parse_translate_length(s: &str) -> TranslateLength {
                   .parse::<f32>()
                   .unwrap_or(0.0);
         TranslateLength::Px(OrderedFloat(v))
+    }
+}
+
+/// Parse a CSS grid track list string (e.g. `"1fr 1fr"`, `"200px 1fr"`,
+/// `"repeat(3, 1fr)"`, `"auto"`) into a `Vec<Value>`.
+///
+/// Each entry is one of:
+/// - `Value::Length(n, Unit::Px)`      — fixed pixel track
+/// - `Value::Length(n, Unit::Percent)` — percentage track
+/// - `Value::Length(n, Unit::Fr)`      — fractional unit
+/// - `Value::Keyword("auto")`          — auto-sized track
+pub fn parse_track_list(val: &str) -> Vec<Value> {
+    let val = val.trim();
+    let mut tracks: Vec<Value> = Vec::new();
+
+    // Expand repeat(...) before splitting on spaces.
+    let expanded = expand_repeat_tracks(val);
+
+    for token in expanded.split_whitespace() {
+        let token = token.trim();
+        if token.is_empty() { continue; }
+        tracks.push(parse_track_token(token));
+    }
+    tracks
+}
+
+/// Expand `repeat(N, <track-list>)` within a track value string.
+fn expand_repeat_tracks(val: &str) -> String {
+    let lower = val.to_ascii_lowercase();
+    if !lower.starts_with("repeat(") {
+        // No repeat() at the start — return as-is.
+        return val.to_string();
+    }
+
+    let mut result = String::with_capacity(val.len());
+
+    // Find matching closing paren for repeat(...)
+    let inner_start = "repeat(".len();
+    let inner_chars: Vec<char> = val[inner_start..].chars().collect();
+    let mut depth = 1i32;
+    let mut end = 0;
+    for (i, &c) in inner_chars.iter().enumerate() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 { end = i; break; }
+            }
+            _ => {}
+        }
+    }
+    let inner: String = inner_chars[..end].iter().collect();
+    let rest: String = inner_chars[end + 1..].iter().collect();
+
+    // Parse count and track definition.
+    if let Some(comma_pos) = inner.find(',') {
+        let count_str = inner[..comma_pos].trim();
+        let track_def = inner[comma_pos + 1..].trim();
+        if let Ok(n) = count_str.parse::<usize>() {
+            for i in 0..n {
+                if i > 0 { result.push(' '); }
+                result.push_str(track_def);
+            }
+        }
+    }
+
+    // Recursively expand whatever comes after the closing paren.
+    let rest_expanded = expand_repeat_tracks(rest.trim());
+    if !rest_expanded.trim().is_empty() {
+        result.push(' ');
+        result.push_str(rest_expanded.trim());
+    }
+    result
+}
+
+fn parse_track_token(token: &str) -> Value {
+    let t = token.trim().to_ascii_lowercase();
+    if t == "auto" {
+        Value::Keyword(intern("auto"))
+    } else if t == "min-content" || t == "max-content" {
+        Value::Keyword(intern(&t))
+    } else if t.ends_with("fr") {
+        let n = t.trim_end_matches("fr").parse::<f32>().unwrap_or(1.0);
+        Value::Length(n, Unit::Fr)
+    } else if t.ends_with("px") {
+        let n = t.trim_end_matches("px").parse::<f32>().unwrap_or(0.0);
+        Value::Length(n, Unit::Px)
+    } else if t.ends_with('%') {
+        let n = t.trim_end_matches('%').parse::<f32>().unwrap_or(0.0);
+        Value::Length(n, Unit::Percent)
+    } else if t.ends_with("em") || t.ends_with("rem") {
+        let n = t.trim_end_matches("rem").trim_end_matches("em").parse::<f32>().unwrap_or(1.0);
+        Value::Length(n, Unit::Em)
+    } else {
+        // fallback: try as keyword
+        Value::Keyword(intern(token.trim()))
     }
 }

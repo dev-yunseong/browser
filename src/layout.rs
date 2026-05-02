@@ -631,6 +631,7 @@ pub enum DisplayType {
     Input,
     Image,
     Flex,
+    Grid,
 }
 
 pub fn build_layout_tree<'a>(
@@ -1729,6 +1730,243 @@ impl<'a> LayoutBox<'a> {
             return (Some(self), final_x, final_y);
         }
 
+        if self.display == DisplayType::Grid {
+            // ── Grid formatting context ───────────────────────────────────────
+            //
+            // Implements basic CSS Grid layout:
+            //   1. Parse grid-template-columns / grid-template-rows track lists.
+            //   2. Resolve track sizes: px tracks are fixed; fr tracks share
+            //      remaining available space proportionally; auto tracks share
+            //      the leftover fr space equally.
+            //   3. Read column-gap / row-gap for spacing.
+            //   4. Auto-place children left-to-right, top-to-bottom.
+            //   5. Stretch each child to fill its cell (default grid behaviour).
+
+            // Helper: read a track-list stored as a CSS keyword value.
+            let read_track_list = |prop: &str| -> Vec<crate::css::Value> {
+                match self.style_node.specified_values.get(&crate::css::intern(prop)) {
+                    Some(Value::Keyword(k)) => crate::css::parse_track_list(k),
+                    _ => Vec::new(),
+                }
+            };
+
+            let col_tracks = read_track_list("grid-template-columns");
+            let row_tracks = read_track_list("grid-template-rows");
+
+            let col_gap = match self.style_node.specified_values.get(&crate::css::intern("column-gap")) {
+                Some(Value::Length(v, Unit::Px)) => *v,
+                Some(Value::Number(v)) => *v,
+                _ => 0.0,
+            };
+            let row_gap = match self.style_node.specified_values.get(&crate::css::intern("row-gap")) {
+                Some(Value::Length(v, Unit::Px)) => *v,
+                Some(Value::Number(v)) => *v,
+                _ => 0.0,
+            };
+
+            // Number of columns: from explicit template, or 1 (block fallback).
+            let num_cols = if !col_tracks.is_empty() { col_tracks.len() } else { 1 };
+
+            // Resolve column widths.
+            let total_col_gaps = if num_cols > 1 { col_gap * (num_cols - 1) as f32 } else { 0.0 };
+            let available_for_cols = (inner_width - total_col_gaps).max(0.0);
+
+            // Sum of fixed (non-fr, non-auto) column widths.
+            let col_fixed_total: f32 = col_tracks.iter().map(|t| match t {
+                Value::Length(v, Unit::Px) => *v,
+                Value::Length(v, Unit::Percent) => inner_width * (v / 100.0),
+                _ => 0.0,
+            }).sum();
+
+            // Total fr units across all column tracks.
+            let col_fr_total: f32 = col_tracks.iter().map(|t| match t {
+                Value::Length(v, crate::css::Unit::Fr) => *v,
+                _ => 0.0,
+            }).sum();
+
+            // Space remaining after fixed tracks — split among fr/auto tracks.
+            let col_fr_space = (available_for_cols - col_fixed_total).max(0.0);
+
+            // Count auto columns (share fr space equally if no fr tracks).
+            let auto_count = col_tracks.iter().filter(|t| matches!(t, Value::Keyword(k) if k.as_ref() == "auto")).count() as f32;
+
+            let col_widths: Vec<f32> = if col_tracks.is_empty() {
+                vec![inner_width]
+            } else {
+                col_tracks.iter().map(|t| match t {
+                    Value::Length(v, Unit::Px) => *v,
+                    Value::Length(v, Unit::Percent) => inner_width * (v / 100.0),
+                    Value::Length(v, crate::css::Unit::Fr) => {
+                        if col_fr_total > 0.0 { (v / col_fr_total) * col_fr_space } else { 0.0 }
+                    }
+                    Value::Keyword(k) if k.as_ref() == "auto" => {
+                        if auto_count > 0.0 { col_fr_space / auto_count } else { 0.0 }
+                    }
+                    _ => 0.0,
+                }).collect()
+            };
+
+            // Collect in-flow children (skip positioned / display:none / whitespace-only text nodes).
+            let mut grid_children: Vec<&StyledNode> = Vec::new();
+            for child_node in &self.style_node.children {
+                if should_skip(child_node) { continue; }
+                // Skip whitespace-only text nodes — they are not grid items.
+                if let NodeData::Text { ref contents } = child_node.node.data {
+                    if contents.borrow().chars().all(|c| c.is_whitespace()) {
+                        continue;
+                    }
+                }
+                let child_pos = get_position_type(child_node);
+                if matches!(child_pos, PositionType::Absolute | PositionType::Fixed) { continue; }
+                grid_children.push(child_node);
+            }
+
+            let num_children = grid_children.len();
+            let num_rows_needed = if num_children == 0 {
+                0
+            } else {
+                (num_children + num_cols - 1) / num_cols
+            };
+
+            // Pass 1: lay out each child at its cell width to determine natural heights.
+            struct GridItem<'gi> {
+                cb: LayoutBox<'gi>,
+                col: usize,
+                row: usize,
+            }
+
+            let mut grid_items: Vec<GridItem<'_>> = Vec::new();
+            for (child_idx, child_node) in grid_children.iter().enumerate() {
+                let col = child_idx % num_cols;
+                let row = child_idx / num_cols;
+                let cell_width = col_widths.get(col).copied().unwrap_or(inner_width);
+
+                let (cb_opt, _, _) = build_layout_tree_with_cb_cached(
+                    child_node,
+                    0.0, 0.0, 0.0,
+                    cell_width.max(1.0),
+                    vw, vh,
+                    child_cb,
+                    intrinsic_cache,
+                );
+                if let Some(cb) = cb_opt {
+                    grid_items.push(GridItem { cb, col, row });
+                }
+            }
+
+            // Pass 2: compute implicit row heights (max of all cells in each row).
+            let mut row_heights: Vec<f32> = vec![0.0_f32; num_rows_needed];
+            for item in &grid_items {
+                if item.row < row_heights.len() {
+                    let item_h = item.cb.dimensions.height
+                        + item.cb.padding.top + item.cb.padding.bottom
+                        + item.cb.border.top + item.cb.border.bottom
+                        + item.cb.margin.top + item.cb.margin.bottom;
+                    row_heights[item.row] = row_heights[item.row].max(item_h);
+                }
+            }
+
+            // Apply explicit row track heights if provided.
+            for (row_idx, row_h) in row_heights.iter_mut().enumerate() {
+                if let Some(track) = row_tracks.get(row_idx) {
+                    let explicit_h = match track {
+                        Value::Length(v, Unit::Px) => Some(*v),
+                        Value::Length(v, Unit::Percent) => Some(vh * (v / 100.0)),
+                        _ => None,
+                    };
+                    if let Some(eh) = explicit_h {
+                        *row_h = row_h.max(eh);
+                    }
+                }
+            }
+
+            // Pass 3: compute absolute row and column positions.
+            let content_top = self.dimensions.y + self.padding.top + self.border.top;
+            let content_left = self.dimensions.x + self.padding.left + self.border.left;
+
+            let mut row_tops: Vec<f32> = Vec::with_capacity(num_rows_needed);
+            {
+                let mut cur_top = content_top;
+                for (row_idx, &rh) in row_heights.iter().enumerate() {
+                    row_tops.push(cur_top);
+                    cur_top += rh;
+                    if row_idx + 1 < num_rows_needed { cur_top += row_gap; }
+                }
+            }
+
+            let mut col_lefts: Vec<f32> = Vec::with_capacity(num_cols);
+            {
+                let mut cur_left = content_left;
+                for (col_idx, &cw) in col_widths.iter().enumerate() {
+                    col_lefts.push(cur_left);
+                    cur_left += cw;
+                    if col_idx + 1 < num_cols { cur_left += col_gap; }
+                }
+            }
+
+            // Pass 4: position and (optionally) stretch each grid item.
+            for item in &mut grid_items {
+                let cell_x = col_lefts.get(item.col).copied().unwrap_or(content_left);
+                let cell_y = row_tops.get(item.row).copied().unwrap_or(content_top);
+                let cell_w = col_widths.get(item.col).copied().unwrap_or(inner_width);
+                let cell_h = row_heights.get(item.row).copied().unwrap_or(0.0);
+
+                // Default alignment: stretch (item fills cell on both axes).
+                let item_x = cell_x + item.cb.margin.left;
+                let item_y = cell_y + item.cb.margin.top;
+
+                let dx = item_x - item.cb.dimensions.x;
+                let dy = item_y - item.cb.dimensions.y;
+                offset_layout_box(&mut item.cb, dx, dy);
+
+                // Stretch width to the cell's content width.
+                item.cb.dimensions.width = (cell_w
+                    - item.cb.margin.left - item.cb.margin.right
+                    - item.cb.padding.left - item.cb.padding.right
+                    - item.cb.border.left - item.cb.border.right
+                ).max(0.0);
+
+                // Stretch height only when no explicit height is set.
+                let has_explicit_height = matches!(
+                    item.cb.style_node.specified_values.get(&crate::css::intern("height")),
+                    Some(Value::Length(v, Unit::Px)) if *v > 0.0
+                );
+                if !has_explicit_height {
+                    let avail_cell_h = (cell_h
+                        - item.cb.margin.top - item.cb.margin.bottom
+                        - item.cb.padding.top - item.cb.padding.bottom
+                        - item.cb.border.top - item.cb.border.bottom
+                    ).max(0.0);
+                    if avail_cell_h > item.cb.dimensions.height {
+                        item.cb.dimensions.height = avail_cell_h;
+                    }
+                }
+
+                max_child_x = max_child_x.max(
+                    item.cb.dimensions.x + border_box_width(&item.cb) + item.cb.margin.right,
+                );
+                child_y = child_y.max(
+                    item.cb.dimensions.y + border_box_height(&item.cb) + item.cb.margin.bottom,
+                );
+            }
+
+            // Move items into self.children.
+            for item in grid_items {
+                self.children.push(item.cb);
+            }
+
+            // Finalize grid container height.
+            let content_height = (child_y - content_top
+                + self.padding.bottom + self.border.bottom).max(0.0);
+            if self.dimensions.height <= 0.0 || height <= 0.0 {
+                self.dimensions.height = content_height;
+            }
+
+            let final_x = container_start_x; // grid containers are block-level
+            let final_y = self.dimensions.y + self.dimensions.height + self.margin.bottom;
+            return (Some(self), final_x, final_y);
+        }
+
         // --- FLOAT-AWARE SINGLE-PASS LAYOUT ---
         //
         // Pass 1 (classify): iterate self.style_node.children (immutable borrow of self)
@@ -2585,6 +2823,7 @@ fn get_display_type(sn: &StyledNode) -> DisplayType {
             "block" => return DisplayType::Block,
             "inline-block" => return DisplayType::InlineBlock,
             "flex" => return DisplayType::Flex,
+            "grid" => return DisplayType::Grid,
             "none" => return DisplayType::Inline, // will be handled by is_none_display
             _ => {}
         }
@@ -2620,7 +2859,7 @@ fn is_block_level(d: DisplayType) -> bool {
     // rather than filling the full container width.
     matches!(
         d,
-        DisplayType::Block | DisplayType::ListItem | DisplayType::Flex
+        DisplayType::Block | DisplayType::ListItem | DisplayType::Flex | DisplayType::Grid
     )
 }
 
@@ -2880,7 +3119,7 @@ impl<'a> LayoutBox<'a> {
 
     pub fn establishes_bfc(&self) -> bool {
         match self.display {
-            DisplayType::InlineBlock | DisplayType::Flex | DisplayType::TableCell => true,
+            DisplayType::InlineBlock | DisplayType::Flex | DisplayType::Grid | DisplayType::TableCell => true,
             _ => {
                 // overflow != visible also establishes BFC
                 if let Some(Value::Keyword(v)) = self
@@ -3150,6 +3389,28 @@ mod tests {
     fn layout_from_html(html: &str, width: f32, height: f32) -> (LayoutBox<'static>, f32, f32) {
         let dom = Box::leak(Box::new(dom::parse_html(html)));
         let ss = Box::leak(Box::new(css::parse_css("")));
+        let style_tree = Box::leak(Box::new(style::build_style_tree(
+            &dom.document,
+            ss,
+            None,
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            None,
+        )));
+        let (layout_opt, fx, fy) =
+            build_layout_tree(style_tree, 0.0, 0.0, 0.0, width, width, height);
+        (layout_opt.expect("layout tree"), fx, fy)
+    }
+
+    fn layout_from_html_css(
+        html: &str,
+        css_src: &str,
+        width: f32,
+        height: f32,
+    ) -> (LayoutBox<'static>, f32, f32) {
+        let dom = Box::leak(Box::new(dom::parse_html(html)));
+        let ss = Box::leak(Box::new(css::parse_css(css_src)));
         let style_tree = Box::leak(Box::new(style::build_style_tree(
             &dom.document,
             ss,
@@ -5257,6 +5518,180 @@ mod tests {
             images.dimensions.x > gmail.dimensions.x,
             "Images must be to the right of Gmail: gmail.x={}, images.x={}",
             gmail.dimensions.x, images.dimensions.x
+        );
+    }
+
+    // ── Grid layout tests ─────────────────────────────────────────────────────
+
+    /// `display: grid; grid-template-columns: 1fr 1fr` → two equal columns side by side.
+    #[test]
+    fn test_grid_two_equal_fr_columns() {
+        let html = r#"<div id="grid">
+            <div id="a">A</div>
+            <div id="b">B</div>
+        </div>"#;
+        let css_src = "#grid { display: grid; grid-template-columns: 1fr 1fr; }";
+        let (layout, _, _) = layout_from_html_css(html, css_src, 800.0, 600.0);
+
+        let a = find_element_by_id(&layout, "a").expect("cell A");
+        let b = find_element_by_id(&layout, "b").expect("cell B");
+
+        // Both children should be on the same row (same y).
+        assert!(
+            (a.dimensions.y - b.dimensions.y).abs() < 2.0,
+            "A and B should be on the same row: a.y={}, b.y={}",
+            a.dimensions.y, b.dimensions.y
+        );
+        // A should be to the left of B.
+        assert!(
+            a.dimensions.x < b.dimensions.x,
+            "A should be to the left of B: a.x={}, b.x={}",
+            a.dimensions.x, b.dimensions.x
+        );
+        // Each column should be roughly half the container width (400px in an 800px viewport).
+        assert!(
+            (a.dimensions.width - 400.0).abs() < 5.0,
+            "1fr column A should be ~400px wide, got {}",
+            a.dimensions.width
+        );
+        assert!(
+            (b.dimensions.width - 400.0).abs() < 5.0,
+            "1fr column B should be ~400px wide, got {}",
+            b.dimensions.width
+        );
+    }
+
+    /// `gap: 16px` inserts spacing between grid cells.
+    #[test]
+    fn test_grid_gap_spacing() {
+        let html = r#"<div id="grid">
+            <div id="a">A</div>
+            <div id="b">B</div>
+        </div>"#;
+        let css_src = "#grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }";
+        let (layout, _, _) = layout_from_html_css(html, css_src, 800.0, 600.0);
+
+        let a = find_element_by_id(&layout, "a").expect("cell A");
+        let b = find_element_by_id(&layout, "b").expect("cell B");
+
+        // B's left edge should be at least 16px to the right of A's right edge.
+        let a_right = a.dimensions.x + a.dimensions.width;
+        let gap = b.dimensions.x - a_right;
+        assert!(
+            gap >= 15.0,
+            "gap between cells should be >= 16px, got {}",
+            gap
+        );
+    }
+
+    /// `grid-template-columns: 200px 1fr` → fixed + flexible column.
+    #[test]
+    fn test_grid_fixed_plus_fr_column() {
+        let html = r#"<div id="grid">
+            <div id="a">A</div>
+            <div id="b">B</div>
+        </div>"#;
+        let css_src = "#grid { display: grid; grid-template-columns: 200px 1fr; }";
+        let (layout, _, _) = layout_from_html_css(html, css_src, 800.0, 600.0);
+
+        let a = find_element_by_id(&layout, "a").expect("cell A");
+        let b = find_element_by_id(&layout, "b").expect("cell B");
+
+        // First column should be exactly 200px.
+        assert!(
+            (a.dimensions.width - 200.0).abs() < 2.0,
+            "fixed column A should be 200px wide, got {}",
+            a.dimensions.width
+        );
+        // Second column fills the rest (~600px in an 800px container).
+        assert!(
+            b.dimensions.width > 500.0,
+            "fr column B should fill remaining space (>500px), got {}",
+            b.dimensions.width
+        );
+        // A and B should be on the same row.
+        assert!(
+            (a.dimensions.y - b.dimensions.y).abs() < 2.0,
+            "A and B should be on the same row: a.y={}, b.y={}",
+            a.dimensions.y, b.dimensions.y
+        );
+    }
+
+    /// `grid-template-columns: repeat(3, 1fr)` → three equal columns.
+    #[test]
+    fn test_grid_repeat_three_fr_columns() {
+        let html = r#"<div id="grid">
+            <div id="a">A</div>
+            <div id="b">B</div>
+            <div id="c">C</div>
+        </div>"#;
+        let css_src = "#grid { display: grid; grid-template-columns: repeat(3, 1fr); }";
+        let (layout, _, _) = layout_from_html_css(html, css_src, 900.0, 600.0);
+
+        let a = find_element_by_id(&layout, "a").expect("cell A");
+        let b = find_element_by_id(&layout, "b").expect("cell B");
+        let c = find_element_by_id(&layout, "c").expect("cell C");
+
+        // All three should be on the same row (y within 2px).
+        assert!(
+            (a.dimensions.y - b.dimensions.y).abs() < 2.0 &&
+            (b.dimensions.y - c.dimensions.y).abs() < 2.0,
+            "A, B, C should be on the same row"
+        );
+        // Each column should be ~300px (900 / 3).
+        assert!(
+            (a.dimensions.width - 300.0).abs() < 5.0,
+            "repeat(3, 1fr) column A should be ~300px, got {}",
+            a.dimensions.width
+        );
+        assert!(
+            (b.dimensions.width - 300.0).abs() < 5.0,
+            "repeat(3, 1fr) column B should be ~300px, got {}",
+            b.dimensions.width
+        );
+        assert!(
+            (c.dimensions.width - 300.0).abs() < 5.0,
+            "repeat(3, 1fr) column C should be ~300px, got {}",
+            c.dimensions.width
+        );
+        // Children should be ordered left-to-right.
+        assert!(a.dimensions.x < b.dimensions.x && b.dimensions.x < c.dimensions.x,
+            "A, B, C should be ordered left-to-right");
+    }
+
+    /// Grid wraps children into multiple rows when more items than columns.
+    #[test]
+    fn test_grid_auto_rows_wrap() {
+        let html = r#"<div id="grid">
+            <div id="a">A</div>
+            <div id="b">B</div>
+            <div id="c">C</div>
+            <div id="d">D</div>
+        </div>"#;
+        let css_src = "#grid { display: grid; grid-template-columns: 1fr 1fr; }";
+        let (layout, _, _) = layout_from_html_css(html, css_src, 800.0, 600.0);
+
+        let a = find_element_by_id(&layout, "a").expect("cell A");
+        let b = find_element_by_id(&layout, "b").expect("cell B");
+        let c = find_element_by_id(&layout, "c").expect("cell C");
+        let d = find_element_by_id(&layout, "d").expect("cell D");
+
+        // Row 1: A and B at the same y.
+        assert!(
+            (a.dimensions.y - b.dimensions.y).abs() < 2.0,
+            "A and B should be in row 1: a.y={}, b.y={}",
+            a.dimensions.y, b.dimensions.y
+        );
+        // Row 2: C and D at the same y, below row 1.
+        assert!(
+            (c.dimensions.y - d.dimensions.y).abs() < 2.0,
+            "C and D should be in row 2: c.y={}, d.y={}",
+            c.dimensions.y, d.dimensions.y
+        );
+        assert!(
+            c.dimensions.y > a.dimensions.y + 1.0,
+            "Row 2 should be below row 1: c.y={}, a.y={}",
+            c.dimensions.y, a.dimensions.y
         );
     }
 }
