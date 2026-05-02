@@ -506,6 +506,9 @@ pub struct LayoutBox<'a> {
     pub display: DisplayType,
     pub z_index: i32,
     pub position: PositionType,
+    /// Marker text for list items (e.g. "•" for disc, "1." for decimal).
+    /// `None` when `list-style-type: none` or the element is not a list item.
+    pub list_marker: Option<String>,
 }
 
 impl<'a> Clone for LayoutBox<'a> {
@@ -555,6 +558,7 @@ impl<'a> Clone for LayoutBox<'a> {
                         display: src.display,
                         z_index: src.z_index,
                         position: src.position,
+                        list_marker: src.list_marker.clone(),
                     };
                     let num_children = src.children.len();
                     // Push Post first so it is processed after all children.
@@ -741,6 +745,7 @@ impl<'a> LayoutBox<'a> {
             display,
             z_index,
             position,
+            list_marker: None,
         };
 
         if let NodeData::Element {
@@ -1823,7 +1828,7 @@ impl<'a> LayoutBox<'a> {
         let no_wrap = white_space == "nowrap";
         let applies_text_align = matches!(
             self.display,
-            DisplayType::Block | DisplayType::Flex | DisplayType::InlineBlock | DisplayType::TableCell
+            DisplayType::Block | DisplayType::ListItem | DisplayType::Flex | DisplayType::InlineBlock | DisplayType::TableCell
         );
 
         // Inline line accumulator
@@ -1875,6 +1880,10 @@ impl<'a> LayoutBox<'a> {
         }
 
         let mut positioned_entries: Vec<&StyledNode> = Vec::new();
+
+        // Counter for ordered list item markers (1., 2., …).
+        // Only incremented when a ListItem child is placed in normal flow.
+        let mut list_item_counter: u32 = 0;
 
         for entry in entries {
             match entry.kind {
@@ -1959,6 +1968,25 @@ impl<'a> LayoutBox<'a> {
                         intrinsic_cache,
                     );
                     if let Some(mut cb) = cb_opt {
+                        // Assign list marker for ListItem boxes.
+                        if cb.display == DisplayType::ListItem {
+                            list_item_counter += 1;
+                            let style_type = cb
+                                .style_node
+                                .specified_values
+                                .get(&crate::css::intern("list-style-type"))
+                                .and_then(|v| {
+                                    if let Value::Keyword(k) = v { Some(k.as_ref()) } else { None }
+                                })
+                                .unwrap_or("disc");
+                            cb.list_marker = match style_type {
+                                "none" => None,
+                                "decimal" => Some(format!("{}.", list_item_counter)),
+                                "circle" => Some("\u{25E6}".to_string()),  // ◦
+                                "square" => Some("\u{25AA}".to_string()),  // ▪
+                                _ => Some("\u{2022}".to_string()),         // • (disc)
+                            };
+                        }
                         // CSS margin collapsing (spec § 8.3.1):
                         //
                         // Case 1 — adjacent siblings: the bottom margin of the previous
@@ -2565,11 +2593,13 @@ fn get_display_type(sn: &StyledNode) -> DisplayType {
         match name.local.to_string().as_str() {
             // Genuine block-level elements (fill container width, force line break)
             "html" | "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "body" | "header"
-            | "footer" | "nav" | "section" | "article" | "ul" | "ol" | "li" | "main" | "aside"
+            | "footer" | "nav" | "section" | "article" | "ul" | "ol" | "main" | "aside"
             | "form" | "details" | "summary" | "figure" | "figcaption" | "address"
             | "blockquote" | "pre" | "hr" | "fieldset" | "legend"
             // <center> is a legacy block element with implicit text-align:center
             | "center" => DisplayType::Block,
+            // List items get their own display type so markers can be painted
+            "li" => DisplayType::ListItem,
             // table and its sub-elements: use TableRow/TableCell so they shrink-wrap
             // rather than expand to full container width like block elements do.
             "table" => DisplayType::Table,
@@ -5123,6 +5153,83 @@ mod tests {
             "child B should be placed after child A in the row: a_right={}, b.x={}",
             a.dimensions.x + a.dimensions.width,
             b.dimensions.x
+        );
+    }
+
+    // ── List marker tests ─────────────────────────────────────────────────────
+
+    /// `<ul><li>` elements must have a disc marker (•) and `DisplayType::ListItem`.
+    #[test]
+    fn test_ul_li_has_disc_marker() {
+        let html = r#"<ul><li id="a">Item A</li><li id="b">Item B</li></ul>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let item_a = find_element_by_id(&layout, "a").expect("li#a not found");
+        let item_b = find_element_by_id(&layout, "b").expect("li#b not found");
+
+        assert_eq!(item_a.display, DisplayType::ListItem, "li must be ListItem");
+        assert_eq!(
+            item_a.list_marker.as_deref(),
+            Some("\u{2022}"),
+            "ul li should have disc marker •"
+        );
+        assert_eq!(
+            item_b.list_marker.as_deref(),
+            Some("\u{2022}"),
+            "second ul li should also have disc marker"
+        );
+    }
+
+    /// `<ol><li>` elements must have decimal markers (1., 2., …).
+    #[test]
+    fn test_ol_li_has_decimal_marker() {
+        let html = r#"<ol><li id="a">First</li><li id="b">Second</li><li id="c">Third</li></ol>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let item_a = find_element_by_id(&layout, "a").expect("li#a not found");
+        let item_b = find_element_by_id(&layout, "b").expect("li#b not found");
+        let item_c = find_element_by_id(&layout, "c").expect("li#c not found");
+
+        assert_eq!(
+            item_a.list_marker.as_deref(),
+            Some("1."),
+            "first ol li should have marker 1."
+        );
+        assert_eq!(
+            item_b.list_marker.as_deref(),
+            Some("2."),
+            "second ol li should have marker 2."
+        );
+        assert_eq!(
+            item_c.list_marker.as_deref(),
+            Some("3."),
+            "third ol li should have marker 3."
+        );
+    }
+
+    /// `list-style-type: none` suppresses the marker.
+    #[test]
+    fn test_list_style_type_none_suppresses_marker() {
+        let html = r#"<ul style="list-style-type:none"><li id="x">No marker</li></ul>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let item = find_element_by_id(&layout, "x").expect("li#x not found");
+        assert!(
+            item.list_marker.is_none(),
+            "list-style-type:none should suppress marker, got {:?}",
+            item.list_marker
+        );
+    }
+
+    /// List items must have left padding so content is indented away from the marker.
+    #[test]
+    fn test_ul_has_default_left_padding() {
+        let html = r#"<ul id="list"><li>Item</li></ul>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let list = find_element_by_id(&layout, "list").expect("ul not found");
+        assert!(
+            list.padding.left >= 30.0,
+            "ul should have padding-left >= 30px for indentation, got {}",
+            list.padding.left
         );
     }
 

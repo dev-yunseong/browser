@@ -434,6 +434,20 @@ pub fn parse_css(source: &str) -> Stylesheet {
                     declarations.push(Declaration { name: intern("row-gap"),    value: row_val,  important });
                     declarations.push(Declaration { name: intern("column-gap"), value: col_val,  important });
                 }
+                // list-style shorthand: "list-style: none | disc | decimal | ..."
+                // We only care about list-style-type for now.
+                "list-style" => {
+                    let first = val_raw.split_whitespace().next().unwrap_or("disc");
+                    // Common values: none, disc, circle, square, decimal, etc.
+                    let type_val = match first {
+                        "none" | "disc" | "circle" | "square" | "decimal"
+                        | "lower-alpha" | "upper-alpha" | "lower-roman" | "upper-roman" => {
+                            Value::Keyword(intern(first))
+                        }
+                        _ => parse_value(first),
+                    };
+                    declarations.push(Declaration { name: intern("list-style-type"), value: type_val, important });
+                }
                 // inset shorthand: "inset: <top> [<right> [<bottom> [<left>]]]"
                 // Same quad syntax as margin/padding, maps to top/right/bottom/left.
                 "inset" => {

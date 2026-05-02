@@ -605,6 +605,40 @@ impl LayerTreeBuilder {
             });
         }
 
+        // List item marker (• / ◦ / ▪ / "1." etc.)
+        // Painted to the left of the list item's content box, inside the padding-left area.
+        if layout.display == DisplayType::ListItem {
+            if let Some(ref marker) = layout.list_marker {
+                let font_size = match sv.get(&crate::css::intern("font-size")) {
+                    Some(Value::Length(v, _)) => *v,
+                    _ => 16.0,
+                };
+                let color = match sv.get(&crate::css::intern("color")) {
+                    Some(Value::Color(c)) => c.clone(),
+                    _ => crate::css::Color { r: 0, g: 0, b: 0, a: 255 },
+                };
+                // Place marker ~20px to the left of the content box left edge.
+                // The padding-left (~40px) leaves enough room for the marker.
+                let marker_x = (d.x - 20.0).max(0.0);
+                let marker_rect = crate::layout::Rect {
+                    x: marker_x,
+                    y: d.y,
+                    width: 20.0,
+                    height: font_size,
+                };
+                commands.push(PaintCommand::Text {
+                    rect: marker_rect,
+                    text: marker.clone(),
+                    font_size,
+                    color,
+                    clip,
+                    bold: false,
+                    italic: false,
+                    text_decoration: 0,
+                });
+            }
+        }
+
         // Input button label
         // <input type="submit|button|reset"> carries its visible label in the
         // `input_label` field (populated in LayoutBox::new from the `value` attribute).
