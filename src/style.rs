@@ -482,7 +482,17 @@ pub fn build_style_tree(
     // Phase 2: Sequential Inheritance & Deduplication
     let mut store = StyleStore::default();
     let mut arena_idx = 0;
-    build_final_tree(root, &mut arena_idx, &mut raw_styles, parent_style, &mut store)
+    let mut tree = build_final_tree(root, &mut arena_idx, &mut raw_styles, parent_style, &mut store);
+
+    // Phase 3: Inject ::before / ::after pseudo-element children.
+    // For each element node in the tree, find CSS rules whose selectors have a
+    // matching pseudo_element ("before" or "after").  When a matching rule provides
+    // a `content` property that is not "none" or "normal", inject a synthetic text
+    // StyledNode as the first (before) or last (after) child of the element.
+    let all_rules: Vec<&crate::css::Rule> = stylesheet.all_rules();
+    inject_pseudo_elements(&mut tree, &all_rules);
+
+    tree
 }
 
 /// Returns the CSS initial value for a given property name, or `None` if not defined here.
@@ -882,6 +892,179 @@ fn parse_legacy_length_attr(value: &str) -> Option<Value> {
         .map(|n| Value::Length(n, crate::css::Unit::Px))
 }
 
+// ── Pseudo-element injection ──────────────────────────────────────────────────
+
+/// Check whether a CSS selector (ignoring its `pseudo_element` field) matches a
+/// styled element node.  This is a simplified match: it only checks the
+/// rightmost part of the selector (tag / id / class) and does not walk ancestor
+/// combinators.  This is sufficient for the most common pseudo-element patterns
+/// (`p::before`, `.clearfix::after`, `div.foo::before`, etc.).
+///
+/// Returns `true` when the selector base matches `node`.
+fn selector_base_matches_element(sel: &crate::css::Selector, node: &StyledNode) -> bool {
+    use crate::css::Selector;
+    let (tag, id, classes) = match &node.node.data {
+        NodeData::Element { ref name, ref attrs, .. } => {
+            let t = name.local.to_string();
+            let mut id: Option<String> = None;
+            let mut classes: Vec<String> = Vec::new();
+            for attr in attrs.borrow().iter() {
+                let k = attr.name.local.to_string();
+                let v = attr.value.to_string();
+                if k == "id" { id = Some(v.clone()); }
+                if k == "class" {
+                    classes = v.split_whitespace().map(|s| s.to_string()).collect();
+                }
+            }
+            (t, id, classes)
+        }
+        _ => return false, // Only elements can have pseudo-elements
+    };
+
+    if let Some(ref s_tag) = sel.tag {
+        if *s_tag != tag { return false; }
+    }
+    if let Some(ref s_id) = sel.id {
+        if id.as_deref() != Some(s_id) { return false; }
+    }
+    for s_class in &sel.class {
+        if !classes.contains(s_class) { return false; }
+    }
+    // Require at least one constraint to avoid matching everything with `*::before`.
+    let has_constraint = sel.tag.is_some() || sel.id.is_some() || !sel.class.is_empty();
+    has_constraint
+}
+
+/// Build a synthetic `StyledNode` that acts as a pseudo-element.
+///
+/// `content_text` — the text to inject (may be empty for block-level decorators).
+/// `pseudo_decls` — the CSS declarations from the matching rule.
+/// `parent_values` — the parent element's computed style, used to inherit properties.
+fn make_pseudo_styled_node(
+    content_text: String,
+    pseudo_decls: &[crate::css::Declaration],
+    parent_values: &PropertyMap,
+) -> StyledNode {
+    use html5ever::tendril::StrTendril;
+    use markup5ever_rcdom::Node;
+
+    // Create a real text node handle so that layout recognises it as a text run.
+    let text_handle = Node::new(NodeData::Text {
+        contents: std::cell::RefCell::new(StrTendril::from(content_text.as_str())),
+    });
+
+    // Build the property map: start with inheritable properties from parent, then
+    // apply the pseudo-element's own declarations on top.
+    let mut map: HashMap<Arc<str>, Value> = HashMap::new();
+
+    // Inherit a small set of properties from the parent element.
+    let inheritable = [
+        "color", "font-size", "font-family", "font-weight",
+        "font-style", "line-height", "text-align", "white-space",
+    ];
+    for prop in &inheritable {
+        let key = intern(prop);
+        if let Some(v) = parent_values.get(&key) {
+            map.insert(key, v.clone());
+        }
+    }
+
+    // Apply pseudo-element declarations (skip `content` itself).
+    for decl in pseudo_decls {
+        if decl.name.as_ref() == "content" { continue; }
+        map.insert(decl.name.clone(), decl.value.clone());
+    }
+
+    StyledNode {
+        node: text_handle,
+        specified_values: PropertyMap(Arc::new(map)),
+        children: Vec::new(),
+    }
+}
+
+/// Compute which synthetic nodes to inject for a single element node.
+/// Returns `(before, after)` where each is `Some(StyledNode)` if a matching
+/// `::before` / `::after` rule with a valid `content` exists.
+fn compute_pseudo_injections(
+    node: &StyledNode,
+    all_rules: &[&crate::css::Rule],
+) -> (Option<StyledNode>, Option<StyledNode>) {
+    if !matches!(node.node.data, NodeData::Element { .. }) {
+        return (None, None);
+    }
+
+    let parent_values = &node.specified_values;
+    let mut before_node: Option<StyledNode> = None;
+    let mut after_node:  Option<StyledNode> = None;
+
+    for rule in all_rules {
+        for sel in &rule.selectors {
+            let pe = match &sel.pseudo_element {
+                Some(pe) => pe.as_str(),
+                None => continue,
+            };
+            if pe != "before" && pe != "after" { continue; }
+
+            if !selector_base_matches_element(sel, node) { continue; }
+
+            // Find `content` declaration; skip the rule if absent or suppressed.
+            let content_decl = rule.declarations.iter().find(|d| d.name.as_ref() == "content");
+            let content_str = match content_decl {
+                Some(decl) => match &decl.value {
+                    Value::Keyword(k) if matches!(k.as_ref(), "none" | "normal") => continue,
+                    Value::Keyword(k) => {
+                        // Strip wrapping quotes that the CSS parser preserves.
+                        let s = k.as_ref();
+                        if (s.starts_with('"') && s.ends_with('"'))
+                            || (s.starts_with('\'') && s.ends_with('\''))
+                        {
+                            s[1..s.len()-1].to_string()
+                        } else {
+                            s.to_string()
+                        }
+                    }
+                    _ => continue,
+                },
+                None => continue,
+            };
+
+            let synthetic = make_pseudo_styled_node(content_str, &rule.declarations, parent_values);
+            match pe {
+                "before" => { before_node = Some(synthetic); }
+                "after"  => { after_node  = Some(synthetic); }
+                _ => {}
+            }
+        }
+    }
+
+    (before_node, after_node)
+}
+
+/// Walk the entire styled tree and inject synthetic `::before` / `::after` children
+/// wherever a matching CSS rule with a valid `content` property exists.
+///
+/// Uses an iterative depth-first traversal via raw pointers to avoid stack
+/// overflows on deeply nested DOM trees (5 000+ levels).
+fn inject_pseudo_elements(tree: &mut StyledNode, all_rules: &[&crate::css::Rule]) {
+    // SAFETY: each raw pointer is derived from a live mutable reference.
+    // We never alias two mutable references to the same node simultaneously.
+    let mut work: Vec<*mut StyledNode> = vec![tree as *mut StyledNode];
+
+    while let Some(ptr) = work.pop() {
+        let node = unsafe { &mut *ptr };
+
+        // Step 1: inject pseudo-elements for this node FIRST, before pushing children.
+        let (before, after) = compute_pseudo_injections(node, all_rules);
+        if let Some(b) = before { node.children.insert(0, b); }
+        if let Some(a) = after  { node.children.push(a); }
+
+        // Step 2: push children onto the work stack after the Vec is stable.
+        for child in node.children.iter_mut().rev() {
+            work.push(child as *mut StyledNode);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1146,6 +1329,138 @@ mod tests {
         assert_eq!(grow, Some(Value::Number(1.0)));
         assert_eq!(shrink, Some(Value::Number(1.0)));
         assert_eq!(basis, Some(Value::Length(0.0, crate::css::Unit::Percent)));
+    }
+
+    // --- ::before / ::after pseudo-element injection ---
+
+    /// Walk the styled tree and find the first child of `parent_tag` element that
+    /// is a text node carrying the given text string.
+    fn find_text_child(root: &StyledNode, parent_tag: &str, text: &str) -> bool {
+        let node = match find_node(root, parent_tag) {
+            Some(n) => n,
+            None => return false,
+        };
+        for child in &node.children {
+            if let markup5ever_rcdom::NodeData::Text { ref contents } = child.node.data {
+                if contents.borrow().as_ref() == text { return true; }
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn test_pseudo_before_content_injected() {
+        // `p::before { content: ">> "; }` — should inject a synthetic ">> " text node
+        // as the first child of every <p>.
+        let tree = make_tree(
+            r#"<html><body><p>hello</p></body></html>"#,
+            r#"p::before { content: ">> "; }"#,
+        );
+        assert!(
+            find_text_child(&tree, "p", ">> "),
+            "::before content '>> ' should be the first child of <p>"
+        );
+    }
+
+    #[test]
+    fn test_pseudo_after_content_injected() {
+        // `p::after { content: " <<"; }` — should inject as the last child of <p>.
+        let tree = make_tree(
+            r#"<html><body><p>hello</p></body></html>"#,
+            r#"p::after { content: " <<"; }"#,
+        );
+        assert!(
+            find_text_child(&tree, "p", " <<"),
+            "::after content ' <<' should be a child of <p>"
+        );
+    }
+
+    #[test]
+    fn test_pseudo_before_content_none_suppressed() {
+        // `content: none` must suppress the pseudo-element entirely.
+        let tree = make_tree(
+            r#"<html><body><p>hello</p></body></html>"#,
+            r#"p::before { content: none; }"#,
+        );
+        let p = find_node(&tree, "p").expect("p not found");
+        // The only child should be the "hello" text node, not a pseudo-element.
+        let pseudo_injected = p.children.iter().any(|c| {
+            matches!(&c.node.data, markup5ever_rcdom::NodeData::Text { ref contents }
+                if contents.borrow().as_ref() != "hello")
+        });
+        assert!(!pseudo_injected, "content: none must suppress ::before injection");
+    }
+
+    #[test]
+    fn test_pseudo_no_content_not_injected() {
+        // A `::before` rule without a `content` declaration must not inject anything.
+        let tree = make_tree(
+            r#"<html><body><p>hello</p></body></html>"#,
+            r#"p::before { color: red; }"#,
+        );
+        let p = find_node(&tree, "p").expect("p not found");
+        let pseudo_count = p.children.iter().filter(|c| {
+            matches!(&c.node.data, markup5ever_rcdom::NodeData::Text { ref contents }
+                if contents.borrow().as_ref() != "hello")
+        }).count();
+        assert_eq!(pseudo_count, 0, "missing content declaration must suppress pseudo-element");
+    }
+
+    #[test]
+    fn test_pseudo_before_inherits_parent_color() {
+        // The synthetic ::before node should inherit color from the parent element.
+        let tree = make_tree(
+            r#"<html><body><p>hello</p></body></html>"#,
+            r#"p { color: rgb(255, 0, 0); } p::before { content: "> "; }"#,
+        );
+        let p = find_node(&tree, "p").expect("p not found");
+        let before = p.children.first().expect("::before child not found");
+        let c = get_color(before, "color").expect("inherited color not found on ::before");
+        assert_eq!(c, Color { r: 255, g: 0, b: 0, a: 255 });
+    }
+
+    #[test]
+    fn test_pseudo_clearfix_after_empty_content() {
+        // `::after { content: ""; display: block; clear: both; }` — clearfix pattern.
+        let tree = make_tree(
+            r#"<html><body><div class="cf">content</div></body></html>"#,
+            r#".cf::after { content: ""; display: block; clear: both; }"#,
+        );
+        let div = find_node(&tree, "div").expect("div not found");
+        let after = div.children.last().expect("::after child not found");
+        let display = get_keyword(after, "display");
+        assert_eq!(display.as_deref(), Some("block"),
+            "clearfix ::after should have display: block");
+        let clear = get_keyword(after, "clear");
+        assert_eq!(clear.as_deref(), Some("both"),
+            "clearfix ::after should have clear: both");
+    }
+
+    #[test]
+    fn test_parse_selector_pseudo_element_before() {
+        use crate::css::parse_selector;
+        let s = parse_selector("p::before");
+        assert_eq!(s.tag, Some("p".to_string()));
+        assert_eq!(s.pseudo_element, Some("before".to_string()));
+        assert!(s.pseudo_class.is_none());
+    }
+
+    #[test]
+    fn test_parse_selector_pseudo_element_after() {
+        use crate::css::parse_selector;
+        let s = parse_selector(".clearfix::after");
+        assert_eq!(s.class, vec!["clearfix".to_string()]);
+        assert_eq!(s.pseudo_element, Some("after".to_string()));
+        assert!(s.pseudo_class.is_none());
+    }
+
+    #[test]
+    fn test_parse_selector_pseudo_class_unchanged() {
+        use crate::css::parse_selector;
+        let s = parse_selector("a:hover");
+        assert_eq!(s.tag, Some("a".to_string()));
+        assert_eq!(s.pseudo_class, Some("hover".to_string()));
+        assert!(s.pseudo_element.is_none());
     }
 }
 

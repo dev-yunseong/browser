@@ -645,6 +645,10 @@ pub struct Selector {
     pub class: Vec<String>,
     pub attributes: Vec<AttributeSelector>,
     pub pseudo_class: Option<String>,
+    /// Pseudo-element (`"before"` or `"after"`), set when the selector ends with
+    /// `::before` or `::after`.  Single-colon pseudo-classes (`:hover`, `:focus`,
+    /// `:root`) stay in `pseudo_class`.
+    pub pseudo_element: Option<String>,
     pub combinator: Option<Combinator>,
     pub ancestor: Option<Box<Selector>>,
 }
@@ -710,14 +714,37 @@ pub fn parse_selector(s: &str) -> Selector {
             "+" => pending_combinator = Some(Combinator::NextSibling),
             "~" => pending_combinator = Some(Combinator::SubsequentSibling),
             _ => {
+                // Split on the first `:` to separate the base selector from any pseudo.
                 let mut p_parts = part.splitn(2, ':');
                 let base_part = p_parts.next().unwrap_or(part);
-                let pseudo = p_parts.next().map(|s| s.to_string());
-                
-                if base_part.is_empty() && pseudo.is_none() { continue; }
+                // The remainder after the first `:` may start with another `:` for
+                // pseudo-elements (::before, ::after) or be a plain pseudo-class name.
+                let pseudo_rest = p_parts.next();
+
+                let (pseudo_class, pseudo_element): (Option<String>, Option<String>) = match pseudo_rest {
+                    None => (None, None),
+                    Some(rest) => {
+                        if let Some(pe) = rest.strip_prefix(':') {
+                            // Double-colon pseudo-element: ::before / ::after
+                            let name = pe.to_lowercase();
+                            if name == "before" || name == "after" {
+                                (None, Some(name))
+                            } else {
+                                // Unknown pseudo-element — skip.
+                                (None, None)
+                            }
+                        } else {
+                            // Single-colon pseudo-class: :hover, :focus, :root, etc.
+                            (Some(rest.to_string()), None)
+                        }
+                    }
+                };
+
+                if base_part.is_empty() && pseudo_class.is_none() && pseudo_element.is_none() { continue; }
 
                 let mut current_sel = Selector::new();
-                current_sel.pseudo_class = pseudo;
+                current_sel.pseudo_class = pseudo_class;
+                current_sel.pseudo_element = pseudo_element;
                 let mut current_token = String::new();
                 let mut last_char = ' ';
 
