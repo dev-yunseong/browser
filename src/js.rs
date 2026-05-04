@@ -949,6 +949,9 @@ impl JsRuntime {
                     let fragment_nodes = parse_html_fragment(&html_str, &ctx_tag);
                     // Replace children
                     let mut children = node.children.borrow_mut();
+                    for old_child in children.iter() {
+                        old_child.parent.set(None);
+                    }
                     children.clear();
                     for child in fragment_nodes {
                         child.parent.set(Some(Rc::downgrade(node)));
@@ -2422,6 +2425,48 @@ mod tests {
         // Also check querySelector works after mutation
         let found = eval(&mut rt, "document.querySelector('#app p') !== null ? 'found' : 'null'");
         assert_eq!(found, "found", "Expected querySelector('#app p') to find element after innerHTML set");
+    }
+
+    #[test]
+    fn test_inner_html_replacement_detaches_old_subtree_relationships() {
+        let mut rt = make_runtime("<html><body><div id='app'><span id='old'>old</span><!--gone--></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var app = document.getElementById('app');
+                var old = document.getElementById('old');
+                var oldComment = app.lastChild;
+                app.innerHTML = '<p id=\"new\">new</p>';
+                return [
+                    old.parentNode === null,
+                    oldComment.parentNode === null,
+                    app.childNodes.length,
+                    app.firstChild.id,
+                    document.getElementById('old') === null
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "true:true:1:new:true");
+    }
+
+    #[test]
+    fn test_inner_html_replacement_can_rebuild_subtree_after_multiple_sets() {
+        let mut rt = make_runtime("<html><body><div id='app'><span id='old'>old</span></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var app = document.getElementById('app');
+                app.innerHTML = '<section id=\"mid\"><b>mid</b></section>';
+                var mid = document.getElementById('mid');
+                app.innerHTML = '<p id=\"final\">done</p><!--tail-->';
+                return [
+                    mid.parentNode === null,
+                    app.childNodes.length,
+                    app.firstChild.id,
+                    app.lastChild.nodeType,
+                    app.textContent
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "true:2:final:8:done");
     }
 
     #[test]
