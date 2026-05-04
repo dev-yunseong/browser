@@ -2491,6 +2491,58 @@ mod tests {
     }
 
     #[test]
+    fn test_append_child_document_fragment_detaches_live_children_from_old_parent() {
+        let mut rt = make_runtime("<html><body><div id='left'><span id='move'>x</span><b id='stay'>y</b></div><div id='right'></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var left = document.getElementById('left');
+                var right = document.getElementById('right');
+                var move = document.getElementById('move');
+                var frag = document.createDocumentFragment();
+                frag.appendChild(move);
+                right.appendChild(frag);
+                return [
+                    left.childNodes.length,
+                    left.firstChild.id,
+                    right.childNodes.length,
+                    right.firstChild.id,
+                    move.parentNode === right,
+                    frag.childNodes.length
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "1:stay:1:move:true:0");
+    }
+
+    #[test]
+    fn test_insert_before_document_fragment_preserves_order_for_reparented_children() {
+        let mut rt = make_runtime("<html><body><div id='src'><span id='one'>1</span><span id='two'>2</span></div><div id='dst'><i id='tail'>t</i></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var src = document.getElementById('src');
+                var dst = document.getElementById('dst');
+                var tail = document.getElementById('tail');
+                var one = document.getElementById('one');
+                var two = document.getElementById('two');
+                var frag = document.createDocumentFragment();
+                frag.appendChild(two);
+                frag.appendChild(one);
+                dst.insertBefore(frag, tail);
+                return [
+                    src.childNodes.length,
+                    dst.childNodes.item(0).id,
+                    dst.childNodes.item(1).id,
+                    dst.childNodes.item(2).id,
+                    one.parentNode === dst,
+                    two.parentNode === dst,
+                    frag.childNodes.length
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "0:two:one:tail:true:true:0");
+    }
+
+    #[test]
     fn test_create_comment_is_native_and_serializes() {
         let mut rt = make_runtime("<html><body><div id='app'></div></body></html>");
         let result = eval(&mut rt, r#"
