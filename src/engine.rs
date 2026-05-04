@@ -20,6 +20,7 @@ pub struct PageResult {
     pub element_ids: Vec<(layout::Rect, String)>,
     pub focusable_elements: Vec<(layout::Rect, String)>,
     pub image_urls: Vec<String>,
+    pub layout_metrics: HashMap<String, js::LayoutMetrics>,
     pub body: String,
     pub base_url: Url,
     pub csp_policy: Option<js::CspPolicy>,
@@ -592,6 +593,7 @@ pub fn process_html_with_cache(
     let mut event_handlers = Vec::new();
     let mut element_ids = Vec::new();
     let mut focusable_elements = Vec::new();
+    let mut layout_metrics = HashMap::new();
     let image_urls: Vec<String>;
 
     render::render_layout_tree(&layout_tree, &mut pixmap, image_cache, &base_url);
@@ -600,6 +602,7 @@ pub fn process_html_with_cache(
     layout_tree.collect_event_handlers(&mut event_handlers);
     layout_tree.collect_element_ids(&mut element_ids);
     layout_tree.collect_focusable_elements(&mut focusable_elements);
+    collect_layout_metrics(&layout_tree, &mut layout_metrics);
 
     let mut controls_with_nodes = Vec::new();
     layout_tree.collect_form_controls(&mut controls_with_nodes);
@@ -657,12 +660,33 @@ pub fn process_html_with_cache(
             element_ids,
             focusable_elements,
             image_urls,
+            layout_metrics,
             body: body.to_string(),
             base_url: base_url.clone(),
             csp_policy,
         },
         stylesheet,
     ))
+}
+
+fn collect_layout_metrics(layout_tree: &layout::LayoutBox, out: &mut HashMap<String, js::LayoutMetrics>) {
+    let mut stack = vec![layout_tree];
+    while let Some(layout) = stack.pop() {
+        if matches!(layout.style_node.node.data, markup5ever_rcdom::NodeData::Element { .. }) {
+            out.insert(
+                js::node_path_key(&layout.style_node.node),
+                js::LayoutMetrics {
+                    x: layout.dimensions.x,
+                    y: layout.dimensions.y,
+                    width: layout.dimensions.width,
+                    height: layout.dimensions.height,
+                },
+            );
+        }
+        for child in layout.children.iter().rev() {
+            stack.push(child);
+        }
+    }
 }
 
 // ── BrowserEngine ─────────────────────────────────────────────────────────────
@@ -688,7 +712,7 @@ impl BrowserEngine {
             image_cache: HashMap::new(),
             css_cache: HashMap::new(),
             last_stylesheet: None,
-            js_runtime: js::JsRuntime::new(None, None, None, console_buffer.clone()),
+            js_runtime: js::JsRuntime::new(None, None, None, None, console_buffer.clone()),
             console_buffer,
             current_csp_policy: None,
             js_style_overrides: HashMap::new(),
@@ -718,7 +742,7 @@ impl BrowserEngine {
         self.last_stylesheet = Some(stylesheet);
         self.current_csp_policy = page.csp_policy.clone();
         self.last_page = Some(page.clone());
-        self.init_js_for_page(&page.body);
+        self.init_js_for_page(&page);
         self.refresh_after_image_loads(page, width)
     }
 
@@ -753,6 +777,7 @@ impl BrowserEngine {
         let (page, stylesheet) = result;
         self.last_stylesheet = Some(stylesheet);
         self.last_page = Some(page.clone());
+        self.js_runtime.set_layout_metrics(page.layout_metrics.clone());
         self.refresh_after_image_loads(page, width)
     }
 
@@ -944,13 +969,13 @@ impl BrowserEngine {
     /// Re-initialize the JS runtime for the current page.
     /// Parses the DOM from `body`, runs all page scripts (CSP-gated),
     /// and collects any immediate JS style overrides.
-    pub fn init_js_for_page(&mut self, body: &str) {
-        let base_url = self.last_page.as_ref().map(|p| p.base_url.clone());
-        let dom = dom::parse_html(body);
+    pub fn init_js_for_page(&mut self, page: &PageResult) {
+        let dom = dom::parse_html(&page.body);
         self.js_runtime = js::JsRuntime::new(
             Some(dom.document.clone()),
-            base_url,
+            Some(page.base_url.clone()),
             self.current_csp_policy.clone(),
+            Some(page.layout_metrics.clone()),
             self.console_buffer.clone(),
         );
 
@@ -981,7 +1006,7 @@ impl BrowserEngine {
     pub fn clear_for_new_url(&mut self) {
         self.js_style_overrides.clear();
         self.clear_console();
-        self.js_runtime = js::JsRuntime::new(None, None, None, self.console_buffer.clone());
+        self.js_runtime = js::JsRuntime::new(None, None, None, None, self.console_buffer.clone());
         self.current_csp_policy = None;
         self.last_stylesheet = None;
         self.last_page = None;

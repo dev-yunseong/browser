@@ -9,7 +9,7 @@ fn test_focus_events() {
         <div id="b" tabindex="0"></div>
     "#;
     let dom = dom::parse_html(html);
-    let mut js = JsRuntime::new(Some(dom.document.clone()), None, None, browser::js::new_console_buffer());
+    let mut js = JsRuntime::new(Some(dom.document.clone()), None, None, None, browser::js::new_console_buffer());
     
     js.execute(r#"
         globalThis.log_output = [];
@@ -51,7 +51,7 @@ fn test_focus_blur_interleaving() {
         <div id="b" tabindex="0"></div>
     "#;
     let dom = dom::parse_html(html);
-    let mut js = JsRuntime::new(Some(dom.document.clone()), None, None, browser::js::new_console_buffer());
+    let mut js = JsRuntime::new(Some(dom.document.clone()), None, None, None, browser::js::new_console_buffer());
     
     js.execute(r#"
         globalThis.log_output = [];
