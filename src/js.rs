@@ -56,6 +56,7 @@ thread_local! {
     static PREVIOUS_FOCUSED_NODE: RefCell<Option<String>> = RefCell::new(None);
     static CURRENT_ORIGIN: RefCell<Option<Url>> = RefCell::new(None);
     static CSP_POLICY: RefCell<Option<CspPolicy>> = RefCell::new(None);
+    static LAYOUT_METRICS: RefCell<HashMap<String, LayoutMetrics>> = RefCell::new(HashMap::new());
     static CONSOLE_BUFFER: RefCell<Option<ConsoleBuffer>> = const { RefCell::new(None) };
 }
 
@@ -89,6 +90,24 @@ pub type ConsoleBuffer = Arc<ConsoleState>;
 pub struct EvalOutcome {
     pub result: Option<String>,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct LayoutMetrics {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl LayoutMetrics {
+    pub fn right(&self) -> f32 {
+        self.x + self.width
+    }
+
+    pub fn bottom(&self) -> f32 {
+        self.y + self.height
+    }
 }
 
 fn now_timestamp_ms() -> u64 {
@@ -228,11 +247,13 @@ impl JsRuntime {
         dom: Option<Handle>,
         base_url: Option<Url>,
         policy: Option<CspPolicy>,
+        layout_metrics: Option<HashMap<String, LayoutMetrics>>,
         console_buffer: ConsoleBuffer,
     ) -> Self {
         DOM_ROOT.with(|root| *root.borrow_mut() = dom);
         CURRENT_ORIGIN.with(|origin| *origin.borrow_mut() = base_url);
         CSP_POLICY.with(|p| *p.borrow_mut() = policy);
+        LAYOUT_METRICS.with(|metrics| *metrics.borrow_mut() = layout_metrics.unwrap_or_default());
         CONSOLE_BUFFER.with(|cell| *cell.borrow_mut() = Some(console_buffer));
         let mut context = Context::default();
         let (task_sender, task_receiver) = channel();
@@ -998,6 +1019,36 @@ impl JsRuntime {
         });
         context.register_global_callable(js_string!("__aura_get_text_content"), 1, get_text_content).unwrap();
 
+        // __aura_get_layout_metrics(nid) -> metrics object or null
+        let get_layout_metrics = NativeFunction::from_copy_closure(|_this, args, context| {
+            let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let metrics = NODE_REGISTRY.with(|reg| {
+                let reg = reg.borrow();
+                reg.get(&nid)
+                    .and_then(|node| {
+                        let key = node_path_key(node);
+                        LAYOUT_METRICS.with(|metrics| metrics.borrow().get(&key).cloned())
+                    })
+            });
+
+            if let Some(metrics) = metrics {
+                use boa_engine::object::ObjectInitializer;
+                let mut obj = ObjectInitializer::new(context);
+                obj.property(js_string!("x"), JsValue::from(metrics.x), boa_engine::property::Attribute::all());
+                obj.property(js_string!("y"), JsValue::from(metrics.y), boa_engine::property::Attribute::all());
+                obj.property(js_string!("width"), JsValue::from(metrics.width), boa_engine::property::Attribute::all());
+                obj.property(js_string!("height"), JsValue::from(metrics.height), boa_engine::property::Attribute::all());
+                obj.property(js_string!("top"), JsValue::from(metrics.y), boa_engine::property::Attribute::all());
+                obj.property(js_string!("left"), JsValue::from(metrics.x), boa_engine::property::Attribute::all());
+                obj.property(js_string!("right"), JsValue::from(metrics.right()), boa_engine::property::Attribute::all());
+                obj.property(js_string!("bottom"), JsValue::from(metrics.bottom()), boa_engine::property::Attribute::all());
+                Ok(obj.build().into())
+            } else {
+                Ok(JsValue::null())
+            }
+        });
+        context.register_global_callable(js_string!("__aura_get_layout_metrics"), 1, get_layout_metrics).unwrap();
+
         let get_node_value = NativeFunction::from_copy_closure(|_this, args, _context| {
             let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
             let value = NODE_REGISTRY.with(|reg| {
@@ -1378,6 +1429,10 @@ impl JsRuntime {
         }
 
         Self { context, task_receiver }
+    }
+
+    pub fn set_layout_metrics(&mut self, layout_metrics: HashMap<String, LayoutMetrics>) {
+        LAYOUT_METRICS.with(|metrics| *metrics.borrow_mut() = layout_metrics);
     }
 
     pub fn tick(&mut self, timestamp: Option<f64>, deadline_ms: Option<f64>) -> bool {
@@ -1764,6 +1819,35 @@ fn mark_document_fragment_id(id: u32) {
 
 fn is_document_fragment_id(id: u32) -> bool {
     DOCUMENT_FRAGMENT_NODE_IDS.with(|ids| ids.borrow().contains(&id))
+}
+
+pub fn node_path_key(node: &Handle) -> String {
+    let mut indices = Vec::new();
+    let mut current = node.clone();
+
+    loop {
+        let parent_weak = current.parent.take();
+        let Some(parent_weak) = parent_weak else {
+            break;
+        };
+        let Some(parent) = parent_weak.upgrade() else {
+            break;
+        };
+
+        let current_ptr = Rc::as_ptr(&current) as usize;
+        let index = parent
+            .children
+            .borrow()
+            .iter()
+            .position(|child| Rc::as_ptr(child) as usize == current_ptr)
+            .unwrap_or(0);
+        indices.push(index.to_string());
+        current.parent.set(Some(Rc::downgrade(&parent)));
+        current = parent;
+    }
+
+    indices.reverse();
+    indices.join("/")
 }
 
 fn detach_node_from_parent(node: &Handle) {
@@ -2218,12 +2302,44 @@ fn steal_fragment_children(doc: &Handle) -> Vec<Handle> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{css, style};
+    use crate::{css, style, engine};
     use crate::dom;
 
     fn make_runtime(html: &str) -> JsRuntime {
         let dom = dom::parse_html(html);
-        JsRuntime::new(Some(dom.document), None, None, new_console_buffer())
+        JsRuntime::new(Some(dom.document), None, None, None, new_console_buffer())
+    }
+
+    fn layout_metrics_for_html(html: &str, width: f32) -> HashMap<String, LayoutMetrics> {
+        let base_url = Url::parse("https://example.com/").unwrap();
+        let image_cache = HashMap::new();
+        let mut css_cache = HashMap::new();
+        let js_overrides = HashMap::new();
+        let (page, _) = engine::process_html_with_cache(
+            html,
+            &base_url,
+            &image_cache,
+            &mut css_cache,
+            None,
+            &js_overrides,
+            None,
+            None,
+            None,
+            width,
+        ).unwrap();
+        page.layout_metrics
+    }
+
+    fn make_runtime_with_layout(html: &str, width: f32) -> JsRuntime {
+        let dom = dom::parse_html(html);
+        let metrics = layout_metrics_for_html(html, width);
+        JsRuntime::new(
+            Some(dom.document),
+            Some(Url::parse("https://example.com/").unwrap()),
+            None,
+            Some(metrics),
+            new_console_buffer(),
+        )
     }
 
     fn eval(rt: &mut JsRuntime, code: &str) -> String {
@@ -2253,7 +2369,7 @@ mod tests {
     fn test_console_methods_are_captured_with_levels() {
         let buffer = new_console_buffer();
         let dom = dom::parse_html("<html><body></body></html>");
-        let mut rt = JsRuntime::new(Some(dom.document), None, None, buffer.clone());
+        let mut rt = JsRuntime::new(Some(dom.document), None, None, None, buffer.clone());
 
         rt.execute("console.log('hello', 1); console.warn('careful'); console.error('boom');");
 
@@ -3028,7 +3144,7 @@ mod tests {
     fn test_history_push_and_replace_state_updates_location() {
         let url = url::Url::parse("https://example.com:8443/app/index.html").unwrap();
         let dom = crate::dom::parse_html("<html><body></body></html>");
-        let mut rt = JsRuntime::new(Some(dom.document), Some(url), None, new_console_buffer());
+        let mut rt = JsRuntime::new(Some(dom.document), Some(url), None, None, new_console_buffer());
 
         let result = eval(&mut rt, r#"
             (function() {
@@ -3103,7 +3219,7 @@ mod tests {
     fn test_history_push_state_updates_pathname_search_hash() {
         let url = url::Url::parse("https://example.com/start").unwrap();
         let dom = crate::dom::parse_html("<html><body></body></html>");
-        let mut rt = JsRuntime::new(Some(dom.document), Some(url), None, new_console_buffer());
+        let mut rt = JsRuntime::new(Some(dom.document), Some(url), None, None, new_console_buffer());
 
         let result = eval(&mut rt, r#"
             (function() {
@@ -3123,7 +3239,7 @@ mod tests {
     fn test_history_replace_state_overwrites_url_and_state() {
         let url = url::Url::parse("https://example.com/page").unwrap();
         let dom = crate::dom::parse_html("<html><body></body></html>");
-        let mut rt = JsRuntime::new(Some(dom.document), Some(url), None, new_console_buffer());
+        let mut rt = JsRuntime::new(Some(dom.document), Some(url), None, None, new_console_buffer());
 
         let result = eval(&mut rt, r#"
             (function() {
@@ -3153,7 +3269,7 @@ mod tests {
     fn test_location_origin_preserves_port() {
         let url = url::Url::parse("https://example.com:9000/path").unwrap();
         let dom = crate::dom::parse_html("<html><body></body></html>");
-        let mut rt = JsRuntime::new(Some(dom.document), Some(url), None, new_console_buffer());
+        let mut rt = JsRuntime::new(Some(dom.document), Some(url), None, None, new_console_buffer());
         let origin = eval(&mut rt, "window.location.origin");
         assert_eq!(origin, "https://example.com:9000");
     }
@@ -3250,7 +3366,7 @@ mod tests {
     fn test_window_location_set_from_url() {
         let url = url::Url::parse("https://www.example.com:8443/path?q=1#hash").unwrap();
         let dom = crate::dom::parse_html("<html><body></body></html>");
-        let mut rt = JsRuntime::new(Some(dom.document), Some(url), None, new_console_buffer());
+        let mut rt = JsRuntime::new(Some(dom.document), Some(url), None, None, new_console_buffer());
         let href = if let Ok(val) = rt.context.eval(Source::from_bytes(b"window.location.href")) {
             if let Ok(s) = val.to_string(&mut rt.context) { s.to_std_string_escaped() } else { String::new() }
         } else { String::new() };
@@ -3293,6 +3409,60 @@ mod tests {
             })()
         "#);
         assert_eq!(result, "true:x:insertText:42:13");
+    }
+
+    #[test]
+    fn test_geometry_apis_return_layout_backed_rects_for_block_elements() {
+        let mut rt = make_runtime_with_layout(
+            "<html><body><div id='box' style='width: 120px; height: 40px; margin-left: 15px;'>box</div></body></html>",
+            800.0,
+        );
+        let result = eval(&mut rt, r#"
+            (function() {
+                var box = document.getElementById('box');
+                var rect = box.getBoundingClientRect();
+                return [
+                    rect.width > 0,
+                    rect.height > 0,
+                    box.offsetWidth === rect.width,
+                    box.offsetHeight === rect.height,
+                    box.clientWidth === rect.width,
+                    box.clientHeight === rect.height,
+                    box.offsetLeft === rect.left,
+                    box.offsetTop === rect.top,
+                    box.getClientRects().length === 1
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "true:true:true:true:true:true:true:true:true");
+    }
+
+    #[test]
+    fn test_geometry_apis_cover_inline_elements_and_update_after_layout_refresh() {
+        let html = "<html><body><span id='inline' style='display: inline-block; width: 50%; height: 20px;'>x</span></body></html>";
+        let mut rt = make_runtime_with_layout(html, 800.0);
+        let first = eval(&mut rt, r#"
+            (function() {
+                var rect = document.getElementById('inline').getBoundingClientRect();
+                return [rect.width > 0, rect.height > 0, document.getElementById('inline').getClientRects().length].join(':');
+            })()
+        "#);
+        assert_eq!(first, "true:true:1");
+
+        rt.set_layout_metrics(layout_metrics_for_html(html, 400.0));
+        let result = eval(&mut rt, r#"
+            (function() {
+                var el = document.getElementById('inline');
+                var width = el.getBoundingClientRect().width;
+                return [
+                    width > 0,
+                    el.scrollWidth === width,
+                    el.scrollHeight === el.getBoundingClientRect().height,
+                    width < 300
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "true:true:true:true");
     }
 
     #[test]

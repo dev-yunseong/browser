@@ -743,11 +743,20 @@ class Element extends Node {
         }
         return c ? __get_or_create_node(c.nid, c.tag, c.id, c.kind) : null;
     }
-    // getBoundingClientRect stub — returns zeros (layout info not available in JS)
-    getBoundingClientRect() {
+    _layoutMetrics() {
+        if (typeof __aura_get_layout_metrics === 'function') {
+            let metrics = __aura_get_layout_metrics(this._id);
+            if (metrics) return metrics;
+        }
         return { x: 0, y: 0, width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 };
     }
-    getClientRects() { return []; }
+    getBoundingClientRect() {
+        return this._layoutMetrics();
+    }
+    getClientRects() {
+        let rect = this._layoutMetrics();
+        return rect.width > 0 || rect.height > 0 ? [rect] : [];
+    }
     // scrollIntoView stub
     scrollIntoView() {}
     scroll() {}
@@ -822,19 +831,18 @@ class Element extends Node {
     get selectedIndex() { return -1; }
     set selectedIndex(v) {}
     get options() { return new NodeList([]); }
-    // offsetWidth / offsetHeight / scrollWidth / scrollHeight stubs
-    get offsetWidth() { return 0; }
-    get offsetHeight() { return 0; }
-    get offsetTop() { return 0; }
-    get offsetLeft() { return 0; }
-    get scrollWidth() { return 0; }
-    get scrollHeight() { return 0; }
+    get offsetWidth() { return this._layoutMetrics().width; }
+    get offsetHeight() { return this._layoutMetrics().height; }
+    get offsetTop() { return this._layoutMetrics().top; }
+    get offsetLeft() { return this._layoutMetrics().left; }
+    get scrollWidth() { return this._layoutMetrics().width; }
+    get scrollHeight() { return this._layoutMetrics().height; }
     get scrollTop() { return 0; }
     set scrollTop(v) {}
     get scrollLeft() { return 0; }
     set scrollLeft(v) {}
-    get clientWidth() { return 0; }
-    get clientHeight() { return 0; }
+    get clientWidth() { return this._layoutMetrics().width; }
+    get clientHeight() { return this._layoutMetrics().height; }
     // namespaceURI
     get namespaceURI() { return 'http://www.w3.org/1999/xhtml'; }
     // setAttributeNS / getAttributeNS / removeAttributeNS
