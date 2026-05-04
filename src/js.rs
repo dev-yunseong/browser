@@ -2588,6 +2588,50 @@ mod tests {
     }
 
     #[test]
+    fn test_remove_child_detaches_subtree_but_preserves_internal_children() {
+        let mut rt = make_runtime("<html><body><div id='app'><section id='outer'><span id='inner'>x</span></section></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var app = document.getElementById('app');
+                var outer = document.getElementById('outer');
+                var inner = document.getElementById('inner');
+                app.removeChild(outer);
+                return [
+                    outer.parentNode === null,
+                    inner.parentNode === outer,
+                    outer.childNodes.length,
+                    app.childNodes.length,
+                    outer.textContent
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "true:true:1:0:x");
+    }
+
+    #[test]
+    fn test_reused_detached_node_moves_between_containers_with_same_identity() {
+        let mut rt = make_runtime("<html><body><div id='a'></div><div id='b'></div><p id='node'>hi</p></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var a = document.getElementById('a');
+                var b = document.getElementById('b');
+                var node = document.getElementById('node');
+                a.appendChild(node);
+                var firstIdentity = a.firstChild === node;
+                b.appendChild(node);
+                return [
+                    firstIdentity,
+                    a.childNodes.length,
+                    b.childNodes.length,
+                    b.firstChild === node,
+                    node.parentNode === b
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "true:0:1:true:true");
+    }
+
+    #[test]
     fn test_create_comment_is_native_and_serializes() {
         let mut rt = make_runtime("<html><body><div id='app'></div></body></html>");
         let result = eval(&mut rt, r#"
