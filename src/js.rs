@@ -410,12 +410,35 @@ impl JsRuntime {
         });
         context.register_global_callable(js_string!("__aura_get_previous_element_sibling_id"), 1, get_previous_element_sibling_id).unwrap();
 
+        let get_document_element = NativeFunction::from_copy_closure(|_this, _args, _context| {
+            let document_element_nid = DOM_ROOT.with(|root| {
+                root.borrow()
+                    .as_ref()
+                    .and_then(find_document_element)
+                    .map(register_node)
+            });
+            Ok(document_element_nid.map(JsValue::from).unwrap_or(JsValue::null()))
+        });
+        context.register_global_callable(js_string!("__aura_get_document_element"), 0, get_document_element).unwrap();
+
+        let get_head = NativeFunction::from_copy_closure(|_this, _args, _context| {
+            let head_nid = DOM_ROOT.with(|root| {
+                root.borrow()
+                    .as_ref()
+                    .and_then(|document| find_document_surface_element(document, "head"))
+                    .map(register_node)
+            });
+            Ok(head_nid.map(JsValue::from).unwrap_or(JsValue::null()))
+        });
+        context.register_global_callable(js_string!("__aura_get_head"), 0, get_head).unwrap();
+
         // Register native __aura_get_body
         let get_body = NativeFunction::from_copy_closure(|_this, _args, _context| {
             let body_nid = DOM_ROOT.with(|root| {
-                if let Some(ref r) = *root.borrow() {
-                    find_element_by_tag(r, "body").map(register_node)
-                } else { None }
+                root.borrow()
+                    .as_ref()
+                    .and_then(|document| find_document_surface_element(document, "body"))
+                    .map(register_node)
             });
             Ok(body_nid.map(JsValue::from).unwrap_or(JsValue::null()))
         });
@@ -1567,6 +1590,26 @@ fn find_element_by_tag(root: &Handle, tag: &str) -> Option<Handle> {
     None
 }
 
+fn find_direct_child_element_by_tag(root: &Handle, tag: &str) -> Option<Handle> {
+    for child in root.children.borrow().iter() {
+        if let NodeData::Element { ref name, .. } = child.data {
+            if name.local.to_string() == tag {
+                return Some(child.clone());
+            }
+        }
+    }
+    None
+}
+
+fn find_document_element(root: &Handle) -> Option<Handle> {
+    find_direct_child_element_by_tag(root, "html")
+}
+
+fn find_document_surface_element(root: &Handle, tag: &str) -> Option<Handle> {
+    let document_element = find_document_element(root)?;
+    find_direct_child_element_by_tag(&document_element, tag)
+}
+
 fn find_element_by_id(root: &Handle, id: &str) -> Option<Handle> {
     if let NodeData::Element { ref attrs, .. } = root.data {
         for attr in attrs.borrow().iter() {
@@ -2458,6 +2501,46 @@ mod tests {
             })()
         "#);
         assert_eq!(result, "true:10:html:true:true");
+    }
+
+    #[test]
+    fn test_document_surface_uses_explicit_html_head_body_nodes() {
+        let mut rt = make_runtime("<!DOCTYPE html><html><head><title>x</title></head><body><div id='app'>ok</div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                return [
+                    document.documentElement !== null,
+                    document.documentElement.nodeName,
+                    document.head !== null,
+                    document.head.parentNode === document.documentElement,
+                    document.body !== null,
+                    document.body.parentNode === document.documentElement,
+                    document.body.firstChild.id,
+                    document.documentElement === document.documentElement,
+                    document.head === document.head,
+                    document.body === document.body
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "true:HTML:true:true:true:true:app:true:true:true");
+    }
+
+    #[test]
+    fn test_document_surface_matches_parser_inserted_structure_for_malformed_html() {
+        let mut rt = make_runtime("<title>hello</title><p>world</p>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                return [
+                    document.documentElement !== null,
+                    document.head !== null,
+                    document.body !== null,
+                    document.head.textContent,
+                    document.body.textContent,
+                    document.body.parentNode === document.documentElement
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "true:true:true:hello:world:true");
     }
 
     #[test]

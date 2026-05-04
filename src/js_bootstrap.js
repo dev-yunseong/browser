@@ -970,22 +970,18 @@ var document = {
         let nids = JSON.parse(nids_json);
         return new NodeList(nids);
     },
-
+    // Document surface getters follow the parsed tree shape, not arbitrary descendants.
     get body() {
         let nativeId = __aura_get_body();
         return nativeId ? __get_or_create_node(nativeId, 'body', null, 'element') : null;
     },
     get head() {
-        let nids_json = __aura_get_elements_by_tag(0, 'head');
-        let nids = JSON.parse(nids_json);
-        if (nids.length === 0) return null;
-        return __get_or_create_node(nids[0], 'head', null, 'element');
+        let nativeId = __aura_get_head();
+        return nativeId ? __get_or_create_node(nativeId, 'head', null, 'element') : null;
     },
     get documentElement() {
-        let nids_json = __aura_get_elements_by_tag(0, 'html');
-        let nids = JSON.parse(nids_json);
-        if (nids.length === 0) return null;
-        return __get_or_create_node(nids[0], 'html', null, 'element');
+        let nativeId = __aura_get_document_element();
+        return nativeId ? __get_or_create_node(nativeId, 'html', null, 'element') : null;
     },
     get doctype() {
         let nativeId = 0;
