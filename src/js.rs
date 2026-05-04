@@ -745,6 +745,23 @@ impl JsRuntime {
         });
         context.register_global_callable(js_string!("__aura_create_text_node"), 1, create_text_node).unwrap();
 
+        // __aura_create_comment(text) -> nid
+        let create_comment = NativeFunction::from_copy_closure(|_this, args, _context| {
+            use html5ever::tendril::StrTendril;
+            use markup5ever_rcdom::{Node, NodeData};
+
+            let text = args.get(0)
+                .and_then(|v| v.as_string())
+                .map(|s| s.to_std_string_escaped())
+                .unwrap_or_default();
+            let node = Node::new(NodeData::Comment {
+                contents: StrTendril::from(text.as_str()),
+            });
+            Ok(JsValue::from(register_node(node)))
+        });
+        context.register_global_callable(js_string!("__aura_create_comment"), 1, create_comment.clone()).unwrap();
+        context.register_global_callable(js_string!("__aura_create_comment_node"), 1, create_comment).unwrap();
+
         // __aura_create_document_fragment() -> nid
         let create_document_fragment = NativeFunction::from_copy_closure(|_this, _args, _context| {
             use markup5ever_rcdom::{Node, NodeData};
@@ -897,7 +914,10 @@ impl JsRuntime {
             let text = NODE_REGISTRY.with(|reg| {
                 let reg = reg.borrow();
                 if let Some(node) = reg.get(&nid) {
-                    collect_text_content(node)
+                    match &node.data {
+                        NodeData::Comment { contents } => contents.to_string(),
+                        _ => collect_text_content(node),
+                    }
                 } else {
                     String::new()
                 }
@@ -906,35 +926,61 @@ impl JsRuntime {
         });
         context.register_global_callable(js_string!("__aura_get_text_content"), 1, get_text_content).unwrap();
 
+        let get_node_value = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let value = NODE_REGISTRY.with(|reg| {
+                let reg = reg.borrow();
+                reg.get(&nid).and_then(|node| match &node.data {
+                    NodeData::Text { contents } => Some(contents.borrow().to_string()),
+                    NodeData::Comment { contents } => Some(contents.to_string()),
+                    _ => None,
+                })
+            });
+            Ok(value.map(|v| JsValue::from(js_string!(v))).unwrap_or(JsValue::null()))
+        });
+        context.register_global_callable(js_string!("__aura_get_node_value"), 1, get_node_value.clone()).unwrap();
+        context.register_global_callable(js_string!("__aura_get_character_data"), 1, get_node_value.clone()).unwrap();
+        context.register_global_callable(js_string!("__aura_get_comment_data"), 1, get_node_value).unwrap();
+
         // __aura_set_text_content(nid, text) → void
         let set_text_content = NativeFunction::from_copy_closure(|_this, args, _context| {
             let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
             let text = args.get(1).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
-            NODE_REGISTRY.with(|reg| {
-                let reg = reg.borrow();
-                if let Some(node) = reg.get(&nid) {
-                    match &node.data {
-                        NodeData::Text { contents } => {
-                            *contents.borrow_mut() = text.as_str().into();
-                        }
-                        _ => {
-                            use html5ever::tendril::StrTendril;
-                            use markup5ever_rcdom::Node;
+            let node = NODE_REGISTRY.with(|reg| reg.borrow().get(&nid).cloned());
+            if let Some(node) = node {
+                match &node.data {
+                    NodeData::Text { contents } => {
+                        *contents.borrow_mut() = text.as_str().into();
+                    }
+                    NodeData::Comment { .. } => {
+                        use html5ever::tendril::StrTendril;
+                        use markup5ever_rcdom::Node;
 
-                            let text_node = Node::new(NodeData::Text {
-                                contents: std::cell::RefCell::new(StrTendril::from(text.as_str())),
-                            });
-                            text_node.parent.set(Some(Rc::downgrade(node)));
-                            let mut children = node.children.borrow_mut();
-                            children.clear();
-                            children.push(text_node);
-                        }
+                        let replacement = Node::new(NodeData::Comment {
+                            contents: StrTendril::from(text.as_str()),
+                        });
+                        replace_registered_node(nid, replacement);
+                    }
+                    _ => {
+                        use html5ever::tendril::StrTendril;
+                        use markup5ever_rcdom::Node;
+
+                        let text_node = Node::new(NodeData::Text {
+                            contents: std::cell::RefCell::new(StrTendril::from(text.as_str())),
+                        });
+                        text_node.parent.set(Some(Rc::downgrade(&node)));
+                        let mut children = node.children.borrow_mut();
+                        children.clear();
+                        children.push(text_node);
                     }
                 }
-            });
+            }
             Ok(JsValue::undefined())
         });
-        context.register_global_callable(js_string!("__aura_set_text_content"), 2, set_text_content).unwrap();
+        context.register_global_callable(js_string!("__aura_set_text_content"), 2, set_text_content.clone()).unwrap();
+        context.register_global_callable(js_string!("__aura_set_node_value"), 2, set_text_content.clone()).unwrap();
+        context.register_global_callable(js_string!("__aura_set_character_data"), 2, set_text_content.clone()).unwrap();
+        context.register_global_callable(js_string!("__aura_set_comment_data"), 2, set_text_content).unwrap();
 
         // __aura_get_attribute(nid, name) → string | null
         let get_attr = NativeFunction::from_copy_closure(|_this, args, _context| {
@@ -1013,6 +1059,12 @@ impl JsRuntime {
                     NodeData::Text { .. } => {
                         items.push(format!("{{\"nid\":{},\"tag\":\"\",\"id\":\"\",\"kind\":\"text\"}}", child_nid));
                     }
+                    NodeData::Comment { .. } => {
+                        items.push(format!("{{\"nid\":{},\"tag\":\"\",\"id\":\"\",\"kind\":\"comment\"}}", child_nid));
+                    }
+                    NodeData::Doctype { ref name, .. } => {
+                        items.push(format!("{{\"nid\":{},\"tag\":\"{}\",\"id\":\"\",\"kind\":\"doctype\"}}", child_nid, name));
+                    }
                     NodeData::Document => {
                         items.push(format!("{{\"nid\":{},\"tag\":\"\",\"id\":\"\",\"kind\":\"fragment\"}}", child_nid));
                     }
@@ -1023,6 +1075,50 @@ impl JsRuntime {
             Ok(JsValue::from(js_string!(format!("[{}]", result))))
         });
         context.register_global_callable(js_string!("__aura_get_children"), 1, get_children).unwrap();
+
+        let get_doctype_id = NativeFunction::from_copy_closure(|_this, _args, _context| {
+            let doctype_nid = DOM_ROOT.with(|root| {
+                root.borrow()
+                    .as_ref()
+                    .and_then(find_document_doctype)
+                    .map(register_node)
+            });
+            Ok(doctype_nid.map(JsValue::from).unwrap_or(JsValue::null()))
+        });
+        context.register_global_callable(js_string!("__aura_get_doctype_id"), 0, get_doctype_id.clone()).unwrap();
+        context.register_global_callable(js_string!("__aura_get_document_type"), 0, get_doctype_id.clone()).unwrap();
+        context.register_global_callable(js_string!("__aura_get_doctype"), 0, get_doctype_id).unwrap();
+
+        let get_document_type_info = NativeFunction::from_copy_closure(|_this, args, context| {
+            let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let info = NODE_REGISTRY.with(|reg| {
+                let reg = reg.borrow();
+                reg.get(&nid).and_then(|node| {
+                    if let NodeData::Doctype {
+                        ref name,
+                        ref public_id,
+                        ref system_id,
+                    } = node.data
+                    {
+                        Some((name.to_string(), public_id.to_string(), system_id.to_string()))
+                    } else {
+                        None
+                    }
+                })
+            });
+            if let Some((name, public_id, system_id)) = info {
+                use boa_engine::object::ObjectInitializer;
+                let mut obj = ObjectInitializer::new(context);
+                obj.property(js_string!("name"), JsValue::from(js_string!(name)), boa_engine::property::Attribute::all());
+                obj.property(js_string!("publicId"), JsValue::from(js_string!(public_id)), boa_engine::property::Attribute::all());
+                obj.property(js_string!("systemId"), JsValue::from(js_string!(system_id)), boa_engine::property::Attribute::all());
+                Ok(obj.build().into())
+            } else {
+                Ok(JsValue::null())
+            }
+        });
+        context.register_global_callable(js_string!("__aura_get_document_type_info"), 1, get_document_type_info.clone()).unwrap();
+        context.register_global_callable(js_string!("__aura_get_doctype_info"), 1, get_document_type_info).unwrap();
 
         // __aura_get_node_info(nid) → {tag, id, class} or null
         let get_node_info = NativeFunction::from_copy_closure(|_this, args, context| {
@@ -1041,6 +1137,10 @@ impl JsRuntime {
                         return Some((tag, id, class, "element".to_string()));
                     } else if let NodeData::Text { .. } = node.data {
                         return Some((String::new(), String::new(), String::new(), "text".to_string()));
+                    } else if let NodeData::Comment { .. } = node.data {
+                        return Some((String::new(), String::new(), String::new(), "comment".to_string()));
+                    } else if let NodeData::Doctype { ref name, .. } = node.data {
+                        return Some((name.to_string(), String::new(), String::new(), "doctype".to_string()));
                     }
                 }
                 None
@@ -1070,6 +1170,7 @@ impl JsRuntime {
                     NodeData::Element { .. } => 1,
                     NodeData::Text { .. } => 3,
                     NodeData::Comment { .. } => 8,
+                    NodeData::Doctype { .. } => 10,
                     NodeData::Document => 9,
                     _ => 0,
                 }).unwrap_or(0)
@@ -1452,6 +1553,15 @@ fn find_element_by_id(root: &Handle, id: &str) -> Option<Handle> {
     None
 }
 
+fn find_document_doctype(root: &Handle) -> Option<Handle> {
+    for child in root.children.borrow().iter() {
+        if let NodeData::Doctype { .. } = child.data {
+            return Some(child.clone());
+        }
+    }
+    None
+}
+
 fn find_parent_of_node(root: &Handle, target_nid: u32) -> Option<Handle> {
     for child in root.children.borrow().iter() {
         // Check if any child matches the target_nid (needs to be registered first to check nid)
@@ -1492,6 +1602,38 @@ fn register_node(handle: Handle) -> u32 {
     NODE_REGISTRY.with(|reg| reg.borrow_mut().insert(id, handle));
     REVERSE_NODE_REGISTRY.with(|reg| reg.borrow_mut().insert(ptr, id));
     id
+}
+
+fn replace_registered_node(id: u32, new_handle: Handle) {
+    let parent = NODE_REGISTRY.with(|reg| {
+        reg.borrow()
+            .get(&id)
+            .and_then(|node| node.parent.take().and_then(|weak| weak.upgrade()))
+    });
+    if let Some(ref parent_handle) = parent {
+        let old_ptr = NODE_REGISTRY.with(|reg| {
+            reg.borrow()
+                .get(&id)
+                .map(|node| Rc::as_ptr(node) as usize)
+                .unwrap_or(0)
+        });
+        let mut children = parent_handle.children.borrow_mut();
+        if let Some(pos) = children.iter().position(|child| Rc::as_ptr(child) as usize == old_ptr) {
+            new_handle.parent.set(Some(Rc::downgrade(parent_handle)));
+            children[pos] = new_handle.clone();
+        }
+    }
+
+    NODE_REGISTRY.with(|reg| {
+        if let Some(old_handle) = reg.borrow_mut().insert(id, new_handle.clone()) {
+            let old_ptr = Rc::as_ptr(&old_handle) as usize;
+            REVERSE_NODE_REGISTRY.with(|reverse| {
+                reverse.borrow_mut().remove(&old_ptr);
+            });
+        }
+    });
+    let new_ptr = Rc::as_ptr(&new_handle) as usize;
+    REVERSE_NODE_REGISTRY.with(|reg| reg.borrow_mut().insert(new_ptr, id));
 }
 
 fn mark_document_fragment_id(id: u32) {
@@ -1792,6 +1934,11 @@ fn serialize_node(node: &Handle, out: &mut String) {
     match &node.data {
         NodeData::Text { ref contents } => {
             out.push_str(&html_escape(&contents.borrow().to_string()));
+        }
+        NodeData::Doctype { ref name, .. } => {
+            out.push_str("<!DOCTYPE ");
+            out.push_str(name);
+            out.push('>');
         }
         NodeData::Element { ref name, ref attrs, .. } => {
             let tag = name.local.to_string();
@@ -2181,6 +2328,62 @@ mod tests {
             })()
         "#);
         assert_eq!(result, "3:head:mid:tail:0:true:headmidtail");
+    }
+
+    #[test]
+    fn test_create_comment_is_native_and_serializes() {
+        let mut rt = make_runtime("<html><body><div id='app'></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var app = document.getElementById('app');
+                var comment = document.createComment('note');
+                app.appendChild(comment);
+                comment.data = 'done';
+                return [
+                    comment.nodeType,
+                    comment.nodeName,
+                    comment.nodeValue,
+                    comment.parentNode === app,
+                    app.innerHTML
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "8:#comment:done:true:<!--done-->");
+    }
+
+    #[test]
+    fn test_parsed_comment_is_visible_in_child_nodes() {
+        let mut rt = make_runtime("<html><body><div id='app'><!--hello--><span>tail</span></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var app = document.getElementById('app');
+                var first = app.firstChild;
+                return [
+                    app.childNodes.length,
+                    first.nodeType,
+                    first.nodeValue,
+                    app.lastChild.textContent
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "2:8:hello:tail");
+    }
+
+    #[test]
+    fn test_document_doctype_is_exposed_to_js() {
+        let mut rt = make_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                return [
+                    document.doctype !== null,
+                    document.doctype.nodeType,
+                    document.doctype.name,
+                    document.doctype.nodeValue === null,
+                    document.doctype === document.doctype
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "true:10:html:true:true");
     }
 
     // ── New runtime parity tests (#113) ──────────────────────────────────────
