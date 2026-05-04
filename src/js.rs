@@ -1,4 +1,5 @@
 use boa_engine::{Context, Source, JsValue, NativeFunction, js_string};
+use crate::css::{AttributeMatch, Combinator, Selector, parse_selector};
 use std::collections::{HashMap, HashSet, VecDeque};
 use markup5ever_rcdom::{NodeData, Handle};
 use std::cell::RefCell;
@@ -1797,131 +1798,175 @@ fn insert_fragment_children(parent: &Handle, fragment: &Handle, insert_pos: Opti
 
 // ── CSS Selector Matching ─────────────────────────────────────────────────────
 
-/// Simple CSS selector parser: supports tag, #id, .class, and combinations
-/// e.g. "div", "#foo", ".bar", "div.foo", "div#id", ".a.b"
-/// Also supports comma-separated selectors: "h1, h2, h3"
-fn selector_matches(node: &Handle, selector: &str) -> bool {
-    // Comma-separated: match any
-    if selector.contains(',') {
-        return selector.split(',').any(|s| selector_matches(node, s.trim()));
+fn split_selector_groups(selector: &str) -> Vec<&str> {
+    let mut groups = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (idx, ch) in selector.char_indices() {
+        match ch {
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth -= 1,
+            ',' if depth == 0 => {
+                let part = selector[start..idx].trim();
+                if !part.is_empty() {
+                    groups.push(part);
+                }
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let tail = selector[start..].trim();
+    if !tail.is_empty() {
+        groups.push(tail);
+    }
+    groups
+}
+
+fn selector_is_supported_for_dom_queries(selector: &Selector) -> bool {
+    if selector.pseudo_class.is_some() || selector.pseudo_element.is_some() {
+        return false;
+    }
+    selector
+        .ancestor
+        .as_deref()
+        .map(selector_is_supported_for_dom_queries)
+        .unwrap_or(true)
+}
+
+fn selector_subject_matches_handle(node: &Handle, selector: &Selector) -> bool {
+    let NodeData::Element { ref name, ref attrs, .. } = node.data else {
+        return false;
+    };
+
+    let has_constraint = selector.tag.is_some()
+        || selector.id.is_some()
+        || !selector.class.is_empty()
+        || !selector.attributes.is_empty();
+    if !has_constraint {
+        return false;
     }
 
-    if let NodeData::Element { ref name, ref attrs, .. } = node.data {
-        let tag = name.local.to_string().to_lowercase();
-        let attrs_b = attrs.borrow();
-        let id_val = attrs_b.iter().find(|a| a.name.local.to_string() == "id").map(|a| a.value.to_string()).unwrap_or_default();
-        let class_val = attrs_b.iter().find(|a| a.name.local.to_string() == "class").map(|a| a.value.to_string()).unwrap_or_default();
-        let classes: Vec<&str> = class_val.split_whitespace().collect();
-
-        // Parse compound selector (no spaces — those would be descendant combinators)
-        // We handle simple compound selectors: tag.class#id combinations
-        let sel = selector.trim();
-
-        // Check for attribute selectors like [type="submit"] - simplified
-        if sel.contains('[') {
-            return selector_matches_with_attr(node, sel);
+    let tag = name.local.to_string().to_lowercase();
+    if let Some(ref required_tag) = selector.tag {
+        if tag != required_tag.to_lowercase() {
+            return false;
         }
+    }
 
-        // Split into parts by '#' and '.'
-        // Strategy: extract optional tag prefix, then check all id/class parts
-        let mut remaining = sel;
-        let mut required_tag: Option<&str> = None;
-
-        // Extract tag prefix (before any '.' or '#')
-        let prefix_end = remaining.find(|c| c == '.' || c == '#').unwrap_or(remaining.len());
-        if prefix_end > 0 {
-            let prefix = &remaining[..prefix_end];
-            if prefix != "*" {
-                required_tag = Some(prefix);
-            }
-            remaining = &remaining[prefix_end..];
+    let attrs_ref = attrs.borrow();
+    let id_val = attrs_ref
+        .iter()
+        .find(|a| a.name.local.to_string() == "id")
+        .map(|a| a.value.to_string());
+    if let Some(ref required_id) = selector.id {
+        if id_val.as_deref() != Some(required_id.as_str()) {
+            return false;
         }
+    }
 
-        if let Some(t) = required_tag {
-            if tag != t.to_lowercase() {
+    let class_val = attrs_ref
+        .iter()
+        .find(|a| a.name.local.to_string() == "class")
+        .map(|a| a.value.to_string())
+        .unwrap_or_default();
+    let classes: Vec<&str> = class_val.split_whitespace().collect();
+    for required_class in &selector.class {
+        if !classes.contains(&required_class.as_str()) {
+            return false;
+        }
+    }
+
+    for attr_sel in &selector.attributes {
+        let matched = attrs_ref.iter().any(|attr| {
+            if attr.name.local.to_string() != attr_sel.name {
                 return false;
             }
-        }
-
-        // Check remaining .class and #id parts
-        while !remaining.is_empty() {
-            if remaining.starts_with('#') {
-                let end = remaining[1..].find(|c| c == '.' || c == '#').map(|p| p + 1).unwrap_or(remaining.len());
-                let required_id = &remaining[1..end];
-                if id_val != required_id {
-                    return false;
-                }
-                remaining = &remaining[end..];
-            } else if remaining.starts_with('.') {
-                let end = remaining[1..].find(|c| c == '.' || c == '#').map(|p| p + 1).unwrap_or(remaining.len());
-                let required_class = &remaining[1..end];
-                if !classes.contains(&required_class) {
-                    return false;
-                }
-                remaining = &remaining[end..];
-            } else {
-                break;
+            match &attr_sel.value {
+                AttributeMatch::Exists => true,
+                AttributeMatch::Equals(expected) => attr.value.to_string() == *expected,
             }
+        });
+        if !matched {
+            return false;
         }
-        true
-    } else {
-        false
+    }
+
+    true
+}
+
+fn previous_element_siblings(node: &Handle) -> Vec<Handle> {
+    let Some(parent) = get_parent_handle(node) else {
+        return Vec::new();
+    };
+    let node_ptr = Rc::as_ptr(node) as usize;
+    let mut siblings = Vec::new();
+    for child in parent.children.borrow().iter() {
+        if Rc::as_ptr(child) as usize == node_ptr {
+            break;
+        }
+        if matches!(child.data, NodeData::Element { .. }) {
+            siblings.push(child.clone());
+        }
+    }
+    siblings
+}
+
+fn selector_matches_parsed_handle(node: &Handle, selector: &Selector) -> bool {
+    if !selector_is_supported_for_dom_queries(selector) || !selector_subject_matches_handle(node, selector) {
+        return false;
+    }
+
+    let Some(ref ancestor_sel) = selector.ancestor else {
+        return true;
+    };
+
+    let combinator = selector.combinator.as_ref().unwrap_or(&Combinator::Descendant);
+    match combinator {
+        Combinator::Descendant => {
+            let mut current = get_parent_handle(node);
+            while let Some(parent) = current {
+                if matches!(parent.data, NodeData::Element { .. }) && selector_matches_parsed_handle(&parent, ancestor_sel) {
+                    return true;
+                }
+                current = get_parent_handle(&parent);
+            }
+            false
+        }
+        Combinator::Child => get_parent_handle(node)
+            .filter(|parent| matches!(parent.data, NodeData::Element { .. }))
+            .map(|parent| selector_matches_parsed_handle(&parent, ancestor_sel))
+            .unwrap_or(false),
+        Combinator::NextSibling => previous_element_siblings(node)
+            .into_iter()
+            .rev()
+            .next()
+            .map(|sibling| selector_matches_parsed_handle(&sibling, ancestor_sel))
+            .unwrap_or(false),
+        Combinator::SubsequentSibling => previous_element_siblings(node)
+            .into_iter()
+            .rev()
+            .any(|sibling| selector_matches_parsed_handle(&sibling, ancestor_sel)),
     }
 }
 
-fn selector_matches_with_attr(node: &Handle, sel: &str) -> bool {
-    if let NodeData::Element { ref name, ref attrs, .. } = node.data {
-        let tag = name.local.to_string().to_lowercase();
-        let attrs_b = attrs.borrow();
-
-        // Extract tag part before '['
-        let bracket_pos = sel.find('[').unwrap_or(sel.len());
-        let tag_part = &sel[..bracket_pos];
-        if !tag_part.is_empty() && tag_part != "*" && tag != tag_part.to_lowercase() {
-            return false;
-        }
-
-        // Parse [attr=value] or [attr]
-        let bracket_content = &sel[bracket_pos..];
-        if let Some(inner) = bracket_content.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-            if inner.contains('=') {
-                let mut parts = inner.splitn(2, '=');
-                let attr_name = parts.next().unwrap_or("").trim().trim_matches('"');
-                let attr_val = parts.next().unwrap_or("").trim().trim_matches('"');
-                return attrs_b.iter().any(|a| a.name.local.to_string() == attr_name && a.value.to_string() == attr_val);
-            } else {
-                let attr_name = inner.trim();
-                return attrs_b.iter().any(|a| a.name.local.to_string() == attr_name);
-            }
-        }
-        false
-    } else {
-        false
+fn selector_matches_handle(node: &Handle, selector: &str) -> bool {
+    let groups = split_selector_groups(selector);
+    if groups.is_empty() {
+        return false;
     }
+    groups.into_iter().any(|group| {
+        let parsed = parse_selector(group);
+        selector_matches_parsed_handle(node, &parsed)
+    })
 }
 
 fn query_selector_first(root: &Handle, selector: &str, skip_root: bool) -> Option<Handle> {
-    // Handle descendant combinator: "ancestor descendant"
-    // We do a simple two-pass: find all ancestors, then find descendants
-    let sel = selector.trim();
-
-    // Check for descendant combinator (space not inside brackets)
-    if let Some((ancestor_sel, desc_sel)) = split_descendant_selector(sel) {
-        // Find all elements matching ancestor_sel, then search their subtrees
-        let ancestors = query_selector_all_nodes(root, ancestor_sel, skip_root);
-        for ancestor in ancestors {
-            if let Some(found) = query_selector_first(&ancestor, desc_sel, true) {
-                return Some(found);
-            }
-        }
-        return None;
-    }
-
-    if !skip_root && selector_matches(root, sel) {
+    if !skip_root && selector_matches_handle(root, selector) {
         return Some(root.clone());
     }
     for child in root.children.borrow().iter() {
-        if let Some(found) = query_selector_first(child, sel, false) {
+        if let Some(found) = query_selector_first(child, selector, false) {
             return Some(found);
         }
     }
@@ -1930,53 +1975,14 @@ fn query_selector_first(root: &Handle, selector: &str, skip_root: bool) -> Optio
 
 fn query_selector_all_nodes(root: &Handle, selector: &str, skip_root: bool) -> Vec<Handle> {
     let mut results = Vec::new();
-    let sel = selector.trim();
-
-    if let Some((ancestor_sel, desc_sel)) = split_descendant_selector(sel) {
-        let ancestors = query_selector_all_nodes(root, ancestor_sel, skip_root);
-        for ancestor in ancestors {
-            let mut desc = query_selector_all_nodes(&ancestor, desc_sel, true);
-            results.append(&mut desc);
-        }
-        return results;
-    }
-
-    if !skip_root && selector_matches(root, sel) {
+    if !skip_root && selector_matches_handle(root, selector) {
         results.push(root.clone());
     }
     for child in root.children.borrow().iter() {
-        let mut found = query_selector_all_nodes(child, sel, false);
+        let mut found = query_selector_all_nodes(child, selector, false);
         results.append(&mut found);
     }
     results
-}
-
-/// Split "ancestor descendant" into (ancestor_sel, descendant_sel).
-/// Returns None if there's no descendant combinator (space outside brackets/parens).
-fn split_descendant_selector(sel: &str) -> Option<(&str, &str)> {
-    let mut depth = 0i32;
-    let bytes = sel.as_bytes();
-    let mut last_space: Option<usize> = None;
-
-    for (i, &b) in bytes.iter().enumerate() {
-        match b {
-            b'(' | b'[' => depth += 1,
-            b')' | b']' => depth -= 1,
-            b' ' if depth == 0 => {
-                last_space = Some(i);
-            }
-            _ => {}
-        }
-    }
-
-    if let Some(pos) = last_space {
-        let ancestor = sel[..pos].trim_end();
-        let desc = sel[pos + 1..].trim_start();
-        if !ancestor.is_empty() && !desc.is_empty() {
-            return Some((ancestor, desc));
-        }
-    }
-    None
 }
 
 fn find_elements_by_class(root: &Handle, cls: &str, skip_root: bool) -> Vec<Handle> {
@@ -2170,6 +2176,7 @@ fn steal_fragment_children(doc: &Handle) -> Vec<Handle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{css, style};
     use crate::dom;
 
     fn make_runtime(html: &str) -> JsRuntime {
@@ -2184,6 +2191,20 @@ mod tests {
             }
         }
         String::new()
+    }
+
+    fn collect_ids_with_property(node: &style::StyledNode, property: &str, out: &mut Vec<String>) {
+        let key = css::intern(property);
+        if node.specified_values.contains_key(&key) {
+            if let NodeData::Element { ref attrs, .. } = node.node.data {
+                if let Some(id_attr) = attrs.borrow().iter().find(|attr| attr.name.local.to_string() == "id") {
+                    out.push(id_attr.value.to_string());
+                }
+            }
+        }
+        for child in &node.children {
+            collect_ids_with_property(child, property, out);
+        }
     }
 
     #[test]
@@ -2541,6 +2562,73 @@ mod tests {
             })()
         "#);
         assert_eq!(result, "true:true:true:hello:world:true");
+    }
+
+    #[test]
+    fn test_supported_selector_subset_matches_style_engine_results() {
+        let html = "<html><body><div id='container' data-kind='wrap'><span id='hero' class='card primary' data-role='lead'>hero</span><span id='note' class='card'>note</span><p id='tail' data-role='body'>tail</p></div><section id='other'><span id='ghost' class='card'>ghost</span></section></body></html>";
+        let selectors = [
+            "#hero",
+            ".card.primary",
+            "div span",
+            "[data-role]",
+            "[data-kind='wrap']",
+            "span, p",
+        ];
+
+        for selector in selectors {
+            let dom = dom::parse_html(html);
+            let stylesheet = css::parse_css(&format!("{selector} {{ outline-style: solid; }}"));
+            let styled = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None, None, None);
+            let mut styled_ids = Vec::new();
+            collect_ids_with_property(&styled, "outline-style", &mut styled_ids);
+            styled_ids.sort();
+
+            let mut rt = make_runtime(html);
+            let js_selector = serde_json::to_string(selector).unwrap();
+            let js_ids = eval(&mut rt, &format!(r#"
+                Array.from(document.querySelectorAll({js_selector}))
+                    .map(function(node) {{ return node.id; }})
+                    .filter(function(id) {{ return id.length > 0; }})
+                    .sort()
+                    .join(',')
+            "#));
+            let expected = styled_ids.join(",");
+            assert_eq!(js_ids, expected, "selector parity mismatch for {selector}");
+        }
+    }
+
+    #[test]
+    fn test_matches_and_closest_share_query_selector_contract() {
+        let mut rt = make_runtime("<html><body><div id='card' class='card'><span id='hero' class='card primary' data-role='lead'>hero</span></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var hero = document.getElementById('hero');
+                return [
+                    hero.matches('.card.primary'),
+                    hero.matches('[data-role="lead"]'),
+                    hero.closest('div.card').id,
+                    hero.closest('section') === null
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "true:true:card:true");
+    }
+
+    #[test]
+    fn test_unsupported_pseudo_selectors_fail_predictably_in_dom_queries() {
+        let mut rt = make_runtime("<html><body><div id='hero' class='card'>hero</div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var hero = document.getElementById('hero');
+                return [
+                    document.querySelectorAll('.card:hover').length,
+                    hero.matches('.card:hover'),
+                    document.querySelector('.card::before') === null
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "0:false:true");
     }
 
     #[test]
