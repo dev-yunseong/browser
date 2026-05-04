@@ -382,6 +382,34 @@ impl JsRuntime {
         });
         context.register_global_callable(js_string!("__aura_get_parent_id"), 1, get_parent_id).unwrap();
 
+        let get_next_sibling_id = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let sibling_nid = get_sibling_id(nid, SiblingDirection::Next, false).map(JsValue::from);
+            Ok(sibling_nid.unwrap_or(JsValue::null()))
+        });
+        context.register_global_callable(js_string!("__aura_get_next_sibling_id"), 1, get_next_sibling_id).unwrap();
+
+        let get_previous_sibling_id = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let sibling_nid = get_sibling_id(nid, SiblingDirection::Previous, false).map(JsValue::from);
+            Ok(sibling_nid.unwrap_or(JsValue::null()))
+        });
+        context.register_global_callable(js_string!("__aura_get_previous_sibling_id"), 1, get_previous_sibling_id).unwrap();
+
+        let get_next_element_sibling_id = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let sibling_nid = get_sibling_id(nid, SiblingDirection::Next, true).map(JsValue::from);
+            Ok(sibling_nid.unwrap_or(JsValue::null()))
+        });
+        context.register_global_callable(js_string!("__aura_get_next_element_sibling_id"), 1, get_next_element_sibling_id).unwrap();
+
+        let get_previous_element_sibling_id = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let sibling_nid = get_sibling_id(nid, SiblingDirection::Previous, true).map(JsValue::from);
+            Ok(sibling_nid.unwrap_or(JsValue::null()))
+        });
+        context.register_global_callable(js_string!("__aura_get_previous_element_sibling_id"), 1, get_previous_element_sibling_id).unwrap();
+
         // Register native __aura_get_body
         let get_body = NativeFunction::from_copy_closure(|_this, _args, _context| {
             let body_nid = DOM_ROOT.with(|root| {
@@ -1587,6 +1615,12 @@ fn find_parent_of_node(root: &Handle, target_nid: u32) -> Option<Handle> {
 
 use std::rc::Rc;
 
+#[derive(Clone, Copy)]
+enum SiblingDirection {
+    Next,
+    Previous,
+}
+
 fn register_node(handle: Handle) -> u32 {
     let ptr = Rc::as_ptr(&handle) as usize;
     if let Some(id) = REVERSE_NODE_REGISTRY.with(|reg| reg.borrow().get(&ptr).cloned()) {
@@ -1654,6 +1688,46 @@ fn detach_node_from_parent(node: &Handle) {
             parent.children.borrow_mut().retain(|c| Rc::as_ptr(c) as usize != node_ptr);
         }
     }
+}
+
+fn get_parent_handle(node: &Handle) -> Option<Handle> {
+    let parent_weak = node.parent.take();
+    let parent = parent_weak.and_then(|weak| weak.upgrade());
+    if let Some(ref parent_handle) = parent {
+        node.parent.set(Some(Rc::downgrade(parent_handle)));
+    }
+    parent
+}
+
+fn get_sibling_id(nid: u32, direction: SiblingDirection, elements_only: bool) -> Option<u32> {
+    let node = NODE_REGISTRY.with(|reg| reg.borrow().get(&nid).cloned())?;
+    let parent = get_parent_handle(&node)?;
+    let node_ptr = Rc::as_ptr(&node) as usize;
+    let children: Vec<Handle> = parent.children.borrow().iter().cloned().collect();
+    let index = children
+        .iter()
+        .position(|child| Rc::as_ptr(child) as usize == node_ptr)?;
+
+    match direction {
+        SiblingDirection::Next => {
+            for sibling in children.iter().skip(index + 1) {
+                if elements_only && !matches!(sibling.data, NodeData::Element { .. }) {
+                    continue;
+                }
+                return Some(register_node(sibling.clone()));
+            }
+        }
+        SiblingDirection::Previous => {
+            for sibling in children[..index].iter().rev() {
+                if elements_only && !matches!(sibling.data, NodeData::Element { .. }) {
+                    continue;
+                }
+                return Some(register_node(sibling.clone()));
+            }
+        }
+    }
+
+    None
 }
 
 fn append_fragment_children(parent: &Handle, fragment: &Handle) {
@@ -2384,6 +2458,56 @@ mod tests {
             })()
         "#);
         assert_eq!(result, "true:10:html:true:true");
+    }
+
+    #[test]
+    fn test_sibling_navigation_traverses_mixed_node_kinds_in_tree_order() {
+        let mut rt = make_runtime(
+            "<html><body><div id='app'>alpha<!--note--><span id='mid'>mid</span><b id='tail'>tail</b></div></body></html>"
+        );
+        let result = eval(&mut rt, r#"
+            (function() {
+                var app = document.getElementById('app');
+                var text = app.firstChild;
+                var comment = text.nextSibling;
+                var mid = comment.nextSibling;
+                var tail = mid.nextSibling;
+                return [
+                    text.nodeType,
+                    comment.nodeType,
+                    comment.previousSibling === text,
+                    mid.previousSibling === comment,
+                    mid.nextElementSibling === tail,
+                    tail.previousElementSibling === mid,
+                    tail.nextSibling === null
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "3:8:true:true:true:true:true");
+    }
+
+    #[test]
+    fn test_sibling_navigation_reuses_stable_wrappers_across_relationship_lookups() {
+        let mut rt = make_runtime(
+            "<html><body><div id='app'><span id='one'>one</span><!--gap--><span id='two'>two</span></div></body></html>"
+        );
+        let result = eval(&mut rt, r#"
+            (function() {
+                var app = document.getElementById('app');
+                var first = document.getElementById('one');
+                var second = document.getElementById('two');
+                var comment = first.nextSibling;
+                return [
+                    first.nextSibling === app.childNodes.item(1),
+                    comment.nextSibling === second,
+                    second.previousSibling === comment,
+                    second.previousElementSibling === first,
+                    second.parentNode === app,
+                    second.parentElement === app
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "true:true:true:true:true:true");
     }
 
     // ── New runtime parity tests (#113) ──────────────────────────────────────
