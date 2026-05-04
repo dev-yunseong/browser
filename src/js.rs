@@ -935,6 +935,23 @@ impl JsRuntime {
         });
         context.register_global_callable(js_string!("__aura_get_inner_html"), 1, get_inner_html).unwrap();
 
+        // __aura_get_outer_html(nid) → string
+        let get_outer_html = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let html = NODE_REGISTRY.with(|reg| {
+                let reg = reg.borrow();
+                if let Some(node) = reg.get(&nid) {
+                    let mut out = String::new();
+                    serialize_node(node, &mut out);
+                    out
+                } else {
+                    String::new()
+                }
+            });
+            Ok(JsValue::from(js_string!(html)))
+        });
+        context.register_global_callable(js_string!("__aura_get_outer_html"), 1, get_outer_html).unwrap();
+
         // __aura_set_inner_html(nid, html_str) → void
         let set_inner_html = NativeFunction::from_copy_closure(|_this, args, _context| {
             let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
@@ -2398,6 +2415,26 @@ mod tests {
         let mut rt = make_runtime("<html><body><div id='app'><p>hello</p></div></body></html>");
         let result = eval(&mut rt, "document.getElementById('app').innerHTML");
         assert!(result.contains("hello"), "Expected innerHTML to contain 'hello', got: {:?}", result);
+    }
+
+    #[test]
+    fn test_outer_html_preserves_attributes_and_comment_children() {
+        let mut rt = make_runtime("<html><body><div id='app' data-role='lead' title='hello &amp; goodbye'>text<!--note--><span class='x'>tail</span></div></body></html>");
+        let result = eval(&mut rt, "document.getElementById('app').outerHTML");
+        assert_eq!(
+            result,
+            r#"<div id="app" data-role="lead" title="hello &amp; goodbye">text<!--note--><span class="x">tail</span></div>"#
+        );
+    }
+
+    #[test]
+    fn test_document_element_outer_html_excludes_doctype_but_keeps_head_and_body_structure() {
+        let mut rt = make_runtime("<!DOCTYPE html><html><head><title>x</title></head><body><!--lead--><main id='app'>ok</main></body></html>");
+        let result = eval(&mut rt, "document.documentElement.outerHTML");
+        assert_eq!(
+            result,
+            r#"<html><head><title>x</title></head><body><!--lead--><main id="app">ok</main></body></html>"#
+        );
     }
 
     #[test]
