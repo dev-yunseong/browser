@@ -1055,6 +1055,28 @@ impl JsRuntime {
         });
         context.register_global_callable(js_string!("__aura_get_attribute"), 2, get_attr).unwrap();
 
+        let get_attributes = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
+            let json = NODE_REGISTRY.with(|reg| {
+                let reg = reg.borrow();
+                if let Some(node) = reg.get(&nid) {
+                    if let NodeData::Element { ref attrs, .. } = node.data {
+                        let items: Vec<String> = attrs.borrow().iter().map(|attr| {
+                            format!(
+                                "{{\"name\":{},\"value\":{}}}",
+                                serde_json::to_string(&attr.name.local.to_string()).unwrap_or_else(|_| "\"\"".to_string()),
+                                serde_json::to_string(&attr.value.to_string()).unwrap_or_else(|_| "\"\"".to_string())
+                            )
+                        }).collect();
+                        return format!("[{}]", items.join(","));
+                    }
+                }
+                "[]".to_string()
+            });
+            Ok(JsValue::from(js_string!(json)))
+        });
+        context.register_global_callable(js_string!("__aura_get_attributes"), 1, get_attributes).unwrap();
+
         // __aura_remove_attribute(nid, name) → void
         let remove_attr = NativeFunction::from_copy_closure(|_this, args, _context| {
             let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
@@ -2629,6 +2651,48 @@ mod tests {
             })()
         "#);
         assert_eq!(result, "0:false:true");
+    }
+
+    #[test]
+    fn test_clone_node_shallow_copies_element_attributes_without_children() {
+        let mut rt = make_runtime("<html><body><div id='card' class='hero primary' data-role='lead'><span id='child'>text</span><!--note--></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var card = document.getElementById('card');
+                var clone = card.cloneNode(false);
+                return [
+                    clone.nodeName,
+                    clone.getAttribute('class'),
+                    clone.getAttribute('data-role'),
+                    clone.childNodes.length,
+                    clone.parentNode === null
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "DIV:hero primary:lead:0:true");
+    }
+
+    #[test]
+    fn test_clone_node_deep_preserves_text_comment_and_subtree_shape() {
+        let mut rt = make_runtime("<html><body><div id='card' data-role='lead'><span id='child'>text</span><!--note--></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var card = document.getElementById('card');
+                var clone = card.cloneNode(true);
+                return [
+                    clone !== card,
+                    clone.getAttribute('data-role'),
+                    clone.childNodes.length,
+                    clone.firstChild.nodeName,
+                    clone.firstChild.textContent,
+                    clone.lastChild.nodeType,
+                    clone.lastChild.nodeValue,
+                    clone.firstChild !== card.firstChild,
+                    clone.firstChild.parentNode === clone
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "true:lead:2:SPAN:text:8:note:true:true");
     }
 
     #[test]
