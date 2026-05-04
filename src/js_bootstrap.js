@@ -485,11 +485,21 @@ class Node extends EventTarget {
             }
             return fragment;
         }
-        // Shallow clone: create same-tag element, copy attributes
         let info = __aura_get_node_info(this._id);
         if (!info) return null;
         let clone = document.createElement(info.tag);
-        // Copy all attributes via innerHTML trick is too complex; skip for now
+        let attrs = typeof __aura_get_attributes === 'function'
+            ? JSON.parse(__aura_get_attributes(this._id))
+            : [];
+        for (let i = 0; i < attrs.length; i++) {
+            clone.setAttribute(attrs[i].name, attrs[i].value);
+        }
+        if (deep) {
+            let children = this.childNodes;
+            for (let i = 0; i < children.length; i++) {
+                clone.appendChild(children[i].cloneNode(true));
+            }
+        }
         return clone;
     }
     contains(other) {
