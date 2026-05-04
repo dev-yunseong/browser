@@ -51,20 +51,112 @@ function __aura_apply_location_href(href) {
 // -- Node Registry (Ensures stable objects for events) -----------------------
 var __node_registry = new Map();
 
+function __aura_node_kind_from_type(nodeType) {
+    if (nodeType === 1) return 'element';
+    if (nodeType === 3) return 'text';
+    if (nodeType === 8) return 'comment';
+    if (nodeType === 9) return 'document';
+    if (nodeType === 10) return 'doctype';
+    if (nodeType === 11) return 'fragment';
+    return null;
+}
+
+function __aura_native_node_type(id) {
+    if (!id || typeof __aura_get_node_type !== 'function') return 0;
+    return __aura_get_node_type(id) || 0;
+}
+
+function __aura_get_node_descriptor(id, tag, string_id, kind) {
+    let info = null;
+    if (id && typeof __aura_get_node_info === 'function') {
+        info = __aura_get_node_info(id);
+    }
+
+    let resolvedKind = kind || (info && info.kind) || __aura_node_kind_from_type(__aura_native_node_type(id)) || null;
+    let resolvedTag = tag || (info && info.tag) || null;
+    let resolvedId = string_id || (info && info.id) || null;
+
+    if (!resolvedKind && resolvedTag) resolvedKind = 'element';
+
+    return {
+        tag: resolvedTag,
+        id: resolvedId,
+        kind: resolvedKind
+    };
+}
+
+function __aura_read_character_data(id, kind) {
+    if (!id) return '';
+    if (typeof __aura_get_node_value === 'function') {
+        let value = __aura_get_node_value(id);
+        return value == null ? '' : String(value);
+    }
+    if (typeof __aura_get_character_data === 'function') {
+        let value = __aura_get_character_data(id);
+        return value == null ? '' : String(value);
+    }
+    if (kind === 'comment' && typeof __aura_get_comment_data === 'function') {
+        let value = __aura_get_comment_data(id);
+        return value == null ? '' : String(value);
+    }
+    return __aura_get_text_content(id);
+}
+
+function __aura_write_character_data(id, kind, value) {
+    if (!id) return false;
+    let text = String(value);
+    if (typeof __aura_set_node_value === 'function') {
+        __aura_set_node_value(id, text);
+        return true;
+    }
+    if (typeof __aura_set_character_data === 'function') {
+        __aura_set_character_data(id, text);
+        return true;
+    }
+    if (kind === 'comment' && typeof __aura_set_comment_data === 'function') {
+        __aura_set_comment_data(id, text);
+        return true;
+    }
+    if (kind === 'text') {
+        __aura_set_text_content(id, text);
+        return true;
+    }
+    return false;
+}
+
+function __aura_read_document_type_info(id) {
+    if (id && typeof __aura_get_document_type_info === 'function') {
+        return __aura_get_document_type_info(id);
+    }
+    if (id && typeof __aura_get_doctype_info === 'function') {
+        return __aura_get_doctype_info(id);
+    }
+    return null;
+}
+
 function __get_or_create_node(id, tag, string_id, kind) {
     if (!id) return null;
     if (__node_registry.has(id)) return __node_registry.get(id);
+    let descriptor = __aura_get_node_descriptor(id, tag, string_id, kind);
     let node;
-    if (kind === 'text') {
+    if (descriptor.kind === 'text') {
         node = new TextNode(id);
-    } else if (kind === 'fragment') {
+    } else if (descriptor.kind === 'comment') {
+        node = new Comment(id);
+    } else if (descriptor.kind === 'fragment') {
         node = new DocumentFragment(id);
-    } else if (tag) {
-        node = new Element(id, tag, string_id);
+    } else if (descriptor.kind === 'doctype') {
+        node = new DocumentType(id);
+    } else if (descriptor.kind === 'document') {
+        node = document;
+    } else if (descriptor.tag) {
+        node = new Element(id, descriptor.tag, descriptor.id);
     } else {
-        node = new Node(id);
+        node = new Node(id, descriptor.kind || 'element');
     }
-    __node_registry.set(id, node);
+    if (node !== document) {
+        __node_registry.set(id, node);
+    }
     return node;
 }
 
@@ -233,37 +325,92 @@ class Node extends EventTarget {
         this._kind = kind;
     }
     get nodeType() {
+        if (this._kind === 'element') return 1;
         if (this._kind === 'text') return 3;
+        if (this._kind === 'comment') return 8;
+        if (this._kind === 'document') return 9;
+        if (this._kind === 'doctype') return 10;
         if (this._kind === 'fragment') return 11;
-        return 1;
+        return __aura_native_node_type(this._id) || 0;
+    }
+    get nodeName() {
+        if (this._kind === 'text') return '#text';
+        if (this._kind === 'comment') return '#comment';
+        if (this._kind === 'document') return '#document';
+        if (this._kind === 'fragment') return '#document-fragment';
+        if (this._kind === 'doctype') return this.name || '';
+        let info = this._id ? __aura_get_node_descriptor(this._id, null, null, this._kind) : null;
+        if (info && info.tag) return info.tag.toUpperCase();
+        return '';
+    }
+    get nodeValue() {
+        return null;
     }
     get parentNode() {
+        if (!this._id) return null;
         let pid = __aura_get_parent_id(this._id);
         if (!pid) return null;
         let info = __aura_get_node_info(pid);
         return info ? __get_or_create_node(pid, info.tag, info.id, info.kind) : __get_or_create_node(pid);
     }
+    get parentElement() {
+        let parent = this.parentNode;
+        return parent && parent.nodeType === Node.ELEMENT_NODE ? parent : null;
+    }
     get childNodes() {
+        if (!this._id) return new NodeList([]);
         let arr = JSON.parse(__aura_get_children(this._id));
         return new NodeList(arr);
     }
     get firstChild() {
+        if (!this._id) return null;
         let arr = JSON.parse(__aura_get_children(this._id));
         if (arr.length === 0) return null;
         let c = arr[0];
         return __get_or_create_node(c.nid, c.tag, c.id, c.kind);
     }
     get lastChild() {
+        if (!this._id) return null;
         let arr = JSON.parse(__aura_get_children(this._id));
         if (arr.length === 0) return null;
         let c = arr[arr.length - 1];
         return __get_or_create_node(c.nid, c.tag, c.id, c.kind);
     }
     get textContent() {
+        if (!this._id) return '';
         return __aura_get_text_content(this._id);
     }
     set textContent(val) {
+        if (!this._id) return;
         __aura_set_text_content(this._id, String(val));
+    }
+    get nextSibling() {
+        let parent = this.parentNode;
+        if (!parent) return null;
+        let siblings = parent.childNodes;
+        for (let i = 0; i < siblings.length - 1; i++) {
+            if (siblings[i] && siblings[i]._id === this._id) return siblings[i + 1];
+        }
+        return null;
+    }
+    get previousSibling() {
+        let parent = this.parentNode;
+        if (!parent) return null;
+        let siblings = parent.childNodes;
+        for (let i = 1; i < siblings.length; i++) {
+            if (siblings[i] && siblings[i]._id === this._id) return siblings[i - 1];
+        }
+        return null;
+    }
+    get nextElementSibling() {
+        let node = this.nextSibling;
+        while (node && node.nodeType !== Node.ELEMENT_NODE) node = node.nextSibling;
+        return node;
+    }
+    get previousElementSibling() {
+        let node = this.previousSibling;
+        while (node && node.nodeType !== Node.ELEMENT_NODE) node = node.previousSibling;
+        return node;
     }
     appendChild(child) {
         if (child && child._id !== undefined && child._id !== null) {
@@ -291,6 +438,15 @@ class Node extends EventTarget {
         return oldChild;
     }
     cloneNode(deep) {
+        if (this._kind === 'text') {
+            return document.createTextNode(this.data);
+        }
+        if (this._kind === 'comment') {
+            return document.createComment(this.data);
+        }
+        if (this._kind === 'doctype') {
+            return new DocumentType(null, this.name, this.publicId, this.systemId);
+        }
         if (this._kind === 'fragment') {
             let fragment = document.createDocumentFragment();
             if (deep) {
@@ -429,22 +585,22 @@ class Element extends Node {
     }
     get children() {
         let arr = JSON.parse(__aura_get_children(this._id));
-        return new NodeList(arr.filter(c => c.kind !== 'text'));
+        return new NodeList(arr.filter(c => c.kind === 'element'));
     }
     get childElementCount() {
         let arr = JSON.parse(__aura_get_children(this._id));
-        return arr.filter(c => c.kind !== 'text').length;
+        return arr.filter(c => c.kind === 'element').length;
     }
     get firstElementChild() {
         let arr = JSON.parse(__aura_get_children(this._id));
-        let c = arr.find(c => c.kind !== 'text');
+        let c = arr.find(c => c.kind === 'element');
         return c ? __get_or_create_node(c.nid, c.tag, c.id, c.kind) : null;
     }
     get lastElementChild() {
         let arr = JSON.parse(__aura_get_children(this._id));
         var c = null;
         for (let i = arr.length - 1; i >= 0; i--) {
-            if (arr[i].kind !== 'text') { c = arr[i]; break; }
+            if (arr[i].kind === 'element') { c = arr[i]; break; }
         }
         return c ? __get_or_create_node(c.nid, c.tag, c.id, c.kind) : null;
     }
@@ -460,11 +616,6 @@ class Element extends Node {
     scrollBy() {}
     // nodeType for Element is always ELEMENT_NODE (1)
     get nodeType() { return 1; }
-    // Sibling navigation stubs
-    get nextSibling() { return null; }
-    get previousSibling() { return null; }
-    get nextElementSibling() { return null; }
-    get previousElementSibling() { return null; }
     // insertAdjacentHTML: inject HTML relative to this element
     insertAdjacentHTML(position, html) {
         position = position.toLowerCase();
@@ -582,18 +733,90 @@ class Element extends Node {
 class TextNode extends Node {
     constructor(id) {
         super(id, 'text');
+        this._data = '';
     }
     get data() {
-        return this.textContent;
+        return this._id ? __aura_read_character_data(this._id, 'text') : this._data;
     }
     set data(val) {
-        this.textContent = val;
+        let text = String(val);
+        if (!__aura_write_character_data(this._id, 'text', text)) {
+            this._data = text;
+        }
     }
     get nodeValue() {
-        return this.textContent;
+        return this.data;
     }
     set nodeValue(val) {
-        this.textContent = val;
+        this.data = val;
+    }
+    get textContent() {
+        return this.data;
+    }
+    set textContent(val) {
+        this.data = val;
+    }
+}
+
+class Comment extends Node {
+    constructor(id, data) {
+        super(id, 'comment');
+        this._data = data === undefined ? '' : String(data);
+    }
+    get data() {
+        return this._id ? __aura_read_character_data(this._id, 'comment') : this._data;
+    }
+    set data(val) {
+        let text = String(val);
+        if (!__aura_write_character_data(this._id, 'comment', text)) {
+            this._data = text;
+        }
+    }
+    get nodeValue() {
+        return this.data;
+    }
+    set nodeValue(val) {
+        this.data = val;
+    }
+    get textContent() {
+        return this.data;
+    }
+    set textContent(val) {
+        this.data = val;
+    }
+}
+
+class DocumentType extends Node {
+    constructor(id, name, publicId, systemId) {
+        super(id, 'doctype');
+        this._name = name || '';
+        this._publicId = publicId || '';
+        this._systemId = systemId || '';
+    }
+    _info() {
+        return this._id ? __aura_read_document_type_info(this._id) : null;
+    }
+    get name() {
+        let info = this._info();
+        return info && info.name !== undefined ? String(info.name) : this._name;
+    }
+    get publicId() {
+        let info = this._info();
+        return info && info.publicId !== undefined ? String(info.publicId) : this._publicId;
+    }
+    get systemId() {
+        let info = this._info();
+        return info && info.systemId !== undefined ? String(info.systemId) : this._systemId;
+    }
+    get nodeValue() {
+        return null;
+    }
+    get textContent() {
+        return null;
+    }
+    set textContent(val) {}
+    get nextSibling() {
+        return super.nextSibling;
     }
 }
 
@@ -613,6 +836,7 @@ Node.TEXT_NODE = 3;
 Node.CDATA_SECTION_NODE = 4;
 Node.COMMENT_NODE = 8;
 Node.DOCUMENT_NODE = 9;
+Node.DOCUMENT_TYPE_NODE = 10;
 Node.DOCUMENT_FRAGMENT_NODE = 11;
 
 // -- Storage -----------------------------------------------------------------
@@ -672,6 +896,22 @@ var document = {
         let nativeId = __aura_create_text_node(String(text));
         return __get_or_create_node(nativeId, null, null, 'text');
     },
+    createComment: function(data) {
+        let text = String(data);
+        if (typeof __aura_create_comment_node === 'function') {
+            let nativeId = __aura_create_comment_node(text);
+            let comment = __get_or_create_node(nativeId, null, null, 'comment');
+            comment._data = text;
+            return comment;
+        }
+        if (typeof __aura_create_comment === 'function') {
+            let nativeId = __aura_create_comment(text);
+            let comment = __get_or_create_node(nativeId, null, null, 'comment');
+            comment._data = text;
+            return comment;
+        }
+        return new Comment(null, text);
+    },
     createDocumentFragment: function() {
         let nativeId = __aura_create_document_fragment();
         return __get_or_create_node(nativeId, null, null, 'fragment');
@@ -718,6 +958,15 @@ var document = {
         let nids = JSON.parse(nids_json);
         if (nids.length === 0) return null;
         return __get_or_create_node(nids[0], 'html', null, 'element');
+    },
+    get doctype() {
+        let nativeId = 0;
+        if (typeof __aura_get_document_type === 'function') {
+            nativeId = __aura_get_document_type() || 0;
+        } else if (typeof __aura_get_doctype === 'function') {
+            nativeId = __aura_get_doctype() || 0;
+        }
+        return nativeId ? __get_or_create_node(nativeId, null, null, 'doctype') : null;
     },
     activeElement: null,
     location: { href: '', hostname: '', pathname: '/', search: '', hash: '', protocol: 'https:', host: '', port: '', origin: '' },
@@ -1047,17 +1296,6 @@ class XMLHttpRequest extends EventTarget {
     overrideMimeType() {}
 }
 window.XMLHttpRequest = XMLHttpRequest;
-
-// -- document.createComment / document.createTextNode -------------------------
-document.createComment = function(data) {
-    return { nodeType: 8, data: data, _id: 0, textContent: '' };
-};
-
-// Override createTextNode to return a proper node-like object with nodeType
-document.createTextNode = function(text) {
-    let nativeId = __aura_create_text_node(String(text));
-    return __get_or_create_node(nativeId, null, null, 'text');
-};
 
 // -- window.matchMedia -------------------------------------------------------
 window.matchMedia = function(query) {
@@ -1464,6 +1702,9 @@ window.IntersectionObserver = IntersectionObserver;
 window.ResizeObserver = ResizeObserver;
 window.Node = Node;
 window.Element = Element;
+window.Text = TextNode;
+window.Comment = Comment;
+window.DocumentType = DocumentType;
 window.DocumentFragment = DocumentFragment;
 window.NodeList = NodeList;
 window.EventTarget = EventTarget;
