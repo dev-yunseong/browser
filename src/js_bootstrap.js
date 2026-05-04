@@ -166,14 +166,26 @@ class Event {
         this.type = type;
         this.bubbles = options.bubbles || false;
         this.cancelable = options.cancelable || false;
+        this.composed = options.composed || false;
         this.target = null;
         this.currentTarget = null;
+        this.eventPhase = 0;
         this.defaultPrevented = false;
+        this._path = [];
+        this._stopped = false;
+        this._immediateStopped = false;
     }
-    preventDefault() { this.defaultPrevented = true; }
+    preventDefault() {
+        if (this.cancelable) this.defaultPrevented = true;
+    }
     stopPropagation() { this._stopped = true; }
     stopImmediatePropagation() { this._stopped = true; this._immediateStopped = true; }
+    composedPath() { return this._path.slice(); }
 }
+Event.NONE = 0;
+Event.CAPTURING_PHASE = 1;
+Event.AT_TARGET = 2;
+Event.BUBBLING_PHASE = 3;
 
 class MouseEvent extends Event {
     constructor(type, options = {}) {
@@ -183,45 +195,131 @@ class MouseEvent extends Event {
     }
 }
 
+function __aura_normalize_listener_options(options) {
+    if (options === true) return { capture: true, once: false };
+    if (!options || options === false) return { capture: false, once: false };
+    return {
+        capture: !!options.capture,
+        once: !!options.once
+    };
+}
+
+function __aura_add_listener(target, type, callback, options) {
+    if (typeof callback !== 'function') return;
+    if (!target._listeners) target._listeners = new Map();
+    if (!target._listeners.has(type)) target._listeners.set(type, []);
+    let normalized = __aura_normalize_listener_options(options);
+    target._listeners.get(type).push({
+        callback: callback,
+        capture: normalized.capture,
+        once: normalized.once
+    });
+}
+
+function __aura_remove_listener(target, type, callback, options) {
+    if (!target._listeners || !target._listeners.has(type)) return;
+    let normalized = __aura_normalize_listener_options(options);
+    target._listeners.set(type, target._listeners.get(type).filter(function(listener) {
+        return listener.callback !== callback || listener.capture !== normalized.capture;
+    }));
+}
+
+function __aura_append_window_to_path(path) {
+    if (path[path.length - 1] !== window) path.push(window);
+}
+
+function __aura_event_path(target) {
+    let path = [target];
+    if (target === window) return path;
+    if (target === document) {
+        __aura_append_window_to_path(path);
+        return path;
+    }
+    let current = target;
+    while (current && current.parentNode) {
+        current = current.parentNode;
+        path.push(current);
+    }
+    if (path[path.length - 1] !== document) path.push(document);
+    __aura_append_window_to_path(path);
+    return path;
+}
+
+function __aura_run_on_handler(target, event) {
+    let onHandler = target && target['on' + event.type];
+    if (typeof onHandler === 'function') {
+        try { onHandler.call(target, event); } catch(e) { console.log("Event Error: " + e); }
+    }
+}
+
+function __aura_invoke_listeners(target, event, capture) {
+    let list = target && target._listeners ? target._listeners.get(event.type) : null;
+    if (!list || list.length === 0) return;
+    for (let listener of list.slice()) {
+        if (event._immediateStopped) break;
+        if (!!listener.capture !== !!capture) continue;
+        try { listener.callback.call(target, event); } catch(e) { console.log("Event Error: " + e); }
+        if (listener.once) {
+            __aura_remove_listener(target, event.type, listener.callback, { capture: listener.capture });
+        }
+    }
+}
+
+function __aura_dispatch_event(target, event) {
+    event.target = target;
+    event.currentTarget = null;
+    event.eventPhase = Event.NONE;
+    event._stopped = false;
+    event._immediateStopped = false;
+    event._path = __aura_event_path(target);
+
+    let path = event._path;
+    for (let i = path.length - 1; i >= 1; i--) {
+        if (event._stopped) break;
+        let current = path[i];
+        event.currentTarget = current;
+        event.eventPhase = Event.CAPTURING_PHASE;
+        __aura_invoke_listeners(current, event, true);
+    }
+
+    if (!event._stopped) {
+        event.currentTarget = target;
+        event.eventPhase = Event.AT_TARGET;
+        __aura_invoke_listeners(target, event, true);
+        if (!event._immediateStopped) {
+            __aura_invoke_listeners(target, event, false);
+            if (!event._immediateStopped) __aura_run_on_handler(target, event);
+        }
+    }
+
+    if (event.bubbles && !event._stopped) {
+        for (let i = 1; i < path.length; i++) {
+            if (event._stopped) break;
+            let current = path[i];
+            event.currentTarget = current;
+            event.eventPhase = Event.BUBBLING_PHASE;
+            __aura_invoke_listeners(current, event, false);
+            if (!event._immediateStopped) __aura_run_on_handler(current, event);
+        }
+    }
+
+    event.currentTarget = null;
+    event.eventPhase = Event.NONE;
+    return !event.defaultPrevented;
+}
+
 class EventTarget {
     constructor() {
         this._listeners = new Map();
     }
-    addEventListener(type, callback) {
-        if (!this._listeners.has(type)) this._listeners.set(type, []);
-        this._listeners.get(type).push(callback);
+    addEventListener(type, callback, options) {
+        __aura_add_listener(this, type, callback, options);
     }
-    removeEventListener(type, callback) {
-        if (!this._listeners.has(type)) return;
-        this._listeners.set(type, this._listeners.get(type).filter(l => l !== callback));
+    removeEventListener(type, callback, options) {
+        __aura_remove_listener(this, type, callback, options);
     }
     dispatchEvent(event) {
-        event.target = this;
-        let current = this;
-        // Simple bubbling (if supported by event)
-        while (current) {
-            if (event._stopped) break;
-            event.currentTarget = current;
-
-            // 1. Check addEventListener listeners
-            let list = current._listeners ? current._listeners.get(event.type) : null;
-            if (list) {
-                for (let listener of list) {
-                    if (event._immediateStopped) break;
-                    try { listener.call(current, event); } catch(e) { console.log("Event Error: " + e); }
-                }
-            }
-
-            // 2. Check onEVENT property
-            let onHandler = current['on' + event.type];
-            if (typeof onHandler === 'function') {
-                try { onHandler.call(current, event); } catch(e) { console.log("Event Error: " + e); }
-            }
-
-            if (!event.bubbles) break;
-            current = current.parentNode;
-        }
-        return !event.defaultPrevented;
+        return __aura_dispatch_event(this, event);
     }
 }
 
@@ -902,27 +1000,18 @@ var _document_listeners = new Map();
 var document = {
     // Event listener support on document itself
     _listeners: new Map(),
-    addEventListener: function(type, callback) {
-        if (!this._listeners.has(type)) this._listeners.set(type, []);
-        this._listeners.get(type).push(callback);
+    addEventListener: function(type, callback, options) {
+        __aura_add_listener(this, type, callback, options);
         // DOMContentLoaded fires immediately (page already loaded)
         if (type === 'DOMContentLoaded') {
             try { callback(new Event('DOMContentLoaded')); } catch(e) {}
         }
     },
-    removeEventListener: function(type, callback) {
-        if (!this._listeners.has(type)) return;
-        this._listeners.set(type, this._listeners.get(type).filter(l => l !== callback));
+    removeEventListener: function(type, callback, options) {
+        __aura_remove_listener(this, type, callback, options);
     },
     dispatchEvent: function(event) {
-        event.target = this;
-        let list = this._listeners.get(event.type);
-        if (list) {
-            for (let l of list) {
-                try { l.call(this, event); } catch(e) { console.log("Event Error: " + e); }
-            }
-        }
-        return !event.defaultPrevented;
+        return __aura_dispatch_event(this, event);
     },
 
     getElementById: function(id) {
@@ -1437,6 +1526,14 @@ class CustomEvent extends Event {
     }
 }
 
+// -- FocusEvent --------------------------------------------------------------
+class FocusEvent extends Event {
+    constructor(type, options = {}) {
+        super(type, options);
+        this.relatedTarget = options.relatedTarget || null;
+    }
+}
+
 // -- KeyboardEvent -----------------------------------------------------------
 class KeyboardEvent extends Event {
     constructor(type, options = {}) {
@@ -1445,7 +1542,7 @@ class KeyboardEvent extends Event {
         this.code = options.code || '';
         this.keyCode = options.keyCode || 0;
         this.charCode = options.charCode || 0;
-        this.which = options.which || 0;
+        this.which = options.which || this.keyCode || this.charCode || 0;
         this.altKey = options.altKey || false;
         this.ctrlKey = options.ctrlKey || false;
         this.shiftKey = options.shiftKey || false;
@@ -1454,6 +1551,15 @@ class KeyboardEvent extends Event {
         this.location = options.location || 0;
     }
     getModifierState(key) { return false; }
+}
+
+// -- InputEvent --------------------------------------------------------------
+class InputEvent extends Event {
+    constructor(type, options = {}) {
+        super(type, options);
+        this.data = options.data !== undefined ? options.data : null;
+        this.inputType = options.inputType || '';
+    }
 }
 
 // -- TouchEvent / PointerEvent stubs -----------------------------------------
@@ -1483,21 +1589,6 @@ class WheelEvent extends MouseEvent {
         this.deltaY = options.deltaY || 0;
         this.deltaZ = options.deltaZ || 0;
         this.deltaMode = options.deltaMode || 0;
-    }
-}
-
-class InputEvent extends Event {
-    constructor(type, options = {}) {
-        super(type, options);
-        this.data = options.data || null;
-        this.inputType = options.inputType || '';
-    }
-}
-
-class FocusEvent extends Event {
-    constructor(type, options = {}) {
-        super(type, options);
-        this.relatedTarget = options.relatedTarget || null;
     }
 }
 
@@ -1592,25 +1683,17 @@ window.onscroll = null;
 // window.addEventListener wrapping around document events for common cases
 var _window_listeners = new Map();
 window.addEventListener = function(type, callback, options) {
-    if (!_window_listeners.has(type)) _window_listeners.set(type, []);
-    _window_listeners.get(type).push(callback);
+    __aura_add_listener(window, type, callback, options);
     // Load event fires immediately (page already done)
     if (type === 'load' || type === 'DOMContentLoaded') {
         try { callback(new Event(type)); } catch(e) {}
     }
 };
-window.removeEventListener = function(type, callback) {
-    if (!_window_listeners.has(type)) return;
-    _window_listeners.set(type, _window_listeners.get(type).filter(l => l !== callback));
+window.removeEventListener = function(type, callback, options) {
+    __aura_remove_listener(window, type, callback, options);
 };
 window.dispatchEvent = function(event) {
-    var list = _window_listeners.get(event.type);
-    if (list) {
-        for (var l of list) {
-            try { l.call(window, event); } catch(e) { console.log("Window Event Error: " + e); }
-        }
-    }
-    return true;
+    return __aura_dispatch_event(window, event);
 };
 
 // -- URL class stub ----------------------------------------------------------
@@ -1719,13 +1802,13 @@ window.AbortSignal = { timeout: function() { return new AbortController().signal
 // -- Expose event classes on window ------------------------------------------
 window.Event = Event;
 window.CustomEvent = CustomEvent;
+window.FocusEvent = FocusEvent;
+window.InputEvent = InputEvent;
 window.MouseEvent = MouseEvent;
 window.KeyboardEvent = KeyboardEvent;
 window.TouchEvent = TouchEvent;
 window.PointerEvent = PointerEvent;
 window.WheelEvent = WheelEvent;
-window.InputEvent = InputEvent;
-window.FocusEvent = FocusEvent;
 window.UIEvent = UIEvent;
 window.ErrorEvent = ErrorEvent;
 window.MessageEvent = MessageEvent;

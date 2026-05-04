@@ -2388,6 +2388,69 @@ mod tests {
     }
 
     #[test]
+    fn test_event_dispatch_runs_capture_target_and_bubble_in_order_with_composed_path() {
+        let mut rt = make_runtime("<html><body><div id='outer'><button id='btn'>click</button></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var log = [];
+                var btn = document.getElementById('btn');
+                var outer = document.getElementById('outer');
+
+                function record(label) {
+                    return function(e) {
+                        log.push(label + ':' + e.eventPhase);
+                    };
+                }
+
+                window.addEventListener('click', record('window-capture'), true);
+                document.addEventListener('click', record('document-capture'), true);
+                outer.addEventListener('click', record('outer-capture'), true);
+                btn.addEventListener('click', record('target-capture'), true);
+                btn.addEventListener('click', function(e) {
+                    log.push('target-bubble:' + e.eventPhase);
+                    log.push(e.composedPath().map(function(node) {
+                        if (node === window) return 'window';
+                        if (node === document) return '#document';
+                        return node.id || node.nodeName;
+                    }).join('>'));
+                });
+                outer.addEventListener('click', record('outer-bubble'));
+                document.addEventListener('click', record('document-bubble'));
+                window.addEventListener('click', record('window-bubble'));
+
+                btn.dispatchEvent(new Event('click', { bubbles: true, composed: true }));
+                return log.join('|');
+            })()
+        "#);
+        assert_eq!(
+            result,
+            "window-capture:1|document-capture:1|outer-capture:1|target-capture:2|target-bubble:2|btn>outer>BODY>HTML>#document>window|outer-bubble:3|document-bubble:3|window-bubble:3"
+        );
+    }
+
+    #[test]
+    fn test_prevent_default_only_marks_cancelable_events() {
+        let mut rt = make_runtime("<html><body><button id='btn'>click</button></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var btn = document.getElementById('btn');
+                btn.addEventListener('submit', function(e) { e.preventDefault(); });
+                var plain = new Event('submit');
+                var cancelable = new Event('submit', { cancelable: true });
+                var plainResult = btn.dispatchEvent(plain);
+                var cancelableResult = btn.dispatchEvent(cancelable);
+                return [
+                    plain.defaultPrevented,
+                    plainResult,
+                    cancelable.defaultPrevented,
+                    cancelableResult
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "false:true:true:false");
+    }
+
+    #[test]
     fn test_document_add_event_listener_domcontentloaded() {
         let mut rt = make_runtime("<html><body></body></html>");
         // DOMContentLoaded fires synchronously when addEventListener is called
@@ -3207,6 +3270,29 @@ mod tests {
         let mut rt = make_runtime("<html><body></body></html>");
         let result = eval(&mut rt, "(function() { var e = new KeyboardEvent('keydown', {key: 'Enter', keyCode: 13}); return e.key + ':' + e.keyCode; })()");
         assert_eq!(result, "Enter:13");
+    }
+
+    #[test]
+    fn test_focus_input_and_custom_event_constructors_expose_expected_fields() {
+        let mut rt = make_runtime("<html><body><input id='field'><button id='btn'></button></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var btn = document.getElementById('btn');
+                var field = document.getElementById('field');
+                var focus = new FocusEvent('focusin', { relatedTarget: btn });
+                var input = new InputEvent('input', { data: 'x', inputType: 'insertText' });
+                var custom = new CustomEvent('ready', { detail: 42 });
+                var key = new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13 });
+                return [
+                    focus.relatedTarget === btn,
+                    input.data,
+                    input.inputType,
+                    custom.detail,
+                    key.which
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "true:x:insertText:42:13");
     }
 
     #[test]
