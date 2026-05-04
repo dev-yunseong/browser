@@ -385,6 +385,13 @@ class Node extends EventTarget {
         __aura_set_text_content(this._id, String(val));
     }
     get nextSibling() {
+        if (!this._id) return null;
+        if (typeof __aura_get_next_sibling_id === 'function') {
+            let nid = __aura_get_next_sibling_id(this._id);
+            if (!nid) return null;
+            let info = __aura_get_node_info(nid);
+            return info ? __get_or_create_node(nid, info.tag, info.id, info.kind) : __get_or_create_node(nid);
+        }
         let parent = this.parentNode;
         if (!parent) return null;
         let siblings = parent.childNodes;
@@ -394,6 +401,13 @@ class Node extends EventTarget {
         return null;
     }
     get previousSibling() {
+        if (!this._id) return null;
+        if (typeof __aura_get_previous_sibling_id === 'function') {
+            let nid = __aura_get_previous_sibling_id(this._id);
+            if (!nid) return null;
+            let info = __aura_get_node_info(nid);
+            return info ? __get_or_create_node(nid, info.tag, info.id, info.kind) : __get_or_create_node(nid);
+        }
         let parent = this.parentNode;
         if (!parent) return null;
         let siblings = parent.childNodes;
@@ -403,11 +417,25 @@ class Node extends EventTarget {
         return null;
     }
     get nextElementSibling() {
+        if (!this._id) return null;
+        if (typeof __aura_get_next_element_sibling_id === 'function') {
+            let nid = __aura_get_next_element_sibling_id(this._id);
+            if (!nid) return null;
+            let info = __aura_get_node_info(nid);
+            return info ? __get_or_create_node(nid, info.tag, info.id, info.kind) : __get_or_create_node(nid);
+        }
         let node = this.nextSibling;
         while (node && node.nodeType !== Node.ELEMENT_NODE) node = node.nextSibling;
         return node;
     }
     get previousElementSibling() {
+        if (!this._id) return null;
+        if (typeof __aura_get_previous_element_sibling_id === 'function') {
+            let nid = __aura_get_previous_element_sibling_id(this._id);
+            if (!nid) return null;
+            let info = __aura_get_node_info(nid);
+            return info ? __get_or_create_node(nid, info.tag, info.id, info.kind) : __get_or_create_node(nid);
+        }
         let node = this.previousSibling;
         while (node && node.nodeType !== Node.ELEMENT_NODE) node = node.previousSibling;
         return node;
