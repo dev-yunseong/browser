@@ -549,6 +549,9 @@ class Element extends Node {
         __aura_set_inner_html(this._id, String(val));
     }
     get outerHTML() {
+        if (typeof __aura_get_outer_html === 'function') {
+            return __aura_get_outer_html(this._id);
+        }
         let info = __aura_get_node_info(this._id);
         if (!info) return '';
         let inner = __aura_get_inner_html(this._id);
