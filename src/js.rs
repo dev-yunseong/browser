@@ -1,5 +1,5 @@
 use boa_engine::{Context, Source, JsValue, NativeFunction, js_string};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use markup5ever_rcdom::{NodeData, Handle};
 use std::cell::RefCell;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -45,6 +45,7 @@ thread_local! {
     static DOM_ROOT: RefCell<Option<Handle>> = RefCell::new(None);
     static NODE_REGISTRY: RefCell<HashMap<u32, Handle>> = RefCell::new(HashMap::new());
     static REVERSE_NODE_REGISTRY: RefCell<HashMap<usize, u32>> = RefCell::new(HashMap::new());
+    static DOCUMENT_FRAGMENT_NODE_IDS: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
     static NEXT_NODE_ID: RefCell<u32> = RefCell::new(1);
     static FETCH_REGISTRY: RefCell<HashMap<u32, (JsValue, JsValue)>> = RefCell::new(HashMap::new());
     static FETCH_BODY_REGISTRY: RefCell<HashMap<u32, String>> = RefCell::new(HashMap::new());
@@ -365,11 +366,18 @@ impl JsRuntime {
         // Register native __aura_get_parent_id
         let get_parent_id = NativeFunction::from_copy_closure(|_this, args, _context| {
             let child_nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
-            let parent_nid = DOM_ROOT.with(|root| {
-                if let Some(ref r) = *root.borrow() {
-                    find_parent_of_node(r, child_nid).map(register_node)
-                } else { None }
+            let parent_handle = NODE_REGISTRY.with(|reg| {
+                let reg = reg.borrow();
+                reg.get(&child_nid).and_then(|node| {
+                    let parent_weak = node.parent.take();
+                    let parent = parent_weak.and_then(|pw| pw.upgrade());
+                    if let Some(ref parent_handle) = parent {
+                        node.parent.set(Some(Rc::downgrade(parent_handle)));
+                    }
+                    parent
+                })
             });
+            let parent_nid = parent_handle.map(register_node);
             Ok(parent_nid.map(JsValue::from).unwrap_or(JsValue::null()))
         });
         context.register_global_callable(js_string!("__aura_get_parent_id"), 1, get_parent_id).unwrap();
@@ -737,6 +745,17 @@ impl JsRuntime {
         });
         context.register_global_callable(js_string!("__aura_create_text_node"), 1, create_text_node).unwrap();
 
+        // __aura_create_document_fragment() -> nid
+        let create_document_fragment = NativeFunction::from_copy_closure(|_this, _args, _context| {
+            use markup5ever_rcdom::{Node, NodeData};
+
+            let node = Node::new(NodeData::Document);
+            let nid = register_node(node);
+            mark_document_fragment_id(nid);
+            Ok(JsValue::from(nid))
+        });
+        context.register_global_callable(js_string!("__aura_create_document_fragment"), 0, create_document_fragment).unwrap();
+
         // __aura_append_child(parent_nid, child_nid) → void
         let append_child = NativeFunction::from_copy_closure(|_this, args, _context| {
             let parent_nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
@@ -744,14 +763,13 @@ impl JsRuntime {
             NODE_REGISTRY.with(|reg| {
                 let reg = reg.borrow();
                 if let (Some(parent), Some(child)) = (reg.get(&parent_nid), reg.get(&child_nid)) {
-                    // Remove from existing parent if any
-                    let child_ptr = Rc::as_ptr(child) as usize;
-                    if let Some(old_parent_handle) = find_parent_by_ptr_in_dom(child_ptr) {
-                        old_parent_handle.children.borrow_mut().retain(|c| Rc::as_ptr(c) as usize != child_ptr);
+                    if is_document_fragment_id(child_nid) {
+                        append_fragment_children(parent, child);
+                    } else {
+                        detach_node_from_parent(child);
+                        child.parent.set(Some(Rc::downgrade(parent)));
+                        parent.children.borrow_mut().push(child.clone());
                     }
-                    // Set new parent relationship via Cell::set
-                    child.parent.set(Some(Rc::downgrade(parent)));
-                    parent.children.borrow_mut().push(child.clone());
                 }
             });
             Ok(JsValue::undefined())
@@ -782,24 +800,30 @@ impl JsRuntime {
             NODE_REGISTRY.with(|reg| {
                 let reg = reg.borrow();
                 if let (Some(parent), Some(new_child)) = (reg.get(&parent_nid), reg.get(&new_nid)) {
-                    // Remove from existing parent
-                    let new_ptr = Rc::as_ptr(new_child) as usize;
-                    if let Some(old_parent) = find_parent_by_ptr_in_dom(new_ptr) {
-                        old_parent.children.borrow_mut().retain(|c| Rc::as_ptr(c) as usize != new_ptr);
-                    }
-                    new_child.parent.set(Some(Rc::downgrade(parent)));
-
-                    let mut children = parent.children.borrow_mut();
-                    if let Some(ref_nid_val) = ref_nid {
-                        if let Some(ref_node) = reg.get(&ref_nid_val) {
+                    let insert_pos = ref_nid.and_then(|ref_nid_val| {
+                        reg.get(&ref_nid_val).and_then(|ref_node| {
                             let ref_ptr = Rc::as_ptr(ref_node) as usize;
-                            if let Some(pos) = children.iter().position(|c| Rc::as_ptr(c) as usize == ref_ptr) {
-                                children.insert(pos, new_child.clone());
-                                return;
-                            }
+                            parent
+                                .children
+                                .borrow()
+                                .iter()
+                                .position(|c| Rc::as_ptr(c) as usize == ref_ptr)
+                        })
+                    });
+
+                    if is_document_fragment_id(new_nid) {
+                        insert_fragment_children(parent, new_child, insert_pos);
+                    } else {
+                        detach_node_from_parent(new_child);
+                        new_child.parent.set(Some(Rc::downgrade(parent)));
+
+                        let mut children = parent.children.borrow_mut();
+                        if let Some(pos) = insert_pos {
+                            children.insert(pos, new_child.clone());
+                            return;
                         }
+                        children.push(new_child.clone());
                     }
-                    children.push(new_child.clone());
                 }
             });
             Ok(JsValue::undefined())
@@ -968,32 +992,34 @@ impl JsRuntime {
         // __aura_get_children_nids(nid) → JSON array of {nid, tag, string_id}
         let get_children = NativeFunction::from_copy_closure(|_this, args, _context| {
             let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
-            let result = NODE_REGISTRY.with(|reg| {
+            let child_handles = NODE_REGISTRY.with(|reg| {
                 let reg = reg.borrow();
-                if let Some(node) = reg.get(&nid) {
-                    let mut items = Vec::new();
-                    for child in node.children.borrow().iter() {
-                        let child_nid = register_node(child.clone());
-                        match &child.data {
-                            NodeData::Element { ref name, ref attrs, .. } => {
-                                let tag = name.local.to_string();
-                                let id_attr = attrs.borrow().iter()
-                                    .find(|a| a.name.local.to_string() == "id")
-                                    .map(|a| a.value.to_string())
-                                    .unwrap_or_default();
-                                items.push(format!("{{\"nid\":{},\"tag\":\"{}\",\"id\":\"{}\",\"kind\":\"element\"}}", child_nid, tag, id_attr));
-                            }
-                            NodeData::Text { .. } => {
-                                items.push(format!("{{\"nid\":{},\"tag\":\"\",\"id\":\"\",\"kind\":\"text\"}}", child_nid));
-                            }
-                            _ => {}
-                        }
-                    }
-                    items.join(",")
-                } else {
-                    String::new()
-                }
+                reg.get(&nid)
+                    .map(|node| node.children.borrow().iter().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default()
             });
+            let mut items = Vec::new();
+            for child in child_handles {
+                let child_nid = register_node(child.clone());
+                match &child.data {
+                    NodeData::Element { ref name, ref attrs, .. } => {
+                        let tag = name.local.to_string();
+                        let id_attr = attrs.borrow().iter()
+                            .find(|a| a.name.local.to_string() == "id")
+                            .map(|a| a.value.to_string())
+                            .unwrap_or_default();
+                        items.push(format!("{{\"nid\":{},\"tag\":\"{}\",\"id\":\"{}\",\"kind\":\"element\"}}", child_nid, tag, id_attr));
+                    }
+                    NodeData::Text { .. } => {
+                        items.push(format!("{{\"nid\":{},\"tag\":\"\",\"id\":\"\",\"kind\":\"text\"}}", child_nid));
+                    }
+                    NodeData::Document => {
+                        items.push(format!("{{\"nid\":{},\"tag\":\"\",\"id\":\"\",\"kind\":\"fragment\"}}", child_nid));
+                    }
+                    _ => {}
+                }
+            }
+            let result = items.join(",");
             Ok(JsValue::from(js_string!(format!("[{}]", result))))
         });
         context.register_global_callable(js_string!("__aura_get_children"), 1, get_children).unwrap();
@@ -1004,6 +1030,9 @@ impl JsRuntime {
             let info = NODE_REGISTRY.with(|reg| {
                 let reg = reg.borrow();
                 if let Some(node) = reg.get(&nid) {
+                    if is_document_fragment_id(nid) {
+                        return Some((String::new(), String::new(), String::new(), "fragment".to_string()));
+                    }
                     if let NodeData::Element { ref name, ref attrs, .. } = node.data {
                         let tag = name.local.to_string();
                         let attrs_b = attrs.borrow();
@@ -1034,6 +1063,9 @@ impl JsRuntime {
         let get_node_type = NativeFunction::from_copy_closure(|_this, args, _context| {
             let nid = args.get(0).and_then(|v| v.as_number()).map(|n| n as u32).unwrap_or(0);
             let node_type = NODE_REGISTRY.with(|reg| {
+                if is_document_fragment_id(nid) {
+                    return 11;
+                }
                 reg.borrow().get(&nid).map(|node| match node.data {
                     NodeData::Element { .. } => 1,
                     NodeData::Text { .. } => 3,
@@ -1452,13 +1484,56 @@ fn register_node(handle: Handle) -> u32 {
     }
 
     let id = NEXT_NODE_ID.with(|id_cell| {
-        let id = *id_cell.borrow();
-        *id_cell.borrow_mut() += 1;
+        let mut next = id_cell.borrow_mut();
+        let id = *next;
+        *next += 1;
         id
     });
     NODE_REGISTRY.with(|reg| reg.borrow_mut().insert(id, handle));
     REVERSE_NODE_REGISTRY.with(|reg| reg.borrow_mut().insert(ptr, id));
     id
+}
+
+fn mark_document_fragment_id(id: u32) {
+    DOCUMENT_FRAGMENT_NODE_IDS.with(|ids| {
+        ids.borrow_mut().insert(id);
+    });
+}
+
+fn is_document_fragment_id(id: u32) -> bool {
+    DOCUMENT_FRAGMENT_NODE_IDS.with(|ids| ids.borrow().contains(&id))
+}
+
+fn detach_node_from_parent(node: &Handle) {
+    let node_ptr = Rc::as_ptr(node) as usize;
+    let parent_weak = node.parent.take();
+    if let Some(parent_weak) = parent_weak {
+        if let Some(parent) = parent_weak.upgrade() {
+            parent.children.borrow_mut().retain(|c| Rc::as_ptr(c) as usize != node_ptr);
+        }
+    }
+}
+
+fn append_fragment_children(parent: &Handle, fragment: &Handle) {
+    let fragment_children: Vec<Handle> = fragment.children.borrow_mut().drain(..).collect();
+    let mut parent_children = parent.children.borrow_mut();
+    for child in fragment_children {
+        detach_node_from_parent(&child);
+        child.parent.set(Some(Rc::downgrade(parent)));
+        parent_children.push(child);
+    }
+}
+
+fn insert_fragment_children(parent: &Handle, fragment: &Handle, insert_pos: Option<usize>) {
+    let fragment_children: Vec<Handle> = fragment.children.borrow_mut().drain(..).collect();
+    let mut parent_children = parent.children.borrow_mut();
+    let mut pos = insert_pos.unwrap_or(parent_children.len());
+    for child in fragment_children {
+        detach_node_from_parent(&child);
+        child.parent.set(Some(Rc::downgrade(parent)));
+        parent_children.insert(pos, child);
+        pos += 1;
+    }
 }
 
 // ── CSS Selector Matching ─────────────────────────────────────────────────────
@@ -1763,7 +1838,7 @@ fn collect_text_content(node: &Handle) -> String {
         NodeData::Text { ref contents } => {
             out.push_str(&contents.borrow().to_string());
         }
-        NodeData::Element { .. } => {
+        NodeData::Element { .. } | NodeData::Document => {
             for child in node.children.borrow().iter() {
                 out.push_str(&collect_text_content(child));
             }
@@ -2040,6 +2115,72 @@ mod tests {
         // Also check querySelector works after mutation
         let found = eval(&mut rt, "document.querySelector('#app p') !== null ? 'found' : 'null'");
         assert_eq!(found, "found", "Expected querySelector('#app p') to find element after innerHTML set");
+    }
+
+    #[test]
+    fn test_create_document_fragment_has_fragment_node_type() {
+        let mut rt = make_runtime("<html><body><div id='app'></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var frag = document.createDocumentFragment();
+                return [frag.nodeType, frag.childNodes.length, frag.parentNode === null].join(':');
+            })()
+        "#);
+        assert_eq!(result, "11:0:true");
+    }
+
+    #[test]
+    fn test_append_child_document_fragment_transfers_children() {
+        let mut rt = make_runtime("<html><body><div id='app'></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var app = document.getElementById('app');
+                var frag = document.createDocumentFragment();
+                var first = document.createElement('span');
+                first.textContent = 'a';
+                var second = document.createTextNode('b');
+                frag.appendChild(first);
+                frag.appendChild(second);
+                app.appendChild(frag);
+                return [
+                    app.childNodes.length,
+                    app.firstChild.textContent,
+                    app.lastChild.textContent,
+                    frag.childNodes.length,
+                    first.parentNode === app,
+                    app.textContent
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "2:a:b:0:true:ab");
+    }
+
+    #[test]
+    fn test_insert_before_document_fragment_transfers_children_in_order() {
+        let mut rt = make_runtime("<html><body><div id='app'><span id='tail'>tail</span></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var app = document.getElementById('app');
+                var tail = document.getElementById('tail');
+                var frag = document.createDocumentFragment();
+                var first = document.createTextNode('head');
+                var second = document.createElement('b');
+                second.textContent = 'mid';
+                frag.appendChild(first);
+                frag.appendChild(second);
+                app.insertBefore(frag, tail);
+                return [
+                    app.childNodes.length,
+                    app.firstChild.textContent,
+                    app.childNodes.item(1).textContent,
+                    app.lastChild.textContent,
+                    frag.childNodes.length,
+                    second.parentNode === app,
+                    app.textContent
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "3:head:mid:tail:0:true:headmidtail");
     }
 
     // ── New runtime parity tests (#113) ──────────────────────────────────────

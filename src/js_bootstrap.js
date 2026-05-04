@@ -57,6 +57,8 @@ function __get_or_create_node(id, tag, string_id, kind) {
     let node;
     if (kind === 'text') {
         node = new TextNode(id);
+    } else if (kind === 'fragment') {
+        node = new DocumentFragment(id);
     } else if (tag) {
         node = new Element(id, tag, string_id);
     } else {
@@ -231,7 +233,9 @@ class Node extends EventTarget {
         this._kind = kind;
     }
     get nodeType() {
-        return this._kind === 'text' ? 3 : 1;
+        if (this._kind === 'text') return 3;
+        if (this._kind === 'fragment') return 11;
+        return 1;
     }
     get parentNode() {
         let pid = __aura_get_parent_id(this._id);
@@ -287,6 +291,16 @@ class Node extends EventTarget {
         return oldChild;
     }
     cloneNode(deep) {
+        if (this._kind === 'fragment') {
+            let fragment = document.createDocumentFragment();
+            if (deep) {
+                let children = this.childNodes;
+                for (let i = 0; i < children.length; i++) {
+                    fragment.appendChild(children[i].cloneNode(true));
+                }
+            }
+            return fragment;
+        }
         // Shallow clone: create same-tag element, copy attributes
         let info = __aura_get_node_info(this._id);
         if (!info) return null;
@@ -583,6 +597,15 @@ class TextNode extends Node {
     }
 }
 
+class DocumentFragment extends Node {
+    constructor(id) {
+        super(id, 'fragment');
+    }
+    get nodeName() {
+        return '#document-fragment';
+    }
+}
+
 // -- Node static constants ---------------------------------------------------
 Node.ELEMENT_NODE = 1;
 Node.ATTRIBUTE_NODE = 2;
@@ -650,7 +673,8 @@ var document = {
         return __get_or_create_node(nativeId, null, null, 'text');
     },
     createDocumentFragment: function() {
-        return document.createElement('div');
+        let nativeId = __aura_create_document_fragment();
+        return __get_or_create_node(nativeId, null, null, 'fragment');
     },
 
     querySelector: function(selector) {
@@ -716,10 +740,9 @@ var document = {
         var nodes = [];
         function collect(node) {
             nodes.push(node);
-            var arr = JSON.parse(__aura_get_children(node._id));
-            for (var c of arr) {
-                var child = __get_or_create_node(c.nid, c.tag, c.id, c.kind);
-                collect(child);
+            var children = node && node.childNodes ? node.childNodes : [];
+            for (var i = 0; i < children.length; i++) {
+                collect(children[i]);
             }
         }
         if (root && root._id) collect(root);
@@ -747,10 +770,9 @@ var document = {
         var nodes = [];
         function collect(node) {
             nodes.push(node);
-            var arr = JSON.parse(__aura_get_children(node._id));
-            for (var c of arr) {
-                var child = __get_or_create_node(c.nid, c.tag, c.id, c.kind);
-                collect(child);
+            var children = node && node.childNodes ? node.childNodes : [];
+            for (var i = 0; i < children.length; i++) {
+                collect(children[i]);
             }
         }
         if (root && root._id) collect(root);
@@ -1442,6 +1464,7 @@ window.IntersectionObserver = IntersectionObserver;
 window.ResizeObserver = ResizeObserver;
 window.Node = Node;
 window.Element = Element;
+window.DocumentFragment = DocumentFragment;
 window.NodeList = NodeList;
 window.EventTarget = EventTarget;
 window.XMLHttpRequest = XMLHttpRequest;
