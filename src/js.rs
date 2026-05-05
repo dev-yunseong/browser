@@ -583,6 +583,26 @@ impl JsRuntime {
         });
         context.register_global_callable(js_string!("__aura_resolve_url"), 2, resolve_url).unwrap();
 
+        // Register native __aura_can_execute_script_url
+        let can_execute_script_url = NativeFunction::from_copy_closure(|_this, args, _context| {
+            let url_str = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            let base_url = CURRENT_ORIGIN.with(|o| (*o.borrow()).clone());
+            let target_url = if let Some(base) = base_url.as_ref() {
+                base.join(&url_str).unwrap_or_else(|_| Url::parse(&url_str).unwrap_or(base.clone()))
+            } else {
+                Url::parse(&url_str).unwrap_or_else(|_| Url::parse("about:blank").unwrap())
+            };
+            let allowed = CSP_POLICY.with(|p| {
+                if let Some(ref policy) = *p.borrow() {
+                    policy.is_allowed("script-src", &target_url, base_url.as_ref())
+                } else {
+                    true
+                }
+            });
+            Ok(JsValue::from(allowed))
+        });
+        context.register_global_callable(js_string!("__aura_can_execute_script_url"), 1, can_execute_script_url).unwrap();
+
         // Register native __aura_fetch
         let aura_fetch = NativeFunction::from_copy_closure(|_this, args, _context| {
             let url_str = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
@@ -1427,6 +1447,18 @@ impl JsRuntime {
                 println!("[JS Bootstrap] URL init error: {:?}", e);
             }
         }
+
+        let script_allowed = CSP_POLICY.with(|p| {
+            p.borrow()
+                .as_ref()
+                .map(|policy| policy.allows_inline_script())
+                .unwrap_or(true)
+        });
+        let script_allowed_init = format!(
+            "window.__aura_inline_script_allowed = {};",
+            if script_allowed { "true" } else { "false" }
+        );
+        let _ = context.eval(Source::from_bytes(script_allowed_init.as_bytes()));
 
         Self { context, task_receiver }
     }
@@ -4343,6 +4375,69 @@ mod tests {
             result,
             "one, two|x-test,content-type|https://example.com/api|POST|application/json|include|{\"ok\":true}|201|true|application/json|yes|function|false|true"
         );
+    }
+
+    #[test]
+    fn test_dynamic_inline_script_executes_and_fires_load() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                window.dynamicScriptValue = 0;
+                window.dynamicScriptEvents = [];
+                var script = document.createElement('script');
+                script.text = 'window.dynamicScriptValue = 42;';
+                script.addEventListener('load', function() { window.dynamicScriptEvents.push('load'); });
+                script.addEventListener('error', function() { window.dynamicScriptEvents.push('error'); });
+                document.body.appendChild(script);
+                return window.dynamicScriptValue;
+            })()
+        "#);
+        assert_eq!(result, "42");
+
+        rt.tick(None, None);
+        let events = eval(&mut rt, "window.dynamicScriptEvents.join(',')");
+        assert_eq!(events, "load");
+    }
+
+    #[test]
+    fn test_dynamic_script_csp_and_module_decision() {
+        let dom = crate::dom::parse_html("<html><body></body></html>");
+        let csp = CspPolicy {
+            script_src: vec!["'self'".to_string()],
+            connect_src: vec![],
+        };
+        let mut rt = JsRuntime::new(Some(dom.document), Some(url::Url::parse("https://example.com/").unwrap()), Some(csp), None, new_console_buffer());
+
+        let result = eval(&mut rt, r#"
+            (function() {
+                window.blockedDynamicValue = 0;
+                window.dynamicScriptEvents = [];
+                var inline = document.createElement('script');
+                inline.text = 'window.blockedDynamicValue = 99;';
+                inline.addEventListener('error', function() { window.dynamicScriptEvents.push('inline-error'); });
+                document.body.appendChild(inline);
+
+                var moduleScript = document.createElement('script');
+                moduleScript.type = 'module';
+                moduleScript.text = 'window.blockedDynamicValue = 100;';
+                moduleScript.addEventListener('error', function() { window.dynamicScriptEvents.push('module-error:' + moduleScript._auraModuleUnsupported); });
+                document.body.appendChild(moduleScript);
+
+                return [
+                    window.blockedDynamicValue,
+                    window.__aura_inline_script_allowed,
+                    typeof __aura_can_execute_script_url,
+                    __aura_can_execute_script_url('/app.js'),
+                    __aura_can_execute_script_url('https://cdn.example.net/app.js')
+                ].join('|');
+            })()
+        "#);
+
+        assert_eq!(result, "0|false|function|true|false");
+        rt.tick(None, None);
+        rt.tick(None, None);
+        let events = eval(&mut rt, "window.dynamicScriptEvents.join(',')");
+        assert_eq!(events, "inline-error,module-error:true");
     }
 
     #[test]

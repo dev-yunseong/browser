@@ -1075,6 +1075,7 @@ class Node extends EventTarget {
             __aura_append_child(this._id, child._id);
             if (oldParent && oldParent !== this) __aura_child_list_mutation(oldParent, [], [child], oldPrevious, oldNext);
             if (added.length > 0) __aura_child_list_mutation(this, added, [], previous, null);
+            added.forEach(__aura_maybe_run_script);
         }
         return child;
     }
@@ -1098,6 +1099,7 @@ class Node extends EventTarget {
             __aura_insert_before(this._id, newChild._id, refChild ? refChild._id : null);
             if (oldParent && oldParent !== this) __aura_child_list_mutation(oldParent, [], [newChild], oldPrevious, oldNext);
             if (added.length > 0) __aura_child_list_mutation(this, added, [], previous, next);
+            added.forEach(__aura_maybe_run_script);
         }
         return newChild;
     }
@@ -2236,6 +2238,7 @@ window.__aura_environmentNotes = {
     ],
     viewport: 'Fixed 800x600 CSS pixel viewport in the current headless runtime.'
 };
+window.__aura_inline_script_allowed = true;
 
 // -- history -----------------------------------------------------------------
 window.history = {
@@ -2916,6 +2919,65 @@ window.fetch = function(input, init) {
     });
 };
 
+function __aura_script_type(script) {
+    return (script.getAttribute('type') || '').trim().toLowerCase();
+}
+
+function __aura_script_fire(script, type) {
+    __aura_queue_task(() => script.dispatchEvent(new Event(type)));
+}
+
+function __aura_execute_classic_script(script, code) {
+    try {
+        (0, eval)(String(code || ''));
+        __aura_script_fire(script, 'load');
+    } catch (e) {
+        console.error('Script execution error: ' + e);
+        __aura_script_fire(script, 'error');
+    }
+}
+
+function __aura_maybe_run_script(node) {
+    if (!node || node.nodeType !== Node.ELEMENT_NODE || String(node.tagName || '').toLowerCase() !== 'script') return;
+    let script = node;
+    if (script._alreadyStarted) return;
+    script._alreadyStarted = true;
+
+    let type = __aura_script_type(script);
+    if (type && type !== 'text/javascript' && type !== 'application/javascript' && type !== 'classic') {
+        script._auraModuleUnsupported = type === 'module';
+        console.warn(type === 'module'
+            ? 'Module scripts are not supported yet; dynamic module script signaled error.'
+            : 'Unsupported script type skipped: ' + type);
+        __aura_script_fire(script, 'error');
+        return;
+    }
+
+    let src = script.src;
+    if (src) {
+        if (typeof __aura_can_execute_script_url === 'function' && !__aura_can_execute_script_url(src)) {
+            console.warn('CSP blocked dynamic script: ' + src);
+            __aura_script_fire(script, 'error');
+            return;
+        }
+        fetch(src)
+            .then(response => response.ok ? response.text() : Promise.reject(new Error('HTTP ' + response.status)))
+            .then(code => __aura_execute_classic_script(script, code))
+            .catch(error => {
+                console.error('Script load error: ' + error);
+                __aura_script_fire(script, 'error');
+            });
+        return;
+    }
+
+    if (!window.__aura_inline_script_allowed) {
+        console.warn('CSP blocked inline dynamic script');
+        __aura_script_fire(script, 'error');
+        return;
+    }
+    __aura_execute_classic_script(script, script.text || script.textContent || '');
+}
+
 // -- MutationObserver --------------------------------------------------------
 class MutationObserver {
     constructor(callback) {
@@ -3546,9 +3608,21 @@ window.HTMLAnchorElement = HTMLAnchorElement;
 class HTMLScriptElement extends HTMLElement {
     get src() { return __aura_get_attribute(this._id, 'src') || ''; }
     set src(v) { __aura_set_attribute(this._id, 'src', String(v)); }
+    get type() { return __aura_get_attribute(this._id, 'type') || ''; }
+    set type(v) { __aura_set_attribute(this._id, 'type', String(v)); }
+    get text() { return this.textContent; }
+    set text(v) { this.textContent = String(v); }
     get async() { return __aura_has_attribute(this._id, 'async'); }
     set async(v) { if (v) __aura_set_attribute(this._id, 'async', ''); else __aura_remove_attribute(this._id, 'async'); }
     get defer() { return __aura_has_attribute(this._id, 'defer'); }
+    set defer(v) { if (v) __aura_set_attribute(this._id, 'defer', ''); else __aura_remove_attribute(this._id, 'defer'); }
+    get noModule() { return __aura_has_attribute(this._id, 'nomodule'); }
+    set noModule(v) { if (v) __aura_set_attribute(this._id, 'nomodule', ''); else __aura_remove_attribute(this._id, 'nomodule'); }
+    get crossOrigin() { return __aura_get_attribute(this._id, 'crossorigin'); }
+    set crossOrigin(v) {
+        if (v === null || v === undefined) __aura_remove_attribute(this._id, 'crossorigin');
+        else __aura_set_attribute(this._id, 'crossorigin', String(v));
+    }
 }
 window.HTMLScriptElement = HTMLScriptElement;
 
