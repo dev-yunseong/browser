@@ -3941,6 +3941,46 @@ mod tests {
     }
 
     #[test]
+    fn test_xml_http_request_state_headers_and_abort() {
+        let url = url::Url::parse("https://example.com/app/index.html").unwrap();
+        let dom = crate::dom::parse_html("<html><body></body></html>");
+        let mut rt = JsRuntime::new(Some(dom.document), Some(url), None, None, new_console_buffer());
+
+        let result = eval(&mut rt, r#"
+            (function() {
+                var xhr = new XMLHttpRequest();
+                var events = [];
+                xhr.onreadystatechange = function() { events.push('rs:' + xhr.readyState); };
+                xhr.onabort = function() { events.push('abort'); };
+                xhr.onloadend = function() { events.push('end'); };
+                xhr.open('post', '../api', true);
+                xhr.setRequestHeader('X-Test', 'one');
+                xhr.setRequestHeader('x-test', 'two');
+                var opened = [
+                    xhr.readyState,
+                    xhr._method,
+                    xhr._url,
+                    xhr._headers.get('x-test'),
+                    XMLHttpRequest.DONE
+                ].join(',');
+
+                xhr._responseHeaders = new Headers({ 'Content-Type': 'text/plain' });
+                xhr._changeReadyState(xhr.HEADERS_RECEIVED);
+                var responseHeader = xhr.getResponseHeader('content-type');
+                var allHeaders = xhr.getAllResponseHeaders().indexOf('content-type: text/plain') >= 0;
+                xhr.abort();
+
+                return [opened, responseHeader, allHeaders, events.join('|'), xhr.status, xhr.responseText].join('||');
+            })()
+        "#);
+
+        assert_eq!(
+            result,
+            "1,POST,https://example.com/api,one, two,4||text/plain||true||rs:1|rs:2|rs:4|abort|end||0||"
+        );
+    }
+
+    #[test]
     fn test_match_media_returns_object() {
         let mut rt = make_runtime("<html><body></body></html>");
         let result = eval(&mut rt, "(function() { var mm = window.matchMedia('(max-width: 800px)'); return typeof mm.matches; })()");
