@@ -4035,6 +4035,58 @@ mod tests {
     }
 
     #[test]
+    fn test_window_navigator_screen_environment_parity() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var scrollEvents = 0;
+                window.addEventListener('scroll', function() { scrollEvents++; });
+                scrollTo({ left: 12, top: 34 });
+                scrollBy(3, 4);
+
+                var mqlEvents = 0;
+                var mql = matchMedia('(min-width: 1px)');
+                mql.addEventListener('change', function() { mqlEvents++; });
+                mql.dispatchEvent(new Event('change'));
+
+                var orientationEvents = 0;
+                screen.orientation.addEventListener('change', function() { orientationEvents++; });
+                screen.orientation.dispatchEvent(new Event('change'));
+
+                return [
+                    window.self === window,
+                    window.top === window,
+                    window.parent === window,
+                    navigator.appName,
+                    navigator.webdriver,
+                    navigator.plugins.length,
+                    typeof navigator.permissions.query,
+                    typeof navigator.clipboard.readText,
+                    typeof navigator.geolocation.getCurrentPosition,
+                    navigator.javaEnabled(),
+                    navigator.sendBeacon('/ping'),
+                    screen.availLeft,
+                    screen.orientation.type,
+                    visualViewport.pageLeft + ',' + visualViewport.pageTop,
+                    scrollX + ',' + scrollY,
+                    scrollEvents,
+                    mql.media + ':' + mqlEvents,
+                    orientationEvents,
+                    locationbar.visible && toolbar.visible,
+                    confirm('question'),
+                    prompt('name', 'fallback'),
+                    __aura_environmentNotes.unsupported.indexOf('indexedDB') >= 0
+                ].join('|');
+            })()
+        "#);
+
+        assert_eq!(
+            result,
+            "true|true|true|Netscape|false|0|function|function|function|false|true|0|landscape-primary|15,38|15,38|2|(min-width: 1px):1|1|true|false|fallback|true"
+        );
+    }
+
+    #[test]
     fn test_device_pixel_ratio() {
         let mut rt = make_runtime("<html><body></body></html>");
         let dpr = eval(&mut rt, "window.devicePixelRatio");
