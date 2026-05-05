@@ -1762,4 +1762,90 @@ mod tests {
             "different widths must produce different page.width values"
         );
     }
+
+    #[test]
+    fn test_form_metadata_extracts_action_method_and_control_names() {
+        let html = r#"<html><body><form action="/search" method="post">
+            <input name="q" value="hello">
+            <input name="btnG" value="Search" type="submit">
+            <input name="msg" value="desc">
+        </form></body></html>"#;
+        let base = Url::parse("https://example.com").unwrap();
+        let mut cache = HashMap::new();
+        let (page, _) = process_html_with_cache(
+            html,
+            &base,
+            &HashMap::new(),
+            &mut cache,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            800.0,
+        )
+        .unwrap();
+
+        let meta = page.form_metadata.expect("form_metadata should be Some");
+        assert_eq!(meta.action, "/search");
+        assert_eq!(meta.method, "post");
+        assert_eq!(meta.controls.len(), 3);
+
+        assert_eq!(meta.controls[0].name, "q");
+        assert_eq!(meta.controls[0].initial_value, "hello");
+
+        assert_eq!(meta.controls[1].name, "btnG");
+        assert_eq!(meta.controls[1].initial_value, "Search");
+
+        assert_eq!(meta.controls[2].name, "msg");
+        assert_eq!(meta.controls[2].initial_value, "desc");
+    }
+
+    #[test]
+    fn test_form_metadata_none_when_no_form() {
+        let html = "<html><body><p>no form here</p></body></html>";
+        let base = Url::parse("https://example.com").unwrap();
+        let mut cache = HashMap::new();
+        let (page, _) = process_html_with_cache(
+            html,
+            &base,
+            &HashMap::new(),
+            &mut cache,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            800.0,
+        )
+        .unwrap();
+
+        assert!(page.form_metadata.is_none());
+    }
+
+    #[test]
+    fn test_form_metadata_default_method_get() {
+        let html = r#"<form action="/search"><input name="q" value="test"></form>"#;
+        let base = Url::parse("https://example.com").unwrap();
+        let mut cache = HashMap::new();
+        let (page, _) = process_html_with_cache(
+            html,
+            &base,
+            &HashMap::new(),
+            &mut cache,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            800.0,
+        )
+        .unwrap();
+
+        let meta = page.form_metadata.unwrap();
+        assert_eq!(meta.action, "/search");
+        assert_eq!(meta.method, "get");
+        assert_eq!(meta.controls.len(), 1);
+        assert_eq!(meta.controls[0].name, "q");
+    }
 }
