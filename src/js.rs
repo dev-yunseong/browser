@@ -10,6 +10,7 @@ use serde::{Serialize, Deserialize};
 use std::sync::Mutex;
 use std::rc::Rc;
 use lazy_static::lazy_static;
+use crate::css::{AttributeMatch, Combinator, Selector, parse_selector};
 
 
 lazy_static! {
@@ -423,6 +424,56 @@ fn register_native_functions(scope: &mut v8::ContextScope<v8::HandleScope>, glob
     global.set(scope, v8::String::new(scope, "info").unwrap().into(), f.into());
     let f = v8::Function::new(scope, console_debug).unwrap();
     global.set(scope, v8::String::new(scope, "debug").unwrap().into(), f.into());
+
+    register_fn(scope, global, "__aura_get_document_element", get_document_element_cb);
+    register_fn(scope, global, "__aura_get_head", get_head_cb);
+    register_fn(scope, global, "__aura_get_body", get_body_cb);
+    register_fn(scope, global, "__aura_get_element_by_id", get_element_by_id_cb);
+    register_fn(scope, global, "__aura_query_selector", query_selector_cb);
+    register_fn(scope, global, "__aura_query_selector_all", query_selector_all_cb);
+    register_fn(scope, global, "__aura_get_elements_by_class", get_elements_by_class_cb);
+    register_fn(scope, global, "__aura_get_elements_by_tag", get_elements_by_tag_cb);
+    register_fn(scope, global, "__aura_get_parent_id", get_parent_id_cb);
+    register_fn(scope, global, "__aura_get_next_sibling_id", get_next_sibling_cb);
+    register_fn(scope, global, "__aura_get_previous_sibling_id", get_previous_sibling_cb);
+    register_fn(scope, global, "__aura_get_next_element_sibling_id", get_next_element_sibling_cb);
+    register_fn(scope, global, "__aura_get_previous_element_sibling_id", get_previous_element_sibling_cb);
+    register_fn(scope, global, "__aura_get_inner_html", get_inner_html_cb);
+    register_fn(scope, global, "__aura_get_outer_html", get_outer_html_cb);
+    register_fn(scope, global, "__aura_set_inner_html", set_inner_html_cb);
+    register_fn(scope, global, "__aura_get_text_content", get_text_content_cb);
+    register_fn(scope, global, "__aura_set_text_content", set_text_content_cb);
+    register_fn(scope, global, "__aura_get_attribute", get_attribute_cb);
+    register_fn(scope, global, "__aura_set_attribute", set_attribute_cb);
+    register_fn(scope, global, "__aura_get_attributes", get_attributes_cb);
+    register_fn(scope, global, "__aura_has_attribute", has_attribute_cb);
+    register_fn(scope, global, "__aura_remove_attribute", remove_attribute_cb);
+    register_fn(scope, global, "__aura_create_element", create_element_cb);
+    register_fn(scope, global, "__aura_create_text_node", create_text_node_cb);
+    register_fn(scope, global, "__aura_create_comment", create_comment_cb);
+    register_fn(scope, global, "__aura_create_document_fragment", create_document_fragment_cb);
+    register_fn(scope, global, "__aura_append_child", append_child_cb);
+    register_fn(scope, global, "__aura_remove_child", remove_child_cb);
+    register_fn(scope, global, "__aura_insert_before", insert_before_cb);
+    register_fn(scope, global, "__aura_remove_self", remove_self_cb);
+    register_fn(scope, global, "__aura_get_children", get_children_cb);
+    register_fn(scope, global, "__aura_get_node_info", get_node_info_cb);
+    register_fn(scope, global, "__aura_get_node_type", get_node_type_cb);
+    register_fn(scope, global, "__aura_get_node_value", get_node_value_cb);
+    register_fn(scope, global, "__aura_set_node_value", set_node_value_cb);
+    register_fn(scope, global, "__aura_get_layout_metrics", get_layout_metrics_cb);
+    register_fn(scope, global, "__aura_get_doctype_id", get_doctype_id_cb);
+    register_fn(scope, global, "__aura_get_doctype_info", get_doctype_info_cb);
+    register_fn(scope, global, "__aura_set_focus", set_focus_cb);
+    register_fn(scope, global, "__aura_queue_task", queue_task_cb);
+    register_fn(scope, global, "__aura_resolve_url", resolve_url_cb);
+    register_fn(scope, global, "__aura_can_execute_script_url", can_execute_script_url_cb);
+    register_fn(scope, global, "__aura_parse_url", parse_url_cb);
+    register_fn(scope, global, "__aura_storage_get", storage_get_cb);
+    register_fn(scope, global, "__aura_storage_set", storage_set_cb);
+    register_fn(scope, global, "__aura_storage_remove", storage_remove_cb);
+    register_fn(scope, global, "__aura_storage_clear", storage_clear_cb);
+    register_fn(scope, global, "__aura_fetch", fetch_cb);
 }
 
 fn console_log(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, _rv: v8::ReturnValue<v8::Value>) {
@@ -1186,39 +1237,135 @@ fn collect_text_content(node: &Handle) -> String {
 
 
 
-fn query_selector_first(_root: &Handle, _selector: &str, _skip_root: bool) -> Option<Handle> {
-    // TODO: implement CSS selector matching
+fn split_selector_groups(selector: &str) -> Vec<&str> {
+    let mut groups = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (idx, ch) in selector.char_indices() {
+        match ch {
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth -= 1,
+            ',' if depth == 0 => {
+                let part = selector[start..idx].trim();
+                if !part.is_empty() { groups.push(part); }
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let tail = selector[start..].trim();
+    if !tail.is_empty() { groups.push(tail); }
+    groups
+}
+
+fn selector_is_supported_for_dom_queries(selector: &Selector) -> bool {
+    if selector.pseudo_class.is_some() || selector.pseudo_element.is_some() { return false; }
+    selector.ancestor.as_deref().map(selector_is_supported_for_dom_queries).unwrap_or(true)
+}
+
+fn selector_subject_matches_handle(node: &Handle, selector: &Selector) -> bool {
+    let NodeData::Element { ref name, ref attrs, .. } = node.data else { return false; };
+    let has_constraint = selector.tag.is_some() || selector.id.is_some() || !selector.class.is_empty() || !selector.attributes.is_empty();
+    if !has_constraint { return false; }
+    let tag = name.local.to_string().to_lowercase();
+    if let Some(ref required_tag) = selector.tag { if tag != required_tag.to_lowercase() { return false; } }
+    let attrs_ref = attrs.borrow();
+    let id_val = attrs_ref.iter().find(|a| a.name.local.to_string() == "id").map(|a| a.value.to_string());
+    if let Some(ref required_id) = selector.id { if id_val.as_deref() != Some(required_id.as_str()) { return false; } }
+    let class_val = attrs_ref.iter().find(|a| a.name.local.to_string() == "class").map(|a| a.value.to_string()).unwrap_or_default();
+    let classes: Vec<&str> = class_val.split_whitespace().collect();
+    for required_class in &selector.class { if !classes.contains(&required_class.as_str()) { return false; } }
+    for attr_sel in &selector.attributes {
+        let matched = attrs_ref.iter().any(|attr| {
+            if attr.name.local.to_string() != attr_sel.name { return false; }
+            match &attr_sel.value { AttributeMatch::Exists => true, AttributeMatch::Equals(expected) => attr.value.to_string() == *expected }
+        });
+        if !matched { return false; }
+    }
+    true
+}
+
+fn previous_element_siblings(node: &Handle) -> Vec<Handle> {
+    let Some(parent) = get_parent_handle(node) else { return Vec::new(); };
+    let node_ptr = Rc::as_ptr(node) as usize;
+    let mut siblings = Vec::new();
+    for child in parent.children.borrow().iter() {
+        if Rc::as_ptr(child) as usize == node_ptr { break; }
+        if matches!(child.data, NodeData::Element { .. }) { siblings.push(child.clone()); }
+    }
+    siblings
+}
+
+fn selector_matches_parsed_handle(node: &Handle, selector: &Selector) -> bool {
+    if !selector_is_supported_for_dom_queries(selector) || !selector_subject_matches_handle(node, selector) { return false; }
+    let Some(ref ancestor_sel) = selector.ancestor else { return true; };
+    let combinator = selector.combinator.as_ref().unwrap_or(&Combinator::Descendant);
+    match combinator {
+        Combinator::Descendant => {
+            let mut current = get_parent_handle(node);
+            while let Some(parent) = current {
+                if matches!(parent.data, NodeData::Element { .. }) && selector_matches_parsed_handle(&parent, ancestor_sel) { return true; }
+                current = get_parent_handle(&parent);
+            }
+            false
+        }
+        Combinator::Child => get_parent_handle(node)
+            .filter(|parent| matches!(parent.data, NodeData::Element { .. }))
+            .map(|parent| selector_matches_parsed_handle(&parent, ancestor_sel))
+            .unwrap_or(false),
+        Combinator::NextSibling => previous_element_siblings(node).into_iter().rev().next()
+            .map(|sibling| selector_matches_parsed_handle(&sibling, ancestor_sel)).unwrap_or(false),
+        Combinator::SubsequentSibling => previous_element_siblings(node).into_iter().rev()
+            .any(|sibling| selector_matches_parsed_handle(&sibling, ancestor_sel)),
+    }
+}
+
+fn selector_matches_handle(node: &Handle, selector: &str) -> bool {
+    let groups = split_selector_groups(selector);
+    if groups.is_empty() { return false; }
+    groups.into_iter().any(|group| { let parsed = parse_selector(group); selector_matches_parsed_handle(node, &parsed) })
+}
+
+fn query_selector_first(root: &Handle, selector: &str, skip_root: bool) -> Option<Handle> {
+    if !skip_root && selector_matches_handle(root, selector) { return Some(root.clone()); }
+    for child in root.children.borrow().iter() {
+        if let Some(found) = query_selector_first(child, selector, false) { return Some(found); }
+    }
     None
 }
-fn query_selector_all_nodes(_root: &Handle, _selector: &str, _skip_root: bool) -> Vec<Handle> {
-    // TODO: implement CSS selector matching
-    vec![]
+
+fn query_selector_all_nodes(root: &Handle, selector: &str, skip_root: bool) -> Vec<Handle> {
+    let mut results = Vec::new();
+    if !skip_root && selector_matches_handle(root, selector) { results.push(root.clone()); }
+    for child in root.children.borrow().iter() {
+        results.append(&mut query_selector_all_nodes(child, selector, false));
+    }
+    results
 }
+
 fn find_elements_by_class(root: &Handle, cls: &str, skip_root: bool) -> Vec<Handle> {
-    let mut out = vec![];
+    let mut results = Vec::new();
     if !skip_root {
         if let NodeData::Element { ref attrs, .. } = root.data {
-            let classes: Vec<String> = attrs.borrow().iter()
-                .find(|a| a.name.local.to_string() == "class")
-                .map(|a| a.value.to_string().split_whitespace().map(|s| s.to_string()).collect())
-                .unwrap_or_default();
-            if classes.contains(&cls.to_string()) { out.push(root.clone()); }
+            let class_val = attrs.borrow().iter().find(|a| a.name.local.to_string() == "class").map(|a| a.value.to_string()).unwrap_or_default();
+            if class_val.split_whitespace().any(|c| c == cls) { results.push(root.clone()); }
         }
     }
     for child in root.children.borrow().iter() {
-        out.extend(find_elements_by_class(child, cls, false));
+        results.append(&mut find_elements_by_class(child, cls, false));
     }
-    out
+    results
 }
+
 fn find_elements_by_tag_name(root: &Handle, tag: &str, skip_root: bool) -> Vec<Handle> {
-    let mut out = vec![];
+    let mut results = Vec::new();
     if !skip_root {
         if let NodeData::Element { ref name, .. } = root.data {
-            if name.local.to_string() == tag { out.push(root.clone()); }
+            if tag == "*" || name.local.to_string().to_lowercase() == tag { results.push(root.clone()); }
         }
     }
     for child in root.children.borrow().iter() {
-        out.extend(find_elements_by_tag_name(child, tag, false));
+        results.append(&mut find_elements_by_tag_name(child, tag, false));
     }
-    out
+    results
 }
