@@ -1234,8 +1234,15 @@ class Element extends Node {
     }
     focus() {
         __aura_set_focus(this.id);
+        document.activeElement = this;
+        this.dispatchEvent(new Event('focus', { bubbles: false }));
+        this.dispatchEvent(new Event('focusin', { bubbles: true }));
     }
-    blur() {}
+    blur() {
+        if (document.activeElement === this) document.activeElement = document.body;
+        this.dispatchEvent(new Event('blur', { bubbles: false }));
+        this.dispatchEvent(new Event('focusout', { bubbles: true }));
+    }
     matches(selector) {
         // Use querySelector from root to check if this element matches
         // Simplified: just check tag/class/id
@@ -1365,18 +1372,74 @@ class Element extends Node {
             }
         });
     }
-    // checked / value properties (for input elements)
-    get value() { return __aura_get_attribute(this._id, 'value') || ''; }
-    set value(v) { __aura_set_attribute(this._id, 'value', String(v)); }
+    get form() {
+        let node = this.parentElement;
+        while (node) {
+            if (node.tagName === 'FORM') return node;
+            node = node.parentElement;
+        }
+        return null;
+    }
+    get defaultValue() {
+        if (this.tagName === 'TEXTAREA') return __aura_get_attribute(this._id, 'value') || this.textContent || '';
+        return __aura_get_attribute(this._id, 'value') || '';
+    }
+    set defaultValue(v) {
+        this.setAttribute('value', String(v));
+    }
+    get value() {
+        if (this.tagName === 'TEXTAREA') return this.textContent || '';
+        if (this.tagName === 'SELECT') {
+            let option = this.options.item(this.selectedIndex);
+            return option ? option.value : '';
+        }
+        if (this.tagName === 'OPTION') {
+            let attr = __aura_get_attribute(this._id, 'value');
+            return attr !== null ? attr : this.textContent;
+        }
+        return __aura_get_attribute(this._id, 'value') || '';
+    }
+    set value(v) {
+        let value = String(v);
+        if (this.tagName === 'TEXTAREA') {
+            this.textContent = value;
+            this.setAttribute('value', value);
+            return;
+        }
+        if (this.tagName === 'SELECT') {
+            let options = Array.from(this.options);
+            let matched = false;
+            for (let i = 0; i < options.length; i++) {
+                let selected = !matched && options[i].value === value;
+                options[i].selected = selected;
+                matched = matched || selected;
+            }
+            return;
+        }
+        this.setAttribute('value', value);
+    }
     get checked() { return __aura_has_attribute(this._id, 'checked'); }
     set checked(v) {
-        if (v) __aura_set_attribute(this._id, 'checked', 'checked');
-        else __aura_remove_attribute(this._id, 'checked');
+        let checked = !!v;
+        if (checked && this.type === 'radio' && this.name) {
+            let root = this.form || document;
+            let radios = root.querySelectorAll('input');
+            for (let i = 0; i < radios.length; i++) {
+                let radio = radios.item(i);
+                if (radio !== this && radio.type === 'radio' && radio.name === this.name) {
+                    radio.removeAttribute('checked');
+                }
+            }
+        }
+        if (checked) this.setAttribute('checked', 'checked');
+        else this.removeAttribute('checked');
     }
+    get defaultChecked() { return this.checked; }
+    set defaultChecked(v) { this.checked = v; }
     get disabled() { return __aura_has_attribute(this._id, 'disabled'); }
     set disabled(v) {
-        if (v) __aura_set_attribute(this._id, 'disabled', 'disabled');
-        else __aura_remove_attribute(this._id, 'disabled');
+        if (v) this.setAttribute('disabled', 'disabled');
+        else this.removeAttribute('disabled');
     }
     get href() { return __aura_get_attribute(this._id, 'href') || ''; }
     set href(v) { __aura_set_attribute(this._id, 'href', String(v)); }
@@ -1386,10 +1449,53 @@ class Element extends Node {
     set type(v) { __aura_set_attribute(this._id, 'type', String(v)); }
     get name() { return __aura_get_attribute(this._id, 'name') || ''; }
     set name(v) { __aura_set_attribute(this._id, 'name', String(v)); }
-    // Form select stubs
-    get selectedIndex() { return -1; }
-    set selectedIndex(v) {}
-    get options() { return new NodeList([]); }
+    get options() {
+        if (this.tagName !== 'SELECT') return new NodeList([]);
+        return this.querySelectorAll('option');
+    }
+    get selectedIndex() {
+        if (this.tagName !== 'SELECT') return -1;
+        let options = Array.from(this.options);
+        for (let i = 0; i < options.length; i++) {
+            if (options[i].selected) return i;
+        }
+        return options.length > 0 ? 0 : -1;
+    }
+    set selectedIndex(v) {
+        if (this.tagName !== 'SELECT') return;
+        let index = Number(v);
+        let options = Array.from(this.options);
+        for (let i = 0; i < options.length; i++) {
+            options[i].selected = i === index;
+        }
+    }
+    get selected() {
+        if (this.tagName !== 'OPTION') return false;
+        return __aura_has_attribute(this._id, 'selected');
+    }
+    set selected(v) {
+        if (this.tagName !== 'OPTION') return;
+        if (v) {
+            let select = this.parentElement;
+            while (select && select.tagName !== 'SELECT') select = select.parentElement;
+            if (select && !select.multiple) {
+                let options = Array.from(select.options);
+                for (let i = 0; i < options.length; i++) {
+                    if (options[i] !== this) options[i].removeAttribute('selected');
+                }
+            }
+            this.setAttribute('selected', 'selected');
+        } else {
+            this.removeAttribute('selected');
+        }
+    }
+    get defaultSelected() { return this.selected; }
+    set defaultSelected(v) { this.selected = v; }
+    get multiple() { return __aura_has_attribute(this._id, 'multiple'); }
+    set multiple(v) {
+        if (v) this.setAttribute('multiple', 'multiple');
+        else this.removeAttribute('multiple');
+    }
     get offsetWidth() { return this._layoutMetrics().width; }
     get offsetHeight() { return this._layoutMetrics().height; }
     get offsetTop() { return this._layoutMetrics().top; }

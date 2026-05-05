@@ -2894,6 +2894,58 @@ mod tests {
     }
 
     #[test]
+    fn test_form_input_and_textarea_value_state_stays_coherent() {
+        let mut rt = make_runtime("<html><body><form id='form'><input id='field' name='q' value='old'><textarea id='ta'>hello</textarea></form></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var field = document.getElementById('field');
+                var textarea = document.getElementById('ta');
+                field.value = 'new';
+                textarea.value = 'world';
+                return [
+                    field.value,
+                    field.getAttribute('value'),
+                    field.defaultValue,
+                    field.form.id,
+                    textarea.value,
+                    textarea.textContent,
+                    textarea.getAttribute('value')
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "new:new:new:form:world:world:world");
+    }
+
+    #[test]
+    fn test_form_checkbox_radio_and_select_state_parity() {
+        let mut rt = make_runtime("<html><body><form><input id='check' type='checkbox'><input id='r1' type='radio' name='group' checked><input id='r2' type='radio' name='group'><select id='sel'><option value='a'>A</option><option id='b' value='b'>B</option><option>C</option></select></form></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var check = document.getElementById('check');
+                var r1 = document.getElementById('r1');
+                var r2 = document.getElementById('r2');
+                var sel = document.getElementById('sel');
+                check.checked = true;
+                r2.checked = true;
+                sel.value = 'b';
+                var afterValue = [sel.selectedIndex, sel.value, document.getElementById('b').selected].join(',');
+                sel.selectedIndex = 2;
+                return [
+                    check.checked,
+                    check.hasAttribute('checked'),
+                    r1.checked,
+                    r2.checked,
+                    afterValue,
+                    sel.selectedIndex,
+                    sel.value,
+                    sel.options.length
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "true:true:false:true:1,b,true:2:C:3");
+    }
+
+    #[test]
     fn test_add_event_listener_fires() {
         let mut rt = make_runtime("<html><body><button id='btn'>click</button></body></html>");
         eval(&mut rt, "var clicked = false; var btn = document.getElementById('btn'); btn.addEventListener('click', function() { clicked = true; });");
