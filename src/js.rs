@@ -322,13 +322,148 @@ impl JsRuntime {
         }
     }
 
-    pub fn set_layout_metrics(&mut self, _layout_metrics: HashMap<String, LayoutMetrics>) {}
-
-    pub fn tick(&mut self, _timestamp: Option<f64>, _deadline_ms: Option<f64>) -> bool {
-        false
+    pub fn set_layout_metrics(&mut self, layout_metrics: HashMap<String, LayoutMetrics>) {
+        LAYOUT_METRICS.with(|metrics| *metrics.borrow_mut() = layout_metrics);
     }
 
-    pub fn trigger_event(&mut self, _target_id: &str, _event_type: &str) {}
+    pub fn tick(&mut self, timestamp: Option<f64>, deadline_ms: Option<f64>) -> bool {
+        let mut did_work = false;
+        if self.sync_focus() { did_work = true; }
+
+        while let Ok(task) = self.task_receiver.try_recv() {
+            MACRO_TASKS.with(|tasks| tasks.borrow_mut().push_back(task));
+        }
+
+        let macro_task = MACRO_TASKS.with(|tasks| tasks.borrow_mut().pop_front());
+        if let Some(task) = macro_task {
+            task();
+            did_work = true;
+        }
+
+        self.run_pending_callbacks();
+        self.run_microtasks();
+
+        if let Some(ts) = timestamp {
+            let mut tasks = VecDeque::new();
+            RAF_TASKS.with(|t| tasks = t.borrow_mut().drain(..).collect());
+            if !tasks.is_empty() {
+                did_work = true;
+                for task in tasks {
+                    task(ts);
+                    self.run_pending_callbacks();
+                    self.run_microtasks();
+                }
+            }
+        }
+
+        if let Some(deadline) = deadline_ms {
+            loop {
+                let task_opt = IDLE_TASKS.with(|tasks| tasks.borrow_mut().pop_front());
+                if let Some((_, task)) = task_opt {
+                    did_work = true;
+                    task(deadline);
+                    self.run_pending_callbacks();
+                    self.run_microtasks();
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as f64;
+                    if now >= deadline { break; }
+                } else { break; }
+            }
+        }
+
+        while let Some((callback, payload, is_resolve)) = FETCH_PENDING.with(|p| p.borrow_mut().pop_front()) {
+            did_work = true;
+            self.call_with_payload(callback, &payload, is_resolve);
+            self.run_microtasks();
+        }
+
+        did_work
+    }
+
+    fn run_pending_callbacks(&mut self) {
+        let pending: Vec<(v8::Global<v8::Function>, Option<f64>)> = RUN_PENDING.with(|p| p.borrow_mut().drain(..).collect());
+        if pending.is_empty() { return; }
+        let hs = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
+        let hs = &mut hs.init();
+        let local_context = v8::Local::new(hs, &self.global_context);
+        let scope = &mut v8::ContextScope::new(hs, local_context);
+        for (cb_global, ts_opt) in pending {
+            let func = v8::Local::new(scope, &cb_global);
+            let undef = v8::undefined(scope);
+            if let Some(ts) = ts_opt {
+                let ts_val = v8::Number::new(scope, ts);
+                let _ = func.call(scope, undef.into(), &[ts_val.into()]);
+            } else {
+                let _ = func.call(scope, undef.into(), &[]);
+            }
+        }
+    }
+
+    fn call_with_payload(&mut self, callback: v8::Global<v8::Function>, payload: &str, is_resolve: bool) {
+        let hs = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
+        let hs = &mut hs.init();
+        let local_context = v8::Local::new(hs, &self.global_context);
+        let scope = &mut v8::ContextScope::new(hs, local_context);
+        let func = v8::Local::new(scope, &callback);
+        let undef = v8::undefined(scope);
+        if is_resolve {
+            let tc2 = std::pin::pin!(v8::TryCatch::new(scope));
+            let tc2 = &mut tc2.init();
+            let script_src = format!("__aura_make_fetch_response({})", payload);
+            let src = v8::String::new(tc2, &script_src).unwrap();
+            if let Some(script) = v8::Script::compile(tc2, src, None) {
+                if let Some(result) = script.run(tc2) {
+                    let _ = func.call(tc2, undef.into(), &[result]);
+                }
+            }
+        } else {
+            let msg = v8::String::new(scope, payload).unwrap();
+            let _ = func.call(scope, undef.into(), &[msg.into()]);
+        }
+    }
+
+    fn run_microtasks(&mut self) {
+        loop {
+            let mut micro_work_done = false;
+            while let Some(task) = MICRO_TASKS.with(|tasks| tasks.borrow_mut().pop_front()) {
+                task();
+                micro_work_done = true;
+            }
+            let hs = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
+            let hs = &mut hs.init();
+            let local_context = v8::Local::new(hs, &self.global_context);
+            let scope = &mut v8::ContextScope::new(hs, local_context);
+            scope.perform_microtask_checkpoint();
+            if !micro_work_done { break; }
+        }
+    }
+
+    fn sync_focus(&mut self) -> bool {
+        let old = PREVIOUS_FOCUSED_NODE.with(|f| (*f.borrow()).clone());
+        let new = FOCUSED_NODE.with(|f| (*f.borrow()).clone());
+        if old == new { return false; }
+        PREVIOUS_FOCUSED_NODE.with(|f| *f.borrow_mut() = new.clone());
+        if let Some(ref old_id) = old {
+            self.trigger_event(old_id, "blur");
+            self.trigger_event(old_id, "focusout");
+        }
+        if let Some(ref new_id) = new {
+            self.trigger_event(new_id, "focus");
+            self.trigger_event(new_id, "focusin");
+        }
+        true
+    }
+
+    pub fn trigger_event(&mut self, target_id: &str, event_type: &str) {
+        let native_id = DOM_ROOT.with(|root| {
+            if let Some(ref r) = *root.borrow() {
+                find_element_by_id(r, target_id).map(register_node)
+            } else { None }
+        });
+        if let Some(nid) = native_id {
+            let code = format!("document.__trigger_event({}, '{}', {{ bubbles: true }})", nid, event_type);
+            self.execute(&code);
+        }
+    }
 
     pub fn execute(&mut self, source: &str) {
         let outcome = self.execute_with_result(source);
@@ -402,14 +537,46 @@ impl JsRuntime {
     }
 
     pub fn get_style_overrides(&mut self) -> HashMap<String, HashMap<String, String>> {
-        HashMap::new()
+        let mut result = HashMap::new();
+        let hs = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
+        let hs = &mut hs.init();
+        let local_context = v8::Local::new(hs, &self.global_context);
+        let scope = &mut v8::ContextScope::new(hs, local_context);
+        {
+            let tc = std::pin::pin!(v8::TryCatch::new(scope));
+            let tc = &mut tc.init();
+            let src = v8::String::new(tc, "__aura_style_log.join('####')").unwrap();
+            if let Some(script) = v8::Script::compile(tc, src, None) {
+                if let Some(val) = script.run(tc) {
+                    if let Some(s) = val.to_string(tc) {
+                        let s_std = s.to_rust_string_lossy(tc);
+                        for entry in s_std.split("####") {
+                            let parts: Vec<&str> = entry.splitn(3, "||||").collect();
+                            if parts.len() == 3 && !parts[0].is_empty() {
+                                result.entry(parts[0].to_string()).or_insert_with(HashMap::new)
+                                    .insert(parts[1].to_string(), parts[2].to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        {
+            let tc2 = std::pin::pin!(v8::TryCatch::new(scope));
+            let tc2 = &mut tc2.init();
+            let clear = v8::String::new(tc2, "__aura_style_log = [];").unwrap();
+            if let Some(script) = v8::Script::compile(tc2, clear, None) { let _ = script.run(tc2); }
+        }
+        result
     }
 
     pub fn get_focused_node_id(&self) -> Option<String> {
-        None
+        FOCUSED_NODE.with(|f| (*f.borrow()).clone())
     }
 
-    pub fn set_focused_node_id(&mut self, _id: Option<String>) {}
+    pub fn set_focused_node_id(&mut self, id: Option<String>) {
+        FOCUSED_NODE.with(|f| *f.borrow_mut() = id);
+    }
 }
 
 
@@ -474,6 +641,10 @@ fn register_native_functions(scope: &mut v8::ContextScope<v8::HandleScope>, glob
     register_fn(scope, global, "__aura_storage_remove", storage_remove_cb);
     register_fn(scope, global, "__aura_storage_clear", storage_clear_cb);
     register_fn(scope, global, "__aura_fetch", fetch_cb);
+    register_fn(scope, global, "setTimeout", setTimeout_cb);
+    register_fn(scope, global, "requestAnimationFrame", raf_cb);
+    register_fn(scope, global, "requestIdleCallback", ric_cb);
+    register_fn(scope, global, "cancelIdleCallback", cic_cb);
 }
 
 fn console_log(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, _rv: v8::ReturnValue<v8::Value>) {
@@ -896,6 +1067,50 @@ fn storage_clear_cb(scope: &mut v8::PinScope, args: v8::FunctionCallbackArgument
     if let Some(m)=store.data.get_mut(&origin) { m.clear(); store.save(); }
 }
 fn fetch_cb(_scope: &mut v8::PinScope, _args: v8::FunctionCallbackArguments, _rv: v8::ReturnValue<v8::Value>) {}
+
+fn setTimeout_cb(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, _rv: v8::ReturnValue<v8::Value>) {
+    let cb = args.get(0);
+    if cb.is_function() {
+        let cb_func: v8::Local<v8::Function> = unsafe { std::mem::transmute(cb) };
+        let cb_global = v8::Global::new(scope, cb_func);
+        MACRO_TASKS.with(|tasks| tasks.borrow_mut().push_back(Box::new(move || {
+            RUN_PENDING.with(|p| p.borrow_mut().push((cb_global.clone(), None)));
+        })));
+    }
+}
+
+fn raf_cb(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, _rv: v8::ReturnValue<v8::Value>) {
+    let cb = args.get(0);
+    if cb.is_function() {
+        let cb_func: v8::Local<v8::Function> = unsafe { std::mem::transmute(cb) };
+        let cb_global = v8::Global::new(scope, cb_func);
+        RAF_TASKS.with(|tasks| tasks.borrow_mut().push_back(Box::new(move |timestamp| {
+            RUN_PENDING.with(|p| p.borrow_mut().push((cb_global.clone(), Some(timestamp))));
+        })));
+    }
+}
+
+fn ric_cb(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, mut rv: v8::ReturnValue<v8::Value>) {
+    let cb = args.get(0);
+    if cb.is_function() {
+        let cb_func: v8::Local<v8::Function> = unsafe { std::mem::transmute(cb) };
+        let cb_global = v8::Global::new(scope, cb_func);
+        let id = NEXT_IDLE_ID.with(|id_cell| {
+            let id = *id_cell.borrow();
+            *id_cell.borrow_mut() += 1;
+            id
+        });
+        IDLE_TASKS.with(|tasks| tasks.borrow_mut().push_back((id, Box::new(move |deadline| {
+            RUN_PENDING.with(|p| p.borrow_mut().push((cb_global.clone(), Some(deadline))));
+        }))));
+        rv.set_uint32(id);
+    }
+}
+
+fn cic_cb(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, _rv: v8::ReturnValue<v8::Value>) {
+    let id = args.get(0).uint32_value(scope).unwrap_or(0);
+    IDLE_TASKS.with(|tasks| tasks.borrow_mut().retain(|(tid, _)| *tid != id));
+}
 
 fn console_impl(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, level: ConsoleLevel) {
     let mut output = String::new();
