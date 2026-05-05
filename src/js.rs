@@ -3750,6 +3750,40 @@ mod tests {
     }
 
     #[test]
+    fn test_history_back_forward_go_dispatches_navigation_events() {
+        let url = url::Url::parse("https://example.com/start#zero").unwrap();
+        let dom = crate::dom::parse_html("<html><body></body></html>");
+        let mut rt = JsRuntime::new(Some(dom.document), Some(url), None, None, new_console_buffer());
+
+        let result = eval(&mut rt, r#"
+            (function() {
+                var events = [];
+                window.addEventListener('popstate', function(e) {
+                    events.push('pop:' + JSON.stringify(e.state));
+                });
+                window.addEventListener('hashchange', function(e) {
+                    events.push('hash:' + e.oldURL + '>' + e.newURL);
+                });
+                history.pushState({page: 1}, '', '/one#same');
+                history.pushState({page: 2}, '', '/two#next');
+                history.back();
+                var afterBack = [location.pathname, location.hash, JSON.stringify(history.state)].join('|');
+                history.forward();
+                var afterForward = [location.pathname, location.hash, JSON.stringify(history.state)].join('|');
+                history.go(-2);
+                var afterGo = [location.pathname, location.hash, history.state === null].join('|');
+                history.go(99);
+                return [afterBack, afterForward, afterGo, events.join(';'), history.length].join('||');
+            })()
+        "#);
+
+        assert_eq!(
+            result,
+            "/one|#same|{\"page\":1}||/two|#next|{\"page\":2}||/start|#zero|true||pop:{\"page\":1};hash:https://example.com/two#next>https://example.com/one#same;pop:{\"page\":2};hash:https://example.com/one#same>https://example.com/two#next;pop:null;hash:https://example.com/two#next>https://example.com/start#zero||3"
+        );
+    }
+
+    #[test]
     fn test_new_url_relative_resolution() {
         let mut rt = make_runtime("<html><body></body></html>");
         // Relative path '/x' against base with port

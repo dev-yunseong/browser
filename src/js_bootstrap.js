@@ -1952,8 +1952,31 @@ window.history = {
     length: 1,
     state: null,
     _entries: [location.href],
+    _states: [null],
     _index: 0,
+    _ensureCurrentEntry: function() {
+        if (this._entries.length === 1 && this._index === 0 && this._entries[0] !== location.href) {
+            this._entries[0] = location.href;
+        }
+    },
+    _dispatchNavigationEvents: function(oldURL, oldHash, newURL, newHash) {
+        window.dispatchEvent(new PopStateEvent('popstate', { state: this.state }));
+        if (oldHash !== newHash) {
+            window.dispatchEvent(new HashChangeEvent('hashchange', { oldURL, newURL }));
+        }
+    },
+    _traverseTo: function(index) {
+        this._ensureCurrentEntry();
+        if (index < 0 || index >= this._entries.length || index === this._index) return;
+        let oldURL = location.href;
+        let oldHash = location.hash;
+        this._index = index;
+        this.state = this._states[this._index];
+        __aura_apply_location_href(this._entries[this._index]);
+        this._dispatchNavigationEvents(oldURL, oldHash, location.href, location.hash);
+    },
     pushState: function(state, title, url) {
+        this._ensureCurrentEntry();
         this.state = state;
         var nextHref = location.href;
         if (url !== undefined && url !== null) {
@@ -1965,11 +1988,14 @@ window.history = {
             __aura_apply_location_href(nextHref);
         }
         this._entries = this._entries.slice(0, this._index + 1);
+        this._states = this._states.slice(0, this._index + 1);
         this._entries.push(nextHref);
+        this._states.push(state);
         this._index = this._entries.length - 1;
         this.length = this._entries.length;
     },
     replaceState: function(state, title, url) {
+        this._ensureCurrentEntry();
         this.state = state;
         if (url !== undefined && url !== null) {
             var resolved;
@@ -1982,10 +2008,16 @@ window.history = {
                 this._entries[this._index] = location.href;
             }
         }
+        this._states[this._index] = state;
     },
-    back: function() {},
-    forward: function() {},
-    go: function() {},
+    back: function() { this.go(-1); },
+    forward: function() { this.go(1); },
+    go: function(delta) {
+        let step = delta === undefined ? 0 : Number(delta);
+        if (!Number.isFinite(step)) step = 0;
+        if (step === 0) return;
+        this._traverseTo(this._index + Math.trunc(step));
+    },
 };
 
 // -- performance -------------------------------------------------------------
