@@ -801,6 +801,7 @@ impl BrowserEngine {
         // Focus change
         for (rect, id) in &page.focusable_elements {
             if hit_test(x, y, rect) {
+                self.js_runtime.set_focused_node_id(Some(id.clone()));
                 results.push(ClickResult::FocusChanged { id: id.clone() });
             }
         }
@@ -835,10 +836,31 @@ impl BrowserEngine {
         results
     }
 
-    /// Stub: inject text into the currently focused form input.
-    /// Full implementation deferred to follow-up issue.
-    pub fn type_text(&mut self, _text: &str) {
-        println!("[BrowserEngine] type_text: not yet implemented");
+    /// Inject text into the currently focused text-like form control.
+    pub fn type_text(&mut self, text: &str) {
+        let Some(id) = self.js_runtime.get_focused_node_id() else {
+            return;
+        };
+        let id_json = serde_json::to_string(&id).unwrap_or_else(|_| "\"\"".to_string());
+        let text_json = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
+        let code = format!(
+            r#"
+            (function() {{
+                var el = document.getElementById({id_json});
+                var text = {text_json};
+                if (!el || el.disabled) return;
+                var tag = el.tagName;
+                var type = (el.type || '').toLowerCase();
+                if (tag === 'TEXTAREA' || tag === 'INPUT') {{
+                    if (type === 'checkbox' || type === 'radio' || type === 'button' || type === 'submit' || type === 'reset') return;
+                    el.value = (el.value || '') + text;
+                    el.dispatchEvent(new InputEvent('input', {{ bubbles: true, data: text, inputType: 'insertText' }}));
+                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                }}
+            }})();
+            "#
+        );
+        self.js_runtime.execute(&code);
     }
 
     fn cache_missing_images_with<F>(&mut self, image_urls: &[String], mut fetch: F) -> bool
@@ -1370,6 +1392,35 @@ mod tests {
 
         assert!(!loaded);
         assert!(engine.image_cache.is_empty());
+    }
+
+    #[test]
+    fn test_type_text_updates_focused_input_dom_state_and_events() {
+        let mut engine = BrowserEngine::new();
+        let base_url = Url::parse("https://example.com/").unwrap();
+        let mut css_cache = HashMap::new();
+        let (page, _) = process_html_with_cache(
+            "<html><body><input id='field' value='a'><script>window.events=[]; var field = document.getElementById('field'); field.addEventListener('input', function(e) { window.events.push('input:' + e.data); }); field.addEventListener('change', function() { window.events.push('change'); });</script></body></html>",
+            &base_url,
+            &HashMap::new(),
+            &mut css_cache,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            800.0,
+        )
+        .unwrap();
+        engine.init_js_for_page(&page);
+
+        engine.js_runtime.set_focused_node_id(Some("field".to_string()));
+        engine.type_text("bc");
+
+        let value = engine.evaluate_js("document.getElementById('field').value");
+        let events = engine.evaluate_js("window.events.join('|')");
+        assert_eq!(value, "abc");
+        assert_eq!(events, "input:bc|change");
     }
 
     #[test]
