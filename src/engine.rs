@@ -1018,6 +1018,56 @@ impl BrowserEngine {
         }
     }
 
+    /// Construct a form submission URL from the current page's form metadata
+    /// (action/method) and live DOM field values via the JS runtime.
+    /// Returns Some(url) to navigate to, or None if no form exists.
+    pub fn submit_form(&mut self) -> Option<String> {
+        let (base_url, action, control_names) = {
+            let page = self.last_page.as_ref()?;
+            let meta = page.form_metadata.as_ref()?;
+            let base_url = page.base_url.clone();
+            let action = meta.action.clone();
+            let control_names: Vec<String> = meta
+                .controls
+                .iter()
+                .filter_map(|c| {
+                    let name = c.name.trim().to_string();
+                    if name.is_empty() { None } else { Some(name) }
+                })
+                .collect();
+            (base_url, action, control_names)
+        };
+
+        if control_names.is_empty() {
+            return Some(base_url.to_string());
+        }
+
+        let action_url = if action.is_empty() {
+            base_url.clone()
+        } else {
+            base_url.join(&action).ok()?
+        };
+
+        let mut params: Vec<(String, String)> = Vec::new();
+        for name in &control_names {
+            let escaped_name = name.replace('\\', "\\\\").replace('\'', "\\'");
+            let script = format!(
+                "(function(){{ var el=document.querySelector('[name=\"{}\"]'); return el?el.value:''; }})()",
+                escaped_name
+            );
+            let value = self.evaluate_js(&script);
+            params.push((name.clone(), value));
+        }
+
+        let query: String = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(params.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .finish();
+
+        let mut final_url = action_url;
+        final_url.set_query(Some(&query));
+        Some(final_url.to_string())
+    }
+
     /// Return the computed style properties for a CSS selector.
     /// Stub — full implementation deferred to a follow-up issue.
     pub fn computed_style(&self, _selector: &str) -> HashMap<String, String> {
@@ -1161,6 +1211,12 @@ pub enum EngineCmd {
         deadline: Option<f64>,
         reply: mpsc::Sender<bool>,
     },
+    /// Submit the current page's form. Constructs the navigation URL from form
+    /// metadata (action/method) and current DOM field values.
+    /// Returns Some(navigation_url) on success, None if no form exists.
+    Submit {
+        reply: mpsc::Sender<Option<String>>,
+    },
     #[allow(dead_code)]
     Shutdown,
 }
@@ -1235,6 +1291,9 @@ fn run_engine_actor_with_engine(rx: mpsc::Receiver<EngineCmd>, eng: &mut Browser
                     eng.js_style_overrides.entry(id).or_default().extend(props);
                 }
                 let _ = reply.send(needs);
+            }
+            EngineCmd::Submit { reply } => {
+                let _ = reply.send(eng.submit_form());
             }
             EngineCmd::Shutdown => break,
         }
@@ -1377,6 +1436,14 @@ impl EngineHandle {
             return false;
         }
         reply_rx.recv().unwrap_or(false)
+    }
+
+    pub fn send_submit(&self) -> Option<String> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if self.tx.send(EngineCmd::Submit { reply: reply_tx }).is_err() {
+            return None;
+        }
+        reply_rx.recv().unwrap_or(None)
     }
 }
 
@@ -1847,5 +1914,85 @@ mod tests {
         assert_eq!(meta.method, "get");
         assert_eq!(meta.controls.len(), 1);
         assert_eq!(meta.controls[0].name, "q");
+    }
+
+    #[test]
+    fn test_submit_form_constructs_get_url_with_live_values() {
+        let html = r#"<form action="/search" method="get"><input name="q" value="hello"></form>"#;
+        let base = Url::parse("https://example.com").unwrap();
+        let mut cache = HashMap::new();
+        let (page, _) = process_html_with_cache(
+            html,
+            &base,
+            &HashMap::new(),
+            &mut cache,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            800.0,
+        )
+        .unwrap();
+
+        let mut engine = BrowserEngine::new();
+        engine.init_js_for_page(&page);
+        engine.last_page = Some(page);
+
+        let url = engine.submit_form().expect("submit_form should return URL");
+        assert!(url.starts_with("https://example.com/search?"));
+        assert!(url.contains("q=hello"));
+    }
+
+    #[test]
+    fn test_submit_form_none_when_no_form() {
+        let html = "<html><body><p>no form</p></body></html>";
+        let base = Url::parse("https://example.com").unwrap();
+        let mut cache = HashMap::new();
+        let (page, _) = process_html_with_cache(
+            html,
+            &base,
+            &HashMap::new(),
+            &mut cache,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            800.0,
+        )
+        .unwrap();
+
+        let mut engine = BrowserEngine::new();
+        engine.last_page = Some(page);
+        assert!(engine.submit_form().is_none());
+    }
+
+    #[test]
+    fn test_submit_form_empty_action_uses_base_url() {
+        let html = r#"<form><input name="q" value="rust"></form>"#;
+        let base = Url::parse("https://example.com/page").unwrap();
+        let mut cache = HashMap::new();
+        let (page, _) = process_html_with_cache(
+            html,
+            &base,
+            &HashMap::new(),
+            &mut cache,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            800.0,
+        )
+        .unwrap();
+
+        let mut engine = BrowserEngine::new();
+        engine.init_js_for_page(&page);
+        engine.last_page = Some(page);
+
+        let url = engine.submit_form().expect("should return URL");
+        assert!(url.starts_with("https://example.com/page?"));
+        assert!(url.contains("q=rust"));
     }
 }
