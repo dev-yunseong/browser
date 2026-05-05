@@ -705,27 +705,27 @@ pub fn process_html_with_cache(
                 }
             }
         }
-        form_control_metas.push(FormControlMeta {
-            name: name.clone(),
-            rect,
-            initial_value: val.clone(),
-        });
         if matches!(input_type.as_str(), "submit" | "button" | "reset") {
             form_buttons.push((rect, val));
         } else {
-            form_controls.push((rect, val));
-            form_control_names.push(name.clone());
+            form_control_metas.push(FormControlMeta {
+                name: name.clone(),
+                rect,
+                initial_value: val.clone(),
+            });
+            form_controls.push((rect, val.clone()));
+            form_control_names.push(name);
         }
     }
 
-    let form_metadata = if !form_control_metas.is_empty() {
+    let form_metadata = if form_action.is_empty() && form_control_metas.is_empty() {
+        None
+    } else {
         Some(FormMetadata {
             action: form_action,
             method: form_method,
             controls: form_control_metas,
         })
-    } else {
-        None
     };
 
     let render_elapsed = start.elapsed();
@@ -1896,7 +1896,6 @@ mod tests {
     fn test_form_metadata_extracts_action_method_and_control_names() {
         let html = r#"<html><body><form action="/search" method="post">
             <input name="q" value="hello">
-            <input name="btnG" value="Search" type="submit">
             <input name="msg" value="desc">
         </form></body></html>"#;
         let base = Url::parse("https://example.com").unwrap();
@@ -1918,16 +1917,13 @@ mod tests {
         let meta = page.form_metadata.expect("form_metadata should be Some");
         assert_eq!(meta.action, "/search");
         assert_eq!(meta.method, "post");
-        assert_eq!(meta.controls.len(), 3);
+        assert_eq!(meta.controls.len(), 2);
 
         assert_eq!(meta.controls[0].name, "q");
         assert_eq!(meta.controls[0].initial_value, "hello");
 
-        assert_eq!(meta.controls[1].name, "btnG");
-        assert_eq!(meta.controls[1].initial_value, "Search");
-
-        assert_eq!(meta.controls[2].name, "msg");
-        assert_eq!(meta.controls[2].initial_value, "desc");
+        assert_eq!(meta.controls[1].name, "msg");
+        assert_eq!(meta.controls[1].initial_value, "desc");
     }
 
     #[test]

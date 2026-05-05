@@ -2818,13 +2818,23 @@ fn get_display_type(sn: &StyledNode) -> DisplayType {
     if let NodeData::Text { .. } = sn.node.data {
         return DisplayType::Inline;
     }
+    // Check if this is a form control element first — CSS display:block
+    // on <input>/<button>/<select>/<textarea> means "fill width" not "become block".
+    // These must always use DisplayType::Input so collect_form_controls finds them.
+    let is_form_control = if let NodeData::Element { ref name, .. } = sn.node.data {
+        matches!(name.local.to_string().as_str(), "input" | "button" | "select" | "textarea")
+    } else {
+        false
+    };
     if let Some(Value::Keyword(d)) = sn.specified_values.get(&crate::css::intern("display")) {
         match &**d {
+            "block" if is_form_control => return DisplayType::Input,
             "block" => return DisplayType::Block,
+            "inline-block" if is_form_control => return DisplayType::Input,
             "inline-block" => return DisplayType::InlineBlock,
             "flex" => return DisplayType::Flex,
             "grid" => return DisplayType::Grid,
-            "none" => return DisplayType::Inline, // will be handled by is_none_display
+            "none" => return DisplayType::Inline,
             _ => {}
         }
     }
