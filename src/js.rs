@@ -2946,6 +2946,72 @@ mod tests {
     }
 
     #[test]
+    fn test_shadow_root_is_fragment_backed_and_scoped_from_document_queries() {
+        let mut rt = make_runtime("<html><body><div id='host'></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var host = document.getElementById('host');
+                var shadow = host.attachShadow({ mode: 'open' });
+                shadow.innerHTML = '<span id="inside">shadow</span>';
+                return [
+                    shadow instanceof ShadowRoot,
+                    shadow instanceof DocumentFragment,
+                    shadow.nodeType,
+                    shadow.host === host,
+                    host.shadowRoot === shadow,
+                    shadow.getElementById('inside').textContent,
+                    document.getElementById('inside') === null,
+                    document.querySelector('#inside') === null
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "true:true:11:true:true:shadow:true:true");
+    }
+
+    #[test]
+    fn test_closed_shadow_root_and_duplicate_attach_semantics() {
+        let mut rt = make_runtime("<html><body><div id='host'></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var host = document.getElementById('host');
+                var shadow = host.attachShadow({ mode: 'closed' });
+                var duplicate = 'none';
+                try { host.attachShadow({ mode: 'open' }); } catch (e) { duplicate = 'threw'; }
+                return [
+                    shadow instanceof ShadowRoot,
+                    shadow.mode,
+                    shadow.host === host,
+                    host.shadowRoot === null,
+                    duplicate
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "true:closed:true:true:threw");
+    }
+
+    #[test]
+    fn test_shadow_dom_event_path_crosses_shadow_root_to_host() {
+        let mut rt = make_runtime("<html><body><div id='host'></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var host = document.getElementById('host');
+                var shadow = host.attachShadow({ mode: 'open' });
+                shadow.innerHTML = '<button id="btn">go</button>';
+                var btn = shadow.getElementById('btn');
+                var seen = [];
+                host.addEventListener('click', function(e) {
+                    seen = e.composedPath().map(function(node) {
+                        return node.id || (node instanceof ShadowRoot ? '#shadow-root' : node.nodeName || 'window');
+                    });
+                });
+                btn.dispatchEvent(new Event('click', { bubbles: true, composed: true }));
+                return seen.join('>');
+            })()
+        "#);
+        assert_eq!(result, "btn>#shadow-root>host>BODY>HTML>#document>window");
+    }
+
+    #[test]
     fn test_add_event_listener_fires() {
         let mut rt = make_runtime("<html><body><button id='btn'>click</button></body></html>");
         eval(&mut rt, "var clicked = false; var btn = document.getElementById('btn'); btn.addEventListener('click', function() { clicked = true; });");
