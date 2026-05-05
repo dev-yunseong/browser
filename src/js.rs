@@ -1383,33 +1383,9 @@ impl JsRuntime {
         let url_init = CURRENT_ORIGIN.with(|origin| {
             if let Some(ref url) = *origin.borrow() {
                 let href = url.to_string();
-                let hostname = url.host_str().unwrap_or("").to_string();
-                let pathname = url.path().to_string();
-                let search = url.query().map(|q| format!("?{}", q)).unwrap_or_default();
-                let hash = url.fragment().map(|f| format!("#{}", f)).unwrap_or_default();
-                let protocol = url.scheme().to_string() + ":";
-                let host = url.host_str().map(|h| {
-                    if let Some(port) = url.port() {
-                        format!("{}:{}", h, port)
-                    } else {
-                        h.to_string()
-                    }
-                }).unwrap_or_default();
-                let port = url.port().map(|p| p.to_string()).unwrap_or_default();
-                let origin = url.origin().unicode_serialization();
                 format!(
                     r#"(function() {{
-                        var _loc = {{
-                            href: {href:?},
-                            hostname: {hostname:?},
-                            pathname: {pathname:?},
-                            search: {search:?},
-                            hash: {hash:?},
-                            protocol: {protocol:?},
-                            host: {host:?},
-                            port: {port:?},
-                            origin: {origin:?},
-                        }};
+                        var _loc = __aura_create_location({href:?});
                         document.location = _loc;
                         document.URL = {href:?};
                         document.documentURI = {href:?};
@@ -3987,6 +3963,86 @@ mod tests {
         let mut rt = make_runtime("<html><body></body></html>");
         let result = eval(&mut rt, "(function() { var u = new URL('/path?q=1', 'https://example.com:8443/base/index.html'); return u.href + '|' + u.origin; })()");
         assert_eq!(result, "https://example.com:8443/path?q=1|https://example.com:8443");
+    }
+
+    #[test]
+    fn test_url_mutation_and_search_params_stay_linked() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var u = new URL('../next?a=1&a=2&space=hello+world#top', 'https://example.com:8443/base/index.html');
+                var before = [
+                    u.href,
+                    u.searchParams.get('a'),
+                    u.searchParams.getAll('a').join(','),
+                    u.searchParams.get('space')
+                ].join('|');
+                u.searchParams.append('b', 'two words');
+                u.searchParams.set('a', '3');
+                u.pathname = 'final';
+                u.hash = 'done';
+                var after = [
+                    u.href,
+                    u.search,
+                    u.searchParams.toString(),
+                    u.toJSON()
+                ].join('|');
+                return before + '||' + after;
+            })()
+        "#);
+        assert_eq!(
+            result,
+            "https://example.com:8443/next?a=1&a=2&space=hello+world#top|1|1,2|hello world||https://example.com:8443/final?a=3&space=hello+world&b=two+words#done|?a=3&space=hello+world&b=two+words|a=3&space=hello+world&b=two+words|https://example.com:8443/final?a=3&space=hello+world&b=two+words#done"
+        );
+    }
+
+    #[test]
+    fn test_url_search_params_supports_duplicates_iteration_and_sort() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var params = new URLSearchParams('b=2&a=1&a=3');
+                params.delete('a', '1');
+                params.append('c', 'see');
+                params.sort();
+                return [
+                    params.size,
+                    params.has('a', '3'),
+                    params.getAll('a').join(','),
+                    Array.from(params.keys()).join(','),
+                    Array.from(params.values()).join(','),
+                    Array.from(params).map(function(pair) { return pair.join('='); }).join('&'),
+                    params.toString()
+                ].join('|');
+            })()
+        "#);
+        assert_eq!(result, "3|true|3|a,b,c|3,2,see|a=3&b=2&c=see|a=3&b=2&c=see");
+    }
+
+    #[test]
+    fn test_location_assignment_and_component_setters_update_document_urls() {
+        let url = url::Url::parse("https://example.com:8443/app/index.html?old=1#top").unwrap();
+        let dom = crate::dom::parse_html("<html><body></body></html>");
+        let mut rt = JsRuntime::new(Some(dom.document), Some(url), None, None, new_console_buffer());
+        let result = eval(&mut rt, r#"
+            (function() {
+                location.assign('../next?q=1#frag');
+                var afterAssign = [location.href, location.pathname, location.search, location.hash, document.URL].join('|');
+                location.pathname = '/final';
+                location.search = 'x=1';
+                location.hash = 'done';
+                return afterAssign + '||' + [
+                    location.href,
+                    location.origin,
+                    document.baseURI,
+                    String(location)
+                ].join('|');
+            })()
+        "#);
+        assert_eq!(
+            result,
+            "https://example.com:8443/next?q=1#frag|/next|?q=1|#frag|https://example.com:8443/next?q=1#frag||https://example.com:8443/final?x=1#done|https://example.com:8443|https://example.com:8443/final?x=1#done|https://example.com:8443/final?x=1#done"
+        );
     }
 
     #[test]

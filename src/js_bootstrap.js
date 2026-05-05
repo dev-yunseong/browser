@@ -33,6 +33,12 @@ function __aura_apply_location_href(href) {
     var parts = __aura_url_parts(href);
     if (!parts) return false;
     var loc = document.location;
+    if (loc && typeof loc._setHref === 'function') {
+        loc._setHref(parts.href, loc.href);
+        window.location = loc;
+        location = loc;
+        return true;
+    }
     loc.href = parts.href;
     loc.protocol = parts.protocol;
     loc.host = parts.host;
@@ -2389,15 +2395,137 @@ window.dispatchEvent = function(event) {
     return __aura_dispatch_event(window, event);
 };
 
-// -- URL class stub ----------------------------------------------------------
+// -- URL and URLSearchParams -------------------------------------------------
+function __aura_encode_query_part(value) {
+    return encodeURIComponent(String(value)).replace(/%20/g, '+');
+}
+
+function __aura_decode_query_part(value) {
+    return decodeURIComponent(String(value).replace(/\+/g, ' '));
+}
+
+class URLSearchParams {
+    constructor(init, updateCallback) {
+        this._pairs = [];
+        this._updateCallback = typeof updateCallback === 'function' ? updateCallback : null;
+        this._replaceFrom(init);
+    }
+    _replaceFrom(init) {
+        this._pairs = [];
+        if (init instanceof URLSearchParams) {
+            for (let pair of init) this._pairs.push([pair[0], pair[1]]);
+        } else if (Array.isArray(init)) {
+            for (let pair of init) {
+                if (pair && pair.length >= 2) this._pairs.push([String(pair[0]), String(pair[1])]);
+            }
+        } else if (init && typeof init === 'object' && typeof init !== 'string') {
+            for (let key of Object.keys(init)) this._pairs.push([String(key), String(init[key])]);
+        } else if (init !== undefined && init !== null) {
+            let query = String(init).replace(/^\?/, '');
+            if (query.length > 0) {
+                for (let part of query.split('&')) {
+                    if (part === '') continue;
+                    let eq = part.indexOf('=');
+                    let key = eq >= 0 ? part.slice(0, eq) : part;
+                    let value = eq >= 0 ? part.slice(eq + 1) : '';
+                    this._pairs.push([__aura_decode_query_part(key), __aura_decode_query_part(value)]);
+                }
+            }
+        }
+    }
+    _replaceFromString(query) {
+        this._replaceFrom(query || '');
+    }
+    _changed() {
+        if (this._updateCallback) this._updateCallback(this.toString());
+    }
+    append(name, value) {
+        this._pairs.push([String(name), String(value)]);
+        this._changed();
+    }
+    delete(name, value) {
+        name = String(name);
+        let hasValue = arguments.length > 1;
+        let expected = String(value);
+        this._pairs = this._pairs.filter(pair => pair[0] !== name || (hasValue && pair[1] !== expected));
+        this._changed();
+    }
+    get(name) {
+        name = String(name);
+        let pair = this._pairs.find(pair => pair[0] === name);
+        return pair ? pair[1] : null;
+    }
+    getAll(name) {
+        name = String(name);
+        return this._pairs.filter(pair => pair[0] === name).map(pair => pair[1]);
+    }
+    has(name, value) {
+        name = String(name);
+        if (arguments.length > 1) {
+            let expected = String(value);
+            return this._pairs.some(pair => pair[0] === name && pair[1] === expected);
+        }
+        return this._pairs.some(pair => pair[0] === name);
+    }
+    set(name, value) {
+        name = String(name);
+        value = String(value);
+        let replaced = false;
+        let next = [];
+        for (let pair of this._pairs) {
+            if (pair[0] === name) {
+                if (!replaced) {
+                    next.push([name, value]);
+                    replaced = true;
+                }
+            } else {
+                next.push(pair);
+            }
+        }
+        if (!replaced) next.push([name, value]);
+        this._pairs = next;
+        this._changed();
+    }
+    sort() {
+        this._pairs.sort((a, b) => a[0] < b[0] ? -1 : (a[0] > b[0] ? 1 : 0));
+        this._changed();
+    }
+    toString() {
+        return this._pairs.map(pair => __aura_encode_query_part(pair[0]) + '=' + __aura_encode_query_part(pair[1])).join('&');
+    }
+    forEach(fn, thisArg) {
+        for (let pair of this._pairs.slice()) fn.call(thisArg, pair[1], pair[0], this);
+    }
+    keys() { return this._iterator(0); }
+    values() { return this._iterator(1); }
+    entries() { return this._iterator(null); }
+    _iterator(index) {
+        let pairs = this._pairs.slice();
+        let i = 0;
+        return {
+            next: function() {
+                if (i >= pairs.length) return { done: true };
+                let pair = pairs[i++];
+                return { value: index === null ? [pair[0], pair[1]] : pair[index], done: false };
+            },
+            [Symbol.iterator]() { return this; }
+        };
+    }
+    [Symbol.iterator]() { return this.entries(); }
+    get size() { return this._pairs.length; }
+}
+window.URLSearchParams = URLSearchParams;
+
 class URL {
     constructor(url, base) {
-        var parsed = __aura_parse_url(
-            String(url),
-            base === undefined || base === null || base === '' ? null : String(base)
-        );
+        this._searchParams = null;
+        this._setHref(String(url), base === undefined || base === null || base === '' ? null : String(base));
+    }
+    _setHref(href, base) {
+        let parsed = __aura_parse_url(href, base);
         if (!parsed) throw new TypeError('Invalid URL');
-        this.href = parsed.href || '';
+        this._initializing = true;
+        this._href = parsed.href || '';
         this.protocol = parsed.protocol || '';
         this.host = parsed.host || '';
         this.hostname = parsed.hostname || '';
@@ -2408,44 +2536,117 @@ class URL {
         this.origin = parsed.origin || '';
         this.username = '';
         this.password = '';
+        this._initializing = false;
+        this._href = this._compose();
+        if (this._searchParams) this._searchParams._replaceFromString(this.search);
+    }
+    _compose() {
+        return this.protocol + '//' + this.host + (this.pathname || '/') + (this.search || '') + (this.hash || '');
+    }
+    _updateHref() {
+        if (!this._initializing && this._protocol && this._host !== undefined) {
+            this._href = this._compose();
+            this.origin = this.protocol + '//' + this.host;
+        }
+    }
+    _reparse() {
+        this._setHref(this._compose(), null);
+    }
+    get href() { return this._href; }
+    set href(value) { this._setHref(String(value), null); }
+    set protocol(value) { this._protocol = String(value).replace(/:$/, '') + ':'; this._updateHref(); }
+    get protocol() { return this._protocol; }
+    set host(value) {
+        this._host = String(value);
+        let parts = this._host.split(':');
+        this._hostname = parts[0] || '';
+        this._port = parts[1] || '';
+        this._updateHref();
+    }
+    get host() { return this._host; }
+    set hostname(value) {
+        this._hostname = String(value);
+        this._host = this._hostname + (this._port ? ':' + this._port : '');
+        this._updateHref();
+    }
+    get hostname() { return this._hostname; }
+    set port(value) {
+        this._port = String(value || '');
+        this._host = this._hostname + (this._port ? ':' + this._port : '');
+        this._updateHref();
+    }
+    get port() { return this._port; }
+    set pathname(value) {
+        let path = String(value || '/');
+        this._pathname = path.startsWith('/') ? path : '/' + path;
+        this._updateHref();
+    }
+    get pathname() { return this._pathname; }
+    set search(value) {
+        let search = String(value || '');
+        this._search = search === '' ? '' : (search.startsWith('?') ? search : '?' + search);
+        if (this._searchParams) this._searchParams._replaceFromString(this._search);
+        this._updateHref();
+    }
+    get search() { return this._search; }
+    set hash(value) {
+        let hash = String(value || '');
+        this._hash = hash === '' ? '' : (hash.startsWith('#') ? hash : '#' + hash);
+        this._updateHref();
+    }
+    get hash() { return this._hash; }
+    get searchParams() {
+        if (!this._searchParams) {
+            this._searchParams = new URLSearchParams(this.search, query => {
+                this._search = query ? '?' + query : '';
+                this._href = this._compose();
+            });
+        }
+        return this._searchParams;
     }
     toString() { return this.href; }
+    toJSON() { return this.href; }
     static createObjectURL(blob) { return 'blob:'; }
     static revokeObjectURL(url) {}
 }
 window.URL = URL;
 
-// -- URLSearchParams stub ----------------------------------------------------
-class URLSearchParams {
-    constructor(init) {
-        this._params = {};
-        if (typeof init === 'string') {
-            init.replace(/^\?/, '').split('&').forEach(function(pair) {
-                var parts = pair.split('=');
-                if (parts[0]) {
-                    this._params[decodeURIComponent(parts[0])] = decodeURIComponent(parts[1] || '');
-                }
-            }.bind(this));
-        }
+class Location {
+    constructor(href) {
+        this._url = new URL(href || 'about:blank');
     }
-    get(key) { return key in this._params ? this._params[key] : null; }
-    set(key, value) { this._params[key] = String(value); }
-    has(key) { return key in this._params; }
-    delete(key) { delete this._params[key]; }
-    toString() {
-        return Object.keys(this._params).map(k => encodeURIComponent(k) + '=' + encodeURIComponent(this._params[k])).join('&');
+    _setHref(href, base) {
+        this._url = new URL(href, base || this.href);
+        document.URL = this.href;
+        document.documentURI = this.href;
+        document.baseURI = this.href;
     }
-    forEach(fn) { Object.keys(this._params).forEach(k => fn(this._params[k], k, this)); }
-    [Symbol.iterator]() {
-        var keys = Object.keys(this._params), i = 0, self = this;
-        return { next: function() {
-            if (i < keys.length) { var k = keys[i++]; return { value: [k, self._params[k]], done: false }; }
-            return { done: true };
-        }};
-    }
-    get size() { return Object.keys(this._params).length; }
+    get href() { return this._url.href; }
+    set href(value) { this._setHref(String(value), this.href); }
+    get protocol() { return this._url.protocol; }
+    set protocol(value) { this._url.protocol = value; this._url._reparse(); this._setHref(this._url.href); }
+    get host() { return this._url.host; }
+    set host(value) { this._url.host = value; this._url._reparse(); this._setHref(this._url.href); }
+    get hostname() { return this._url.hostname; }
+    set hostname(value) { this._url.hostname = value; this._url._reparse(); this._setHref(this._url.href); }
+    get port() { return this._url.port; }
+    set port(value) { this._url.port = value; this._url._reparse(); this._setHref(this._url.href); }
+    get pathname() { return this._url.pathname; }
+    set pathname(value) { this._url.pathname = value; this._url._reparse(); this._setHref(this._url.href); }
+    get search() { return this._url.search; }
+    set search(value) { this._url.search = value; this._url._reparse(); this._setHref(this._url.href); }
+    get hash() { return this._url.hash; }
+    set hash(value) { this._url.hash = value; this._url._reparse(); this._setHref(this._url.href); }
+    get origin() { return this._url.origin; }
+    assign(url) { this.href = new URL(String(url), this.href).href; }
+    replace(url) { this.assign(url); }
+    reload() {}
+    toString() { return this.href; }
 }
-window.URLSearchParams = URLSearchParams;
+
+function __aura_create_location(href) {
+    return new Location(href);
+}
 
 // -- FormData stub -----------------------------------------------------------
 class FormData {
