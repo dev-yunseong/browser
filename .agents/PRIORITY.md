@@ -204,7 +204,7 @@ URL bar search fallback is independent.
 
 | # | Issue | Why this order |
 |---|---|---|
-| #225 | [Form] Extract form metadata (action, method, field names) in PageResult | Foundation. Form submission needs action/method/field names from DOM. |
+| #225 | [Form] Extract form metadata (action, method, field names) in PageResult (in progress by opencode:deepseek-v4-pro) | Foundation. Form submission needs action/method/field names from DOM. |
 | #226 | [Form] EngineCmd::Submit — form URL construction and submission | Depends on #225 metadata. Builds the navigation URL from form state. |
 | #227 | [GUI] Enter-key form submission in GUI and daemon | Depends on #226. Wires Enter key → submit → navigate in GUI. |
 | #228 | [Navigation] URL bar search fallback (non-URL → Google search) | Independent. Simple URL detection heuristic. |

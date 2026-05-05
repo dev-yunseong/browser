@@ -3037,6 +3037,33 @@ impl<'a> LayoutBox<'a> {
         }
     }
 
+    /// Iterative collect_form_element — finds the first `<form>` element in the layout tree
+    /// and returns its `action` and `method` attributes.
+    /// Returns `None` if no `<form>` element is found.
+    pub fn collect_form_element(&self) -> Option<(String, String)> {
+        let mut stack: Vec<&LayoutBox<'a>> = vec![self];
+        while let Some(node) = stack.pop() {
+            if let NodeData::Element { ref name, ref attrs, .. } = node.style_node.node.data {
+                if name.local.to_string() == "form" {
+                    let mut action = String::new();
+                    let mut method = String::from("get");
+                    for attr in attrs.borrow().iter() {
+                        match attr.name.local.to_string().as_str() {
+                            "action" => action = attr.value.to_string(),
+                            "method" => method = attr.value.to_string().to_lowercase(),
+                            _ => {}
+                        }
+                    }
+                    return Some((action, method));
+                }
+            }
+            for child in node.children.iter().rev() {
+                stack.push(child);
+            }
+        }
+        None
+    }
+
     /// Iterative collect_images — avoids stack overflow on deep trees.
     pub fn collect_images(&self, list: &mut Vec<(Rect, String)>) {
         let mut stack: Vec<&LayoutBox<'a>> = vec![self];

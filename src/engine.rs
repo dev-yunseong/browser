@@ -8,6 +8,22 @@ use crate::{dom, css, style, layout, render, js};
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
+/// Metadata for a single form control (input, textarea, select).
+#[derive(Clone, Debug)]
+pub struct FormControlMeta {
+    pub name: String,
+    pub rect: layout::Rect,
+    pub initial_value: String,
+}
+
+/// Metadata for a `<form>` element: its action/method attributes and child controls.
+#[derive(Clone, Debug)]
+pub struct FormMetadata {
+    pub action: String,
+    pub method: String,
+    pub controls: Vec<FormControlMeta>,
+}
+
 /// The result of rendering a page through the full pipeline.
 #[derive(Clone, Debug)]
 pub struct PageResult {
@@ -24,6 +40,9 @@ pub struct PageResult {
     pub body: String,
     pub base_url: Url,
     pub csp_policy: Option<js::CspPolicy>,
+    /// Form metadata (action, method, and named controls) for the first `<form>` on the page.
+    /// `None` if the page has no `<form>` element.
+    pub form_metadata: Option<FormMetadata>,
 }
 
 /// Result of a click action in headless mode.
@@ -614,17 +633,41 @@ pub fn process_html_with_cache(
         .map(|(_, url)| base_url.join(&url).map(|u| u.to_string()).unwrap_or(url))
         .collect();
 
+    let (form_action, form_method) = layout_tree
+        .collect_form_element()
+        .unwrap_or_else(|| (String::new(), String::from("get")));
+    let mut form_control_metas = Vec::new();
+
     for (rect, node) in controls_with_nodes {
         let mut val = String::new();
+        let mut name = String::new();
         if let markup5ever_rcdom::NodeData::Element { ref attrs, .. } = node.node.data {
             for attr in attrs.borrow().iter() {
-                if attr.name.local.to_string() == "value" {
-                    val = attr.value.to_string();
+                let attr_name = attr.name.local.to_string();
+                match attr_name.as_str() {
+                    "value" => val = attr.value.to_string(),
+                    "name" => name = attr.value.to_string(),
+                    _ => {}
                 }
             }
         }
+        form_control_metas.push(FormControlMeta {
+            name: name.clone(),
+            rect,
+            initial_value: val.clone(),
+        });
         form_controls.push((rect, val));
     }
+
+    let form_metadata = if !form_control_metas.is_empty() {
+        Some(FormMetadata {
+            action: form_action,
+            method: form_method,
+            controls: form_control_metas,
+        })
+    } else {
+        None
+    };
 
     let render_elapsed = start.elapsed();
 
@@ -664,6 +707,7 @@ pub fn process_html_with_cache(
             body: body.to_string(),
             base_url: base_url.clone(),
             csp_policy,
+            form_metadata,
         },
         stylesheet,
     ))
@@ -1717,5 +1761,91 @@ mod tests {
             page_800.width, page_400.width,
             "different widths must produce different page.width values"
         );
+    }
+
+    #[test]
+    fn test_form_metadata_extracts_action_method_and_control_names() {
+        let html = r#"<html><body><form action="/search" method="post">
+            <input name="q" value="hello">
+            <input name="btnG" value="Search" type="submit">
+            <input name="msg" value="desc">
+        </form></body></html>"#;
+        let base = Url::parse("https://example.com").unwrap();
+        let mut cache = HashMap::new();
+        let (page, _) = process_html_with_cache(
+            html,
+            &base,
+            &HashMap::new(),
+            &mut cache,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            800.0,
+        )
+        .unwrap();
+
+        let meta = page.form_metadata.expect("form_metadata should be Some");
+        assert_eq!(meta.action, "/search");
+        assert_eq!(meta.method, "post");
+        assert_eq!(meta.controls.len(), 3);
+
+        assert_eq!(meta.controls[0].name, "q");
+        assert_eq!(meta.controls[0].initial_value, "hello");
+
+        assert_eq!(meta.controls[1].name, "btnG");
+        assert_eq!(meta.controls[1].initial_value, "Search");
+
+        assert_eq!(meta.controls[2].name, "msg");
+        assert_eq!(meta.controls[2].initial_value, "desc");
+    }
+
+    #[test]
+    fn test_form_metadata_none_when_no_form() {
+        let html = "<html><body><p>no form here</p></body></html>";
+        let base = Url::parse("https://example.com").unwrap();
+        let mut cache = HashMap::new();
+        let (page, _) = process_html_with_cache(
+            html,
+            &base,
+            &HashMap::new(),
+            &mut cache,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            800.0,
+        )
+        .unwrap();
+
+        assert!(page.form_metadata.is_none());
+    }
+
+    #[test]
+    fn test_form_metadata_default_method_get() {
+        let html = r#"<form action="/search"><input name="q" value="test"></form>"#;
+        let base = Url::parse("https://example.com").unwrap();
+        let mut cache = HashMap::new();
+        let (page, _) = process_html_with_cache(
+            html,
+            &base,
+            &HashMap::new(),
+            &mut cache,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            800.0,
+        )
+        .unwrap();
+
+        let meta = page.form_metadata.unwrap();
+        assert_eq!(meta.action, "/search");
+        assert_eq!(meta.method, "get");
+        assert_eq!(meta.controls.len(), 1);
+        assert_eq!(meta.controls[0].name, "q");
     }
 }
