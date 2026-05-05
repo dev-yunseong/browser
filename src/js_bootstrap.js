@@ -2204,10 +2204,15 @@ window.getComputedStyle = function(el, pseudoElt) {
     });
 };
 
-// -- XMLHttpRequest stub -----------------------------------------------------
+// -- XMLHttpRequest ----------------------------------------------------------
 class XMLHttpRequest extends EventTarget {
     constructor() {
         super();
+        this.UNSENT = 0;
+        this.OPENED = 1;
+        this.HEADERS_RECEIVED = 2;
+        this.LOADING = 3;
+        this.DONE = 4;
         this.readyState = 0;
         this.status = 0;
         this.statusText = '';
@@ -2222,37 +2227,131 @@ class XMLHttpRequest extends EventTarget {
         this.ontimeout = null;
         this.onprogress = null;
         this.onabort = null;
+        this.onloadend = null;
+        this.onloadstart = null;
         this._method = '';
         this._url = '';
-        this._headers = {};
+        this._headers = new Headers();
+        this._responseHeaders = new Headers();
+        this._async = true;
+        this._sent = false;
+        this._aborted = false;
     }
-    open(method, url, async) {
-        this._method = method;
-        this._url = url;
+    _fire(type) {
+        let event = new Event(type);
+        this.dispatchEvent(event);
+    }
+    _changeReadyState(state) {
+        this.readyState = state;
+        this._fire('readystatechange');
+    }
+    open(method, url, async = true, user, password) {
+        this._method = String(method || 'GET').toUpperCase();
+        try {
+            this._url = new URL(String(url), location.href || document.baseURI || 'about:blank').href;
+        } catch (e) {
+            this._url = String(url);
+        }
+        this._async = async !== false;
+        this._headers = new Headers();
+        this._responseHeaders = new Headers();
+        this._sent = false;
+        this._aborted = false;
+        this.status = 0;
+        this.statusText = '';
+        this.responseText = '';
+        this.response = null;
         this.readyState = 1;
+        this._fire('readystatechange');
     }
     send(body) {
-        // Stub: fire error asynchronously
-        var self = this;
-        setTimeout(function() {
-            self.readyState = 4;
-            self.status = 0;
-            if (typeof self.onerror === 'function') self.onerror(new Event('error'));
-            if (typeof self.onreadystatechange === 'function') self.onreadystatechange();
-        }, 0);
+        if (this.readyState !== this.OPENED || this._sent) {
+            throw new Error('XMLHttpRequest is not open');
+        }
+        if (!this._async) {
+            throw new Error('Synchronous XMLHttpRequest is not supported');
+        }
+
+        this._sent = true;
+        this._aborted = false;
+        this._fire('loadstart');
+
+        fetch(this._url, {
+            method: this._method,
+            headers: this._headers,
+            body: body === undefined || body === null ? undefined : body,
+            credentials: this.withCredentials ? 'include' : 'same-origin'
+        }).then(response => {
+            if (this._aborted) return;
+            this.status = response.status;
+            this.statusText = response.statusText;
+            this.responseURL = response.url || this._url;
+            this._responseHeaders = new Headers(response.headers);
+            this._changeReadyState(this.HEADERS_RECEIVED);
+            this._changeReadyState(this.LOADING);
+            return response.text();
+        }).then(text => {
+            if (this._aborted || text === undefined) return;
+            this.responseText = String(text);
+            if (this.responseType === '' || this.responseType === 'text') {
+                this.response = this.responseText;
+            } else if (this.responseType === 'json') {
+                try { this.response = this.responseText ? JSON.parse(this.responseText) : null; }
+                catch (e) { this.response = null; }
+            } else {
+                this.response = this.responseText;
+            }
+            this._changeReadyState(this.DONE);
+            this._fire('load');
+            this._fire('loadend');
+        }).catch(error => {
+            if (this._aborted) return;
+            this.status = 0;
+            this.statusText = '';
+            this.responseText = '';
+            this.response = null;
+            this._changeReadyState(this.DONE);
+            this._fire('error');
+            this._fire('loadend');
+        });
     }
     setRequestHeader(name, value) {
-        this._headers[name] = value;
+        if (this.readyState !== this.OPENED || this._sent) {
+            throw new Error('XMLHttpRequest is not open');
+        }
+        this._headers.append(name, value);
     }
-    getResponseHeader(name) { return null; }
-    getAllResponseHeaders() { return ''; }
+    getResponseHeader(name) {
+        if (this.readyState < this.HEADERS_RECEIVED) return null;
+        return this._responseHeaders.get(name);
+    }
+    getAllResponseHeaders() {
+        if (this.readyState < this.HEADERS_RECEIVED) return '';
+        return Array.from(this._responseHeaders)
+            .map(pair => pair[0] + ': ' + pair[1] + '\r\n')
+            .join('');
+    }
     abort() {
-        this.readyState = 0;
-        if (typeof this.onabort === 'function') this.onabort(new Event('abort'));
+        this._aborted = true;
+        this._sent = false;
+        this.status = 0;
+        this.statusText = '';
+        this.responseText = '';
+        this.response = null;
+        if (this.readyState !== this.UNSENT && this.readyState !== this.DONE) {
+            this._changeReadyState(this.DONE);
+        }
+        this._fire('abort');
+        this._fire('loadend');
     }
     overrideMimeType() {}
 }
 window.XMLHttpRequest = XMLHttpRequest;
+XMLHttpRequest.UNSENT = 0;
+XMLHttpRequest.OPENED = 1;
+XMLHttpRequest.HEADERS_RECEIVED = 2;
+XMLHttpRequest.LOADING = 3;
+XMLHttpRequest.DONE = 4;
 
 // -- window.matchMedia -------------------------------------------------------
 window.matchMedia = function(query) {
