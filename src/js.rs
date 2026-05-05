@@ -2698,6 +2698,113 @@ mod tests {
     }
 
     #[test]
+    fn test_range_select_node_contents_and_clone_range_state() {
+        let mut rt = make_runtime("<html><body><div id='app'><span>one</span><b>two</b></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var app = document.getElementById('app');
+                var range = document.createRange();
+                range.selectNodeContents(app);
+                var clone = range.cloneRange();
+                range.collapse(false);
+                return [
+                    range instanceof Range,
+                    clone.startContainer.id,
+                    clone.startOffset,
+                    clone.endContainer.id,
+                    clone.endOffset,
+                    clone.toString(),
+                    range.collapsed
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "true:app:0:app:2:onetwo:true");
+    }
+
+    #[test]
+    fn test_range_clone_extract_and_delete_child_contents() {
+        let mut rt = make_runtime("<html><body><div id='app'><span id='one'>one</span><b id='two'>two</b><i id='three'>three</i></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var app = document.getElementById('app');
+                var range = document.createRange();
+                range.setStart(app, 0);
+                range.setEnd(app, 2);
+                var cloned = range.cloneContents();
+                var extracted = range.extractContents();
+                var afterExtract = app.textContent;
+
+                var deleteRange = document.createRange();
+                deleteRange.selectNodeContents(app);
+                deleteRange.deleteContents();
+
+                return [
+                    cloned.textContent,
+                    extracted.textContent,
+                    afterExtract,
+                    app.childNodes.length,
+                    range.collapsed,
+                    range.startContainer.id,
+                    range.startOffset
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "onetwo:onetwo:three:0:true:app:0");
+    }
+
+    #[test]
+    fn test_range_insert_node_at_child_and_text_boundaries() {
+        let mut rt = make_runtime("<html><body><div id='app'><span id='one'>one</span><span id='two'>two</span></div><p id='text'>hello</p></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var app = document.getElementById('app');
+                var middle = document.createElement('em');
+                middle.id = 'middle';
+                middle.textContent = 'middle';
+                var range = document.createRange();
+                range.setStart(app, 1);
+                range.insertNode(middle);
+
+                var text = document.getElementById('text').firstChild;
+                var strong = document.createElement('strong');
+                strong.textContent = 'X';
+                var textRange = document.createRange();
+                textRange.setStart(text, 2);
+                textRange.insertNode(strong);
+
+                return [
+                    Array.from(app.children).map(function(node) { return node.id; }).join(','),
+                    document.getElementById('text').textContent
+                ].join('|');
+            })()
+        "#);
+        assert_eq!(result, "one,middle,two|heXllo");
+    }
+
+    #[test]
+    fn test_range_text_offsets_extract_and_to_string() {
+        let mut rt = make_runtime("<html><body><p id='p'>abcdef</p></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var text = document.getElementById('p').firstChild;
+                var range = document.createRange();
+                range.setStart(text, 1);
+                range.setEnd(text, 4);
+                var before = range.toString();
+                var extracted = range.extractContents();
+                return [
+                    before,
+                    extracted.textContent,
+                    text.data,
+                    range.collapsed,
+                    range.startOffset
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "bcd:bcd:aef:true:1");
+    }
+
+    #[test]
     fn test_add_event_listener_fires() {
         let mut rt = make_runtime("<html><body><button id='btn'>click</button></body></html>");
         eval(&mut rt, "var clicked = false; var btn = document.getElementById('btn'); btn.addEventListener('click', function() { clicked = true; });");
