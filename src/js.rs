@@ -2631,6 +2631,73 @@ mod tests {
     }
 
     #[test]
+    fn test_node_iterator_tracks_reference_node_and_pointer_state() {
+        let mut rt = make_runtime("<html><body><div id='app'><span id='one'></span><span id='two'></span></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var app = document.getElementById('app');
+                var iterator = document.createNodeIterator(app, NodeFilter.SHOW_ELEMENT);
+                var first = iterator.nextNode();
+                var second = iterator.nextNode();
+                var back = iterator.previousNode();
+                return [
+                    iterator instanceof NodeIterator,
+                    first.id,
+                    second.id,
+                    back.id,
+                    iterator.referenceNode.id,
+                    iterator.pointerBeforeReferenceNode
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "true:app:one:one:one:true");
+    }
+
+    #[test]
+    fn test_node_iterator_filters_mixed_nodes_and_observes_later_mutations() {
+        let mut rt = make_runtime("<html><body><div id='app'>alpha<!--note--><span id='one'>x</span></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var app = document.getElementById('app');
+                var iterator = document.createNodeIterator(
+                    app,
+                    NodeFilter.SHOW_TEXT | NodeFilter.SHOW_COMMENT,
+                    function(node) {
+                        return node.nodeType === Node.TEXT_NODE && node.nodeValue === 'x'
+                            ? NodeFilter.FILTER_SKIP
+                            : NodeFilter.FILTER_ACCEPT;
+                    }
+                );
+                var first = iterator.nextNode();
+                var second = iterator.nextNode();
+                var tail = document.createComment('tail');
+                app.appendChild(tail);
+                var third = iterator.nextNode();
+                return [
+                    first.nodeType + ':' + first.nodeValue,
+                    second.nodeType + ':' + second.nodeValue,
+                    third.nodeType + ':' + third.nodeValue
+                ].join('|');
+            })()
+        "#);
+        assert_eq!(result, "3:alpha|8:note|8:tail");
+    }
+
+    #[test]
+    fn test_node_iterator_detach_stops_future_traversal() {
+        let mut rt = make_runtime("<html><body><div id='app'><span id='one'></span></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var iterator = document.createNodeIterator(document.getElementById('app'), NodeFilter.SHOW_ELEMENT);
+                var first = iterator.nextNode();
+                iterator.detach();
+                return [first.id, iterator.nextNode() === null, iterator.previousNode() === null].join(':');
+            })()
+        "#);
+        assert_eq!(result, "app:true:true");
+    }
+
+    #[test]
     fn test_add_event_listener_fires() {
         let mut rt = make_runtime("<html><body><button id='btn'>click</button></body></html>");
         eval(&mut rt, "var clicked = false; var btn = document.getElementById('btn'); btn.addEventListener('click', function() { clicked = true; });");

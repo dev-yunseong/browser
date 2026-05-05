@@ -619,6 +619,54 @@ class TreeWalker {
     }
 }
 
+class NodeIterator {
+    constructor(root, whatToShow, filter) {
+        this.root = root;
+        this.whatToShow = whatToShow === undefined || whatToShow === null ? NodeFilter.SHOW_ALL : whatToShow;
+        this.filter = filter || null;
+        this.referenceNode = root;
+        this.pointerBeforeReferenceNode = true;
+        this._detached = false;
+    }
+    _visible(node) {
+        return __aura_filter_result(node, this.whatToShow, this.filter) === NodeFilter.FILTER_ACCEPT;
+    }
+    _visibleNodes() {
+        return __aura_tree_order(this.root).filter(node => this._visible(node));
+    }
+    nextNode() {
+        if (this._detached) return null;
+        let nodes = this._visibleNodes();
+        let index = nodes.indexOf(this.referenceNode);
+        if (this.pointerBeforeReferenceNode && index >= 0) {
+            this.pointerBeforeReferenceNode = false;
+            return this.referenceNode;
+        }
+        let next = nodes[index + 1];
+        if (!next) return null;
+        this.referenceNode = next;
+        this.pointerBeforeReferenceNode = false;
+        return next;
+    }
+    previousNode() {
+        if (this._detached) return null;
+        let nodes = this._visibleNodes();
+        let index = nodes.indexOf(this.referenceNode);
+        if (!this.pointerBeforeReferenceNode && index >= 0) {
+            this.pointerBeforeReferenceNode = true;
+            return this.referenceNode;
+        }
+        let previous = nodes[index - 1];
+        if (!previous) return null;
+        this.referenceNode = previous;
+        this.pointerBeforeReferenceNode = true;
+        return previous;
+    }
+    detach() {
+        this._detached = true;
+    }
+}
+
 // -- Node & Element Classes ---------------------------------------------------
 
 // Node type constants (static properties added after class definition)
@@ -1336,23 +1384,8 @@ var document = {
         return new TreeWalker(root, whatToShow, filter);
     },
 
-    // createNodeIterator stub
     createNodeIterator: function(root, whatToShow, filter) {
-        var nodes = [];
-        function collect(node) {
-            nodes.push(node);
-            var children = node && node.childNodes ? node.childNodes : [];
-            for (var i = 0; i < children.length; i++) {
-                collect(children[i]);
-            }
-        }
-        if (root && root._id) collect(root);
-        var i = 0;
-        return {
-            nextNode: function() { return i < nodes.length ? nodes[i++] : null; },
-            previousNode: function() { return i > 0 ? nodes[--i] : null; },
-            detach: function() {},
-        };
+        return new NodeIterator(root, whatToShow, filter);
     },
 
     // createRange stub
@@ -2026,6 +2059,7 @@ window.NodeList = NodeList;
 window.HTMLCollection = HTMLCollection;
 window.NodeFilter = NodeFilter;
 window.TreeWalker = TreeWalker;
+window.NodeIterator = NodeIterator;
 window.EventTarget = EventTarget;
 window.XMLHttpRequest = XMLHttpRequest;
 window.DOMTokenList = DOMTokenList;
