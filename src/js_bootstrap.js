@@ -1157,23 +1157,200 @@ class Node extends EventTarget {
     }
 }
 
+// -- CSSOM -------------------------------------------------------------------
+function __aura_css_camel_to_kebab(name) {
+    return String(name).replace(/([A-Z])/g, "-$1").toLowerCase();
+}
+
+function __aura_css_kebab_to_camel(name) {
+    return String(name).replace(/-([a-z])/g, function(_, ch) { return ch.toUpperCase(); });
+}
+
+class CSSStyleDeclaration {
+    constructor(ownerId = null, readonly = false, initial = null) {
+        this._ownerId = ownerId;
+        this._readonly = readonly;
+        this._props = [];
+        if (initial) {
+            Object.keys(initial).forEach(name => this.setProperty(name, initial[name]));
+        }
+        return new Proxy(this, {
+            get(target, prop, receiver) {
+                if (prop === 'length') return target._props.length;
+                if (typeof prop === 'string' && /^(0|[1-9]\d*)$/.test(prop)) return target.item(Number(prop));
+                if (typeof prop === 'string' && !(prop in target)) return target.getPropertyValue(__aura_css_camel_to_kebab(prop));
+                let value = Reflect.get(target, prop, receiver);
+                return typeof value === 'function' ? value.bind(target) : value;
+            },
+            set(target, prop, value, receiver) {
+                if (typeof prop === 'string' && !(prop in target) && prop[0] !== '_') {
+                    target.setProperty(__aura_css_camel_to_kebab(prop), value);
+                    return true;
+                }
+                return Reflect.set(target, prop, value, receiver);
+            }
+        });
+    }
+    _find(name) {
+        name = String(name).toLowerCase();
+        return this._props.find(entry => entry.name === name);
+    }
+    _assertWritable() {
+        if (this._readonly) throw new Error('CSSStyleDeclaration is read-only');
+    }
+    get cssText() {
+        return this._props.map(entry => entry.name + ': ' + entry.value + (entry.priority ? ' !' + entry.priority : '') + ';').join(' ');
+    }
+    set cssText(value) {
+        this._assertWritable();
+        this._props = [];
+        String(value || '').split(';').forEach(part => {
+            let idx = part.indexOf(':');
+            if (idx <= 0) return;
+            let name = part.slice(0, idx).trim();
+            let rawValue = part.slice(idx + 1).trim();
+            let priority = '';
+            if (/!\s*important$/i.test(rawValue)) {
+                rawValue = rawValue.replace(/!\s*important$/i, '').trim();
+                priority = 'important';
+            }
+            this.setProperty(name, rawValue, priority);
+        });
+    }
+    getPropertyValue(name) {
+        let entry = this._find(name);
+        return entry ? entry.value : '';
+    }
+    getPropertyPriority(name) {
+        let entry = this._find(name);
+        return entry ? entry.priority : '';
+    }
+    setProperty(name, value, priority = '') {
+        this._assertWritable();
+        name = String(name).trim().toLowerCase();
+        if (!name) return;
+        value = String(value == null ? '' : value).trim();
+        priority = String(priority || '').toLowerCase();
+        if (priority && priority !== 'important') return;
+        let entry = this._find(name);
+        if (!entry) {
+            entry = { name, value: '', priority: '' };
+            this._props.push(entry);
+        }
+        entry.value = value;
+        entry.priority = priority;
+        this[__aura_css_kebab_to_camel(name)] = value;
+        if (this._ownerId !== null) __aura_set_style(this._ownerId, name, value);
+    }
+    removeProperty(name) {
+        this._assertWritable();
+        name = String(name).trim().toLowerCase();
+        let old = this.getPropertyValue(name);
+        this._props = this._props.filter(entry => entry.name !== name);
+        if (this._ownerId !== null) __aura_set_style(this._ownerId, name, '');
+        return old;
+    }
+    item(index) {
+        let entry = this._props[index];
+        return entry ? entry.name : '';
+    }
+}
+
+class CSSStyleRule {
+    constructor(selectorText, body) {
+        this.type = CSSRule.STYLE_RULE;
+        this.selectorText = String(selectorText || '').trim();
+        this.style = new CSSStyleDeclaration();
+        this.style.cssText = body || '';
+    }
+    get cssText() {
+        return this.selectorText + ' { ' + this.style.cssText + ' }';
+    }
+}
+
+class CSSStyleSheet {
+    constructor(text = '') {
+        this.disabled = false;
+        this.href = null;
+        this.ownerNode = null;
+        this.parentStyleSheet = null;
+        this.title = null;
+        this.type = 'text/css';
+        this.cssRules = [];
+        this.replaceSync(text);
+    }
+    _parse(text) {
+        let rules = [];
+        let re = /([^{}]+)\{([^{}]*)\}/g;
+        let match;
+        while ((match = re.exec(String(text || ''))) !== null) {
+            rules.push(new CSSStyleRule(match[1], match[2]));
+        }
+        return rules;
+    }
+    insertRule(rule, index = this.cssRules.length) {
+        let parsed = this._parse(rule);
+        if (parsed.length === 0) throw new Error('Invalid CSS rule');
+        index = Number(index);
+        if (index < 0 || index > this.cssRules.length) throw new Error('IndexSizeError');
+        this.cssRules.splice(index, 0, parsed[0]);
+        return index;
+    }
+    deleteRule(index) {
+        index = Number(index);
+        if (index < 0 || index >= this.cssRules.length) throw new Error('IndexSizeError');
+        this.cssRules.splice(index, 1);
+    }
+    replaceSync(text) {
+        this.cssRules = this._parse(text);
+    }
+    replace(text) {
+        this.replaceSync(text);
+        return Promise.resolve(this);
+    }
+    get rules() { return this.cssRules; }
+}
+
+class StyleSheetList {
+    constructor(resolver) {
+        this._resolver = resolver;
+        return new Proxy(this, {
+            get(target, prop, receiver) {
+                if (prop === 'length') return target._items().length;
+                if (typeof prop === 'string' && /^(0|[1-9]\d*)$/.test(prop)) return target.item(Number(prop));
+                let value = Reflect.get(target, prop, receiver);
+                return typeof value === 'function' ? value.bind(target) : value;
+            }
+        });
+    }
+    _items() { return this._resolver(); }
+    item(index) { return this._items()[index] || null; }
+    [Symbol.iterator]() {
+        let i = 0, self = this;
+        return { next() { return i < self.length ? { value: self.item(i++), done: false } : { done: true }; } };
+    }
+}
+
+var CSSRule = { STYLE_RULE: 1, IMPORT_RULE: 3, MEDIA_RULE: 4, FONT_FACE_RULE: 5, PAGE_RULE: 6 };
+var CSS = {
+    supports: function(property, value) {
+        if (value === undefined) return String(property).indexOf(':') > 0;
+        return String(property).trim() !== '' && String(value).trim() !== '';
+    },
+    escape: function(value) {
+        return String(value).replace(/[^a-zA-Z0-9_-]/g, function(ch) {
+            return '\\' + ch.charCodeAt(0).toString(16) + ' ';
+        });
+    }
+};
+
 class Element extends Node {
     constructor(id, tag, string_id) {
         super(id, 'element');
         this.tagName = (tag || '').toUpperCase();
         this.id = string_id || '';
         this._classList = null;
-        this.style = new Proxy({ _id: id }, {
-            set: (target, prop, value) => {
-                let kebab = prop.replace(/([A-Z])/g, "-$1").toLowerCase();
-                __aura_set_style(target._id, kebab, value);
-                target[prop] = value;
-                return true;
-            },
-            get: (target, prop) => {
-                return target[prop];
-            }
-        });
+        this.style = new CSSStyleDeclaration(id);
     }
     get classList() {
         if (!this._classList) this._classList = new DOMTokenList(this._id);
@@ -1886,6 +2063,19 @@ var document = {
         let nids = JSON.parse(nids_json);
         return new NodeList(nids);
     },
+    get styleSheets() {
+        return new StyleSheetList(function() {
+            let nids = JSON.parse(__aura_get_elements_by_tag(0, 'style'));
+            return nids.map(nid => {
+                let node = __get_or_create_node(nid, 'style', null, 'element');
+                if (!node.sheet) {
+                    node.sheet = new CSSStyleSheet(node.textContent || '');
+                    node.sheet.ownerNode = node;
+                }
+                return node.sheet;
+            });
+        });
+    },
 
     // Internal bridge for Rust to trigger events
     __trigger_event: function(id, type, data) {
@@ -1900,6 +2090,12 @@ var document = {
 var window = globalThis;
 window.document = document;
 window.localStorage = localStorage;
+window.CSS = CSS;
+window.CSSRule = CSSRule;
+window.CSSStyleDeclaration = CSSStyleDeclaration;
+window.CSSStyleRule = CSSStyleRule;
+window.CSSStyleSheet = CSSStyleSheet;
+window.StyleSheetList = StyleSheetList;
 var console = { log: log, warn: warn, error: error, info: info, debug: debug };
 var navigator = {
     userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -2191,17 +2387,20 @@ window.sessionStorage = sessionStorage;
 
 // -- getComputedStyle --------------------------------------------------------
 window.getComputedStyle = function(el, pseudoElt) {
-    // Stub: returns an object with all properties returning empty string
-    return new Proxy({}, {
-        get: function(target, prop) {
-            if (prop === 'getPropertyValue') {
-                return function(name) { return ''; };
-            }
-            if (prop === 'length') return 0;
-            if (prop === 'item') return function() { return ''; };
-            return '';
+    let computed = new CSSStyleDeclaration(null, false);
+    if (el && el.style) {
+        for (let i = 0; i < el.style.length; i++) {
+            let name = el.style.item(i);
+            computed._props.push({
+                name,
+                value: el.style.getPropertyValue(name),
+                priority: el.style.getPropertyPriority(name)
+            });
+            computed[__aura_css_kebab_to_camel(name)] = el.style.getPropertyValue(name);
         }
-    });
+    }
+    computed._readonly = true;
+    return computed;
 };
 
 // -- XMLHttpRequest ----------------------------------------------------------
