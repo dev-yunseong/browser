@@ -291,6 +291,8 @@ struct DaemonBrowserApp {
     error: Option<String>,
     current_links: Vec<(layout::Rect, String)>,
     current_form_controls: Vec<(layout::Rect, String)>,
+    current_form_names: Vec<String>,
+    current_form_buttons: Vec<(layout::Rect, String)>,
     current_event_handlers: Vec<(layout::Rect, String)>,
     current_element_ids: Vec<(layout::Rect, String)>,
     current_focusable_elements: Vec<(layout::Rect, String)>,
@@ -346,6 +348,8 @@ impl DaemonBrowserApp {
             error: None,
             current_links: vec![],
             current_form_controls: vec![],
+            current_form_names: vec![],
+            current_form_buttons: vec![],
             current_event_handlers: vec![],
             current_element_ids: vec![],
             current_focusable_elements: vec![],
@@ -429,6 +433,8 @@ impl DaemonBrowserApp {
         self.texture = Some(ctx.load_texture("daemon-page", image, Default::default()));
         self.current_links = page.links;
         self.current_form_controls = page.form_controls;
+        self.current_form_buttons = page.form_buttons;
+        self.current_form_names = page.form_control_names;
         self.current_event_handlers = page.event_handlers;
         self.current_element_ids = page.element_ids;
         self.current_focusable_elements = page.focusable_elements;
@@ -765,6 +771,22 @@ impl eframe::App for DaemonBrowserApp {
                                 ui.put(screen_rect, egui::TextEdit::singleline(val).id_source(i));
                             }
 
+                            // Form buttons overlay
+                            for (l_rect, label) in &self.current_form_buttons {
+                                let screen_rect = egui::Rect::from_min_size(
+                                    rect.min + egui::vec2(l_rect.x, l_rect.y),
+                                    egui::vec2(l_rect.width.max(40.0), l_rect.height.max(16.0)),
+                                );
+                                let resp = ui.put(screen_rect, egui::Button::new(label.as_str()));
+                                if resp.clicked() && self.submit_promise.is_none() && self.content_promise.is_none() {
+                                    let handle = self.handle.clone();
+                                    self.submit_promise = Some(Promise::spawn_thread(
+                                        "daemon-submit-btn",
+                                        move || handle.send_submit(),
+                                    ));
+                                }
+                            }
+
                             if !self.current_form_controls.is_empty()
                                 && ui.input(|i| i.key_pressed(egui::Key::Enter))
                                 && self.submit_promise.is_none()
@@ -772,9 +794,25 @@ impl eframe::App for DaemonBrowserApp {
                                 && self.content_promise.is_none()
                             {
                                 let handle = self.handle.clone();
+                                let names = self.current_form_names.clone();
+                                let values: Vec<String> = (0..self.current_form_controls.len())
+                                    .map(|i| self.form_values.get(&i.to_string()).cloned().unwrap_or_default())
+                                    .collect();
                                 self.submit_promise = Some(Promise::spawn_thread(
                                     "daemon-submit",
-                                    move || handle.send_submit(),
+                                    move || {
+                                        for (name, val) in names.iter().zip(values.iter()) {
+                                            if name.is_empty() { continue; }
+                                            let escaped_name = name.replace('\\', "\\\\").replace('\'', "\\'");
+                                            let escaped_val = val.replace('\\', "\\\\").replace('\'', "\\'");
+                                            let script = format!(
+                                                "(function(){{ var el=document.querySelector('[name=\"{}\"]'); if(el)el.value=\"{}\"; }})()",
+                                                escaped_name, escaped_val
+                                            );
+                                            handle.send_evaluate_js(script);
+                                        }
+                                        handle.send_submit()
+                                    },
                                 ));
                             }
 

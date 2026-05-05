@@ -32,6 +32,9 @@ pub struct PageResult {
     pub height: u32,
     pub links: Vec<(layout::Rect, String)>,
     pub form_controls: Vec<(layout::Rect, String)>,
+    pub form_buttons: Vec<(layout::Rect, String)>,
+    /// Name attributes for form_controls, same order and length.
+    pub form_control_names: Vec<String>,
     pub event_handlers: Vec<(layout::Rect, String)>,
     pub element_ids: Vec<(layout::Rect, String)>,
     pub focusable_elements: Vec<(layout::Rect, String)>,
@@ -369,6 +372,24 @@ pub fn extract_form_controls_from_html(html: &str) -> Vec<(String, String)> {
     results
 }
 
+/// Recursively extract visible text content from a DOM node's children.
+fn extract_text_content(node: &markup5ever_rcdom::Node, out: &mut String) {
+    for child in node.children.borrow().iter() {
+        match &child.data {
+            markup5ever_rcdom::NodeData::Text { contents } => {
+                let text = contents.borrow();
+                if !text.trim().is_empty() {
+                    out.push_str(text.trim());
+                }
+            }
+            markup5ever_rcdom::NodeData::Element { .. } => {
+                extract_text_content(child, out);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Extract the value of an attribute from a raw HTML tag string (e.g., `a href="url" class="x"`).
 fn extract_attr(tag: &str, attr_name: &str) -> Option<String> {
     // We need a case-insensitive search that never mixes byte offsets between two strings
@@ -625,6 +646,8 @@ pub fn process_html_with_cache(
 
     let mut links: Vec<(layout::Rect, String)> = Vec::new();
     let mut form_controls = Vec::new();
+    let mut form_buttons = Vec::new();
+    let mut form_control_names = Vec::new();
     let mut event_handlers = Vec::new();
     let mut element_ids = Vec::new();
     let mut focusable_elements = Vec::new();
@@ -658,14 +681,27 @@ pub fn process_html_with_cache(
         let mut val = String::new();
         let mut name = String::new();
         let mut input_type = String::from("text");
+        let mut tag = String::new();
         if let markup5ever_rcdom::NodeData::Element { ref attrs, .. } = node.node.data {
+            // Determine the tag name — access `name` field via the element data.
+            if let markup5ever_rcdom::NodeData::Element { ref name, .. } = node.node.data {
+                tag = name.local.to_string();
+            }
             for attr in attrs.borrow().iter() {
                 let attr_name = attr.name.local.to_string();
                 match attr_name.as_str() {
-                    "value" => val = attr.value.to_string(),
+                    "value" if tag == "input" => val = attr.value.to_string(),
                     "name" => name = attr.value.to_string(),
                     "type" => input_type = attr.value.to_string().to_lowercase(),
                     _ => {}
+                }
+            }
+            // For <button>, extract text content from child text nodes
+            if tag == "button" {
+                val.clear();
+                extract_text_content(&node.node, &mut val);
+                if input_type.is_empty() || input_type == "text" {
+                    input_type = String::from("submit");
                 }
             }
         }
@@ -674,10 +710,11 @@ pub fn process_html_with_cache(
             rect,
             initial_value: val.clone(),
         });
-        // Skip button-type inputs from the GUI text-input overlay.
-        // They are still included in form_metadata for submit URL construction.
-        if !matches!(input_type.as_str(), "submit" | "button" | "reset") {
+        if matches!(input_type.as_str(), "submit" | "button" | "reset") {
+            form_buttons.push((rect, val));
+        } else {
             form_controls.push((rect, val));
+            form_control_names.push(name.clone());
         }
     }
 
@@ -721,6 +758,8 @@ pub fn process_html_with_cache(
             height,
             links: absolute_links,
             form_controls,
+            form_buttons,
+            form_control_names,
             event_handlers,
             element_ids,
             focusable_elements,

@@ -27,6 +27,8 @@ struct BrowserApp {
     error: Option<String>,
     current_links: Vec<(layout::Rect, String)>,
     current_form_controls: Vec<(layout::Rect, String)>,
+    current_form_names: Vec<String>,
+    current_form_buttons: Vec<(layout::Rect, String)>,
     current_event_handlers: Vec<(layout::Rect, String)>,
     current_element_ids: Vec<(layout::Rect, String)>,
     current_focusable_elements: Vec<(layout::Rect, String)>,
@@ -94,6 +96,8 @@ impl BrowserApp {
             error: None,
             current_links: vec![],
             current_form_controls: vec![],
+            current_form_names: vec![],
+            current_form_buttons: vec![],
             current_event_handlers: vec![],
             current_element_ids: vec![],
             current_focusable_elements: vec![],
@@ -193,6 +197,8 @@ impl BrowserApp {
         self.texture = Some(ctx.load_texture("page_content", image, Default::default()));
         self.current_links = page_data.links.clone();
         self.current_form_controls = page_data.form_controls.clone();
+        self.current_form_buttons = page_data.form_buttons.clone();
+        self.current_form_names = page_data.form_control_names.clone();
         self.current_event_handlers = page_data.event_handlers.clone();
         self.current_element_ids = page_data.element_ids.clone();
         self.current_focusable_elements = page_data.focusable_elements.clone();
@@ -515,6 +521,22 @@ impl eframe::App for BrowserApp {
                             ui.put(screen_rect, egui::TextEdit::singleline(val).id_source(i));
                         }
 
+                        // Overlay form buttons (submit/button/reset) as clickable buttons
+                        for (l_rect, label) in &self.current_form_buttons {
+                            let screen_rect = egui::Rect::from_min_size(
+                                rect.min + egui::vec2(l_rect.x, l_rect.y),
+                                egui::vec2(l_rect.width.max(40.0), l_rect.height.max(16.0)),
+                            );
+                            let resp = ui.put(screen_rect, egui::Button::new(label.as_str()));
+                            if resp.clicked() && self.submit_promise.is_none() && self.content_promise.is_none() {
+                                let handle = self.engine.clone();
+                                self.submit_promise = Some(Promise::spawn_thread(
+                                    "submit-btn",
+                                    move || handle.send_submit(),
+                                ));
+                            }
+                        }
+
                         // Enter-key form submission: when the user presses Enter
                         // while a form control is focused, submit the form.
                         if !self.current_form_controls.is_empty()
@@ -524,9 +546,25 @@ impl eframe::App for BrowserApp {
                             && self.content_promise.is_none()
                         {
                             let handle = self.engine.clone();
+                            let names = self.current_form_names.clone();
+                            let values: Vec<String> = (0..self.current_form_controls.len())
+                                .map(|i| self.form_values.get(&i.to_string()).cloned().unwrap_or_default())
+                                .collect();
                             self.submit_promise = Some(Promise::spawn_thread(
                                 "submit",
-                                move || handle.send_submit(),
+                                move || {
+                                    for (name, val) in names.iter().zip(values.iter()) {
+                                        if name.is_empty() { continue; }
+                                        let escaped_name = name.replace('\\', "\\\\").replace('\'', "\\'");
+                                        let escaped_val = val.replace('\\', "\\\\").replace('\'', "\\'");
+                                        let script = format!(
+                                            "(function(){{ var el=document.querySelector('[name=\"{}\"]'); if(el)el.value=\"{}\"; }})()",
+                                            escaped_name, escaped_val
+                                        );
+                                        handle.send_evaluate_js(script);
+                                    }
+                                    handle.send_submit()
+                                },
                             ));
                         }
 

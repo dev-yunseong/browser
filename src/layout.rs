@@ -3026,7 +3026,7 @@ impl<'a> LayoutBox<'a> {
             if node.display == DisplayType::Input {
                 if let NodeData::Element { ref name, .. } = node.style_node.node.data {
                     let tag = name.local.to_string();
-                    if matches!(tag.as_str(), "input" | "textarea" | "select") {
+                    if matches!(tag.as_str(), "input" | "textarea" | "select" | "button") {
                         list.push((node.dimensions, node.style_node));
                     }
                 }
