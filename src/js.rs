@@ -3809,13 +3809,63 @@ mod tests {
     }
 
     #[test]
-    fn test_document_cookie_empty_string() {
-        let mut rt = make_runtime("<html><body></body></html>");
-        let cookie = eval(&mut rt, "document.cookie");
-        assert_eq!(cookie, "", "Expected empty cookie string");
-        // Writing should not throw
-        let ok = eval(&mut rt, "(function() { try { document.cookie = 'test=1'; return 'ok'; } catch(e) { return 'err'; } })()");
-        assert_eq!(ok, "ok");
+    fn test_document_cookie_get_set_and_replace() {
+        let url = url::Url::parse("https://example.com/app/page.html").unwrap();
+        let dom = crate::dom::parse_html("<html><body></body></html>");
+        let mut rt = JsRuntime::new(Some(dom.document), Some(url), None, None, new_console_buffer());
+
+        let result = eval(&mut rt, r#"
+            (function() {
+                document.cookie = 'theme=light';
+                document.cookie = 'session=abc; Path=/app';
+                var first = document.cookie;
+                document.cookie = 'theme=dark';
+                return [
+                    navigator.cookieEnabled,
+                    first,
+                    document.cookie
+                ].join('|');
+            })()
+        "#);
+
+        assert_eq!(
+            result,
+            "true|theme=light; session=abc|session=abc; theme=dark"
+        );
+    }
+
+    #[test]
+    fn test_document_cookie_scope_and_expiry_semantics() {
+        let url = url::Url::parse("https://sub.example.com/app/page.html").unwrap();
+        let dom = crate::dom::parse_html("<html><body></body></html>");
+        let mut rt = JsRuntime::new(Some(dom.document), Some(url), None, None, new_console_buffer());
+
+        let result = eval(&mut rt, r#"
+            (function() {
+                document.cookie = 'root=1; Domain=example.com; Path=/';
+                document.cookie = 'app=1; Path=/app';
+                document.cookie = 'other=1; Path=/other';
+                document.cookie = 'bad=1; Domain=evil.example; Path=/';
+                document.cookie = 'secure=1; Secure; Path=/';
+                var before = document.cookie;
+
+                location.pathname = '/other/index.html';
+                var otherPath = document.cookie;
+
+                document.cookie = 'root=gone; Domain=example.com; Path=/; Max-Age=0';
+                var afterDelete = document.cookie;
+
+                location.protocol = 'http:';
+                var afterHttp = document.cookie;
+
+                return [before, otherPath, afterDelete, afterHttp].join('|');
+            })()
+        "#);
+
+        assert_eq!(
+            result,
+            "root=1; app=1; secure=1|root=1; other=1; secure=1|other=1; secure=1|other=1"
+        );
     }
 
     #[test]

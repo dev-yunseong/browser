@@ -1906,7 +1906,7 @@ var navigator = {
     language: 'en-US',
     languages: ['en-US', 'en'],
     platform: 'Linux x86_64',
-    cookieEnabled: false,
+    cookieEnabled: true,
     onLine: true,
     hardwareConcurrency: 4,
     maxTouchPoints: 0,
@@ -2040,10 +2040,138 @@ window.performance = {
     timeOrigin: Date.now(),
 };
 
-// -- document.cookie (stub, read-only empty string) --------------------------
+// -- document.cookie ----------------------------------------------------------
+var __aura_cookie_jar = [];
+
+function __aura_cookie_hostname() {
+    return (location.hostname || '').toLowerCase();
+}
+
+function __aura_cookie_pathname() {
+    return location.pathname || '/';
+}
+
+function __aura_cookie_default_path() {
+    let path = __aura_cookie_pathname();
+    if (!path || path[0] !== '/') return '/';
+    let lastSlash = path.lastIndexOf('/');
+    if (lastSlash <= 0) return '/';
+    return path.slice(0, lastSlash);
+}
+
+function __aura_cookie_domain_match(host, domain, hostOnly) {
+    host = String(host || '').toLowerCase();
+    domain = String(domain || '').toLowerCase();
+    if (hostOnly) return host === domain;
+    return host === domain || host.endsWith('.' + domain);
+}
+
+function __aura_cookie_path_match(requestPath, cookiePath) {
+    requestPath = requestPath || '/';
+    cookiePath = cookiePath || '/';
+    if (requestPath === cookiePath) return true;
+    if (!requestPath.startsWith(cookiePath)) return false;
+    return cookiePath.endsWith('/') || requestPath[cookiePath.length] === '/';
+}
+
+function __aura_cookie_is_expired(cookie, now) {
+    return cookie.expires !== null && cookie.expires <= now;
+}
+
+function __aura_cookie_prune() {
+    let now = Date.now();
+    __aura_cookie_jar = __aura_cookie_jar.filter(cookie => !__aura_cookie_is_expired(cookie, now));
+}
+
+function __aura_cookie_visible(cookie) {
+    return !cookie.httpOnly
+        && (!cookie.secure || location.protocol === 'https:')
+        && __aura_cookie_domain_match(__aura_cookie_hostname(), cookie.domain, cookie.hostOnly)
+        && __aura_cookie_path_match(__aura_cookie_pathname(), cookie.path);
+}
+
+function __aura_cookie_parse_expiry(value) {
+    let time = Date.parse(value);
+    return Number.isNaN(time) ? null : time;
+}
+
 Object.defineProperty(document, 'cookie', {
-    get: function() { return ''; },
-    set: function(val) { /* stub: ignore cookie writes */ },
+    get: function() {
+        __aura_cookie_prune();
+        return __aura_cookie_jar
+            .filter(__aura_cookie_visible)
+            .map(cookie => cookie.name + '=' + cookie.value)
+            .join('; ');
+    },
+    set: function(val) {
+        let input = String(val == null ? '' : val);
+        let parts = input.split(';');
+        let pair = parts.shift();
+        if (!pair) return;
+
+        let eq = pair.indexOf('=');
+        if (eq <= 0) return;
+
+        let name = pair.slice(0, eq).trim();
+        if (!name || /[\x00-\x20\x7f()<>@,;:\\"\/\[\]?={}]/.test(name)) return;
+
+        let host = __aura_cookie_hostname();
+        if (!host) return;
+
+        let value = pair.slice(eq + 1).trim();
+        let cookie = {
+            name: name,
+            value: value,
+            domain: host,
+            hostOnly: true,
+            path: __aura_cookie_default_path(),
+            expires: null,
+            secure: false,
+            sameSite: '',
+            httpOnly: false,
+        };
+
+        for (let attr of parts) {
+            let trimmed = attr.trim();
+            if (!trimmed) continue;
+            let attrEq = trimmed.indexOf('=');
+            let attrName = (attrEq >= 0 ? trimmed.slice(0, attrEq) : trimmed).trim().toLowerCase();
+            let attrValue = attrEq >= 0 ? trimmed.slice(attrEq + 1).trim() : '';
+
+            if (attrName === 'domain') {
+                let domain = attrValue.toLowerCase().replace(/^\./, '');
+                if (domain && __aura_cookie_domain_match(host, domain, false)) {
+                    cookie.domain = domain;
+                    cookie.hostOnly = false;
+                } else {
+                    return;
+                }
+            } else if (attrName === 'path') {
+                cookie.path = attrValue && attrValue[0] === '/' ? attrValue : '/';
+            } else if (attrName === 'expires') {
+                let expires = __aura_cookie_parse_expiry(attrValue);
+                if (expires !== null) cookie.expires = expires;
+            } else if (attrName === 'max-age') {
+                let seconds = Number(attrValue);
+                if (Number.isFinite(seconds)) cookie.expires = Date.now() + Math.trunc(seconds) * 1000;
+            } else if (attrName === 'secure') {
+                cookie.secure = true;
+            } else if (attrName === 'samesite') {
+                cookie.sameSite = attrValue;
+            }
+        }
+
+        __aura_cookie_jar = __aura_cookie_jar.filter(existing =>
+            !(existing.name === cookie.name
+                && existing.domain === cookie.domain
+                && existing.path === cookie.path
+                && existing.hostOnly === cookie.hostOnly)
+        );
+
+        if (!__aura_cookie_is_expired(cookie, Date.now())) {
+            __aura_cookie_jar.push(cookie);
+        }
+    },
     configurable: true,
 });
 
