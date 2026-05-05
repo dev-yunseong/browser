@@ -413,6 +413,66 @@ class NodeList {
     }
 }
 
+function __aura_collection_node(item) {
+    if (typeof item === 'object') {
+        return __get_or_create_node(item.nid, item.tag, item.id, item.kind);
+    }
+    let info = __aura_get_node_info(item);
+    return info ? __get_or_create_node(item, info.tag, info.id, info.kind) : __get_or_create_node(item);
+}
+
+class HTMLCollection {
+    constructor(resolver) {
+        this._resolver = resolver;
+        return new Proxy(this, {
+            get(target, prop, receiver) {
+                if (prop === 'length') return target._items().length;
+                if (prop === Symbol.iterator) return target[Symbol.iterator].bind(target);
+                if (typeof prop === 'string') {
+                    if (/^(0|[1-9]\d*)$/.test(prop)) return target.item(Number(prop));
+                    if (!(prop in target)) {
+                        let named = target.namedItem(prop);
+                        if (named) return named;
+                    }
+                }
+                let value = Reflect.get(target, prop, receiver);
+                return typeof value === 'function' ? value.bind(target) : value;
+            },
+            has(target, prop) {
+                if (typeof prop === 'string' && /^(0|[1-9]\d*)$/.test(prop)) {
+                    return Number(prop) < target.length;
+                }
+                return prop in target;
+            }
+        });
+    }
+    _items() {
+        return this._resolver();
+    }
+    item(index) {
+        let item = this._items()[index];
+        return item === undefined ? null : __aura_collection_node(item);
+    }
+    namedItem(name) {
+        name = String(name);
+        for (let item of this._items()) {
+            let node = __aura_collection_node(item);
+            if (!node || node.nodeType !== Node.ELEMENT_NODE) continue;
+            if (node.id === name || node.getAttribute('name') === name) return node;
+        }
+        return null;
+    }
+    [Symbol.iterator]() {
+        let i = 0;
+        return {
+            next: () => {
+                let value = this.item(i++);
+                return value ? { value, done: false } : { done: true };
+            }
+        };
+    }
+}
+
 // -- Node & Element Classes ---------------------------------------------------
 
 // Node type constants (static properties added after class definition)
@@ -713,18 +773,24 @@ class Element extends Node {
         }).map(el => el._id));
     }
     getElementsByClassName(cls) {
-        let nids_json = __aura_get_elements_by_class(this._id, cls);
-        let nids = JSON.parse(nids_json);
-        return new NodeList(nids);
+        let rootId = this._id;
+        let className = String(cls);
+        return new HTMLCollection(function() {
+            return JSON.parse(__aura_get_elements_by_class(rootId, className));
+        });
     }
     getElementsByTagName(tag) {
-        let nids_json = __aura_get_elements_by_tag(this._id, tag.toLowerCase());
-        let nids = JSON.parse(nids_json);
-        return new NodeList(nids);
+        let rootId = this._id;
+        let tagName = String(tag).toLowerCase();
+        return new HTMLCollection(function() {
+            return JSON.parse(__aura_get_elements_by_tag(rootId, tagName));
+        });
     }
     get children() {
-        let arr = JSON.parse(__aura_get_children(this._id));
-        return new NodeList(arr.filter(c => c.kind === 'element'));
+        let rootId = this._id;
+        return new HTMLCollection(function() {
+            return JSON.parse(__aura_get_children(rootId)).filter(c => c.kind === 'element');
+        });
     }
     get childElementCount() {
         let arr = JSON.parse(__aura_get_children(this._id));
@@ -1071,14 +1137,16 @@ var document = {
         return new NodeList(nodes.map(n => n._id));
     },
     getElementsByClassName: function(cls) {
-        let nids_json = __aura_get_elements_by_class(0, cls);
-        let nids = JSON.parse(nids_json);
-        return new NodeList(nids);
+        let className = String(cls);
+        return new HTMLCollection(function() {
+            return JSON.parse(__aura_get_elements_by_class(0, className));
+        });
     },
     getElementsByTagName: function(tag) {
-        let nids_json = __aura_get_elements_by_tag(0, tag.toLowerCase());
-        let nids = JSON.parse(nids_json);
-        return new NodeList(nids);
+        let tagName = String(tag).toLowerCase();
+        return new HTMLCollection(function() {
+            return JSON.parse(__aura_get_elements_by_tag(0, tagName));
+        });
     },
     // Document surface getters follow the parsed tree shape, not arbitrary descendants.
     get body() {
@@ -1835,6 +1903,7 @@ window.Comment = Comment;
 window.DocumentType = DocumentType;
 window.DocumentFragment = DocumentFragment;
 window.NodeList = NodeList;
+window.HTMLCollection = HTMLCollection;
 window.EventTarget = EventTarget;
 window.XMLHttpRequest = XMLHttpRequest;
 window.DOMTokenList = DOMTokenList;

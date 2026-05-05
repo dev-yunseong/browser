@@ -2495,6 +2495,72 @@ mod tests {
     }
 
     #[test]
+    fn test_html_collection_children_is_live_after_mutations() {
+        let mut rt = make_runtime("<html><body><div id='app'><span id='one'>1</span></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var app = document.getElementById('app');
+                var children = app.children;
+                var before = [children instanceof HTMLCollection, children.length, children[0].id].join(':');
+                var two = document.createElement('span');
+                two.id = 'two';
+                app.appendChild(two);
+                app.removeChild(document.getElementById('one'));
+                return before + '|' + [children.length, children.item(0).id, children.namedItem('two') === two].join(':');
+            })()
+        "#);
+        assert_eq!(result, "true:1:one|1:two:true");
+    }
+
+    #[test]
+    fn test_get_elements_collections_are_live_and_support_named_access() {
+        let mut rt = make_runtime("<html><body><div id='app'><span id='one' class='card' name='first'>1</span></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var app = document.getElementById('app');
+                var cards = document.getElementsByClassName('card');
+                var spans = app.getElementsByTagName('span');
+                var two = document.createElement('span');
+                two.id = 'two';
+                two.className = 'card';
+                two.setAttribute('name', 'second');
+                app.appendChild(two);
+                return [
+                    cards instanceof HTMLCollection,
+                    cards.length,
+                    spans.length,
+                    cards.namedItem('second') === two,
+                    cards.second === two,
+                    spans[1] === two
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "true:2:2:true:true:true");
+    }
+
+    #[test]
+    fn test_query_selector_all_remains_static_while_html_collections_are_live() {
+        let mut rt = make_runtime("<html><body><div id='app'><p class='item'>a</p></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var app = document.getElementById('app');
+                var snapshot = app.querySelectorAll('.item');
+                var live = app.getElementsByClassName('item');
+                var next = document.createElement('p');
+                next.className = 'item';
+                app.appendChild(next);
+                return [
+                    snapshot instanceof NodeList,
+                    snapshot.length,
+                    live.length,
+                    Array.from(live).length
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "true:1:2:2");
+    }
+
+    #[test]
     fn test_add_event_listener_fires() {
         let mut rt = make_runtime("<html><body><button id='btn'>click</button></body></html>");
         eval(&mut rt, "var clicked = false; var btn = document.getElementById('btn'); btn.addEventListener('click', function() { clicked = true; });");
