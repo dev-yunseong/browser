@@ -94,20 +94,20 @@ Sub-issues of #103. Fix in order — each builds on the previous layer of visibl
 
 | # | Issue | Why this order |
 |---|---|---|
-| #103 | [Layout] google.com search page layout fidelity | Umbrella tracker for the remaining Google layout work. |
+| #103 | ~~[Layout] google.com search page layout fidelity~~ ✓ | Umbrella tracker for the remaining Google layout work. |
 | #110 | ~~[Layout] google.com — form control intrinsic sizing~~ ✓ | Most foundational. Search input collapsed = nothing else matters. |
 | #111 | ~~[Layout] google.com — absolute/fixed header positioning~~ ✓ | Affects nav placement after baseline sizing is correct. |
 | #112 | ~~[Layout] google.com — spacing and line-box alignment in dense header~~ ✓ | Refinement after positioning is correct. |
 | #113 | ~~[Runtime] google.com — pre-layout DOM/runtime parity gaps~~ ✓ | Runtime parity layer completed before the remaining visual follow-ups. |
-| #119 | [Runtime] issue #113 follow-up — stateful history, text node mutation, URL/base correctness (in progress by claude-sonnet-4-6) | Follow-up to #113 — fixes incoherent history/location state, silent DOM mutation failure, and URL resolution bugs. |
+| #119 | ~~[Runtime] issue #113 follow-up — stateful history, text node mutation, URL/base correctness~~ ✓ | Follow-up to #113 — fixes incoherent history/location state, silent DOM mutation failure, and URL resolution bugs. |
 | #124 | ~~[Layout] google.com — hero/logo and search cluster composition~~ ✓ | Fixed the missing top-center Google logo/hero composition in headless rendering. |
 | #127 | ~~[Layout] google.com — search row control sizing and inline alignment~~ ✓ | Fixed the `<br>`-driven button row break so the search controls stay grouped below the input. |
 | #126 | ~~[Layout] google.com — stray right-edge overflow artifact~~ ✓ | Isolated visual overflow cleanup after the primary structure is corrected. |
 | #125 | ~~[Layout] google.com — footer anchoring and link grouping~~ ✓ | Lowest user-impact remaining defect once the hero/search region is stable. |
-| #134 | [Layout] google.com — header utility cluster anchoring and right-edge clipping (in progress by codex:gpt-5.4) | Most visible remaining defect in the current screenshot; clipped header controls break the page structure at first glance. |
-| #133 | [Layout] google.com — advanced search link escapes the centered hero controls (in progress by codex:gpt-5.4) | Next most visible hero-structure bug after the header cluster is anchored. |
-| #132 | [Render] google.com — search action button labels not painted | Control text rendering after layout positions are stable. |
-| #131 | [Layout] google.com — footer legal copy spacing and line grouping | Lowest-impact remaining cleanup after header/hero/button fidelity is restored. |
+| #134 | ~~[Layout] google.com — header utility cluster anchoring and right-edge clipping (in progress by codex:gpt-5.4)~~ ✓ | Most visible remaining defect in the current screenshot; clipped header controls break the page structure at first glance. |
+| #133 | ~~[Layout] google.com — advanced search link escapes the centered hero controls (in progress by codex:gpt-5.4)~~ ✓ | Next most visible hero-structure bug after the header cluster is anchored. |
+| #132 | ~~[Render] google.com — search action button labels not painted~~ ✓ | Control text rendering after layout positions are stable. |
+| #131 | ~~[Layout] google.com — footer legal copy spacing and line grouping~~ ✓ | Lowest-impact remaining cleanup after header/hero/button fidelity is restored. |
 
 ## Priority 8 - GUI Render Stability
 
@@ -115,7 +115,7 @@ Stabilizes same-page rendering so hover/focus/image-triggered updates do not rel
 
 | # | Issue | Why this order |
 |---|---|---|
-| #137 | [Runtime] stabilize viewport width across re-renders to prevent layout jitter | Fixes visible component size jitter and removes unnecessary full-page relayouts caused by mixed re-render widths. |
+| #137 | ~~[Runtime] stabilize viewport width across re-renders to prevent layout jitter~~ ✓ | Fixes visible component size jitter and removes unnecessary full-page relayouts caused by mixed re-render widths. |
 
 ---
 
@@ -130,8 +130,8 @@ Stabilizes same-page rendering so hover/focus/image-triggered updates do not rel
 | #150 | ~~[CSS] @media query parsing and evaluation~~ ✓ | Responsive CSS activation. yunseong.dev dark navbar/hero needs this. |
 | #156 | ~~[CSS] @media (prefers-color-scheme: dark) support~~ ✓ | Headless renderer defaults to dark; dark-scheme rules now activate. |
 | #157 | ~~[Layout] CSS Grid layout support~~ ✓ | display:grid with fr/repeat/gap. PR #164. |
-| #151 | [Render] box-shadow support | Card depth/elevation. yunseong.dev content card flat without it. |
-| #152 | [Layout] list-style-type and list indentation | Bullet markers missing on yunseong.dev project lists. |
+| #151 | ~~[Render] box-shadow support~~ ✓ | Card depth/elevation. yunseong.dev content card flat without it. |
+| #152 | ~~[Layout] list-style-type and list indentation~~ ✓ | Bullet markers missing on yunseong.dev project lists. |
 | #158 | ~~[CSS] ::before and ::after pseudo-element support~~ ✓ | Clearfix and decorative content. Closed by PR #162. |
 
 ---
@@ -142,6 +142,72 @@ Stabilizes same-page rendering so hover/focus/image-triggered updates do not rel
 |---|---|---|
 | #107 | ~~[DevTools] Developer console panel — display JS console output~~ ✓ | Foundation for DevTools. #108 depends on this. |
 | #108 | ~~[DevTools] Console REPL — execute JS from developer console~~ ✓ | Depends on #107 console panel. |
+
+---
+
+## Priority 11 - DOM Core Completeness
+
+Umbrella tracker: #165 `[DOM] DOM implementation completeness tracker` ✓
+
+Must be done in order. Core node-model correctness comes before selector, event, and geometry parity.
+
+| # | Issue | Why this order |
+|---|---|---|
+| #185 | ~~[DOM] real DocumentFragment semantics and insertion behavior (in progress by codex:gpt-5)~~ ✓ | First concrete slice of #166. Fragment semantics are the biggest structural correctness gap. |
+| #186 | ~~[DOM] JS-visible Comment and DocumentType node support (in progress by codex:gpt-5)~~ ✓ | Expands node-kind coverage after fragment support is real. |
+| #187 | ~~[DOM] sibling navigation APIs and node relationship parity (in progress by codex:gpt-5)~~ ✓ | Depends on the core node model being coherent for all basic node kinds. |
+| #188 | ~~[DOM] document surface semantics (`documentElement`, `head`, `body`) (in progress by codex:gpt-5)~~ ✓ | Final document-surface cleanup within #166 after the underlying node relationships are stable. |
+| #166 | ~~[DOM] core node model, document surface, and fragment correctness~~ ✓ | Umbrella parent for #185–#188. Foundation for all remaining DOM work. |
+| #167 | ~~[DOM] unify selector behavior across CSS matching and JS query APIs (in progress by codex:gpt-5)~~ ✓ | Query/style parity depends on the core node/document model being stable. |
+| #194 | ~~[DOM] cloneNode(deep) mutation correctness (in progress by codex:gpt-5)~~ ✓ | First concrete slice of #168. Cloning semantics should be stable before broader subtree mutation cleanup. |
+| #195 | ~~[DOM] fragment insertion mutation invariants (in progress by codex:gpt-5)~~ ✓ | Re-check fragment mutation paths after clone semantics are solid. |
+| #196 | ~~[DOM] innerHTML subtree replacement invariants (in progress by codex:gpt-5)~~ ✓ | Replacement correctness depends on fragment and clone invariants staying coherent. |
+| #197 | ~~[DOM] detached subtree and node adoption semantics (in progress by codex:gpt-5)~~ ✓ | Final mutation-state cleanup after clone/fragment/replacement behavior is predictable. |
+| #168 | ~~[DOM] DOM mutation correctness for clone, fragment, and subtree operations (in progress by codex:gpt-5)~~ ✓ | Needs #166 fragment/node semantics in place first. |
+| #169 | ~~[DOM] serialization fidelity for innerHTML, outerHTML, and textContent (in progress by codex:gpt-5)~~ ✓ | Safer after core mutation semantics are correct. |
+| #170 | ~~[DOM] event dispatch phases and richer DOM event classes (in progress by codex:gpt-5)~~ ✓ | Depends on stable tree relationships and node identity guarantees from #166. |
+| #171 | ~~[DOM] layout-backed geometry APIs for JS (in progress by codex:gpt-5)~~ ✓ | Depends on stable DOM/layout mapping after the core model and mutation paths settle. |
+| #205 | ~~[DOM] HTMLCollection and live element collection behavior~~ ✓ | First concrete slice of #172. Live element collections should be stable before traversal APIs build on collection behavior. |
+| #206 | ~~[DOM] TreeWalker traversal over live DOM tree~~ ✓ | TreeWalker exposes explicit cursor traversal over the current DOM tree. |
+| #208 | ~~[DOM] NodeIterator traversal over live DOM tree~~ ✓ | NodeIterator is adjacent to TreeWalker but has different cursor semantics. |
+| #207 | ~~[DOM] Range API basics~~ ✓ | Range is the broadest #172 child and should land after traversal support. |
+| #172 | ~~[DOM] collections and traversal APIs (split into #205-#208)~~ ✓ | Best done after the core node model is solid. |
+| #173 | ~~[DOM] MutationObserver support~~ ✓ | Depends on mutation semantics and event-loop delivery behavior already being stable. |
+| #175 | ~~[DOM] form DOM state parity~~ ✓ | Depends on mutation/event/core DOM work for correct control behavior. |
+| #174 | ~~[DOM] shadow DOM support~~ ✓ | Most invasive DOM feature; keep last in DOM track. |
+
+---
+
+## Priority 12 - Browser JS / Web API Completeness
+
+Umbrella tracker: #176 `[JS] browser JavaScript Web API completeness tracker` ✓
+
+| # | Issue | Why this order |
+|---|---|---|
+| #180 | ~~[JS] URL, URLSearchParams, and location API parity~~ ✓ | URL/base resolution is foundational and already intersects prior runtime bugs. |
+| #181 | ~~[JS] History API and navigation event parity~~ ✓ | Builds on URL/location correctness. |
+| #179 | ~~[JS] cookie jar and document.cookie semantics~~ ✓ | Core page/session state needed before broader network parity. |
+| #177 | ~~[JS] Web Fetch API completion~~ ✓ | Main network API. Better after URL/cookie basics are coherent. |
+| #178 | ~~[JS] XMLHttpRequest support~~ ✓ | Can reuse pieces of the fetch/network stack. |
+| #182 | ~~[JS] CSSOM JS surface completion~~ ✓ | Best after DOM core and style read paths improve. |
+| #183 | ~~[JS] window, navigator, and screen environment parity~~ ✓ | Lower-risk environment surface once stateful APIs exist. |
+| #184 | ~~[JS] dynamic script loading and module support~~ ✓ | Most integration-heavy JS feature; keep last in JS track. |
+
+---
+
+## Priority 13 - Google Search (Form Submission + Navigation)
+
+Umbrella tracker: #224 `[Feature] Google Search — form submission and search navigation`
+
+Must be done in order — form metadata extraction unblocks submission, which unblocks GUI integration.
+URL bar search fallback is independent.
+
+| # | Issue | Why this order |
+|---|---|---|
+| #225 | [Form] Extract form metadata (action, method, field names) in PageResult | Foundation. Form submission needs action/method/field names from DOM. |
+| #226 | [Form] EngineCmd::Submit — form URL construction and submission | Depends on #225 metadata. Builds the navigation URL from form state. |
+| #227 | [GUI] Enter-key form submission in GUI and daemon | Depends on #226. Wires Enter key → submit → navigate in GUI. |
+| #228 | [Navigation] URL bar search fallback (non-URL → Google search) | Independent. Simple URL detection heuristic. |
 
 ---
 
@@ -160,6 +226,19 @@ Stabilizes same-page rendering so hover/focus/image-triggered updates do not rel
 #29
 #19
 #60 -> #61 -> #62 -> #63
+#166 -> #185 -> #186 -> #187 -> #188
+#166 -> #167 -> #194 -> #195 -> #196 -> #197 -> #168 -> #169
+#166 -> #170
+#166 -> #171
+#166 -> #172
+#168 -> #173
+#166 -> #175
+#180 -> #181
+#180 -> #179 -> #177 -> #178
+#166 -> #182
+#180 -> #184
+#225 -> #226 -> #227
+#228
 ```
 
 ## Domain closure
@@ -174,3 +253,4 @@ Stabilizes same-page rendering so hover/focus/image-triggered updates do not rel
 | #2 Standard HTML5 & CSS Parsing | #19 done |
 | Perfecting Engine (Performance) | #60 #61 #62 #63 done |
 | #1 Vision | all domains done |
+| Google Search | #224 #225 #226 #227 #228 done |
