@@ -17,7 +17,7 @@ path = "src/bin/browser_cli.rs"
 
 [dependencies]
 ab_glyph = "0.2.32"
-boa_engine = "0.21.1"
+v8 = "147"
 cssparser = "0.37.0"
 eframe = "0.29"
 egui = "0.29"

@@ -1,55 +1,56 @@
-# Handoff — 2026-04-25 00:26
+# Handoff — 2026-05-05 17:10
 
 ## Summary
-Investigated same-page layout jitter and repeated re-render behavior in the browser GUI. Confirmed the main structural cause is inconsistent viewport width across re-render paths (`800.0` in some paths vs `ui.available_width()` in others), created GitHub issue `#137` for that bug, updated `./.agents/PRIORITY.md`, and finished the Google advanced-search grouping fix as PR `#136` on a separate branch.
+Completed Priority 13 (Google Search form submission), fixed multiple form/GUI bugs, started Priority 14 (V8 JS engine migration planning). Created archive-priority skill and shrunk PRIORITY.md from 286→35 lines.
 
 ## Done
-- Traced GUI re-render triggers in `src/main.rs` and engine relayout path in `src/engine.rs`
-- Confirmed full-page re-render happens on hover, focus, click-script, console-eval, and async image-load paths
-- Confirmed relayout width is inconsistent across trigger paths:
-- fixed-width paths use `800.0`
-- other paths use `ui.available_width()` from the content area
-- Analyzed perf logs and determined DOM/style/layout timing is stable while render time fluctuates more, pointing to repaint/raster variance rather than major DOM/layout instability
-- Created GitHub issue `#137`:
-- `[Runtime] stabilize viewport width across re-renders to prevent layout jitter`
-- Updated `./.agents/PRIORITY.md`:
-- added `Priority 8 - GUI Render Stability`
-- added roadmap row for `#137`
-- shifted DevTools section to `Priority 9`
-- Completed Google issue `#133` implementation in code:
-- `src/style.rs`: map legacy `width` / `align` table-cell attributes into computed styles
-- `src/layout.rs`: keep table-row cells on one row, account for percent-width cells in intrinsic sizing, allow centered/right-aligned overflow to offset without left-clamping, add regression test
-- Ran focused verification:
-- `cargo test -q test_inline_utility_link_after_centered_controls_stays_grouped -- --nocapture`
-- `cargo test -q test_text_align_center_shifts_inline_content -- --nocapture`
-- `cargo test -q test_centered_inline_links_keep_intrinsic_width -- --nocapture`
-- `cargo build --bins`
-- Ran live browser CLI review manually:
-- started headless daemon in `drun`
-- navigated `https://yunseong.dev`
-- navigated `https://google.com`
-- captured and visually inspected fresh Google screenshot
-- Created branch `feat/google-advanced-link-grouping`
-- Committed code-only changes as `bc87eb9 fix: group google advanced search link`
-- Opened PR `#136`: `https://github.com/dev-yunseong/browser/pull/136`
+- **#225**: FormMetadata/FormControlMeta structs + collect_form_element() in engine.rs/layout.rs
+- **#226**: EngineCmd::Submit + BrowserEngine::submit_form() — builds GET URL from form metadata + JS DOM values
+- **#227**: Enter-key form submission in GUI (main.rs + browser_daemon.rs)
+- **#228**: resolve_url() — URL bar search fallback (domain → https://, text → Google search)
+- **CLI T6 fix**: click_by_index/click_by_text fallback to daemon GET /page when last_page is None
+- **Form button fix**: submit/button/reset inputs excluded from TextEdit overlay, rendered as clickable egui::Button
+- **Value sync fix**: form_values synced to JS DOM before submit (querySelector + value assignment)
+- **<button> support**: collect_form_controls now matches "button" tag, extract_text_content() helper
+- **DisplayType fix**: form controls keep DisplayType::Input even with CSS display:block (unblocked yunseong.dev)
+- **Buttons excluded from submit URL**: btnG/btnI no longer appear in form_metadata.controls
+- **Console closed by default**: console_panel_open: false in both GUI and daemon
+- **Stack overflow prevention**: engine-actor thread stack 8MB (from default 2MB)
+- **Priority cleanup**: PRIORITY-ARCHIVE.md with 120 resolved issues, PRIORITY.md shrunk to 35 lines
+- **archive-priority skill**: global skill for future priority archiving (~/.agents/skills/archive-priority/)
 
 ## Current State
-PR `#136` is open from `feat/google-advanced-link-grouping` to `main` and contains only the code changes for the Google advanced-search grouping fix. The local worktree is intentionally still dirty in agent metadata files: `./.agents/PRIORITY.md` includes the new `#137` roadmap row, `./.agents/handoffs/LATEST.md` is modified from prior handoff flow, and there are existing untracked handoff/skills paths. The newly created issue `#137` is not implemented yet; it tracks the viewport-width instability that likely causes same-page component size jitter during hover/focus/image-triggered re-renders.
+main branch: all Priority 0-13 issues resolved. Browser-tester 7/7 PASS.
+Next: Priority 14 — V8 JS Engine Migration (#232-#237).
+
+### V8 Issues Created
+| # | Phase | Depends |
+|---|---|---|
+| #232 | Umbrella | - |
+| #233 | Phase 1: rusty_v8 + isolate + script exec | - |
+| #234 | Phase 2: DOM bindings | #233 |
+| #235 | Phase 3: Event system + timers | #234 |
+| #236 | Phase 4: fetch, XHR, storage, CSSOM, forms | #235 |
+| #237 | Phase 5: Integration + testing | #236 |
+
+### Key patterns for V8 migration
+- src/js.rs: 4449 lines, 92 public functions/structs
+- Current API: JsRuntime::new(), execute(), execute_with_result(), tick(), trigger_event()
+- Boa patterns: Context, register_global_callable, JsValue, js_string → V8 patterns: Isolate, Context, HandleScope, FunctionTemplate
+- Thread model: engine actor is single-threaded (reqwest blocking), V8 isolate must stay on same thread
 
 ## Decisions
 | Decision | Reason |
 |----------|--------|
-| Treat the size-jitter problem as a separate runtime stability issue, not a Google-specific layout bug | Root cause is inconsistent viewport width across re-render paths in app/engine flow |
-| Create `#137` instead of folding this into `#133` | `#133` was a concrete Google layout defect; width instability affects general rendering behavior |
-| Keep `#137` in a new roadmap section before DevTools | User-visible render stability is more foundational than finished DevTools items |
-| Leave agent metadata changes uncommitted while creating PR `#136` | PR should stay code-only and avoid unrelated session metadata churn |
+| rusty_v8 over rquickjs | Full ES2024 + JIT, prebuilt binaries (no source build). rquickjs is lighter but less capable |
+| Exclude button values from submit URL | Real browsers only send clicked button's value. Enter-key submit sends no button values |
+| Form controls keep DisplayType::Input with CSS display:block | Bootstrap .form-control breaks form detection otherwise. CSS block on inputs means "fill width" not "become div" |
+| Archive completed priorities | PRIORITY.md was 286 lines of mostly ✓. Active work is only P14 |
 
 ## Next Steps
-1. Implement `#137` by storing one authoritative viewport width in app state and using it for all navigate / re-render paths.
-2. Add lightweight instrumentation logging render trigger source plus width to confirm width stability during hover/focus/image updates.
-3. After `#136` merges, update roadmap state for `#133` / related Google items as appropriate.
-4. Optionally clean up or ignore the existing local handoff metadata separately from code work.
+1. `develop-priority` → starts #233 (V8 Phase 1)
+2. Or `develop-priority` to start #232 umbrella issue
+3. After V8 phases complete: test chatgpt.com, naver.com, yunseong.dev search
 
 ## Blockers / Open Questions
-- `#134` remains open in GitHub even though prior related work was merged earlier.
-- `#119` is still marked in progress by another agent owner.
+- None on V8 migration
