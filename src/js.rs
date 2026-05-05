@@ -1066,7 +1066,128 @@ fn storage_clear_cb(scope: &mut v8::PinScope, args: v8::FunctionCallbackArgument
     let mut store = GLOBAL_STORAGE.lock().unwrap();
     if let Some(m)=store.data.get_mut(&origin) { m.clear(); store.save(); }
 }
-fn fetch_cb(_scope: &mut v8::PinScope, _args: v8::FunctionCallbackArguments, _rv: v8::ReturnValue<v8::Value>) {}
+fn fetch_cb(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, _rv: v8::ReturnValue<v8::Value>) {
+    let url_str = args.get(0).to_rust_string_lossy(scope);
+    let method_str = args.get(1).to_rust_string_lossy(scope);
+    let method_str = if method_str.is_empty() { "GET".to_string() } else { method_str };
+    let headers_json = args.get(2).to_rust_string_lossy(scope);
+    let headers_json = if headers_json.is_empty() { "{}".to_string() } else { headers_json };
+    let body = args.get(3).to_rust_string_lossy(scope);
+    let resolve_val = args.get(4);
+    let reject_val = args.get(5);
+
+    let base_url = CURRENT_ORIGIN.with(|o| (*o.borrow()).clone());
+    let target_url = if let Some(ref base) = base_url {
+        base.join(&url_str).unwrap_or_else(|_| Url::parse(&url_str).unwrap_or(base.clone()))
+    } else {
+        Url::parse(&url_str).unwrap_or_else(|_| Url::parse("about:blank").unwrap())
+    };
+
+    let allowed = CSP_POLICY.with(|p| {
+        p.borrow().as_ref().map(|pol| pol.is_allowed("connect-src", &target_url, base_url.as_ref())).unwrap_or(true)
+    });
+
+    if !allowed {
+        if reject_val.is_function() {
+            let rej: v8::Local<v8::Function> = unsafe { std::mem::transmute(reject_val) };
+            let msg = v8::String::new(scope, "CSP Error: connect-src directive blocked this request").unwrap();
+            let undef = v8::undefined(scope);
+            let _ = rej.call(scope, undef.into(), &[msg.into()]);
+        }
+        return;
+    }
+
+    let fetch_id = NEXT_FETCH_ID.with(|id_cell| {
+        let id = *id_cell.borrow();
+        *id_cell.borrow_mut() += 1;
+        id
+    });
+
+    if resolve_val.is_function() && reject_val.is_function() {
+        let res: v8::Local<v8::Function> = unsafe { std::mem::transmute(resolve_val) };
+        let rej: v8::Local<v8::Function> = unsafe { std::mem::transmute(reject_val) };
+        FETCH_REGISTRY.with(|reg| {
+            reg.borrow_mut().insert(fetch_id, FetchHandlers {
+                resolve: v8::Global::new(scope, res),
+                reject: v8::Global::new(scope, rej),
+            });
+        });
+    }
+
+    TASK_SENDER.with(|s_cell| {
+        if let Some(ref sender) = *s_cell.borrow() {
+            let sender_clone = sender.clone();
+            let origin_str = base_url.as_ref().map(|u| u.origin().unicode_serialization()).unwrap_or_else(|| "null".to_string());
+            let is_cross_origin = base_url.as_ref().map(|u| u.origin() != target_url.origin()).unwrap_or(false);
+
+            std::thread::spawn(move || {
+                let client = reqwest::blocking::Client::new();
+                let method = reqwest::Method::from_bytes(method_str.as_bytes()).unwrap_or(reqwest::Method::GET);
+                let mut req = client.request(method.clone(), target_url.clone());
+                if is_cross_origin { req = req.header("Origin", origin_str.clone()); }
+                if let Ok(headers) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&headers_json) {
+                    for (name, value) in headers {
+                        if let Some(value_str) = value.as_str() { req = req.header(name.as_str(), value_str); }
+                    }
+                }
+                if method != reqwest::Method::GET && method != reqwest::Method::HEAD && !body.is_empty() {
+                    req = req.body(body.clone());
+                }
+                match req.send() {
+                    Ok(response) => {
+                        let response_url = response.url().to_string();
+                        let status = response.status().as_u16();
+                        let status_text = response.status().canonical_reason().unwrap_or("").to_string();
+                        if is_cross_origin {
+                            let acao = response.headers().get("access-control-allow-origin").and_then(|h| h.to_str().ok());
+                            let allowed = match acao { Some("*") => true, Some(val) if val == origin_str => true, _ => false };
+                            if !allowed {
+                                let _ = sender_clone.send(Box::new(move || {
+                                    FETCH_REGISTRY.with(|reg| {
+                                        if let Some(handlers) = reg.borrow_mut().remove(&fetch_id) {
+                                            FETCH_PENDING.with(|p| p.borrow_mut().push_back((handlers.reject, "CORS Error: Origin not allowed".to_string(), false)));
+                                        }
+                                    });
+                                }));
+                                return;
+                            }
+                        }
+                        let mut headers = serde_json::Map::new();
+                        for (name, value) in response.headers().iter() {
+                            if let Ok(value_str) = value.to_str() {
+                                headers.insert(name.as_str().to_string(), serde_json::Value::String(value_str.to_string()));
+                            }
+                        }
+                        let resp_body = response.text().unwrap_or_default();
+                        let payload = serde_json::json!({
+                            "url": response_url, "status": status, "statusText": status_text,
+                            "ok": (200..=299).contains(&status), "headers": headers, "body": resp_body,
+                            "type": "basic", "redirected": false
+                        });
+                        let payload_js = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+                        let _ = sender_clone.send(Box::new(move || {
+                            FETCH_REGISTRY.with(|reg| {
+                                if let Some(handlers) = reg.borrow_mut().remove(&fetch_id) {
+                                    FETCH_PENDING.with(|p| p.borrow_mut().push_back((handlers.resolve, payload_js, true)));
+                                }
+                            });
+                        }));
+                    }
+                    Err(e) => {
+                        let err_msg = e.to_string();
+                        let _ = sender_clone.send(Box::new(move || {
+                            FETCH_REGISTRY.with(|reg| {
+                                if let Some(handlers) = reg.borrow_mut().remove(&fetch_id) {
+                                    FETCH_PENDING.with(|p| p.borrow_mut().push_back((handlers.reject, err_msg, false)));
+                                }
+                            });
+                        }));
+                    }
+                }
+            });
+        }
+    });
+}
 
 fn setTimeout_cb(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, _rv: v8::ReturnValue<v8::Value>) {
     let cb = args.get(0);
