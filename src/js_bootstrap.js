@@ -1515,16 +1515,18 @@ class Element extends Node {
     getAttributeNS(ns, name) { return this.getAttribute(name); }
     removeAttributeNS(ns, name) { this.removeAttribute(name); }
     hasAttributeNS(ns, name) { return this.hasAttribute(name); }
-    // attachShadow stub
     attachShadow(options) {
-        var host = this;
-        var shadow = document.createElement('div');
-        shadow._isShadowRoot = true;
-        shadow.host = host;
-        host._shadowRoot = shadow;
-        return shadow;
+        if (this._shadowRoot) throw new Error('Shadow root already attached');
+        let mode = options && options.mode === 'closed' ? 'closed' : 'open';
+        let fragmentId = __aura_create_document_fragment();
+        let root = new ShadowRoot(fragmentId, this, mode);
+        __node_registry.set(fragmentId, root);
+        this._shadowRoot = root;
+        return root;
     }
-    get shadowRoot() { return this._shadowRoot || null; }
+    get shadowRoot() {
+        return this._shadowRoot && this._shadowRoot.mode === 'open' ? this._shadowRoot : null;
+    }
     // dispatchEvent is inherited from EventTarget; no override needed
     // animate stub
     animate(keyframes, options) {
@@ -1642,6 +1644,47 @@ class DocumentFragment extends Node {
     }
     get nodeName() {
         return '#document-fragment';
+    }
+    querySelector(selector) {
+        let nid = __aura_query_selector(this._id, selector);
+        if (!nid) return null;
+        let info = __aura_get_node_info(nid);
+        return info ? __get_or_create_node(nid, info.tag, info.id, info.kind) : __get_or_create_node(nid);
+    }
+    querySelectorAll(selector) {
+        let nids_json = __aura_query_selector_all(this._id, selector);
+        let nids = JSON.parse(nids_json);
+        return new NodeList(nids.map(nid => {
+            let info = __aura_get_node_info(nid);
+            return __get_or_create_node(nid, info ? info.tag : null, info ? info.id : null, info ? info.kind : null);
+        }).map(el => el._id));
+    }
+    getElementById(id) {
+        let matches = this.querySelectorAll('#' + String(id));
+        return matches.item(0);
+    }
+    get innerHTML() {
+        return __aura_get_inner_html(this._id);
+    }
+    set innerHTML(val) {
+        let oldChildren = Array.from(this.childNodes || []);
+        __aura_set_inner_html(this._id, String(val));
+        __aura_child_list_mutation(this, Array.from(this.childNodes || []), oldChildren, null, null);
+    }
+}
+
+class ShadowRoot extends DocumentFragment {
+    constructor(id, host, mode) {
+        super(id);
+        this.host = host;
+        this.mode = mode === 'closed' ? 'closed' : 'open';
+        this._isShadowRoot = true;
+    }
+    get parentNode() {
+        return this.host;
+    }
+    get parentElement() {
+        return this.host;
     }
 }
 
@@ -2476,6 +2519,7 @@ window.Text = TextNode;
 window.Comment = Comment;
 window.DocumentType = DocumentType;
 window.DocumentFragment = DocumentFragment;
+window.ShadowRoot = ShadowRoot;
 window.NodeList = NodeList;
 window.HTMLCollection = HTMLCollection;
 window.NodeFilter = NodeFilter;
