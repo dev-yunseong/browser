@@ -362,10 +362,10 @@ impl CliState {
     }
 
     fn click_by_index(&mut self, n: usize) -> Result<(), CliError> {
-        let page = self
-            .last_page
-            .as_ref()
-            .ok_or_else(|| CliError::NotFound("No page loaded yet. Use 'navigate <url>' first.".to_string()))?;
+        let page = match &self.last_page {
+            Some(p) => p.clone(),
+            None => self.client.get_page()?,
+        };
         let elem = page.elements.get(n - 1).ok_or_else(|| {
             CliError::NotFound(format!(
                 "No element #{} on page (page has {} links).",
@@ -380,10 +380,10 @@ impl CliState {
     }
 
     fn click_by_text(&mut self, text: &str) -> Result<(), CliError> {
-        let page = self
-            .last_page
-            .as_ref()
-            .ok_or_else(|| CliError::NotFound("No page loaded yet.".to_string()))?;
+        let page = match &self.last_page {
+            Some(p) => p.clone(),
+            None => self.client.get_page()?,
+        };
         let query = text.to_lowercase();
         let elem = page
             .elements
