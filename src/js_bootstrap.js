@@ -2097,8 +2097,12 @@ window.CSSStyleRule = CSSStyleRule;
 window.CSSStyleSheet = CSSStyleSheet;
 window.StyleSheetList = StyleSheetList;
 var console = { log: log, warn: warn, error: error, info: info, debug: debug };
-var navigator = {
+var navigator = new EventTarget();
+Object.assign(navigator, {
     userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    appCodeName: 'Mozilla',
+    appName: 'Netscape',
+    appVersion: '5.0 (X11; Linux x86_64)',
     language: 'en-US',
     languages: ['en-US', 'en'],
     platform: 'Linux x86_64',
@@ -2109,29 +2113,101 @@ var navigator = {
     vendor: 'Google Inc.',
     vendorSub: '',
     productSub: '20030107',
-};
+    product: 'Gecko',
+    doNotTrack: null,
+    webdriver: false,
+    plugins: [],
+    mimeTypes: [],
+    userAgentData: {
+        brands: [{ brand: 'Chromium', version: '120' }, { brand: 'Aura', version: '1' }],
+        mobile: false,
+        platform: 'Linux',
+        getHighEntropyValues: function(hints) {
+            let values = { brands: this.brands, mobile: this.mobile, platform: this.platform };
+            (hints || []).forEach(hint => {
+                if (hint === 'architecture') values.architecture = 'x86';
+                if (hint === 'bitness') values.bitness = '64';
+                if (hint === 'model') values.model = '';
+                if (hint === 'platformVersion') values.platformVersion = '';
+            });
+            return Promise.resolve(values);
+        }
+    },
+    permissions: {
+        query: function(desc) {
+            return Promise.resolve({ name: desc && desc.name || '', state: 'prompt', onchange: null });
+        }
+    },
+    clipboard: {
+        readText: function() { return Promise.resolve(''); },
+        writeText: function() { return Promise.resolve(); }
+    },
+    geolocation: {
+        getCurrentPosition: function(success, error) {
+            if (typeof error === 'function') error({ code: 1, message: 'Geolocation is not available' });
+        },
+        watchPosition: function(success, error) {
+            if (typeof error === 'function') error({ code: 1, message: 'Geolocation is not available' });
+            return 0;
+        },
+        clearWatch: function(id) {}
+    },
+    javaEnabled: function() { return false; },
+    sendBeacon: function(url, data) { return true; },
+    vibrate: function(pattern) { return false; },
+});
+window.navigator = navigator;
 var location = document.location;
 
 // -- window dimensions -------------------------------------------------------
+window.self = window;
+window.window = window;
+window.top = window;
+window.parent = window;
+window.frames = window;
+window.length = 0;
+window.name = '';
+window.status = '';
+window.closed = false;
+window.opener = null;
+window.frameElement = null;
 window.innerWidth = 800;
 window.innerHeight = 600;
 window.outerWidth = 800;
 window.outerHeight = 600;
-window.screen = {
+window.screenX = 0;
+window.screenY = 0;
+window.screenLeft = 0;
+window.screenTop = 0;
+let __aura_screen_orientation = new EventTarget();
+Object.assign(__aura_screen_orientation, {
+    type: 'landscape-primary',
+    angle: 0,
+    onchange: null,
+    lock: function(type) { return Promise.reject(new Error('Screen orientation lock is not supported')); },
+    unlock: function() {}
+});
+window.screen = new EventTarget();
+Object.assign(window.screen, {
     width: 800,
     height: 600,
     availWidth: 800,
     availHeight: 600,
+    availLeft: 0,
+    availTop: 0,
     colorDepth: 24,
     pixelDepth: 24,
-    orientation: { type: 'landscape-primary', angle: 0 },
-};
+    isExtended: false,
+    orientation: __aura_screen_orientation,
+    onchange: null,
+});
 window.devicePixelRatio = 1;
 window.scrollX = 0;
 window.scrollY = 0;
 window.pageXOffset = 0;
 window.pageYOffset = 0;
-window.visualViewport = {
+window.visualViewport = new EventTarget();
+Object.assign(window.visualViewport, {
     width: 800,
     height: 600,
     scale: 1,
@@ -2139,8 +2215,26 @@ window.visualViewport = {
     offsetTop: 0,
     pageLeft: 0,
     pageTop: 0,
-    addEventListener: function() {},
-    removeEventListener: function() {},
+    onresize: null,
+    onscroll: null,
+});
+window.locationbar = { visible: true };
+window.menubar = { visible: true };
+window.personalbar = { visible: true };
+window.scrollbars = { visible: true };
+window.statusbar = { visible: true };
+window.toolbar = { visible: true };
+window.__aura_environmentNotes = {
+    unsupported: [
+        'serviceWorker',
+        'indexedDB',
+        'webgl',
+        'webgpu',
+        'notifications',
+        'real clipboard access',
+        'real geolocation'
+    ],
+    viewport: 'Fixed 800x600 CSS pixel viewport in the current headless runtime.'
 };
 
 // -- history -----------------------------------------------------------------
@@ -2554,16 +2648,15 @@ XMLHttpRequest.DONE = 4;
 
 // -- window.matchMedia -------------------------------------------------------
 window.matchMedia = function(query) {
-    return {
+    let mql = new EventTarget();
+    Object.assign(mql, {
         matches: false,
-        media: query,
+        media: String(query),
         onchange: null,
-        addListener: function() {},
-        removeListener: function() {},
-        addEventListener: function() {},
-        removeEventListener: function() {},
-        dispatchEvent: function() { return false; },
-    };
+        addListener: function(callback) { this.addEventListener('change', callback); },
+        removeListener: function(callback) { this.removeEventListener('change', callback); },
+    });
+    return mql;
 };
 
 // -- window.getSelection -----------------------------------------------------
@@ -3603,9 +3696,40 @@ window.atob = function(s) { return ''; };
 window.btoa = function(s) { return ''; };
 
 // -- window.scroll / scrollTo / scrollBy ------------------------------------
-window.scroll = function() {};
-window.scrollTo = function() {};
-window.scrollBy = function() {};
+function __aura_set_scroll(x, y) {
+    window.scrollX = Number(x) || 0;
+    window.scrollY = Number(y) || 0;
+    window.pageXOffset = window.scrollX;
+    window.pageYOffset = window.scrollY;
+    window.visualViewport.pageLeft = window.scrollX;
+    window.visualViewport.pageTop = window.scrollY;
+    window.dispatchEvent(new Event('scroll'));
+    window.visualViewport.dispatchEvent(new Event('scroll'));
+}
+window.scroll = function(x, y) {
+    if (typeof x === 'object' && x !== null) __aura_set_scroll(x.left || 0, x.top || 0);
+    else __aura_set_scroll(x, y);
+};
+window.scrollTo = window.scroll;
+window.scrollBy = function(x, y) {
+    if (typeof x === 'object' && x !== null) __aura_set_scroll(window.scrollX + (Number(x.left) || 0), window.scrollY + (Number(x.top) || 0));
+    else __aura_set_scroll(window.scrollX + (Number(x) || 0), window.scrollY + (Number(y) || 0));
+};
+window.alert = function(message) { console.log(String(message)); };
+window.confirm = function(message) { console.log(String(message)); return false; };
+window.prompt = function(message, defaultValue) { console.log(String(message)); return defaultValue === undefined ? null : String(defaultValue); };
+window.print = function() {};
+window.stop = function() {};
+window.moveTo = function() {};
+window.moveBy = function() {};
+window.resizeTo = function(width, height) {
+    window.outerWidth = Number(width) || window.outerWidth;
+    window.outerHeight = Number(height) || window.outerHeight;
+};
+window.resizeBy = function(width, height) {
+    window.outerWidth += Number(width) || 0;
+    window.outerHeight += Number(height) || 0;
+};
 
 // -- window.requestIdleCallback already set above via native ----------------
 window.cancelAnimationFrame = function() {};
