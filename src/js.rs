@@ -586,8 +586,11 @@ impl JsRuntime {
         // Register native __aura_fetch
         let aura_fetch = NativeFunction::from_copy_closure(|_this, args, _context| {
             let url_str = args.get(0).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
-            let resolve = args.get(1).cloned().unwrap_or(JsValue::undefined());
-            let reject = args.get(2).cloned().unwrap_or(JsValue::undefined());
+            let method_str = args.get(1).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_else(|| "GET".to_string());
+            let headers_json = args.get(2).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_else(|| "{}".to_string());
+            let body = args.get(3).and_then(|v| v.as_string()).map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            let resolve = args.get(4).cloned().unwrap_or(JsValue::undefined());
+            let reject = args.get(5).cloned().unwrap_or(JsValue::undefined());
 
             let base_url = CURRENT_ORIGIN.with(|o| (*o.borrow()).clone());
             let target_url = if let Some(base) = base_url.as_ref() {
@@ -628,14 +631,29 @@ impl JsRuntime {
 
                     std::thread::spawn(move || {
                         let client = reqwest::blocking::Client::new();
-                        let mut req = client.get(target_url.clone());
+                        let method = reqwest::Method::from_bytes(method_str.as_bytes()).unwrap_or(reqwest::Method::GET);
+                        let mut req = client.request(method.clone(), target_url.clone());
                         if is_cross_origin {
                             req = req.header("Origin", origin_str.clone());
+                        }
+                        if let Ok(headers) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&headers_json) {
+                            for (name, value) in headers {
+                                if let Some(value_str) = value.as_str() {
+                                    req = req.header(name.as_str(), value_str);
+                                }
+                            }
+                        }
+                        if method != reqwest::Method::GET && method != reqwest::Method::HEAD && !body.is_empty() {
+                            req = req.body(body.clone());
                         }
 
                         let res = req.send();
                         match res {
                             Ok(response) => {
+                                let response_url = response.url().to_string();
+                                let status = response.status().as_u16();
+                                let status_text = response.status().canonical_reason().unwrap_or("").to_string();
+
                                 // CORS Check
                                 if is_cross_origin {
                                     let acao = response.headers().get("access-control-allow-origin")
@@ -658,26 +676,32 @@ impl JsRuntime {
                                     }
                                 }
 
+                                let mut headers = serde_json::Map::new();
+                                for (name, value) in response.headers().iter() {
+                                    if let Ok(value_str) = value.to_str() {
+                                        headers.insert(name.as_str().to_string(), serde_json::Value::String(value_str.to_string()));
+                                    }
+                                }
                                 let body = response.text().unwrap_or_default();
+                                let payload = serde_json::json!({
+                                    "url": response_url,
+                                    "status": status,
+                                    "statusText": status_text,
+                                    "ok": (200..=299).contains(&status),
+                                    "headers": headers,
+                                    "body": body,
+                                    "type": "basic",
+                                    "redirected": false
+                                });
+                                let payload_js = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
                                 let _ = sender_clone.send(Box::new(move |ctx| {
                                     let (resolve, _) = FETCH_REGISTRY.with(|reg| reg.borrow_mut().remove(&fetch_id).unwrap());
-                                    FETCH_BODY_REGISTRY.with(|reg| reg.borrow_mut().insert(fetch_id, body));
                                     
                                     if let Some(obj) = resolve.as_object() {
-                                        let res_obj_val = ctx.eval(Source::from_bytes(b"({})")).unwrap();
-                                        let res_obj = res_obj_val.as_object().unwrap();
-                                        
-                                        let text_fn = NativeFunction::from_copy_closure(move |_, _, _| {
-                                            let body = FETCH_BODY_REGISTRY.with(|reg| reg.borrow_mut().remove(&fetch_id).unwrap_or_default());
-                                            Ok(JsValue::from(js_string!(body)))
-                                        });
-                                        
-                                        ctx.register_global_callable(js_string!("__aura_temp_text"), 0, text_fn).unwrap();
-                                        let text_fn_obj = ctx.eval(Source::from_bytes(b"__aura_temp_text")).unwrap();
-                                        let _ = ctx.eval(Source::from_bytes(b"delete globalThis.__aura_temp_text"));
-                                        
-                                        res_obj.set(js_string!("text"), text_fn_obj, false, ctx).unwrap();
-                                        let _ = obj.call(&JsValue::undefined(), &[res_obj_val], ctx);
+                                        let script = format!("__aura_make_fetch_response({})", payload_js);
+                                        if let Ok(res_obj_val) = ctx.eval(Source::from_bytes(script.as_bytes())) {
+                                            let _ = obj.call(&JsValue::undefined(), &[res_obj_val], ctx);
+                                        }
                                     }
                                 }));
                             }
@@ -696,7 +720,7 @@ impl JsRuntime {
             });
             Ok(JsValue::undefined())
         });
-        context.register_global_callable(js_string!("__aura_fetch"), 3, aura_fetch).unwrap();
+        context.register_global_callable(js_string!("__aura_fetch"), 6, aura_fetch).unwrap();
 
         // ── DOM Query APIs ────────────────────────────────────────────────────
 
@@ -4134,6 +4158,61 @@ mod tests {
         let mut rt = make_runtime("<html><body></body></html>");
         let result = eval(&mut rt, "(function() { var ctrl = new AbortController(); ctrl.abort(); return ctrl.signal.aborted ? 'aborted' : 'not'; })()");
         assert_eq!(result, "aborted");
+    }
+
+    #[test]
+    fn test_fetch_headers_request_response_surface() {
+        let url = url::Url::parse("https://example.com/app/index.html").unwrap();
+        let dom = crate::dom::parse_html("<html><body></body></html>");
+        let mut rt = JsRuntime::new(Some(dom.document), Some(url), None, None, new_console_buffer());
+
+        let result = eval(&mut rt, r#"
+            (function() {
+                var headers = new Headers([['X-Test', 'one']]);
+                headers.append('x-test', 'two');
+                headers.set('Content-Type', 'application/json');
+
+                var request = new Request('/api', {
+                    method: 'post',
+                    headers: headers,
+                    body: JSON.stringify({ok: true}),
+                    credentials: 'include'
+                });
+                var requestClone = request.clone();
+
+                var response = Response.json({ok: true}, { status: 201, headers: { 'X-Reply': 'yes' } });
+                var responseClone = response.clone();
+
+                var getBodyRejected = false;
+                try {
+                    new Request('/bad', { method: 'GET', body: 'nope' });
+                } catch (e) {
+                    getBodyRejected = true;
+                }
+
+                return [
+                    headers.get('X-TEST'),
+                    Array.from(headers.keys()).join(','),
+                    request.url,
+                    request.method,
+                    request.headers.get('content-type'),
+                    request.credentials,
+                    requestClone._body,
+                    response.status,
+                    response.ok,
+                    response.headers.get('content-type'),
+                    response.headers.get('x-reply'),
+                    typeof response.text().then,
+                    responseClone.bodyUsed,
+                    getBodyRejected
+                ].join('|');
+            })()
+        "#);
+
+        assert_eq!(
+            result,
+            "one, two|x-test,content-type|https://example.com/api|POST|application/json|include|{\"ok\":true}|201|true|application/json|yes|function|false|true"
+        );
     }
 
     #[test]
