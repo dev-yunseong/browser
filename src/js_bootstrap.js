@@ -667,6 +667,177 @@ class NodeIterator {
     }
 }
 
+function __aura_child_at(container, offset) {
+    if (!container || !container.childNodes) return null;
+    return container.childNodes.item(offset);
+}
+
+function __aura_node_index(node) {
+    if (!node || !node.parentNode) return -1;
+    let siblings = node.parentNode.childNodes;
+    for (let i = 0; i < siblings.length; i++) {
+        if (siblings[i] === node) return i;
+    }
+    return -1;
+}
+
+function __aura_is_character_data(node) {
+    return node && (node.nodeType === Node.TEXT_NODE || node.nodeType === Node.COMMENT_NODE);
+}
+
+function __aura_common_ancestor(a, b) {
+    let ancestors = [];
+    let current = a;
+    while (current) {
+        ancestors.push(current);
+        current = current.parentNode;
+    }
+    current = b;
+    while (current) {
+        if (ancestors.includes(current)) return current;
+        current = current.parentNode;
+    }
+    return null;
+}
+
+class Range {
+    constructor() {
+        this.startContainer = document;
+        this.startOffset = 0;
+        this.endContainer = document;
+        this.endOffset = 0;
+    }
+    setStart(node, offset) {
+        this.startContainer = node;
+        this.startOffset = Math.max(0, Number(offset) || 0);
+    }
+    setEnd(node, offset) {
+        this.endContainer = node;
+        this.endOffset = Math.max(0, Number(offset) || 0);
+    }
+    setStartBefore(node) {
+        this.setStart(node.parentNode, __aura_node_index(node));
+    }
+    setStartAfter(node) {
+        this.setStart(node.parentNode, __aura_node_index(node) + 1);
+    }
+    setEndBefore(node) {
+        this.setEnd(node.parentNode, __aura_node_index(node));
+    }
+    setEndAfter(node) {
+        this.setEnd(node.parentNode, __aura_node_index(node) + 1);
+    }
+    selectNode(node) {
+        let index = __aura_node_index(node);
+        this.setStart(node.parentNode, index);
+        this.setEnd(node.parentNode, index + 1);
+    }
+    selectNodeContents(node) {
+        this.setStart(node, 0);
+        if (__aura_is_character_data(node)) {
+            this.setEnd(node, node.data.length);
+        } else {
+            this.setEnd(node, node.childNodes ? node.childNodes.length : 0);
+        }
+    }
+    collapse(toStart) {
+        if (toStart === false) {
+            this.setStart(this.endContainer, this.endOffset);
+        } else {
+            this.setEnd(this.startContainer, this.startOffset);
+        }
+    }
+    cloneRange() {
+        let range = new Range();
+        range.setStart(this.startContainer, this.startOffset);
+        range.setEnd(this.endContainer, this.endOffset);
+        return range;
+    }
+    get collapsed() {
+        return this.startContainer === this.endContainer && this.startOffset === this.endOffset;
+    }
+    get commonAncestorContainer() {
+        return __aura_common_ancestor(this.startContainer, this.endContainer);
+    }
+    _selectedChildren() {
+        if (this.startContainer !== this.endContainer || __aura_is_character_data(this.startContainer)) return [];
+        let nodes = [];
+        let children = this.startContainer.childNodes || new NodeList([]);
+        let end = Math.min(this.endOffset, children.length);
+        for (let i = this.startOffset; i < end; i++) {
+            let child = children.item(i);
+            if (child) nodes.push(child);
+        }
+        return nodes;
+    }
+    cloneContents() {
+        let fragment = document.createDocumentFragment();
+        if (this.startContainer === this.endContainer && __aura_is_character_data(this.startContainer)) {
+            fragment.appendChild(document.createTextNode(this.startContainer.data.slice(this.startOffset, this.endOffset)));
+            return fragment;
+        }
+        let nodes = this._selectedChildren();
+        for (let i = 0; i < nodes.length; i++) {
+            fragment.appendChild(nodes[i].cloneNode(true));
+        }
+        return fragment;
+    }
+    extractContents() {
+        let fragment = document.createDocumentFragment();
+        if (this.startContainer === this.endContainer && __aura_is_character_data(this.startContainer)) {
+            let node = this.startContainer;
+            let data = node.data;
+            fragment.appendChild(document.createTextNode(data.slice(this.startOffset, this.endOffset)));
+            node.data = data.slice(0, this.startOffset) + data.slice(this.endOffset);
+            this.collapse(true);
+            return fragment;
+        }
+        let nodes = this._selectedChildren();
+        for (let i = 0; i < nodes.length; i++) {
+            fragment.appendChild(nodes[i]);
+        }
+        this.collapse(true);
+        return fragment;
+    }
+    deleteContents() {
+        this.extractContents();
+    }
+    insertNode(node) {
+        if (__aura_is_character_data(this.startContainer)) {
+            let text = this.startContainer;
+            let parent = text.parentNode;
+            let after = document.createTextNode(text.data.slice(this.startOffset));
+            text.data = text.data.slice(0, this.startOffset);
+            parent.insertBefore(after, text.nextSibling);
+            parent.insertBefore(node, after);
+            return;
+        }
+        this.startContainer.insertBefore(node, __aura_child_at(this.startContainer, this.startOffset));
+    }
+    surroundContents(newParent) {
+        let fragment = this.extractContents();
+        newParent.appendChild(fragment);
+        this.insertNode(newParent);
+        this.selectNode(newParent);
+    }
+    toString() {
+        if (this.startContainer === this.endContainer && __aura_is_character_data(this.startContainer)) {
+            return this.startContainer.data.slice(this.startOffset, this.endOffset);
+        }
+        let nodes = this._selectedChildren();
+        if (nodes.length > 0) {
+            return nodes.map(node => node.textContent || '').join('');
+        }
+        return '';
+    }
+    getBoundingClientRect() {
+        return { x:0, y:0, width:0, height:0, top:0, left:0, right:0, bottom:0 };
+    }
+    getClientRects() {
+        return [];
+    }
+}
+
 // -- Node & Element Classes ---------------------------------------------------
 
 // Node type constants (static properties added after class definition)
@@ -1388,24 +1559,8 @@ var document = {
         return new NodeIterator(root, whatToShow, filter);
     },
 
-    // createRange stub
     createRange: function() {
-        return {
-            setStart: function() {},
-            setEnd: function() {},
-            selectNode: function() {},
-            selectNodeContents: function() {},
-            collapse: function() {},
-            cloneRange: function() { return document.createRange(); },
-            deleteContents: function() {},
-            extractContents: function() { return document.createDocumentFragment(); },
-            insertNode: function() {},
-            surroundContents: function() {},
-            getBoundingClientRect: function() { return { x:0, y:0, width:0, height:0, top:0, left:0, right:0, bottom:0 }; },
-            getClientRects: function() { return []; },
-            toString: function() { return ''; },
-            commonAncestorContainer: null,
-        };
+        return new Range();
     },
 
     // execCommand stub
@@ -2060,6 +2215,7 @@ window.HTMLCollection = HTMLCollection;
 window.NodeFilter = NodeFilter;
 window.TreeWalker = TreeWalker;
 window.NodeIterator = NodeIterator;
+window.Range = Range;
 window.EventTarget = EventTarget;
 window.XMLHttpRequest = XMLHttpRequest;
 window.DOMTokenList = DOMTokenList;
