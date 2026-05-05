@@ -700,6 +700,100 @@ function __aura_common_ancestor(a, b) {
     return null;
 }
 
+var __aura_mutation_observers = [];
+var __aura_mutation_delivery_scheduled = false;
+
+function __aura_static_node_list(nodes) {
+    return new NodeList((nodes || []).map(node => node && node._id).filter(id => id !== undefined && id !== null));
+}
+
+function __aura_mutation_options_match(record, options) {
+    if (record.type === 'childList') return !!options.childList;
+    if (record.type === 'attributes') {
+        if (!options.attributes) return false;
+        if (options.attributeFilter && !options.attributeFilter.includes(record.attributeName)) return false;
+        return true;
+    }
+    if (record.type === 'characterData') return !!options.characterData;
+    return false;
+}
+
+function __aura_observes_target(observedTarget, recordTarget, subtree) {
+    if (observedTarget === recordTarget) return true;
+    return !!subtree && observedTarget && observedTarget.contains && observedTarget.contains(recordTarget);
+}
+
+function __aura_schedule_mutation_delivery() {
+    if (__aura_mutation_delivery_scheduled) return;
+    __aura_mutation_delivery_scheduled = true;
+    Promise.resolve().then(function() {
+        __aura_mutation_delivery_scheduled = false;
+        for (let observer of __aura_mutation_observers.slice()) {
+            let records = observer.takeRecords();
+            if (records.length > 0) observer._callback(records, observer);
+        }
+    });
+}
+
+function __aura_queue_mutation(record) {
+    let queuedAny = false;
+    for (let observer of __aura_mutation_observers) {
+        for (let registration of observer._registrations) {
+            if (!__aura_observes_target(registration.target, record.target, registration.options.subtree)) continue;
+            if (!__aura_mutation_options_match(record, registration.options)) continue;
+            let queued = Object.assign({}, record);
+            if (queued.type === 'attributes' && !registration.options.attributeOldValue) queued.oldValue = null;
+            if (queued.type === 'characterData' && !registration.options.characterDataOldValue) queued.oldValue = null;
+            observer._records.push(queued);
+            queuedAny = true;
+            break;
+        }
+    }
+    if (queuedAny) __aura_schedule_mutation_delivery();
+}
+
+function __aura_child_list_mutation(target, addedNodes, removedNodes, previousSibling, nextSibling) {
+    __aura_queue_mutation({
+        type: 'childList',
+        target,
+        addedNodes: __aura_static_node_list(addedNodes),
+        removedNodes: __aura_static_node_list(removedNodes),
+        previousSibling: previousSibling || null,
+        nextSibling: nextSibling || null,
+        attributeName: null,
+        attributeNamespace: null,
+        oldValue: null
+    });
+}
+
+function __aura_attribute_mutation(target, name, oldValue) {
+    __aura_queue_mutation({
+        type: 'attributes',
+        target,
+        addedNodes: new NodeList([]),
+        removedNodes: new NodeList([]),
+        previousSibling: null,
+        nextSibling: null,
+        attributeName: String(name),
+        attributeNamespace: null,
+        oldValue
+    });
+}
+
+function __aura_character_data_mutation(target, oldValue) {
+    __aura_queue_mutation({
+        type: 'characterData',
+        target,
+        addedNodes: new NodeList([]),
+        removedNodes: new NodeList([]),
+        previousSibling: null,
+        nextSibling: null,
+        attributeName: null,
+        attributeNamespace: null,
+        oldValue
+    });
+}
+
 class Range {
     constructor() {
         this.startContainer = document;
@@ -905,7 +999,9 @@ class Node extends EventTarget {
     }
     set textContent(val) {
         if (!this._id) return;
+        let oldChildren = Array.from(this.childNodes || []);
         __aura_set_text_content(this._id, String(val));
+        __aura_child_list_mutation(this, Array.from(this.childNodes || []), oldChildren, null, null);
     }
     get nextSibling() {
         if (!this._id) return null;
@@ -965,19 +1061,37 @@ class Node extends EventTarget {
     }
     appendChild(child) {
         if (child && child._id !== undefined && child._id !== null) {
+            let added = child.nodeType === Node.DOCUMENT_FRAGMENT_NODE ? Array.from(child.childNodes) : [child];
+            let oldParent = child.nodeType === Node.DOCUMENT_FRAGMENT_NODE ? null : child.parentNode;
+            let oldPrevious = child.previousSibling;
+            let oldNext = child.nextSibling;
+            let previous = this.lastChild;
             __aura_append_child(this._id, child._id);
+            if (oldParent && oldParent !== this) __aura_child_list_mutation(oldParent, [], [child], oldPrevious, oldNext);
+            if (added.length > 0) __aura_child_list_mutation(this, added, [], previous, null);
         }
         return child;
     }
     removeChild(child) {
         if (child && child._id !== undefined && child._id !== null) {
+            let previous = child.previousSibling;
+            let next = child.nextSibling;
             __aura_remove_child(this._id, child._id);
+            __aura_child_list_mutation(this, [], [child], previous, next);
         }
         return child;
     }
     insertBefore(newChild, refChild) {
         if (newChild && newChild._id !== undefined && newChild._id !== null) {
+            let added = newChild.nodeType === Node.DOCUMENT_FRAGMENT_NODE ? Array.from(newChild.childNodes) : [newChild];
+            let oldParent = newChild.nodeType === Node.DOCUMENT_FRAGMENT_NODE ? null : newChild.parentNode;
+            let oldPrevious = newChild.previousSibling;
+            let oldNext = newChild.nextSibling;
+            let previous = refChild ? refChild.previousSibling : this.lastChild;
+            let next = refChild || null;
             __aura_insert_before(this._id, newChild._id, refChild ? refChild._id : null);
+            if (oldParent && oldParent !== this) __aura_child_list_mutation(oldParent, [], [newChild], oldPrevious, oldNext);
+            if (added.length > 0) __aura_child_list_mutation(this, added, [], previous, next);
         }
         return newChild;
     }
@@ -1063,13 +1177,17 @@ class Element extends Node {
         return __aura_get_attribute(this._id, 'class') || '';
     }
     set className(val) {
+        let oldValue = this.getAttribute('class');
         __aura_set_attribute(this._id, 'class', String(val));
+        __aura_attribute_mutation(this, 'class', oldValue);
     }
     get innerHTML() {
         return __aura_get_inner_html(this._id);
     }
     set innerHTML(val) {
+        let oldChildren = Array.from(this.childNodes || []);
         __aura_set_inner_html(this._id, String(val));
+        __aura_child_list_mutation(this, Array.from(this.childNodes || []), oldChildren, null, null);
     }
     get outerHTML() {
         if (typeof __aura_get_outer_html === 'function') {
@@ -1087,22 +1205,32 @@ class Element extends Node {
         return __aura_get_text_content(this._id);
     }
     set textContent(val) {
+        let oldChildren = Array.from(this.childNodes || []);
         __aura_set_text_content(this._id, String(val));
+        __aura_child_list_mutation(this, Array.from(this.childNodes || []), oldChildren, null, null);
     }
     setAttribute(name, value) {
+        let oldValue = this.getAttribute(name);
         __aura_set_attribute(this._id, name, String(value));
+        __aura_attribute_mutation(this, name, oldValue);
     }
     getAttribute(name) {
         return __aura_get_attribute(this._id, name);
     }
     removeAttribute(name) {
+        let oldValue = this.getAttribute(name);
         __aura_remove_attribute(this._id, name);
+        __aura_attribute_mutation(this, name, oldValue);
     }
     hasAttribute(name) {
         return __aura_has_attribute(this._id, name);
     }
     remove() {
+        let parent = this.parentNode;
+        let previous = this.previousSibling;
+        let next = this.nextSibling;
         __aura_remove_self(this._id);
+        if (parent) __aura_child_list_mutation(parent, [], [this], previous, next);
     }
     focus() {
         __aura_set_focus(this.id);
@@ -1318,9 +1446,11 @@ class TextNode extends Node {
     }
     set data(val) {
         let text = String(val);
+        let oldValue = this.data;
         if (!__aura_write_character_data(this._id, 'text', text)) {
             this._data = text;
         }
+        __aura_character_data_mutation(this, oldValue);
     }
     get nodeValue() {
         return this.data;
@@ -1346,9 +1476,11 @@ class Comment extends Node {
     }
     set data(val) {
         let text = String(val);
+        let oldValue = this.data;
         if (!__aura_write_character_data(this._id, 'comment', text)) {
             this._data = text;
         }
+        __aura_character_data_mutation(this, oldValue);
     }
     get nodeValue() {
         return this.data;
@@ -1878,12 +2010,40 @@ window.fetch = function(url) {
     });
 };
 
-// -- MutationObserver stub ---------------------------------------------------
+// -- MutationObserver --------------------------------------------------------
 class MutationObserver {
-    constructor(callback) { this._callback = callback; }
-    observe(target, options) {}
-    disconnect() {}
-    takeRecords() { return []; }
+    constructor(callback) {
+        if (typeof callback !== 'function') throw new TypeError('MutationObserver callback must be a function');
+        this._callback = callback;
+        this._registrations = [];
+        this._records = [];
+        __aura_mutation_observers.push(this);
+    }
+    observe(target, options) {
+        options = options || {};
+        let normalized = {
+            childList: !!options.childList,
+            attributes: !!options.attributes || !!options.attributeOldValue || !!options.attributeFilter,
+            characterData: !!options.characterData || !!options.characterDataOldValue,
+            subtree: !!options.subtree,
+            attributeOldValue: !!options.attributeOldValue,
+            characterDataOldValue: !!options.characterDataOldValue,
+            attributeFilter: options.attributeFilter ? Array.from(options.attributeFilter).map(String) : null
+        };
+        this._registrations = this._registrations.filter(registration => registration.target !== target);
+        this._registrations.push({ target, options: normalized });
+        if (!__aura_mutation_observers.includes(this)) __aura_mutation_observers.push(this);
+    }
+    disconnect() {
+        this._registrations = [];
+        this._records = [];
+        __aura_mutation_observers = __aura_mutation_observers.filter(observer => observer !== this);
+    }
+    takeRecords() {
+        let records = this._records.slice();
+        this._records.length = 0;
+        return records;
+    }
 }
 
 // -- IntersectionObserver stub -----------------------------------------------
