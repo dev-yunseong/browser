@@ -657,12 +657,14 @@ pub fn process_html_with_cache(
     for (rect, node) in controls_with_nodes {
         let mut val = String::new();
         let mut name = String::new();
+        let mut input_type = String::from("text");
         if let markup5ever_rcdom::NodeData::Element { ref attrs, .. } = node.node.data {
             for attr in attrs.borrow().iter() {
                 let attr_name = attr.name.local.to_string();
                 match attr_name.as_str() {
                     "value" => val = attr.value.to_string(),
                     "name" => name = attr.value.to_string(),
+                    "type" => input_type = attr.value.to_string().to_lowercase(),
                     _ => {}
                 }
             }
@@ -672,7 +674,11 @@ pub fn process_html_with_cache(
             rect,
             initial_value: val.clone(),
         });
-        form_controls.push((rect, val));
+        // Skip button-type inputs from the GUI text-input overlay.
+        // They are still included in form_metadata for submit URL construction.
+        if !matches!(input_type.as_str(), "submit" | "button" | "reset") {
+            form_controls.push((rect, val));
+        }
     }
 
     let form_metadata = if !form_control_metas.is_empty() {
@@ -1331,6 +1337,7 @@ impl EngineHandle {
         let actor_console = console_buffer.clone();
         std::thread::Builder::new()
             .name("engine-actor".into())
+            .stack_size(8 * 1024 * 1024)
             .spawn(move || {
                 let mut eng = BrowserEngine::new_with_console(actor_console);
                 run_engine_actor_with_engine(rx, &mut eng);
