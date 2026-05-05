@@ -110,6 +110,11 @@ struct OkResponse {
     ok: bool,
 }
 
+#[derive(serde::Serialize)]
+struct SubmitResponse {
+    url: String,
+}
+
 /// Helper: run a blocking closure in spawn_blocking, converting a JoinError into an HTTP 500.
 macro_rules! blocking {
     ($f:expr) => {
@@ -237,14 +242,14 @@ async fn console_handler(State(handle): State<EngineHandle>) -> impl IntoRespons
     (StatusCode::OK, Json(entries)).into_response()
 }
 
-/// Submit the first form on the current page by evaluating `document.forms[0].submit()`.
-///
-/// Note: the JS runtime is a mock, so this is a best-effort stub.
+/// Submit the current page's form by constructing the navigation URL from
+/// form metadata (action/method/fields) stored in PageResult.
 async fn submit_handler(State(handle): State<EngineHandle>) -> impl IntoResponse {
-    blocking!(move || {
-        handle.send_evaluate_js("if(document.forms && document.forms[0]) document.forms[0].submit()".to_string())
-    });
-    (StatusCode::OK, Json(OkResponse { ok: true })).into_response()
+    let url = blocking!(move || { handle.send_submit() });
+    match url {
+        Some(nav_url) => (StatusCode::OK, Json(SubmitResponse { url: nav_url })).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(SubmitResponse { url: String::new() })).into_response(),
+    }
 }
 
 /// Build the axum Router — extracted for testability.
