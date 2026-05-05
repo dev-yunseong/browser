@@ -361,7 +361,7 @@ impl DaemonBrowserApp {
             form_values: HashMap::new(),
             start_time: std::time::Instant::now(),
             console_entries: vec![],
-            console_panel_open: true,
+            console_panel_open: false,
             console_input: String::new(),
             console_history: vec![],
             console_history_index: None,
