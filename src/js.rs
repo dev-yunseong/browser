@@ -2805,6 +2805,95 @@ mod tests {
     }
 
     #[test]
+    fn test_mutation_observer_delivers_child_list_records_as_microtask() {
+        let mut rt = make_runtime("<html><body><div id='app'><span id='one'></span></div></body></html>");
+        rt.execute(r#"
+            var mutationLog = [];
+            var app = document.getElementById('app');
+            var observer = new MutationObserver(function(records, seenObserver) {
+                mutationLog.push([
+                    records.length,
+                    records[0].type,
+                    records[0].target.id,
+                    records[0].addedNodes.length,
+                    records[0].addedNodes.item(0).id,
+                    records[0].previousSibling.id,
+                    records[0].nextSibling === null,
+                    seenObserver === observer
+                ].join(':'));
+            });
+            observer.observe(app, { childList: true });
+            var two = document.createElement('span');
+            two.id = 'two';
+            app.appendChild(two);
+        "#);
+        let result = eval(&mut rt, "mutationLog.join('|')");
+        assert_eq!(result, "1:childList:app:1:two:one:true:true");
+    }
+
+    #[test]
+    fn test_mutation_observer_take_records_for_attributes_and_character_data_subtree() {
+        let mut rt = make_runtime("<html><body><div id='app'><p id='p'>alpha</p></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var app = document.getElementById('app');
+                var p = document.getElementById('p');
+                var text = p.firstChild;
+                var observer = new MutationObserver(function() {});
+                observer.observe(app, {
+                    subtree: true,
+                    attributes: true,
+                    attributeOldValue: true,
+                    attributeFilter: ['data-x'],
+                    characterData: true,
+                    characterDataOldValue: true
+                });
+                p.setAttribute('class', 'ignored');
+                p.setAttribute('data-x', 'new');
+                text.data = 'beta';
+                var records = observer.takeRecords();
+                return records.map(function(record) {
+                    return [
+                        record.type,
+                        record.target.id || record.target.nodeName,
+                        record.attributeName || '',
+                        record.oldValue === null ? 'null' : record.oldValue,
+                        record.addedNodes.length,
+                        record.removedNodes.length
+                    ].join(':');
+                }).join('|');
+            })()
+        "#);
+        assert_eq!(result, "attributes:p:data-x:null:0:0|characterData:#text::alpha:0:0");
+    }
+
+    #[test]
+    fn test_mutation_observer_records_removal_and_disconnect() {
+        let mut rt = make_runtime("<html><body><div id='app'><span id='one'></span><span id='two'></span></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var app = document.getElementById('app');
+                var one = document.getElementById('one');
+                var observer = new MutationObserver(function() {});
+                observer.observe(app, { childList: true });
+                app.removeChild(one);
+                var first = observer.takeRecords()[0];
+                observer.disconnect();
+                app.appendChild(document.createElement('b'));
+                return [
+                    first.type,
+                    first.removedNodes.length,
+                    first.removedNodes.item(0).id,
+                    first.previousSibling === null,
+                    first.nextSibling.id,
+                    observer.takeRecords().length
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "childList:1:one:true:two:0");
+    }
+
+    #[test]
     fn test_add_event_listener_fires() {
         let mut rt = make_runtime("<html><body><button id='btn'>click</button></body></html>");
         eval(&mut rt, "var clicked = false; var btn = document.getElementById('btn'); btn.addEventListener('click', function() { clicked = true; });");
