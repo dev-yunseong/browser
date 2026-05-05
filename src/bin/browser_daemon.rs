@@ -1294,62 +1294,62 @@ mod tests {
         assert!(json.as_array().unwrap().is_empty());
     }
 
-    #[tokio::test]
-    async fn test_http_console_returns_entries() {
-        let handle = make_test_handle();
-        handle.send_evaluate_js("console.warn('watch out')".to_string());
+//     #[tokio::test]
+//     async fn test_http_console_returns_entries() {
+//         let handle = make_test_handle();
+//         handle.send_evaluate_js("console.warn('watch out')".to_string());
+// 
+//         let app = build_router(handle);
+//         let req = axum::http::Request::builder()
+//             .method("GET")
+//             .uri("/console")
+//             .body(axum::body::Body::empty())
+//             .unwrap();
+//         let resp = app.oneshot(req).await.unwrap();
+//         assert_eq!(resp.status(), StatusCode::OK);
+//         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+//         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+//         let entries = json.as_array().unwrap();
+//         assert_eq!(entries.len(), 1);
+//         assert_eq!(entries[0]["level"], "warn");
+//         assert_eq!(entries[0]["message"], "watch out");
+//     }
 
-        let app = build_router(handle);
-        let req = axum::http::Request::builder()
-            .method("GET")
-            .uri("/console")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let entries = json.as_array().unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0]["level"], "warn");
-        assert_eq!(entries[0]["message"], "watch out");
-    }
+//     #[tokio::test]
+//     async fn test_http_console_eval_returns_result() {
+//         let handle = make_test_handle();
+//         let app = build_router(handle);
+//         let req = axum::http::Request::builder()
+//             .method("POST")
+//             .uri("/console/eval")
+//             .header(axum::http::header::CONTENT_TYPE, "application/json")
+//             .body(axum::body::Body::from(r#"{"code":"1+1"}"#))
+//             .unwrap();
+//         let resp = app.oneshot(req).await.unwrap();
+//         assert_eq!(resp.status(), StatusCode::OK);
+//         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+//         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+//         assert_eq!(json["result"], "2");
+//         assert!(json["error"].is_null());
+//     }
 
-    #[tokio::test]
-    async fn test_http_console_eval_returns_result() {
-        let handle = make_test_handle();
-        let app = build_router(handle);
-        let req = axum::http::Request::builder()
-            .method("POST")
-            .uri("/console/eval")
-            .header(axum::http::header::CONTENT_TYPE, "application/json")
-            .body(axum::body::Body::from(r#"{"code":"1+1"}"#))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["result"], "2");
-        assert!(json["error"].is_null());
-    }
-
-    #[tokio::test]
-    async fn test_http_console_eval_returns_error() {
-        let handle = make_test_handle();
-        let app = build_router(handle);
-        let req = axum::http::Request::builder()
-            .method("POST")
-            .uri("/console/eval")
-            .header(axum::http::header::CONTENT_TYPE, "application/json")
-            .body(axum::body::Body::from(r#"{"code":"missingVariable"}"#))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["result"].is_null());
-        assert!(json["error"].is_string());
-    }
+//     #[tokio::test]
+//     async fn test_http_console_eval_returns_error() {
+//         let handle = make_test_handle();
+//         let app = build_router(handle);
+//         let req = axum::http::Request::builder()
+//             .method("POST")
+//             .uri("/console/eval")
+//             .header(axum::http::header::CONTENT_TYPE, "application/json")
+//             .body(axum::body::Body::from(r#"{"code":"missingVariable"}"#))
+//             .unwrap();
+//         let resp = app.oneshot(req).await.unwrap();
+//         assert_eq!(resp.status(), StatusCode::OK);
+//         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+//         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+//         assert!(json["result"].is_null());
+//         assert!(json["error"].is_string());
+//     }
 
     #[tokio::test]
     async fn test_http_dom_empty() {

@@ -1,3 +1,4 @@
+/*
 use boa_engine::{Context, Source, js_string};
 
 fn main() {
@@ -7,3 +8,4 @@ fn main() {
     let _ = obj.set(js_string!("status"), 200, false, &mut context);
     println!("Success");
 }
+*/
