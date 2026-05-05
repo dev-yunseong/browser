@@ -17,8 +17,8 @@ Must be done in order — each phase builds on the previous.
 | # | Issue | Why this order |
 |---|---|---|
 | #233 ✓ | [V8] Phase 1: Set up rusty_v8 + isolate + script execution | Foundation. Cargo.toml + core script eval. |
-| #234 | [V8] Phase 2: Port DOM bindings (document, window, element) (in progress by sisyphus:deepseek-v4-pro) | Depends on #233. Need DOM before events. |
-| #235 | [V8] Phase 3: Port event system + timers | Depends on #234. Events need DOM targets. |
+| #234 ✓ | [V8] Phase 2: Port DOM bindings (document, window, element) | Depends on #233. Need DOM before events. |
+| #235 | [V8] Phase 3: Port event system + timers (in progress by sisyphus:deepseek-v4-pro) | Depends on #234. Events need DOM targets. |
 | #236 | [V8] Phase 4: Port fetch, XHR, storage, CSSOM, form APIs | Depends on #235. Network/storage need stable event loop. |
 | #237 | [V8] Phase 5: Integration + real-world testing | Depends on #236. Final verification against real sites. |
 
