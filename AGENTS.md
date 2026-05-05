@@ -15,6 +15,42 @@
 - Use it for ongoing context.
 - Do not announce that handoff context unless it is directly relevant.
 
+## Browser Project Guide
+
+Browser is a Rust browser engine + native UI app.
+
+Pipeline: `Network -> DOM -> Style -> Layout -> Render -> GUI`
+
+### Common Commands
+- `cargo build`
+- `cargo build --bins`
+- `cargo run`
+- `cargo run --release`
+- `cargo check`
+- `cargo clippy`
+- `cargo test --lib`
+- `cargo test --test test_pipeline`
+- `timeout 300s cargo test -- --test-threads=2`
+- `cargo test <test_name>`
+
+### Architecture Map
+- `src/main.rs`: GUI app, fetch/image orchestration, navigation state, JS runtime integration, pipeline orchestration
+- `src/dom.rs`: HTML parsing
+- `src/css.rs`: CSS parser and selector specificity
+- `src/style.rs`: styled tree, inheritance, inline style handling, stylesheet extraction
+- `src/layout.rs`: layout tree and computed rectangles
+- `src/layer_tree.rs`: paint command tree and clipping commands
+- `src/render.rs`: raster painting
+- `src/js.rs`: Boa-based JS runtime wrapper
+
+### Project Rules
+- Use `./.agents/PRIORITY.md` to choose the next issue.
+- Render width is fixed to `800px` unless changed in code.
+- Build/check/lint on host. For daemon/CLI execution, use `drun rust:latest` (resource-limited).
+- Never run long render/integration loops without timeout.
+- Run `browser-cli-reviewer` before PR creation for browser implementation changes.
+- Before finishing implementation work, run build + tests relevant to the touched scope.
+
 ## Priority Workflows
 
 When the user asks for any of the following:
