@@ -303,6 +303,7 @@ struct DaemonBrowserApp {
     tick_promise: Option<Promise<bool>>,
     /// Pending click result — triggers re-render when a ScriptExecuted click resolves.
     click_promise: Option<Promise<Vec<engine::ClickResult>>>,
+    submit_promise: Option<Promise<Option<String>>>,
     image_promises: HashMap<String, Promise<Result<(String, Vec<u8>), String>>>,
     form_values: HashMap<String, String>,
     start_time: std::time::Instant,
@@ -355,6 +356,7 @@ impl DaemonBrowserApp {
             re_render_promise: None,
             tick_promise: None,
             click_promise: None,
+            submit_promise: None,
             image_promises: HashMap::new(),
             form_values: HashMap::new(),
             start_time: std::time::Instant::now(),
@@ -369,12 +371,13 @@ impl DaemonBrowserApp {
     }
 
     fn load_url(&mut self, url: String, width: f32) {
-        if self.history.is_empty() || self.history[self.history_index] != url {
+        let resolved = engine::resolve_url(&url);
+        if self.history.is_empty() || self.history[self.history_index] != resolved {
             self.history.truncate(self.history_index + 1);
-            self.history.push(url.clone());
+            self.history.push(resolved.clone());
             self.history_index = self.history.len() - 1;
         }
-        self.load_url_direct(url, width);
+        self.load_url_direct(resolved, width);
     }
 
     fn navigate_back(&mut self, width: f32) {
@@ -625,6 +628,16 @@ impl eframe::App for DaemonBrowserApp {
                     }
                 }
 
+                if let Some(submit_p) = &self.submit_promise {
+                    if let Some(maybe_url) = submit_p.ready() {
+                        let url = maybe_url.clone();
+                        self.submit_promise = None;
+                        if let Some(url) = url {
+                            self.load_url(url, 800.0);
+                        }
+                    }
+                }
+
                 // Poll re-render promise
                 if let Some(promise) = &self.re_render_promise {
                     match promise.ready() {
@@ -750,6 +763,19 @@ impl eframe::App for DaemonBrowserApp {
                                     egui::vec2(l_rect.width, l_rect.height),
                                 );
                                 ui.put(screen_rect, egui::TextEdit::singleline(val).id_source(i));
+                            }
+
+                            if !self.current_form_controls.is_empty()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                && self.submit_promise.is_none()
+                                && self.click_promise.is_none()
+                                && self.content_promise.is_none()
+                            {
+                                let handle = self.handle.clone();
+                                self.submit_promise = Some(Promise::spawn_thread(
+                                    "daemon-submit",
+                                    move || handle.send_submit(),
+                                ));
                             }
 
                             // Click handling

@@ -167,6 +167,22 @@ pub fn page_to_api_response(page: &PageResult, base_url: &Url) -> ApiPageRespons
     }
 }
 
+/// Resolve user input to a navigable URL.
+/// - URLs with scheme → use as-is
+/// - Domain-like input (contains dots, no spaces) → prepend `https://`
+/// - Everything else → Google search query
+pub fn resolve_url(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return trimmed.to_string();
+    }
+    if trimmed.contains('.') && !trimmed.contains(' ') {
+        return format!("https://{}", trimmed);
+    }
+    let encoded = url::form_urlencoded::byte_serialize(trimmed.as_bytes()).collect::<String>();
+    format!("https://www.google.com/search?q={}", encoded)
+}
+
 /// Extract the text content of the `<title>` element from raw HTML.
 /// Returns an empty string if no title is found.
 pub fn extract_title_from_html(html: &str) -> String {
@@ -1994,5 +2010,31 @@ mod tests {
         let url = engine.submit_form().expect("should return URL");
         assert!(url.starts_with("https://example.com/page?"));
         assert!(url.contains("q=rust"));
+    }
+
+    #[test]
+    fn test_resolve_url_http_passthrough() {
+        assert_eq!(resolve_url("http://example.com"), "http://example.com");
+        assert_eq!(resolve_url("https://example.com/path"), "https://example.com/path");
+    }
+
+    #[test]
+    fn test_resolve_url_domain_like() {
+        assert_eq!(resolve_url("google.com"), "https://google.com");
+        assert_eq!(resolve_url("example.com/page"), "https://example.com/page");
+    }
+
+    #[test]
+    fn test_resolve_url_search_query() {
+        let result = resolve_url("rust browser engine");
+        assert!(result.starts_with("https://www.google.com/search?q="));
+        assert!(result.contains("rust"));
+        assert!(result.contains("browser"));
+    }
+
+    #[test]
+    fn test_resolve_url_trims_and_encodes() {
+        let result = resolve_url("  hello world  ");
+        assert!(result.starts_with("https://www.google.com/search?q=hello+world"));
     }
 }
