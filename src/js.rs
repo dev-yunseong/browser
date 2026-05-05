@@ -3908,6 +3908,44 @@ mod tests {
     }
 
     #[test]
+    fn test_cssom_style_declaration_and_stylesheets() {
+        let mut rt = make_runtime("<html><head><style>.card { color: red; }</style></head><body><div id='el'>x</div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var el = document.getElementById('el');
+                el.style.setProperty('background-color', 'blue', 'important');
+                el.style.marginTop = '12px';
+                var removed = el.style.removeProperty('margin-top');
+                var computed = getComputedStyle(el);
+
+                var sheet = document.styleSheets[0];
+                var before = [document.styleSheets.length, sheet.cssRules.length, sheet.cssRules[0].selectorText, sheet.cssRules[0].style.color].join(',');
+                var idx = sheet.insertRule('#el { display: block; }', 1);
+                var inserted = [idx, sheet.cssRules.length, sheet.cssRules[1].style.getPropertyValue('display')].join(',');
+                sheet.deleteRule(0);
+
+                return [
+                    el.style.length,
+                    el.style.getPropertyValue('background-color'),
+                    el.style.getPropertyPriority('background-color'),
+                    removed,
+                    computed.backgroundColor,
+                    before,
+                    inserted,
+                    sheet.cssRules[0].selectorText,
+                    CSS.supports('display', 'block'),
+                    CSS.escape('a b')
+                ].join('|');
+            })()
+        "#);
+
+        assert_eq!(
+            result,
+            "1|blue|important|12px|blue|1,1,.card,red|1,2,block|#el|true|a\\20 b"
+        );
+    }
+
+    #[test]
     fn test_node_constants() {
         let mut rt = make_runtime("<html><body></body></html>");
         let elem = eval(&mut rt, "Node.ELEMENT_NODE");
