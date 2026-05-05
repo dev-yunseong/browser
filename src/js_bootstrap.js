@@ -2319,9 +2319,209 @@ window.setInterval = function(fn, delay) {
 window.clearInterval = function() {};
 
 // -- fetch() -----------------------------------------------------------------
-window.fetch = function(url) {
+class Headers {
+    constructor(init) {
+        this._headers = [];
+        if (init instanceof Headers) {
+            init.forEach((value, name) => this.append(name, value));
+        } else if (Array.isArray(init)) {
+            init.forEach(pair => this.append(pair[0], pair[1]));
+        } else if (init && typeof init === 'object') {
+            Object.keys(init).forEach(name => this.append(name, init[name]));
+        }
+    }
+    _normalizeName(name) {
+        let normalized = String(name).toLowerCase();
+        if (!normalized || /[\x00-\x20\x7f()<>@,;:\\"\/\[\]?={}]/.test(normalized)) {
+            throw new TypeError('Invalid header name');
+        }
+        return normalized;
+    }
+    _normalizeValue(value) {
+        return String(value).trim();
+    }
+    append(name, value) {
+        name = this._normalizeName(name);
+        value = this._normalizeValue(value);
+        let existing = this._headers.find(header => header[0] === name);
+        if (existing) existing[1] += ', ' + value;
+        else this._headers.push([name, value]);
+    }
+    delete(name) {
+        name = this._normalizeName(name);
+        this._headers = this._headers.filter(header => header[0] !== name);
+    }
+    get(name) {
+        name = this._normalizeName(name);
+        let header = this._headers.find(header => header[0] === name);
+        return header ? header[1] : null;
+    }
+    has(name) {
+        name = this._normalizeName(name);
+        return this._headers.some(header => header[0] === name);
+    }
+    set(name, value) {
+        name = this._normalizeName(name);
+        value = this._normalizeValue(value);
+        this.delete(name);
+        this._headers.push([name, value]);
+    }
+    forEach(callback, thisArg) {
+        this._headers.forEach(header => callback.call(thisArg, header[1], header[0], this));
+    }
+    keys() { return this._headers.map(header => header[0])[Symbol.iterator](); }
+    values() { return this._headers.map(header => header[1])[Symbol.iterator](); }
+    entries() { return this._headers.map(header => [header[0], header[1]])[Symbol.iterator](); }
+    [Symbol.iterator]() { return this.entries(); }
+}
+window.Headers = Headers;
+
+function __aura_body_to_string(body) {
+    if (body === undefined || body === null) return '';
+    if (body instanceof URLSearchParams) return body.toString();
+    if (body instanceof Blob) return body._text || '';
+    if (body instanceof FormData) {
+        let params = new URLSearchParams();
+        body.forEach((value, name) => params.append(name, value));
+        return params.toString();
+    }
+    return String(body);
+}
+
+function __aura_encode_headers(headers) {
+    let out = {};
+    headers.forEach((value, name) => { out[name] = value; });
+    return JSON.stringify(out);
+}
+
+function __aura_consumable_body(target, body) {
+    target._body = body === undefined || body === null ? '' : String(body);
+    target.bodyUsed = false;
+    target._consumeBody = function() {
+        if (this.bodyUsed) return Promise.reject(new TypeError('Body has already been used'));
+        this.bodyUsed = true;
+        return Promise.resolve(this._body);
+    };
+    target.text = function() { return this._consumeBody(); };
+    target.json = function() { return this._consumeBody().then(text => JSON.parse(text)); };
+    target.arrayBuffer = function() {
+        return this._consumeBody().then(text => {
+            let buffer = new ArrayBuffer(text.length);
+            let view = new Uint8Array(buffer);
+            for (let i = 0; i < text.length; i++) view[i] = text.charCodeAt(i) & 0xff;
+            return buffer;
+        });
+    };
+    target.blob = function() { return this._consumeBody().then(text => new Blob([text])); };
+}
+
+class Request {
+    constructor(input, init = {}) {
+        if (input instanceof Request) {
+            this.url = input.url;
+            this.method = input.method;
+            this.headers = new Headers(input.headers);
+            this.credentials = input.credentials;
+            this.mode = input.mode;
+            this.cache = input.cache;
+            this.redirect = input.redirect;
+            this.referrer = input.referrer;
+            __aura_consumable_body(this, init.body !== undefined ? __aura_body_to_string(init.body) : input._body);
+        } else {
+            this.url = new URL(String(input), location.href).href;
+            this.method = 'GET';
+            this.headers = new Headers();
+            this.credentials = 'same-origin';
+            this.mode = 'cors';
+            this.cache = 'default';
+            this.redirect = 'follow';
+            this.referrer = 'about:client';
+            __aura_consumable_body(this, '');
+        }
+
+        if (init.method !== undefined) this.method = String(init.method).toUpperCase();
+        if (init.headers !== undefined) this.headers = new Headers(init.headers);
+        if (init.credentials !== undefined) this.credentials = String(init.credentials);
+        if (init.mode !== undefined) this.mode = String(init.mode);
+        if (init.cache !== undefined) this.cache = String(init.cache);
+        if (init.redirect !== undefined) this.redirect = String(init.redirect);
+        if (init.referrer !== undefined) this.referrer = String(init.referrer);
+        if (init.body !== undefined) __aura_consumable_body(this, __aura_body_to_string(init.body));
+
+        if ((this.method === 'GET' || this.method === 'HEAD') && this._body) {
+            throw new TypeError('Request with GET/HEAD method cannot have body');
+        }
+    }
+    clone() {
+        if (this.bodyUsed) throw new TypeError('Body has already been used');
+        return new Request(this);
+    }
+}
+window.Request = Request;
+
+class Response {
+    constructor(body = null, init = {}) {
+        this.status = init.status === undefined ? 200 : Number(init.status);
+        this.statusText = init.statusText === undefined ? '' : String(init.statusText);
+        this.headers = new Headers(init.headers);
+        this.url = init.url || '';
+        this.type = init.type || 'basic';
+        this.redirected = !!init.redirected;
+        this.ok = this.status >= 200 && this.status <= 299;
+        __aura_consumable_body(this, __aura_body_to_string(body));
+    }
+    clone() {
+        if (this.bodyUsed) throw new TypeError('Body has already been used');
+        return new Response(this._body, {
+            status: this.status,
+            statusText: this.statusText,
+            headers: this.headers,
+            url: this.url,
+            type: this.type,
+            redirected: this.redirected,
+        });
+    }
+    static json(data, init = {}) {
+        let headers = new Headers(init.headers);
+        if (!headers.has('content-type')) headers.set('content-type', 'application/json');
+        return new Response(JSON.stringify(data), Object.assign({}, init, { headers }));
+    }
+    static redirect(url, status = 302) {
+        return new Response(null, { status, headers: { location: new URL(String(url), location.href).href } });
+    }
+    static error() {
+        return new Response(null, { status: 0, statusText: '', type: 'error' });
+    }
+}
+window.Response = Response;
+
+function __aura_make_fetch_response(data) {
+    return new Response(data.body || '', {
+        status: data.status || 0,
+        statusText: data.statusText || '',
+        headers: data.headers || {},
+        url: data.url || '',
+        type: data.type || 'basic',
+        redirected: !!data.redirected,
+    });
+}
+
+window.fetch = function(input, init) {
+    let request;
+    try {
+        request = new Request(input, init || {});
+    } catch (e) {
+        return Promise.reject(e);
+    }
     return new Promise((resolve, reject) => {
-        __aura_fetch(url, resolve, reject);
+        __aura_fetch(
+            request.url,
+            request.method,
+            __aura_encode_headers(request.headers),
+            request._body,
+            resolve,
+            reject
+        );
     });
 };
 
