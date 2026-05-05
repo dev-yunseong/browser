@@ -473,6 +473,152 @@ class HTMLCollection {
     }
 }
 
+var NodeFilter = {
+    FILTER_ACCEPT: 1,
+    FILTER_REJECT: 2,
+    FILTER_SKIP: 3,
+    SHOW_ALL: 0xFFFFFFFF,
+    SHOW_ELEMENT: 0x1,
+    SHOW_ATTRIBUTE: 0x2,
+    SHOW_TEXT: 0x4,
+    SHOW_CDATA_SECTION: 0x8,
+    SHOW_ENTITY_REFERENCE: 0x10,
+    SHOW_ENTITY: 0x20,
+    SHOW_PROCESSING_INSTRUCTION: 0x40,
+    SHOW_COMMENT: 0x80,
+    SHOW_DOCUMENT: 0x100,
+    SHOW_DOCUMENT_TYPE: 0x200,
+    SHOW_DOCUMENT_FRAGMENT: 0x400
+};
+
+function __aura_what_to_show_mask(node) {
+    if (!node || !node.nodeType) return 0;
+    return 1 << (node.nodeType - 1);
+}
+
+function __aura_filter_result(node, whatToShow, filter) {
+    let mask = whatToShow === undefined || whatToShow === null ? NodeFilter.SHOW_ALL : whatToShow;
+    if ((mask & __aura_what_to_show_mask(node)) === 0) return NodeFilter.FILTER_SKIP;
+    if (!filter) return NodeFilter.FILTER_ACCEPT;
+    let result;
+    if (typeof filter === 'function') {
+        result = filter(node);
+    } else if (typeof filter.acceptNode === 'function') {
+        result = filter.acceptNode(node);
+    }
+    return result || NodeFilter.FILTER_ACCEPT;
+}
+
+function __aura_tree_order(root) {
+    let nodes = [];
+    function walk(node) {
+        if (!node) return;
+        nodes.push(node);
+        let children = node.childNodes || [];
+        for (let i = 0; i < children.length; i++) walk(children[i]);
+    }
+    walk(root);
+    return nodes;
+}
+
+class TreeWalker {
+    constructor(root, whatToShow, filter) {
+        this.root = root;
+        this.whatToShow = whatToShow === undefined || whatToShow === null ? NodeFilter.SHOW_ALL : whatToShow;
+        this.filter = filter || null;
+        this.currentNode = root;
+    }
+    _visible(node) {
+        return __aura_filter_result(node, this.whatToShow, this.filter) === NodeFilter.FILTER_ACCEPT;
+    }
+    _ordered() {
+        return __aura_tree_order(this.root);
+    }
+    nextNode() {
+        let nodes = this._ordered();
+        let start = nodes.indexOf(this.currentNode);
+        for (let i = start + 1; i < nodes.length; i++) {
+            if (this._visible(nodes[i])) {
+                this.currentNode = nodes[i];
+                return nodes[i];
+            }
+        }
+        return null;
+    }
+    previousNode() {
+        let nodes = this._ordered();
+        let start = nodes.indexOf(this.currentNode);
+        if (start < 0) start = nodes.length;
+        for (let i = start - 1; i >= 0; i--) {
+            if (this._visible(nodes[i])) {
+                this.currentNode = nodes[i];
+                return nodes[i];
+            }
+        }
+        return null;
+    }
+    parentNode() {
+        let node = this.currentNode.parentNode;
+        while (node) {
+            if (node === this.root || this._ordered().includes(node)) {
+                if (this._visible(node)) {
+                    this.currentNode = node;
+                    return node;
+                }
+            }
+            if (node === this.root) break;
+            node = node.parentNode;
+        }
+        return null;
+    }
+    firstChild() {
+        let nodes = this.currentNode.childNodes || [];
+        for (let i = 0; i < nodes.length; i++) {
+            if (this._visible(nodes[i])) {
+                this.currentNode = nodes[i];
+                return nodes[i];
+            }
+        }
+        return null;
+    }
+    lastChild() {
+        let nodes = this.currentNode.childNodes || [];
+        for (let i = nodes.length - 1; i >= 0; i--) {
+            if (this._visible(nodes[i])) {
+                this.currentNode = nodes[i];
+                return nodes[i];
+            }
+        }
+        return null;
+    }
+    nextSibling() {
+        let parent = this.currentNode.parentNode;
+        if (!parent) return null;
+        let siblings = parent.childNodes || [];
+        let start = Array.from(siblings).indexOf(this.currentNode);
+        for (let i = start + 1; i < siblings.length; i++) {
+            if (this._visible(siblings[i])) {
+                this.currentNode = siblings[i];
+                return siblings[i];
+            }
+        }
+        return null;
+    }
+    previousSibling() {
+        let parent = this.currentNode.parentNode;
+        if (!parent) return null;
+        let siblings = parent.childNodes || [];
+        let start = Array.from(siblings).indexOf(this.currentNode);
+        for (let i = start - 1; i >= 0; i--) {
+            if (this._visible(siblings[i])) {
+                this.currentNode = siblings[i];
+                return siblings[i];
+            }
+        }
+        return null;
+    }
+}
+
 // -- Node & Element Classes ---------------------------------------------------
 
 // Node type constants (static properties added after class definition)
@@ -1186,34 +1332,8 @@ var document = {
     nodeName: '#document',
     nodeValue: null,
 
-    // createTreeWalker stub
     createTreeWalker: function(root, whatToShow, filter, expandEntityReferences) {
-        var nodes = [];
-        function collect(node) {
-            nodes.push(node);
-            var children = node && node.childNodes ? node.childNodes : [];
-            for (var i = 0; i < children.length; i++) {
-                collect(children[i]);
-            }
-        }
-        if (root && root._id) collect(root);
-        var i = 0;
-        return {
-            currentNode: root,
-            nextNode: function() {
-                if (i < nodes.length) { this.currentNode = nodes[i++]; return this.currentNode; }
-                return null;
-            },
-            previousNode: function() {
-                if (i > 0) { this.currentNode = nodes[--i]; return this.currentNode; }
-                return null;
-            },
-            firstChild: function() { return null; },
-            lastChild: function() { return null; },
-            nextSibling: function() { return null; },
-            previousSibling: function() { return null; },
-            parentNode: function() { return null; },
-        };
+        return new TreeWalker(root, whatToShow, filter);
     },
 
     // createNodeIterator stub
@@ -1904,6 +2024,8 @@ window.DocumentType = DocumentType;
 window.DocumentFragment = DocumentFragment;
 window.NodeList = NodeList;
 window.HTMLCollection = HTMLCollection;
+window.NodeFilter = NodeFilter;
+window.TreeWalker = TreeWalker;
 window.EventTarget = EventTarget;
 window.XMLHttpRequest = XMLHttpRequest;
 window.DOMTokenList = DOMTokenList;

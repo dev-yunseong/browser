@@ -2561,6 +2561,76 @@ mod tests {
     }
 
     #[test]
+    fn test_tree_walker_traverses_live_dom_in_document_order() {
+        let mut rt = make_runtime("<html><body><div id='app'><section id='one'><span id='inner'>x</span></section></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var app = document.getElementById('app');
+                var walker = document.createTreeWalker(app, NodeFilter.SHOW_ELEMENT);
+                var seen = [];
+                var node;
+                while ((node = walker.nextNode())) seen.push(node.id || node.nodeName);
+                var two = document.createElement('p');
+                two.id = 'two';
+                app.appendChild(two);
+                walker.currentNode = document.getElementById('inner');
+                var afterMutation = walker.nextNode();
+                return [
+                    walker instanceof TreeWalker,
+                    seen.join(','),
+                    afterMutation.id
+                ].join('|');
+            })()
+        "#);
+        assert_eq!(result, "true|one,inner|two");
+    }
+
+    #[test]
+    fn test_tree_walker_supports_node_filters_and_mixed_node_kinds() {
+        let mut rt = make_runtime("<html><body><div id='app'>alpha<!--note--><span id='keep'>x</span><span id='skip'>y</span></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var app = document.getElementById('app');
+                var walker = document.createTreeWalker(
+                    app,
+                    NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT | NodeFilter.SHOW_COMMENT,
+                    { acceptNode: function(node) {
+                        if (node.nodeType === Node.ELEMENT_NODE && node.id === 'skip') return NodeFilter.FILTER_REJECT;
+                        return NodeFilter.FILTER_ACCEPT;
+                    }}
+                );
+                var out = [];
+                var node;
+                while ((node = walker.nextNode())) {
+                    out.push(node.nodeType + ':' + (node.id || node.nodeValue));
+                }
+                return out.join('|');
+            })()
+        "#);
+        assert_eq!(result, "3:alpha|8:note|1:keep|3:x|3:y");
+    }
+
+    #[test]
+    fn test_tree_walker_cursor_navigation_methods() {
+        let mut rt = make_runtime("<html><body><div id='app'><span id='one'></span><span id='two'></span><span id='three'></span></div></body></html>");
+        let result = eval(&mut rt, r#"
+            (function() {
+                var app = document.getElementById('app');
+                var walker = document.createTreeWalker(app, NodeFilter.SHOW_ELEMENT);
+                return [
+                    walker.firstChild().id,
+                    walker.nextSibling().id,
+                    walker.previousSibling().id,
+                    walker.parentNode().id,
+                    walker.lastChild().id,
+                    walker.previousNode().id
+                ].join(':');
+            })()
+        "#);
+        assert_eq!(result, "one:two:one:app:three:two");
+    }
+
+    #[test]
     fn test_add_event_listener_fires() {
         let mut rt = make_runtime("<html><body><button id='btn'>click</button></body></html>");
         eval(&mut rt, "var clicked = false; var btn = document.getElementById('btn'); btn.addEventListener('click', function() { clicked = true; });");
