@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html><head><title>Module Tick Timer</title></head><body>
+<div id="timer-target">waiting</div>
+
+<script type="module">
+  window.__results = [];
+  window.__results.push({phase: 'module-start', value: 'executed'});
+
+  globalThis.__timer_fired = false;
+
+  setTimeout(function() {
+    document.getElementById('timer-target').textContent = 'timer-done';
+    globalThis.__timer_fired = true;
+    window.__results.push({phase: 'timer', value: 'fired'});
+  }, 10);
+</script>
+</body></html>

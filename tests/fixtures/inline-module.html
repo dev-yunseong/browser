@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html><head><title>Inline Module</title></head><body>
+<div id="target">original</div>
+<script type="module">
+  window.__results = window.__results || [];
+  window.__results.push({phase: 'module', value: 'module-executed'});
+  document.getElementById('target').textContent = 'modified-by-module';
+</script>
+<script>
+  window.__results = window.__results || [];
+  window.__results.push({phase: 'classic', value: 'classic-executed'});
+</script>
+</body></html>

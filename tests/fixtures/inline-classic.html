@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html><head><title>Inline Classic</title></head><body>
+<div id="target"></div>
+<script>
+  window.__results = [];
+  window.__results.push({phase: 'classic', value: 'sync-classic-executed'});
+  document.getElementById('target').textContent = 'modified-by-classic';
+</script>
+<script defer>
+  window.__results.push({phase: 'classic-defer', value: 'deferred-classic-executed'});
+</script>
+<script>
+  window.__results.push({phase: 'classic-sync2', value: 'after-defer'});
+</script>
+</body></html>

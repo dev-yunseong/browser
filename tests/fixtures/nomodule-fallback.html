@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html><head><title>Nomodule Fallback</title></head><body>
+<div id="target">original</div>
+
+<!-- Classic fallback should execute -->
+<script nomodule>
+  window.__results = [];
+  window.__results.push({phase: 'nomodule-classic', value: 'classic-fallback-executed'});
+  document.getElementById('target').textContent = 'updated-by-classic-nomodule';
+</script>
+
+<!-- Module script should execute -->
+<script type="module">
+  window.__results = window.__results || [];
+  window.__results.push({phase: 'module', value: 'module-executed'});
+  document.getElementById('target').textContent = 'updated-by-module';
+</script>
+</body></html>
