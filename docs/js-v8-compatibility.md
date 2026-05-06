@@ -37,9 +37,9 @@ Remaining work now belongs to `#243` and its leaf issues `#245` through `#249`.
 | URL / URLSearchParams / location | Partial | URL and location now resolve page and relative URLs; long-tail URL standard parity remains incomplete. |
 | localStorage/sessionStorage | Partial | Origin storage exists, but storage event/session behavior is not complete. |
 | Cookies / `document.cookie` | Missing or weak | Real JS-gated sites need a cookie jar and cookie semantics. Follow-up likely needed outside ES modules. |
-| Inline module scripts | Missing | Tracked by `#247`. |
-| External module scripts | Missing | Loader foundation tracked by `#245`; graph evaluation tracked by `#246`. |
-| Static imports | Missing | Tracked by `#246`. |
+| Inline module scripts | Partial | `#245` compiles inline module sources through V8 and caches by synthetic module URL. Browser lifecycle semantics remain `#247`. |
+| External module scripts | Partial | `#245` resolves, CSP-checks, fetches, compiles, and caches external module sources. Graph linking/evaluation remains `#246`. |
+| Static imports | Partial | `#245` reads V8 module requests during compile. Resolver/link/evaluate behavior remains `#246`. |
 | Dynamic `import()` | Missing | Tracked by `#247`. |
 | `import.meta.url` | Missing | Tracked by `#247`. |
 | Top-level await | Missing | Tracked by `#246`. |

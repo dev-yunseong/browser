@@ -54,6 +54,19 @@ function __aura_apply_location_href(href) {
     return true;
 }
 
+function __aura_resolve_url_attribute(value) {
+    var raw = String(value || '');
+    if (!raw) return '';
+    if (typeof __aura_resolve_url === 'function') {
+        return __aura_resolve_url(raw, location.href || document.baseURI || '');
+    }
+    try {
+        return new URL(raw, location.href || document.baseURI || undefined).href;
+    } catch (e) {
+        return raw;
+    }
+}
+
 // -- Node Registry (Ensures stable objects for events) -----------------------
 var __node_registry = new Map();
 
@@ -1626,9 +1639,9 @@ class Element extends Node {
         if (v) this.setAttribute('disabled', 'disabled');
         else this.removeAttribute('disabled');
     }
-    get href() { return __aura_get_attribute(this._id, 'href') || ''; }
+    get href() { return __aura_resolve_url_attribute(__aura_get_attribute(this._id, 'href') || ''); }
     set href(v) { __aura_set_attribute(this._id, 'href', String(v)); }
-    get src() { return __aura_get_attribute(this._id, 'src') || ''; }
+    get src() { return __aura_resolve_url_attribute(__aura_get_attribute(this._id, 'src') || ''); }
     set src(v) { __aura_set_attribute(this._id, 'src', String(v)); }
     get type() { return __aura_get_attribute(this._id, 'type') || ''; }
     set type(v) { __aura_set_attribute(this._id, 'type', String(v)); }
@@ -3408,6 +3421,8 @@ class URL {
         this._updateHref();
     }
     get hash() { return this._hash; }
+    set origin(value) { this._origin = String(value || ''); }
+    get origin() { return this._origin; }
     get searchParams() {
         if (!this._searchParams) {
             this._searchParams = new URLSearchParams(this.search, query => {
@@ -3555,7 +3570,7 @@ class HTMLImageElement extends Element {
         this.onload = null;
         this.onerror = null;
     }
-    get src() { return __aura_get_attribute(this._id, 'src') || ''; }
+    get src() { return __aura_resolve_url_attribute(__aura_get_attribute(this._id, 'src') || ''); }
     set src(v) {
         __aura_set_attribute(this._id, 'src', String(v));
         // Fire onload asynchronously since we can't actually load images
@@ -3600,13 +3615,13 @@ class HTMLButtonElement extends HTMLElement {}
 window.HTMLButtonElement = HTMLButtonElement;
 
 class HTMLAnchorElement extends HTMLElement {
-    get href() { return __aura_get_attribute(this._id, 'href') || ''; }
+    get href() { return __aura_resolve_url_attribute(__aura_get_attribute(this._id, 'href') || ''); }
     set href(v) { __aura_set_attribute(this._id, 'href', String(v)); }
 }
 window.HTMLAnchorElement = HTMLAnchorElement;
 
 class HTMLScriptElement extends HTMLElement {
-    get src() { return __aura_get_attribute(this._id, 'src') || ''; }
+    get src() { return __aura_resolve_url_attribute(__aura_get_attribute(this._id, 'src') || ''); }
     set src(v) { __aura_set_attribute(this._id, 'src', String(v)); }
     get type() { return __aura_get_attribute(this._id, 'type') || ''; }
     set type(v) { __aura_set_attribute(this._id, 'type', String(v)); }

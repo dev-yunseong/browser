@@ -1,10 +1,10 @@
+use markup5ever_rcdom;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::time::Instant;
 use url::Url;
-use rayon::prelude::*;
-use markup5ever_rcdom;
 
-use crate::{dom, css, style, layout, render, js};
+use crate::{css, dom, js, layout, render, style};
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -120,7 +120,10 @@ pub fn page_to_api_response(page: &PageResult, base_url: &Url) -> ApiPageRespons
         .enumerate()
         .map(|(i, (rect, href))| {
             // Match link text by index (same DOM traversal order as collect_links).
-            let text = link_texts.get(i).map(|(_, t)| t.clone()).unwrap_or_default();
+            let text = link_texts
+                .get(i)
+                .map(|(_, t)| t.clone())
+                .unwrap_or_default();
             ApiElement {
                 id: format!("e{}", i),
                 element_type: "link".to_string(),
@@ -129,8 +132,16 @@ pub fn page_to_api_response(page: &PageResult, base_url: &Url) -> ApiPageRespons
                 rect: ApiRect {
                     x: if rect.x.is_finite() { rect.x } else { 0.0 },
                     y: if rect.y.is_finite() { rect.y } else { 0.0 },
-                    w: if rect.width.is_finite() { rect.width } else { 0.0 },
-                    h: if rect.height.is_finite() { rect.height } else { 0.0 },
+                    w: if rect.width.is_finite() {
+                        rect.width
+                    } else {
+                        0.0
+                    },
+                    h: if rect.height.is_finite() {
+                        rect.height
+                    } else {
+                        0.0
+                    },
                 },
             }
         })
@@ -152,8 +163,16 @@ pub fn page_to_api_response(page: &PageResult, base_url: &Url) -> ApiPageRespons
                 rect: ApiRect {
                     x: if rect.x.is_finite() { rect.x } else { 0.0 },
                     y: if rect.y.is_finite() { rect.y } else { 0.0 },
-                    w: if rect.width.is_finite() { rect.width } else { 0.0 },
-                    h: if rect.height.is_finite() { rect.height } else { 0.0 },
+                    w: if rect.width.is_finite() {
+                        rect.width
+                    } else {
+                        0.0
+                    },
+                    h: if rect.height.is_finite() {
+                        rect.height
+                    } else {
+                        0.0
+                    },
                 },
             }
         })
@@ -227,10 +246,29 @@ pub fn markdown_from_html(html: &str) -> String {
                 in_style = false;
             } else if !in_script && !in_style {
                 // Insert newline for block-level tags
-                if matches!(tag_lower, "p" | "br" | "/p" | "div" | "/div"
-                    | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
-                    | "/h1" | "/h2" | "/h3" | "/h4" | "/h5" | "/h6"
-                    | "li" | "/li" | "tr" | "/tr") {
+                if matches!(
+                    tag_lower,
+                    "p" | "br"
+                        | "/p"
+                        | "div"
+                        | "/div"
+                        | "h1"
+                        | "h2"
+                        | "h3"
+                        | "h4"
+                        | "h5"
+                        | "h6"
+                        | "/h1"
+                        | "/h2"
+                        | "/h3"
+                        | "/h4"
+                        | "/h5"
+                        | "/h6"
+                        | "li"
+                        | "/li"
+                        | "tr"
+                        | "/tr"
+                ) {
                     out.push('\n');
                 }
             }
@@ -349,7 +387,9 @@ pub fn extract_form_controls_from_html(html: &str) -> Vec<(String, String)> {
             } else if tag_lower_trimmed == "/script" {
                 in_script = false;
             } else if !in_script {
-                let (verb, _) = tag_lower_trimmed.split_once(' ').unwrap_or((tag_lower_trimmed, ""));
+                let (verb, _) = tag_lower_trimmed
+                    .split_once(' ')
+                    .unwrap_or((tag_lower_trimmed, ""));
                 if matches!(verb, "input" | "textarea" | "select") {
                     // Skip hidden inputs — they are excluded from the layout tree and
                     // must not be included here to keep the index-based zip in sync.
@@ -420,12 +460,14 @@ fn extract_attr(tag: &str, attr_name: &str) -> Option<String> {
             break 'outer;
         }
         tag_byte_offset = tag_off + tag_ch.len_utf8(); // default: past end of tag
-        // Consume the lowercased expansion of `tag_ch` from `lower`.
+                                                       // Consume the lowercased expansion of `tag_ch` from `lower`.
         for lc in tag_ch.to_lowercase() {
             if let Some((_, lc_from_lower)) = lower_chars.next() {
-                debug_assert_eq!(lc, lc_from_lower,
+                debug_assert_eq!(
+                    lc, lc_from_lower,
                     "to_lowercase mismatch: tag_ch={:?} expanded to {:?} but lower had {:?}",
-                    tag_ch, lc, lc_from_lower);
+                    tag_ch, lc, lc_from_lower
+                );
                 lower_consumed += lc.len_utf8();
             }
         }
@@ -448,7 +490,9 @@ fn extract_attr(tag: &str, attr_name: &str) -> Option<String> {
         Some(inner[..end].to_string())
     } else {
         // Unquoted value
-        let end = rest.find(|c: char| c.is_whitespace() || c == '>').unwrap_or(rest.len());
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c == '>')
+            .unwrap_or(rest.len());
         Some(rest[..end].to_string())
     }
 }
@@ -479,7 +523,12 @@ pub fn collect_css_in_order(
     cache: &HashMap<String, String>,
     sources: &mut Vec<CssSource>,
 ) {
-    if let markup5ever_rcdom::NodeData::Element { ref name, ref attrs, .. } = handle.data {
+    if let markup5ever_rcdom::NodeData::Element {
+        ref name,
+        ref attrs,
+        ..
+    } = handle.data
+    {
         let tag = name.local.to_string();
         if tag == "style" {
             let mut inline = String::new();
@@ -580,8 +629,9 @@ pub fn process_html_with_cache(
         println!("  - CSS collect metadata: {:?}", start_collect.elapsed());
 
         // 2. Fetch all remote sources in parallel
-        let fetched_contents: Vec<(String, Option<String>)> =
-            sources.into_par_iter().map(|src| match src {
+        let fetched_contents: Vec<(String, Option<String>)> = sources
+            .into_par_iter()
+            .map(|src| match src {
                 CssSource::Inline(text) => (text, None),
                 CssSource::Remote(url) => {
                     let start_fetch = Instant::now();
@@ -600,7 +650,8 @@ pub fn process_html_with_cache(
                         }
                     }
                 }
-            }).collect();
+            })
+            .collect();
 
         // 3. Assemble and update cache
         let mut final_css = String::new();
@@ -774,10 +825,16 @@ pub fn process_html_with_cache(
     ))
 }
 
-fn collect_layout_metrics(layout_tree: &layout::LayoutBox, out: &mut HashMap<String, js::LayoutMetrics>) {
+fn collect_layout_metrics(
+    layout_tree: &layout::LayoutBox,
+    out: &mut HashMap<String, js::LayoutMetrics>,
+) {
     let mut stack = vec![layout_tree];
     while let Some(layout) = stack.pop() {
-        if matches!(layout.style_node.node.data, markup5ever_rcdom::NodeData::Element { .. }) {
+        if matches!(
+            layout.style_node.node.data,
+            markup5ever_rcdom::NodeData::Element { .. }
+        ) {
             out.insert(
                 js::node_path_key(&layout.style_node.node),
                 js::LayoutMetrics {
@@ -882,7 +939,8 @@ impl BrowserEngine {
         let (page, stylesheet) = result;
         self.last_stylesheet = Some(stylesheet);
         self.last_page = Some(page.clone());
-        self.js_runtime.set_layout_metrics(page.layout_metrics.clone());
+        self.js_runtime
+            .set_layout_metrics(page.layout_metrics.clone());
         self.refresh_after_image_loads(page, width)
     }
 
@@ -1061,7 +1119,10 @@ impl BrowserEngine {
     /// Return the raw HTML source of the last loaded page.
     /// Full DOM serialization is deferred to a follow-up issue.
     pub fn dom_tree(&self) -> String {
-        self.last_page.as_ref().map(|p| p.body.clone()).unwrap_or_default()
+        self.last_page
+            .as_ref()
+            .map(|p| p.body.clone())
+            .unwrap_or_default()
     }
 
     /// Return a summary of the last rendered layout.
@@ -1093,7 +1154,11 @@ impl BrowserEngine {
                 .iter()
                 .filter_map(|c| {
                     let name = c.name.trim().to_string();
-                    if name.is_empty() { None } else { Some(name) }
+                    if name.is_empty() {
+                        None
+                    } else {
+                        Some(name)
+                    }
                 })
                 .collect();
             (base_url, action, control_names)
@@ -1155,22 +1220,74 @@ impl BrowserEngine {
         let console = self.console_buffer.clone();
 
         drop_js_runtime_before_create(&mut self.js_runtime, || {
-            js::JsRuntime::new(Some(document), Some(base_url), policy, Some(metrics), console)
+            js::JsRuntime::new(
+                Some(document),
+                Some(base_url),
+                policy,
+                Some(metrics),
+                console,
+            )
         });
 
-        let scripts = js::extract_scripts_from_dom(&dom.document);
-        let allowed = self
-            .current_csp_policy
-            .as_ref()
-            .map(|p| p.allows_inline_script())
-            .unwrap_or(true);
-
-        if allowed {
-            for script in scripts {
-                self.js_runtime.execute(&script);
+        let scripts = js::extract_script_sources_from_dom(&dom.document, Some(&page.base_url));
+        for script in scripts {
+            match script {
+                js::ScriptSource::InlineClassic(script) => {
+                    let allowed = self
+                        .current_csp_policy
+                        .as_ref()
+                        .map(|p| p.allows_inline_script())
+                        .unwrap_or(true);
+                    if allowed {
+                        self.js_runtime.execute(&script);
+                    } else {
+                        println!("[CSP] Blocked inline script execution");
+                    }
+                }
+                js::ScriptSource::ExternalClassic(url) => {
+                    let allowed = self
+                        .current_csp_policy
+                        .as_ref()
+                        .map(|p| p.is_allowed("script-src", &url, Some(&page.base_url)))
+                        .unwrap_or(true);
+                    if !allowed {
+                        println!("[CSP] Blocked external script execution: {}", url);
+                        continue;
+                    }
+                    match reqwest::blocking::get(url.as_str()).and_then(|response| response.text())
+                    {
+                        Ok(script) => self.js_runtime.execute(&script),
+                        Err(err) => {
+                            println!("[JS] Failed to load external script {}: {}", url, err)
+                        }
+                    }
+                }
+                js::ScriptSource::InlineModule { url, source } => {
+                    let allowed = self
+                        .current_csp_policy
+                        .as_ref()
+                        .map(|p| p.allows_inline_script())
+                        .unwrap_or(true);
+                    if !allowed {
+                        println!("[CSP] Blocked inline module compilation: {}", url);
+                        continue;
+                    }
+                    let outcome = self.js_runtime.compile_module_source(url.clone(), source);
+                    if let Some(error) = outcome.error {
+                        println!("[JS] Failed to compile inline module {}: {}", url, error);
+                    }
+                }
+                js::ScriptSource::ExternalModule(url) => {
+                    let outcome =
+                        self.load_external_module_with(url.clone(), &page.base_url, |module_url| {
+                            reqwest::blocking::get(module_url.as_str())
+                                .and_then(|response| response.text())
+                        });
+                    if let Some(error) = outcome.error {
+                        println!("[JS] Failed to load external module {}: {}", url, error);
+                    }
+                }
             }
-        } else {
-            println!("[CSP] Blocked inline script execution");
         }
 
         let overrides = self.js_runtime.get_style_overrides();
@@ -1178,6 +1295,41 @@ impl BrowserEngine {
             for (id, props) in overrides {
                 self.js_style_overrides.entry(id).or_default().extend(props);
             }
+        }
+    }
+
+    pub fn load_external_module_with<F, E>(
+        &mut self,
+        url: Url,
+        page_base: &Url,
+        fetcher: F,
+    ) -> js::ModuleCompileOutcome
+    where
+        F: FnOnce(&Url) -> Result<String, E>,
+        E: ToString,
+    {
+        let allowed = self
+            .current_csp_policy
+            .as_ref()
+            .map(|p| p.is_allowed("script-src", &url, Some(page_base)))
+            .unwrap_or(true);
+        if !allowed {
+            return js::ModuleCompileOutcome {
+                url,
+                from_cache: false,
+                requests: Vec::new(),
+                error: Some("Blocked by script-src CSP".to_string()),
+            };
+        }
+
+        match fetcher(&url) {
+            Ok(source) => self.js_runtime.compile_module_source(url, source),
+            Err(err) => js::ModuleCompileOutcome {
+                url,
+                from_cache: false,
+                requests: Vec::new(),
+                error: Some(err.to_string()),
+            },
         }
     }
 
@@ -1203,12 +1355,16 @@ impl BrowserEngine {
     /// Advance the JS event loop by one tick.
     /// Returns `true` if a re-render is needed.
     pub fn tick_js(&mut self, timestamp: Option<f64>, deadline: Option<f64>) -> bool {
-        self.js_runtime.tick(Some(timestamp.unwrap_or(0.0)), deadline)
+        self.js_runtime
+            .tick(Some(timestamp.unwrap_or(0.0)), deadline)
     }
 }
 
 #[inline]
-fn drop_js_runtime_before_create(slot: &mut js::JsRuntime, factory: impl FnOnce() -> js::JsRuntime) {
+fn drop_js_runtime_before_create(
+    slot: &mut js::JsRuntime,
+    factory: impl FnOnce() -> js::JsRuntime,
+) {
     // SAFETY: We read the old value, drop it, then write a new value.
     // This satisfies V8's requirement that OwnedIsolate instances must be
     // dropped in reverse creation order. If we used normal assignment
@@ -1317,7 +1473,12 @@ fn run_engine_actor_with_engine(rx: mpsc::Receiver<EngineCmd>, eng: &mut Browser
                 let result = eng.navigate(&url, width);
                 let _ = reply.send(result);
             }
-            EngineCmd::ReRender { hovered_id, focused_id, width, reply } => {
+            EngineCmd::ReRender {
+                hovered_id,
+                focused_id,
+                width,
+                reply,
+            } => {
                 let result = eng.re_render(hovered_id.as_deref(), focused_id.as_deref(), width);
                 let _ = reply.send(result);
             }
@@ -1350,21 +1511,28 @@ fn run_engine_actor_with_engine(rx: mpsc::Receiver<EngineCmd>, eng: &mut Browser
                 let _ = reply.send(eng.computed_style(&selector));
             }
             EngineCmd::GetPage { reply } => {
-                let resp = eng.last_page.as_ref().map(|p| {
-                    page_to_api_response(p, &p.base_url.clone())
-                });
+                let resp = eng
+                    .last_page
+                    .as_ref()
+                    .map(|p| page_to_api_response(p, &p.base_url.clone()));
                 let _ = reply.send(resp);
             }
             EngineCmd::GetElements { reply } => {
-                let elems = eng.last_page.as_ref().map(|p| {
-                    page_to_api_response(p, &p.base_url.clone()).elements
-                }).unwrap_or_default();
+                let elems = eng
+                    .last_page
+                    .as_ref()
+                    .map(|p| page_to_api_response(p, &p.base_url.clone()).elements)
+                    .unwrap_or_default();
                 let _ = reply.send(elems);
             }
             EngineCmd::LoadImage { url, bytes } => {
                 eng.image_cache.insert(url, bytes);
             }
-            EngineCmd::Tick { timestamp, deadline, reply } => {
+            EngineCmd::Tick {
+                timestamp,
+                deadline,
+                reply,
+            } => {
                 let needs = eng.tick_js(Some(timestamp), deadline);
                 let overrides = eng.get_style_overrides();
                 for (id, props) in overrides {
@@ -1407,9 +1575,15 @@ impl EngineHandle {
     pub fn send_navigate(&self, url: String, width: f32) -> Result<PageResult, String> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.tx
-            .send(EngineCmd::Navigate { url, width, reply: reply_tx })
+            .send(EngineCmd::Navigate {
+                url,
+                width,
+                reply: reply_tx,
+            })
             .map_err(|_| "engine disconnected".to_string())?;
-        reply_rx.recv().map_err(|_| "engine disconnected".to_string())?
+        reply_rx
+            .recv()
+            .map_err(|_| "engine disconnected".to_string())?
     }
 
     pub fn send_re_render(
@@ -1420,9 +1594,16 @@ impl EngineHandle {
     ) -> Result<PageResult, String> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.tx
-            .send(EngineCmd::ReRender { hovered_id, focused_id, width, reply: reply_tx })
+            .send(EngineCmd::ReRender {
+                hovered_id,
+                focused_id,
+                width,
+                reply: reply_tx,
+            })
             .map_err(|_| "engine disconnected".to_string())?;
-        reply_rx.recv().map_err(|_| "engine disconnected".to_string())?
+        reply_rx
+            .recv()
+            .map_err(|_| "engine disconnected".to_string())?
     }
 
     pub fn send_get_page(&self) -> Option<ApiPageResponse> {
@@ -1445,7 +1626,11 @@ impl EngineHandle {
 
     pub fn send_get_elements(&self) -> Vec<ApiElement> {
         let (reply_tx, reply_rx) = mpsc::channel();
-        if self.tx.send(EngineCmd::GetElements { reply: reply_tx }).is_err() {
+        if self
+            .tx
+            .send(EngineCmd::GetElements { reply: reply_tx })
+            .is_err()
+        {
             return vec![];
         }
         reply_rx.recv().unwrap_or_default()
@@ -1453,7 +1638,15 @@ impl EngineHandle {
 
     pub fn send_click(&self, x: f32, y: f32) -> Vec<ClickResult> {
         let (reply_tx, reply_rx) = mpsc::channel();
-        if self.tx.send(EngineCmd::Click { x, y, reply: reply_tx }).is_err() {
+        if self
+            .tx
+            .send(EngineCmd::Click {
+                x,
+                y,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
             return vec![];
         }
         reply_rx.recv().unwrap_or_default()
@@ -1461,7 +1654,14 @@ impl EngineHandle {
 
     pub fn send_evaluate_js(&self, script: String) -> String {
         let (reply_tx, reply_rx) = mpsc::channel();
-        if self.tx.send(EngineCmd::EvaluateJs { script, reply: reply_tx }).is_err() {
+        if self
+            .tx
+            .send(EngineCmd::EvaluateJs {
+                script,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
             return String::new();
         }
         reply_rx.recv().unwrap_or_default()
@@ -1469,7 +1669,14 @@ impl EngineHandle {
 
     pub fn send_console_eval_result(&self, script: String) -> js::EvalOutcome {
         let (reply_tx, reply_rx) = mpsc::channel();
-        if self.tx.send(EngineCmd::EvaluateConsole { script, reply: reply_tx }).is_err() {
+        if self
+            .tx
+            .send(EngineCmd::EvaluateConsole {
+                script,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
             return js::EvalOutcome {
                 result: None,
                 error: Some("engine disconnected".to_string()),
@@ -1480,13 +1687,19 @@ impl EngineHandle {
 
     pub fn send_screenshot(&self) -> Option<Vec<u8>> {
         let (reply_tx, reply_rx) = mpsc::channel();
-        self.tx.send(EngineCmd::Screenshot { reply: reply_tx }).ok()?;
+        self.tx
+            .send(EngineCmd::Screenshot { reply: reply_tx })
+            .ok()?;
         reply_rx.recv().ok()?
     }
 
     pub fn send_dom_tree(&self) -> String {
         let (reply_tx, reply_rx) = mpsc::channel();
-        if self.tx.send(EngineCmd::DomTree { reply: reply_tx }).is_err() {
+        if self
+            .tx
+            .send(EngineCmd::DomTree { reply: reply_tx })
+            .is_err()
+        {
             return String::new();
         }
         reply_rx.recv().unwrap_or_default()
@@ -1494,7 +1707,11 @@ impl EngineHandle {
 
     pub fn send_layout_tree(&self) -> String {
         let (reply_tx, reply_rx) = mpsc::channel();
-        if self.tx.send(EngineCmd::LayoutTree { reply: reply_tx }).is_err() {
+        if self
+            .tx
+            .send(EngineCmd::LayoutTree { reply: reply_tx })
+            .is_err()
+        {
             return String::new();
         }
         reply_rx.recv().unwrap_or_default()
@@ -1502,8 +1719,12 @@ impl EngineHandle {
 
     pub fn send_computed_style(&self, selector: String) -> HashMap<String, String> {
         let (reply_tx, reply_rx) = mpsc::channel();
-        if self.tx
-            .send(EngineCmd::ComputedStyle { selector, reply: reply_tx })
+        if self
+            .tx
+            .send(EngineCmd::ComputedStyle {
+                selector,
+                reply: reply_tx,
+            })
             .is_err()
         {
             return HashMap::new();
@@ -1513,7 +1734,15 @@ impl EngineHandle {
 
     pub fn send_tick(&self, timestamp: f64, deadline: Option<f64>) -> bool {
         let (reply_tx, reply_rx) = mpsc::channel();
-        if self.tx.send(EngineCmd::Tick { timestamp, deadline, reply: reply_tx }).is_err() {
+        if self
+            .tx
+            .send(EngineCmd::Tick {
+                timestamp,
+                deadline,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
             return false;
         }
         reply_rx.recv().unwrap_or(false)
@@ -1586,43 +1815,96 @@ mod tests {
         assert!(engine.image_cache.is_empty());
     }
 
-// //     #[test]
-//     fn test_type_text_updates_focused_input_dom_state_and_events() {
-//         let mut engine = BrowserEngine::new();
-//         let base_url = Url::parse("https://example.com/").unwrap();
-//         let mut css_cache = HashMap::new();
-//         let (page, _) = process_html_with_cache(
-//             "<html><body><input id='field' value='a'><script>window.events=[]; var field = document.getElementById('field'); field.addEventListener('input', function(e) { window.events.push('input:' + e.data); }); field.addEventListener('change', function() { window.events.push('change'); });</script></body></html>",
-//             &base_url,
-//             &HashMap::new(),
-//             &mut css_cache,
-//             None,
-//             &HashMap::new(),
-//             None,
-//             None,
-//             None,
-//             800.0,
-//         )
-//         .unwrap();
-//         engine.init_js_for_page(&page);
-// 
-//         engine.js_runtime.set_focused_node_id(Some("field".to_string()));
-//         engine.type_text("bc");
-// 
-//         let value = engine.evaluate_js("document.getElementById('field').value");
-//         let events = engine.evaluate_js("window.events.join('|')");
-//         assert_eq!(value, "abc");
-//         assert_eq!(events, "input:bc|change");
-//     }
+    #[test]
+    fn test_external_module_fetch_compile_same_origin_and_cache() {
+        let mut engine = BrowserEngine::new();
+        let page_url = Url::parse("https://example.com/app/index.html").unwrap();
+        let module_url = Url::parse("https://example.com/app/main.js").unwrap();
+        let source = "import './dep.js'; export const value = 1;".to_string();
 
-// //     #[test]
-//     fn test_clear_console_empties_buffer() {
-//         let mut engine = BrowserEngine::new();
-//         engine.evaluate_js("console.log('hello')");
-//         assert_eq!(engine.console_entries().len(), 1);
-//         engine.clear_console();
-//         assert!(engine.console_entries().is_empty());
-//     }
+        let first = engine.load_external_module_with(module_url.clone(), &page_url, |url| {
+            assert_eq!(url, &module_url);
+            Ok::<String, String>(source.clone())
+        });
+        assert_eq!(first.error, None);
+        assert!(!first.from_cache);
+        assert_eq!(first.requests, vec!["./dep.js".to_string()]);
+        assert_eq!(engine.js_runtime.module_cache_len(), 1);
+
+        let second = engine.load_external_module_with(module_url.clone(), &page_url, |_url| {
+            Ok::<String, String>("export const value = 2;".to_string())
+        });
+        assert_eq!(second.error, None);
+        assert!(second.from_cache);
+        assert_eq!(engine.js_runtime.module_cache_len(), 1);
+    }
+
+    #[test]
+    fn test_external_module_fetch_compile_reports_fetch_error_without_panic() {
+        let mut engine = BrowserEngine::new();
+        let page_url = Url::parse("https://example.com/app/index.html").unwrap();
+        let module_url = Url::parse("https://example.com/app/missing.js").unwrap();
+
+        let outcome = engine.load_external_module_with(module_url, &page_url, |_url| {
+            Err::<String, String>("not found".to_string())
+        });
+
+        assert_eq!(outcome.error.as_deref(), Some("not found"));
+        assert_eq!(engine.js_runtime.module_cache_len(), 0);
+    }
+
+    #[test]
+    fn test_external_module_fetch_compile_respects_script_src_csp() {
+        let mut engine = BrowserEngine::new();
+        engine.current_csp_policy = Some(js::CspPolicy::parse("script-src 'self'"));
+        let page_url = Url::parse("https://example.com/app/index.html").unwrap();
+        let module_url = Url::parse("https://cdn.example.test/app/main.js").unwrap();
+
+        let outcome = engine.load_external_module_with(module_url, &page_url, |_url| {
+            Ok::<String, String>("export const value = 1;".to_string())
+        });
+
+        assert_eq!(outcome.error.as_deref(), Some("Blocked by script-src CSP"));
+        assert_eq!(engine.js_runtime.module_cache_len(), 0);
+    }
+
+    // //     #[test]
+    //     fn test_type_text_updates_focused_input_dom_state_and_events() {
+    //         let mut engine = BrowserEngine::new();
+    //         let base_url = Url::parse("https://example.com/").unwrap();
+    //         let mut css_cache = HashMap::new();
+    //         let (page, _) = process_html_with_cache(
+    //             "<html><body><input id='field' value='a'><script>window.events=[]; var field = document.getElementById('field'); field.addEventListener('input', function(e) { window.events.push('input:' + e.data); }); field.addEventListener('change', function() { window.events.push('change'); });</script></body></html>",
+    //             &base_url,
+    //             &HashMap::new(),
+    //             &mut css_cache,
+    //             None,
+    //             &HashMap::new(),
+    //             None,
+    //             None,
+    //             None,
+    //             800.0,
+    //         )
+    //         .unwrap();
+    //         engine.init_js_for_page(&page);
+    //
+    //         engine.js_runtime.set_focused_node_id(Some("field".to_string()));
+    //         engine.type_text("bc");
+    //
+    //         let value = engine.evaluate_js("document.getElementById('field').value");
+    //         let events = engine.evaluate_js("window.events.join('|')");
+    //         assert_eq!(value, "abc");
+    //         assert_eq!(events, "input:bc|change");
+    //     }
+
+    // //     #[test]
+    //     fn test_clear_console_empties_buffer() {
+    //         let mut engine = BrowserEngine::new();
+    //         engine.evaluate_js("console.log('hello')");
+    //         assert_eq!(engine.console_entries().len(), 1);
+    //         engine.clear_console();
+    //         assert!(engine.console_entries().is_empty());
+    //     }
 
     #[test]
     fn test_console_repl_returns_result_and_console_entries() {
@@ -1723,7 +2005,8 @@ mod tests {
 
     #[test]
     fn test_extract_form_controls_basic() {
-        let html = r#"<form><input name="user" type="text"><input name="pass" type="password"></form>"#;
+        let html =
+            r#"<form><input name="user" type="text"><input name="pass" type="password"></form>"#;
         let controls = extract_form_controls_from_html(html);
         assert_eq!(controls.len(), 2);
         assert_eq!(controls[0].0, "user");
@@ -1743,7 +2026,9 @@ mod tests {
 
     #[test]
     fn test_click_result_serde_navigate() {
-        let r = ClickResult::Navigate { url: "https://example.com".to_string() };
+        let r = ClickResult::Navigate {
+            url: "https://example.com".to_string(),
+        };
         let json = serde_json::to_string(&r).expect("serialize");
         assert!(json.contains("\"type\":\"Navigate\""));
         assert!(json.contains("\"url\":\"https://example.com\""));
@@ -1756,7 +2041,9 @@ mod tests {
 
     #[test]
     fn test_click_result_serde_focus() {
-        let r = ClickResult::FocusChanged { id: "search-input".to_string() };
+        let r = ClickResult::FocusChanged {
+            id: "search-input".to_string(),
+        };
         let json = serde_json::to_string(&r).expect("serialize");
         assert!(json.contains("\"type\":\"FocusChanged\""));
         assert!(json.contains("\"id\":\"search-input\""));
@@ -1772,7 +2059,10 @@ mod tests {
     #[test]
     fn test_extract_attr_basic() {
         let tag = r#"a href="https://example.com" class="link""#;
-        assert_eq!(extract_attr(tag, "href"), Some("https://example.com".to_string()));
+        assert_eq!(
+            extract_attr(tag, "href"),
+            Some("https://example.com".to_string())
+        );
     }
 
     #[test]
@@ -1993,33 +2283,33 @@ mod tests {
         assert_eq!(meta.controls[0].name, "q");
     }
 
-//     #[test]
-// //     fn test_submit_form_constructs_get_url_with_live_values() {
-//         let html = r#"<form action="/search" method="get"><input name="q" value="hello"></form>"#;
-//         let base = Url::parse("https://example.com").unwrap();
-//         let mut cache = HashMap::new();
-//         let (page, _) = process_html_with_cache(
-//             html,
-//             &base,
-//             &HashMap::new(),
-//             &mut cache,
-//             None,
-//             &HashMap::new(),
-//             None,
-//             None,
-//             None,
-//             800.0,
-//         )
-//         .unwrap();
-// 
-//         let mut engine = BrowserEngine::new();
-//         engine.init_js_for_page(&page);
-//         engine.last_page = Some(page);
-// 
-//         let url = engine.submit_form().expect("submit_form should return URL");
-//         assert!(url.starts_with("https://example.com/search?"));
-//         assert!(url.contains("q=hello"));
-//     }
+    //     #[test]
+    // //     fn test_submit_form_constructs_get_url_with_live_values() {
+    //         let html = r#"<form action="/search" method="get"><input name="q" value="hello"></form>"#;
+    //         let base = Url::parse("https://example.com").unwrap();
+    //         let mut cache = HashMap::new();
+    //         let (page, _) = process_html_with_cache(
+    //             html,
+    //             &base,
+    //             &HashMap::new(),
+    //             &mut cache,
+    //             None,
+    //             &HashMap::new(),
+    //             None,
+    //             None,
+    //             None,
+    //             800.0,
+    //         )
+    //         .unwrap();
+    //
+    //         let mut engine = BrowserEngine::new();
+    //         engine.init_js_for_page(&page);
+    //         engine.last_page = Some(page);
+    //
+    //         let url = engine.submit_form().expect("submit_form should return URL");
+    //         assert!(url.starts_with("https://example.com/search?"));
+    //         assert!(url.contains("q=hello"));
+    //     }
 
     #[test]
     fn test_submit_form_none_when_no_form() {
@@ -2045,38 +2335,41 @@ mod tests {
         assert!(engine.submit_form().is_none());
     }
 
-//     #[test]
-// //     fn test_submit_form_empty_action_uses_base_url() {
-//         let html = r#"<form><input name="q" value="rust"></form>"#;
-//         let base = Url::parse("https://example.com/page").unwrap();
-//         let mut cache = HashMap::new();
-//         let (page, _) = process_html_with_cache(
-//             html,
-//             &base,
-//             &HashMap::new(),
-//             &mut cache,
-//             None,
-//             &HashMap::new(),
-//             None,
-//             None,
-//             None,
-//             800.0,
-//         )
-//         .unwrap();
-// 
-//         let mut engine = BrowserEngine::new();
-//         engine.init_js_for_page(&page);
-//         engine.last_page = Some(page);
-// 
-//         let url = engine.submit_form().expect("should return URL");
-//         assert!(url.starts_with("https://example.com/page?"));
-//         assert!(url.contains("q=rust"));
-//     }
+    //     #[test]
+    // //     fn test_submit_form_empty_action_uses_base_url() {
+    //         let html = r#"<form><input name="q" value="rust"></form>"#;
+    //         let base = Url::parse("https://example.com/page").unwrap();
+    //         let mut cache = HashMap::new();
+    //         let (page, _) = process_html_with_cache(
+    //             html,
+    //             &base,
+    //             &HashMap::new(),
+    //             &mut cache,
+    //             None,
+    //             &HashMap::new(),
+    //             None,
+    //             None,
+    //             None,
+    //             800.0,
+    //         )
+    //         .unwrap();
+    //
+    //         let mut engine = BrowserEngine::new();
+    //         engine.init_js_for_page(&page);
+    //         engine.last_page = Some(page);
+    //
+    //         let url = engine.submit_form().expect("should return URL");
+    //         assert!(url.starts_with("https://example.com/page?"));
+    //         assert!(url.contains("q=rust"));
+    //     }
 
     #[test]
     fn test_resolve_url_http_passthrough() {
         assert_eq!(resolve_url("http://example.com"), "http://example.com");
-        assert_eq!(resolve_url("https://example.com/path"), "https://example.com/path");
+        assert_eq!(
+            resolve_url("https://example.com/path"),
+            "https://example.com/path"
+        );
     }
 
     #[test]
