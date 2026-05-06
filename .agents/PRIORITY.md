@@ -31,48 +31,8 @@ Must be done in order — each phase builds on the previous.
 ## Domain closure
 
 | Domain issue | Closes when |
-|---|---|
-| V8 Migration | #232 #233 #234 #235 #236 #237 done |
-
----
-
-## Priority 15 - Complete V8 Migration + ES Module Support
-
-Umbrella tracker: #243 `[JS] Complete V8 migration and ES module support` (in progress by codex:gpt-5)
-
-The runtime now embeds V8 for classic scripts, but ES modules and full modern JavaScript loading semantics remain incomplete. This priority is the new source of truth for finishing the migration after #232.
-
-Compatibility matrix: [docs/js-v8-compatibility.md](../docs/js-v8-compatibility.md)
-
-Must be done in order — each phase builds on the previous.
-
-| # | Issue | Why this order |
 |---|---|---|
-| #244 ✓ | [JS] V8 migration audit and compatibility matrix | Foundation. Clarifies stale phase issues and current support gaps. |
-| #245 ✓ | [JS] ES module loader foundation | Depends on #244. Needs resolver, fetch, CSP, cache, and V8 module compile path. |
-| #246 ✓ | [JS] ES module graph linking and evaluation | Depends on #245. Needs module graph/link/evaluate before browser semantics. |
-| #260 ✓ | [JS] import.meta.url support (Part of #247) | Depends on #246. Module evaluation must supply metadata. |
-| #261 ✓ | [JS] dynamic import() support (Part of #247) | Depends on #260. Needs import.meta pattern for module namespace access. |
-| #262 ✓ | [JS] Respect nomodule attribute (Part of #247) | Depends on #246. Script extraction must filter by attribute. |
-| #263 ✓ | [JS] Module script load/error lifecycle events (Part of #247) | Depends on #246. Events fire after module evaluation completes/fails. |
-| #264 ✓ | [JS] async/defer attribute and module execution ordering (Part of #247) | Depends on #260-#263. Execution ordering builds on full semantics. |
-| #247 ✓ | [JS] Browser ES module semantics (umbrella) | Closes when #260-#264 done. |
-| #248 ✓ | [JS] Integrate ES modules with DOM mutation, style, and tick | Depends on #247. Modules must affect rendering and async work through the event loop. |
-| #249 | [JS] ES module real-world verification (in progress by opencode:deepseek-v4-pro) | Depends on #248. Final fixture and live-site verification. |
-
-## Dependency graph
-
-```
-#244 -> #245 -> #246 -> #260 -> #261 -> #263 -> #264 -> #248 -> #249 -> #243
-                        \-> #262 -/
-```
-(#260-#264 all part of umbrella #247)
-
-## Domain closure
-
-| Domain issue | Closes when |
-|---|---|
-| Complete V8 + ES Modules | #244 #245 #246 #247 #248 #249 done |
+| Complete V8 + ES Modules ✓ | #244 #245 #246 #247 #248 #249 done |
 
 ---
 
