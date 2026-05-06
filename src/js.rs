@@ -79,6 +79,8 @@ thread_local! {
     /// Prevents re-compilation of the same module in cyclic import graphs.
     static RESOLVED_MODULES: RefCell<HashMap<String, v8::Global<v8::Module>>> =
         RefCell::new(HashMap::new());
+    /// Pending form submission requests from JS — checked by engine.
+    static FORM_SUBMIT_REQUESTS: RefCell<Vec<u32>> = RefCell::new(Vec::new());
 }
 
 unsafe extern "C" fn import_meta_callback(
@@ -1240,6 +1242,10 @@ impl JsRuntime {
     pub fn set_focused_node_id(&mut self, id: Option<String>) {
         FOCUSED_NODE.with(|f| *f.borrow_mut() = id);
     }
+
+    pub fn take_form_submit_requests(&mut self) -> Vec<u32> {
+        FORM_SUBMIT_REQUESTS.with(|r| r.borrow_mut().drain(..).collect())
+    }
 }
 
 fn register_native_functions(
@@ -1415,6 +1421,7 @@ fn register_native_functions(
     register_fn(scope, global, "requestAnimationFrame", raf_cb);
     register_fn(scope, global, "requestIdleCallback", ric_cb);
     register_fn(scope, global, "cancelIdleCallback", cic_cb);
+    register_fn(scope, global, "__aura_submit_form", submit_form_cb);
 }
 
 fn console_log(
@@ -2498,6 +2505,16 @@ fn set_focus_cb(
         FOCUSED_NODE.with(|f| *f.borrow_mut() = None);
     } else {
         FOCUSED_NODE.with(|f| *f.borrow_mut() = Some(id));
+    }
+}
+fn submit_form_cb(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let nid = args.get(0).uint32_value(scope).unwrap_or(0);
+    if nid > 0 {
+        FORM_SUBMIT_REQUESTS.with(|r| r.borrow_mut().push(nid));
     }
 }
 fn queue_task_cb(
@@ -3803,6 +3820,218 @@ mod tests {
         );
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.result.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn test_onsubmit_handler_assignment_and_dispatch() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><form id='f'></form></body></html>"#,
+            "https://example.com/",
+        );
+        rt.execute(
+            "var form = document.getElementById('f'); \
+             form.onsubmit = function(e) { e.preventDefault(); window.__handled = true; };",
+        );
+        rt.trigger_event("f", "submit");
+        let outcome = rt.execute_with_result("window.__handled");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_onclick_handler_assignment_and_dispatch() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><button id='btn'></button></body></html>"#,
+            "https://example.com/",
+        );
+        rt.execute(
+            "var btn = document.getElementById('btn'); \
+             btn.onclick = function() { window.__clicked = true; };",
+        );
+        rt.trigger_event("btn", "click");
+        let outcome = rt.execute_with_result("window.__clicked");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_onload_handler_dispatch() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body></body></html>"#,
+            "https://example.com/",
+        );
+        rt.execute(
+            "window.onload = function() { window.__loadFired = true; }; \
+             var ev = new Event('load', { bubbles: false }); \
+             window.dispatchEvent(ev);",
+        );
+        let outcome = rt.execute_with_result("window.__loadFired");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_html_form_element_submit_method_exists() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><form id='f'></form></body></html>"#,
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result("typeof document.getElementById('f').submit");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("function"));
+    }
+
+    #[test]
+    fn test_html_form_element_reset_method_exists() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><form id='f'></form></body></html>"#,
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result("typeof document.getElementById('f').reset");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("function"));
+    }
+
+    #[test]
+    fn test_document_forms_returns_actual_forms() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><form id='f1'></form><form id='f2'></form></body></html>"#,
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result("document.forms.length");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn test_form_elements_returns_controls() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><form id='f'><input name='a'><input name='b'></form></body></html>"#,
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result("document.getElementById('f').elements.length");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn test_form_submit_calls_onsubmit_handler() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><form id='f'><input name='q' value='test'></form></body></html>"#,
+            "https://example.com/",
+        );
+        rt.execute(
+            "var form = document.getElementById('f'); \
+             form.onsubmit = function(e) { e.preventDefault(); window.__formSubmitted = true; }; \
+             form.submit();",
+        );
+        let outcome = rt.execute_with_result("window.__formSubmitted");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_form_reset_resets_input_values() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><form id='f'><input name='q' value='default'></form></body></html>"#,
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result(
+            "var form = document.getElementById('f'); \
+             typeof form.reset === 'function' && \
+             form.querySelector('[name=\"q\"]') !== null",
+        );
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_form_request_submit_triggers_handler() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><form id='f'></form></body></html>"#,
+            "https://example.com/",
+        );
+        rt.execute(
+            "var form = document.getElementById('f'); \
+             form.onsubmit = function(e) { e.preventDefault(); window.__reqSubmitted = true; }; \
+             form.requestSubmit();",
+        );
+        let outcome = rt.execute_with_result("window.__reqSubmitted");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_handler_property_returns_null_when_not_set() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><form id='f'></form></body></html>"#,
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result("document.getElementById('f').onsubmit === null");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_submit_preserves_default_prevented_state() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><form id='f'></form></body></html>"#,
+            "https://example.com/",
+        );
+        rt.execute(
+            "var form = document.getElementById('f'); \
+             var prevented = false; \
+             form.addEventListener('submit', function(e) { e.preventDefault(); prevented = e.defaultPrevented; }); \
+             form.requestSubmit();",
+        );
+        let outcome = rt.execute_with_result("prevented");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_oninput_handler_dispatch() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><input id='inp' type='text'></body></html>"#,
+            "https://example.com/",
+        );
+        rt.execute(
+            "var inp = document.getElementById('inp'); \
+             inp.oninput = function() { window.__inputFired = true; };",
+        );
+        rt.trigger_event("inp", "input");
+        let outcome = rt.execute_with_result("window.__inputFired");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_onkeydown_handler_dispatch() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><input id='inp' type='text'></body></html>"#,
+            "https://example.com/",
+        );
+        rt.execute(
+            "var inp = document.getElementById('inp'); \
+             inp.onkeydown = function() { window.__keyFired = true; };",
+        );
+        rt.trigger_event("inp", "keydown");
+        let outcome = rt.execute_with_result("window.__keyFired");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_form_create_element_creates_html_form_element() {
+        let mut rt = make_dom_runtime(
+            "<html><body></body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result(
+            "var f = document.createElement('form'); typeof f.submit === 'function'",
+        );
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
     }
 }
 

@@ -169,7 +169,11 @@ function __get_or_create_node(id, tag, string_id, kind) {
     } else if (descriptor.kind === 'document') {
         node = document;
     } else if (descriptor.tag) {
-        node = new Element(id, descriptor.tag, descriptor.id);
+        if (descriptor.tag.toLowerCase() === 'form') {
+            node = new HTMLFormElement(id, descriptor.tag, descriptor.id);
+        } else {
+            node = new Element(id, descriptor.tag, descriptor.id);
+        }
     } else {
         node = new Node(id, descriptor.kind || 'element');
     }
@@ -1742,6 +1746,26 @@ class Element extends Node {
     }
 }
 
+// -- IDL Event Handler Properties (Element.prototype) -------------------------
+(function() {
+    var handlers = [
+        'onclick', 'onkeydown', 'onkeyup',
+        'onsubmit', 'oninput', 'onchange',
+        'onload', 'onerror'
+    ];
+    var defs = {};
+    for (var i = 0; i < handlers.length; i++) {
+        (function(name) {
+            var key = '_' + name;
+            defs[name] = {
+                get: function() { return this[key] || null; },
+                set: function(fn) { this[key] = fn; }
+            };
+        })(handlers[i]);
+    }
+    Object.defineProperties(Element.prototype, defs);
+})();
+
 class CharacterData extends Node {
     constructor(id, kind) {
         super(id, kind);
@@ -2088,7 +2112,11 @@ var document = {
     pointerLockElement: null,
 
     // forms / images / scripts / links collections
-    get forms() { return new NodeList([]); },
+    get forms() {
+        return new HTMLCollection(function() {
+            return JSON.parse(__aura_get_elements_by_tag(0, 'form'));
+        });
+    },
     get images() { return new NodeList([]); },
     get scripts() {
         let nids_json = __aura_get_elements_by_tag(0, 'script');
@@ -3668,8 +3696,60 @@ class HTMLStyleElement extends HTMLElement {}
 window.HTMLStyleElement = HTMLStyleElement;
 
 class HTMLFormElement extends HTMLElement {
-    submit() {}
-    reset() {}
+    _controls() {
+        var self = this;
+        var nids = [];
+        if (self._id) {
+            try { nids = nids.concat(JSON.parse(__aura_get_elements_by_tag(self._id, 'input'))); } catch(e) {}
+            try { nids = nids.concat(JSON.parse(__aura_get_elements_by_tag(self._id, 'select'))); } catch(e) {}
+            try { nids = nids.concat(JSON.parse(__aura_get_elements_by_tag(self._id, 'textarea'))); } catch(e) {}
+            try { nids = nids.concat(JSON.parse(__aura_get_elements_by_tag(self._id, 'button'))); } catch(e) {}
+        }
+        return nids;
+    }
+
+    get elements() {
+        var self = this;
+        return new HTMLCollection(function() {
+            return self._controls();
+        });
+    }
+
+    submit() {
+        var event = new Event('submit', { bubbles: true, cancelable: true });
+        var dispatched = this.dispatchEvent(event);
+        if (dispatched && typeof __aura_submit_form === 'function') {
+            __aura_submit_form(this._id);
+        }
+    }
+
+    reset() {
+        var controls = this._controls();
+        for (var i = 0; i < controls.length; i++) {
+            var node = __get_or_create_node(controls[i].nid, controls[i].tag, controls[i].id, controls[i].kind);
+            if (!node) continue;
+            if (node.tagName === 'INPUT' || node.tagName === 'TEXTAREA') {
+                node.value = node.defaultValue;
+                node.checked = node.defaultChecked;
+            } else if (node.tagName === 'SELECT') {
+                var options = Array.from(node.options);
+                for (var j = 0; j < options.length; j++) {
+                    options[j].selected = options[j].defaultSelected;
+                }
+            }
+        }
+    }
+
+    requestSubmit(submitter) {
+        var event = new Event('submit', { bubbles: true, cancelable: true });
+        if (submitter) {
+            event.submitter = submitter;
+        }
+        var dispatched = this.dispatchEvent(event);
+        if (dispatched) {
+            this.submit();
+        }
+    }
 }
 window.HTMLFormElement = HTMLFormElement;
 
