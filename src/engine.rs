@@ -1231,6 +1231,7 @@ impl BrowserEngine {
 
         let scripts = js::extract_script_sources_from_dom(&dom.document, Some(&page.base_url));
         let mut root_module_urls: Vec<Url> = Vec::new();
+        let mut module_script_targets: Vec<(Url, u32)> = Vec::new();
 
         for script in scripts {
             match script {
@@ -1264,7 +1265,7 @@ impl BrowserEngine {
                         }
                     }
                 }
-                js::ScriptSource::InlineModule { url, source } => {
+                js::ScriptSource::InlineModule { url, source, node_id } => {
                     let allowed = self
                         .current_csp_policy
                         .as_ref()
@@ -1278,11 +1279,13 @@ impl BrowserEngine {
                     if let Some(error) = outcome.error {
                         println!("[JS] Failed to compile inline module {}: {}", url, error);
                         js::push_console_entry(js::ConsoleLevel::Error, format!("Failed to compile inline module {url}: {error}"));
+                        module_script_targets.push((url, node_id));
                     } else {
-                        root_module_urls.push(url);
+                        root_module_urls.push(url.clone());
+                        module_script_targets.push((url, node_id));
                     }
                 }
-                js::ScriptSource::ExternalModule(url) => {
+                js::ScriptSource::ExternalModule { url, node_id } => {
                     let outcome =
                         self.load_external_module_with(url.clone(), &page.base_url, |module_url| {
                             reqwest::blocking::get(module_url.as_str())
@@ -1291,8 +1294,10 @@ impl BrowserEngine {
                     if let Some(error) = outcome.error {
                         println!("[JS] Failed to load external module {}: {}", url, error);
                         js::push_console_entry(js::ConsoleLevel::Error, format!("Failed to load external module {url}: {error}"));
+                        module_script_targets.push((url, node_id));
                     } else {
-                        root_module_urls.push(url);
+                        root_module_urls.push(url.clone());
+                        module_script_targets.push((url, node_id));
                     }
                 }
             }
@@ -1304,10 +1309,24 @@ impl BrowserEngine {
         if !root_module_urls.is_empty() {
             let eval_result = self.js_runtime.evaluate_module_graph(&root_module_urls);
             if let Err(errors) = eval_result {
+                let failed_urls: Vec<&str> = errors
+                    .iter()
+                    .filter_map(|e| e.split(": ").next())
+                    .collect();
                 for error in &errors {
                     println!("[JS] Module evaluation error: {error}");
                     js::push_console_entry(js::ConsoleLevel::Error, error.clone());
                 }
+                for (url, node_id) in &module_script_targets {
+                    if failed_urls.iter().any(|f| url.as_str() == *f) {
+                        self.js_runtime
+                            .trigger_event_on_node_id(*node_id, "error");
+                    }
+                }
+            }
+            for (_, node_id) in &module_script_targets {
+                self.js_runtime
+                    .trigger_event_on_node_id(*node_id, "load");
             }
         }
 

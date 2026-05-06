@@ -764,6 +764,14 @@ impl JsRuntime {
         }
     }
 
+    pub fn trigger_event_on_node_id(&mut self, node_id: u32, event_type: &str) {
+        let code = format!(
+            "document.__trigger_event({}, '{}', {{ bubbles: true }})",
+            node_id, event_type
+        );
+        self.execute(&code);
+    }
+
     pub fn execute(&mut self, source: &str) {
         let outcome = self.execute_with_result(source);
         if let Some(error) = outcome.error {
@@ -2965,7 +2973,7 @@ pub fn extract_scripts_from_dom(handle: &Handle) -> Vec<String> {
             ScriptSource::InlineClassic(script) => Some(script),
             ScriptSource::ExternalClassic(_)
             | ScriptSource::InlineModule { .. }
-            | ScriptSource::ExternalModule(_) => None,
+            | ScriptSource::ExternalModule { .. } => None,
         })
         .collect()
 }
@@ -2974,8 +2982,8 @@ pub fn extract_scripts_from_dom(handle: &Handle) -> Vec<String> {
 pub enum ScriptSource {
     InlineClassic(String),
     ExternalClassic(Url),
-    InlineModule { url: Url, source: String },
-    ExternalModule(Url),
+    InlineModule { url: Url, source: String, node_id: u32 },
+    ExternalModule { url: Url, node_id: u32 },
 }
 
 pub fn extract_script_sources_from_dom(
@@ -3027,7 +3035,8 @@ pub fn extract_script_sources_from_dom(
                     if let Some(base) = base_url {
                         if let Ok(url) = base.join(&src).or_else(|_| Url::parse(&src)) {
                             if is_module {
-                                scripts.push(ScriptSource::ExternalModule(url));
+                                let node_id = register_node(handle.clone());
+                                scripts.push(ScriptSource::ExternalModule { url, node_id });
                             } else if is_classic {
                                 scripts.push(ScriptSource::ExternalClassic(url));
                             }
@@ -3049,9 +3058,11 @@ pub fn extract_script_sources_from_dom(
                                     "inline-module-{}",
                                     inline_module_id
                                 )));
+                                let node_id = register_node(handle.clone());
                                 scripts.push(ScriptSource::InlineModule {
                                     url,
                                     source: content,
+                                    node_id,
                                 });
                             }
                         } else if is_classic {
@@ -3173,14 +3184,10 @@ mod tests {
         );
         let base = Url::parse("https://example.com/app/").unwrap();
         let sources = extract_script_sources_from_dom(&dom.document, Some(&base));
-        assert_eq!(
-            sources,
-            vec![
-                ScriptSource::InlineClassic("window.a = 1;".to_string()),
-                ScriptSource::ExternalClassic(Url::parse("https://example.com/bundle.js").unwrap()),
-                ScriptSource::ExternalModule(Url::parse("https://example.com/module.js").unwrap()),
-            ]
-        );
+        assert_eq!(sources.len(), 3);
+        assert!(matches!(&sources[0], ScriptSource::InlineClassic(s) if s == "window.a = 1;"));
+        assert!(matches!(&sources[1], ScriptSource::ExternalClassic(url) if url.as_str() == "https://example.com/bundle.js"));
+        assert!(matches!(&sources[2], ScriptSource::ExternalModule { url, node_id: _ } if url.as_str() == "https://example.com/module.js"));
     }
 
     #[test]
@@ -3191,12 +3198,8 @@ mod tests {
             r#"<html><head><script type="module" src="/m.js"></script></head></html>"#,
         );
         let module_sources = extract_script_sources_from_dom(&module_dom.document, Some(&base));
-        assert_eq!(
-            module_sources,
-            vec![ScriptSource::ExternalModule(
-                Url::parse("https://example.com/m.js").unwrap()
-            )]
-        );
+        assert_eq!(module_sources.len(), 1);
+        assert!(matches!(&module_sources[0], ScriptSource::ExternalModule { url, .. } if url.as_str() == "https://example.com/m.js"));
 
         let nomodule_dom = dom::parse_html(r#"<html><head><script nomodule>window.x=1</script></head></html>"#);
         let nomodule_sources = extract_script_sources_from_dom(&nomodule_dom.document, Some(&base));
