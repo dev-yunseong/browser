@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html><head><title>Module DOM Mutation</title></head><body>
+<div id="text-content">old-text</div>
+<div id="inner-html">old-inner</div>
+<div id="set-attr" data-x="old-attr">text</div>
+<input id="form-input" value="old-value">
+
+<script type="module">
+  window.__results = [];
+  // textContent mutation
+  document.getElementById('text-content').textContent = 'new-text';
+  window.__results.push({phase: 'textContent', value: 'done'});
+
+  // innerHTML mutation
+  document.getElementById('inner-html').innerHTML = '<span>new-inner</span>';
+  window.__results.push({phase: 'innerHTML', value: 'done'});
+
+  // setAttribute mutation
+  document.getElementById('set-attr').setAttribute('data-x', 'new-attr');
+  window.__results.push({phase: 'setAttribute', value: 'done'});
+
+  // form input value
+  document.getElementById('form-input').value = 'new-value';
+  window.__results.push({phase: 'formValue', value: 'done'});
+</script>
+</body></html>

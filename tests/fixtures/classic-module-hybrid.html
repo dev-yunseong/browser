@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html><head><title>Classic Module Hybrid</title></head><body>
+<div id="target">original</div>
+
+<script>
+  window.__results = [];
+  window.__results.push({phase: 'classic-sync1', value: 'first'});
+</script>
+
+<script defer>
+  window.__results.push({phase: 'classic-deferred', value: 'deferred-classic'});
+</script>
+
+<script type="module">
+  window.__results.push({phase: 'module', value: 'module-executed'});
+</script>
+
+<script>
+  window.__results.push({phase: 'classic-sync2', value: 'second'});
+</script>
+
+<script type="module" async>
+  window.__results.push({phase: 'async-module', value: 'async-module-executed'});
+</script>
+</body></html>

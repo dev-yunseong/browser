@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html><head><title>Module Console</title></head><body>
+<div id="target">original</div>
+
+<script type="module">
+  window.__results = [];
+  console.log('hello from module');
+  console.warn('warning from module');
+  console.error('error from module');
+  console.info('info from module');
+  window.__results.push({phase: 'console', value: 'logged'});
+</script>
+</body></html>

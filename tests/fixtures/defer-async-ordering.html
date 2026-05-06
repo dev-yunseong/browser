@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html><head><title>Defer Async Ordering</title></head><body>
+<div id="target">original</div>
+
+<script>
+  window.__results = [];
+  window.__results.push({phase: 'sync1', value: 'executed'});
+</script>
+
+<!-- defer: should execute after sync scripts, before DOMContentLoaded -->
+<script defer>
+  window.__results.push({phase: 'deferred', value: 'executed'});
+</script>
+
+<script async>
+  window.__results.push({phase: 'async', value: 'executed'});
+</script>
+
+<script>
+  window.__results.push({phase: 'sync2', value: 'executed'});
+</script>
+</body></html>

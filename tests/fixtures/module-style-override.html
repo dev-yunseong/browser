@@ -1,0 +1,12 @@
+<!DOCTYPE html>
+<html><head><title>Module Style Override</title></head><body>
+<div id="test">styled-element</div>
+
+<script type="module">
+  window.__results = [];
+  __aura_set_style('test', 'color', 'red');
+  __aura_set_style('test', 'font-size', '24px');
+  __aura_set_style('test', 'display', 'none');
+  window.__results.push({phase: 'style-override', value: 'set'});
+</script>
+</body></html>
