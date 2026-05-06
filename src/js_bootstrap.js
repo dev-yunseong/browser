@@ -1742,21 +1742,54 @@ class Element extends Node {
     }
 }
 
-class TextNode extends Node {
-    constructor(id) {
-        super(id, 'text');
+class CharacterData extends Node {
+    constructor(id, kind) {
+        super(id, kind);
         this._data = '';
     }
     get data() {
-        return this._id ? __aura_read_character_data(this._id, 'text') : this._data;
+        return this._id ? __aura_read_character_data(this._id, this._kind) : this._data;
     }
     set data(val) {
         let text = String(val);
         let oldValue = this.data;
-        if (!__aura_write_character_data(this._id, 'text', text)) {
+        if (!__aura_write_character_data(this._id, this._kind, text)) {
             this._data = text;
         }
         __aura_character_data_mutation(this, oldValue);
+    }
+    get length() {
+        return this.data.length;
+    }
+    appendData(text) {
+        this.data = this.data + String(text);
+    }
+    deleteData(offset, count) {
+        let d = this.data;
+        offset = Math.min(d.length, Math.max(0, Number(offset) || 0));
+        count = Math.max(0, Number(count) || 0);
+        this.data = d.slice(0, offset) + d.slice(offset + count);
+    }
+    insertData(offset, text) {
+        let d = this.data;
+        offset = Math.min(d.length, Math.max(0, Number(offset) || 0));
+        this.data = d.slice(0, offset) + String(text) + d.slice(offset);
+    }
+    replaceData(offset, count, text) {
+        this.deleteData(offset, count);
+        this.insertData(offset, text);
+    }
+    substringData(offset, count) {
+        let d = this.data;
+        offset = Math.min(d.length, Math.max(0, Number(offset) || 0));
+        count = Math.max(0, Number(count) || 0);
+        return d.slice(offset, offset + count);
+    }
+}
+
+class TextNode extends CharacterData {
+    constructor(id) {
+        super(id, 'text');
     }
     get nodeValue() {
         return this.data;
@@ -1772,21 +1805,10 @@ class TextNode extends Node {
     }
 }
 
-class Comment extends Node {
+class Comment extends CharacterData {
     constructor(id, data) {
         super(id, 'comment');
-        this._data = data === undefined ? '' : String(data);
-    }
-    get data() {
-        return this._id ? __aura_read_character_data(this._id, 'comment') : this._data;
-    }
-    set data(val) {
-        let text = String(val);
-        let oldValue = this.data;
-        if (!__aura_write_character_data(this._id, 'comment', text)) {
-            this._data = text;
-        }
-        __aura_character_data_mutation(this, oldValue);
+        if (data !== undefined) this._data = String(data);
     }
     get nodeValue() {
         return this.data;
@@ -3544,6 +3566,7 @@ window.IntersectionObserver = IntersectionObserver;
 window.ResizeObserver = ResizeObserver;
 window.Node = Node;
 window.Element = Element;
+window.CharacterData = CharacterData;
 window.Text = TextNode;
 window.Comment = Comment;
 window.DocumentType = DocumentType;

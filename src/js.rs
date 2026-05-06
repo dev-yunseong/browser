@@ -3618,6 +3618,192 @@ mod tests {
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.result.as_deref(), Some("object"));
     }
+
+    #[test]
+    fn test_character_data_constructor_exists() {
+        let mut rt = make_dom_runtime(
+            "<html><body>hello</body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result("typeof CharacterData");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("function"));
+    }
+
+    #[test]
+    fn test_character_data_is_window_property() {
+        let mut rt = make_dom_runtime(
+            "<html><body>hello</body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result("typeof window.CharacterData");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("function"));
+    }
+
+    #[test]
+    fn test_character_data_prototype_instanceof_node() {
+        let mut rt = make_dom_runtime(
+            "<html><body>hello</body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result("CharacterData.prototype instanceof Node");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_text_node_is_instanceof_character_data() {
+        let mut rt = make_dom_runtime(
+            "<html><body>hello</body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result("document.createTextNode('x') instanceof CharacterData");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_text_node_is_instanceof_node() {
+        let mut rt = make_dom_runtime(
+            "<html><body>hello</body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result("document.createTextNode('x') instanceof Node");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_comment_is_instanceof_character_data() {
+        let mut rt = make_dom_runtime(
+            "<html><body>hello</body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result("document.createComment('x') instanceof CharacterData");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_comment_is_instanceof_node() {
+        let mut rt = make_dom_runtime(
+            "<html><body>hello</body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result("document.createComment('x') instanceof Node");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_text_prototype_instanceof_character_data() {
+        let mut rt = make_dom_runtime(
+            "<html><body>hello</body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result("Text.prototype instanceof CharacterData");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_comment_prototype_instanceof_character_data() {
+        let mut rt = make_dom_runtime(
+            "<html><body>hello</body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result("Comment.prototype instanceof CharacterData");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_text_node_has_data_property() {
+        let mut rt = make_dom_runtime(
+            "<html><body>hello</body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result("document.createTextNode('hello').data");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn test_text_node_has_length_property() {
+        let mut rt = make_dom_runtime(
+            "<html><body>hello</body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result("document.createTextNode('hello').length");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("5"));
+    }
+
+    #[test]
+    fn test_character_data_append_data() {
+        let mut rt = make_dom_runtime(
+            "<html><body>hello</body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result(
+            "var n = document.createTextNode('hello'); n.appendData(' world'); n.data",
+        );
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn test_character_data_delete_data() {
+        let mut rt = make_dom_runtime(
+            "<html><body>hello</body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result(
+            "var n = document.createTextNode('hello'); n.deleteData(1, 3); n.data",
+        );
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("ho"));
+    }
+
+    #[test]
+    fn test_character_data_insert_data() {
+        let mut rt = make_dom_runtime(
+            "<html><body>hello</body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result(
+            "var n = document.createTextNode('ho'); n.insertData(1, 'ell'); n.data",
+        );
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn test_character_data_replace_data() {
+        let mut rt = make_dom_runtime(
+            "<html><body>hello</body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result(
+            "var n = document.createTextNode('hello world'); n.replaceData(0, 5, 'goodbye'); n.data",
+        );
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("goodbye world"));
+    }
+
+    #[test]
+    fn test_character_data_substring_data() {
+        let mut rt = make_dom_runtime(
+            "<html><body>hello</body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result(
+            "document.createTextNode('hello world').substringData(0, 5)",
+        );
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("hello"));
+    }
 }
 
 // ── DOM Helper Functions ──────────────────────────────────────────────────────
