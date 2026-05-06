@@ -81,6 +81,23 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
+unsafe extern "C" fn import_meta_callback(
+    context: v8::Local<v8::Context>,
+    module: v8::Local<v8::Module>,
+    meta: v8::Local<v8::Object>,
+) {
+    v8::callback_scope!(unsafe scope, context);
+
+    let hash = module.get_identity_hash();
+    let url = MODULE_ID_TO_URL
+        .with(|map| map.borrow().get(&hash).cloned())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let key = v8::String::new(scope, "url").unwrap();
+    let value = v8::String::new(scope, &url).unwrap();
+    meta.set(scope, key.into(), value.into());
+}
+
 fn resolve_module_callback<'s>(
     context: v8::Local<'s, v8::Context>,
     specifier: v8::Local<'s, v8::String>,
@@ -360,6 +377,7 @@ impl JsRuntime {
         });
 
         let mut isolate = v8::Isolate::new(v8::CreateParams::default());
+        isolate.set_host_initialize_import_meta_object_callback(import_meta_callback);
         let (task_sender, task_receiver) = std::sync::mpsc::channel();
         TASK_SENDER.with(|s| *s.borrow_mut() = Some(task_sender));
 
@@ -2845,13 +2863,20 @@ pub fn extract_script_sources_from_dom(
             if name.local.to_string() == "script" {
                 let mut src = None;
                 let mut script_type = None;
+                let mut has_nomodule = false;
                 for attr in attrs.borrow().iter() {
                     let attr_name = attr.name.local.to_string();
                     if attr_name == "src" {
                         src = Some(attr.value.to_string());
                     } else if attr_name == "type" {
                         script_type = Some(attr.value.to_string().trim().to_lowercase());
+                    } else if attr_name == "nomodule" {
+                        has_nomodule = true;
                     }
+                }
+
+                if has_nomodule {
+                    return;
                 }
 
                 let is_module = matches!(script_type.as_deref(), Some("module"));
@@ -3021,6 +3046,33 @@ mod tests {
                 ScriptSource::ExternalClassic(Url::parse("https://example.com/bundle.js").unwrap()),
                 ScriptSource::ExternalModule(Url::parse("https://example.com/module.js").unwrap()),
             ]
+        );
+    }
+
+    #[test]
+    fn test_extract_script_sources_skips_nomodule_scripts() {
+        let base = Url::parse("https://example.com/app/").unwrap();
+
+        let module_dom = dom::parse_html(
+            r#"<html><head><script type="module" src="/m.js"></script></head></html>"#,
+        );
+        let module_sources = extract_script_sources_from_dom(&module_dom.document, Some(&base));
+        assert_eq!(
+            module_sources,
+            vec![ScriptSource::ExternalModule(
+                Url::parse("https://example.com/m.js").unwrap()
+            )]
+        );
+
+        let nomodule_dom = dom::parse_html(r#"<html><head><script nomodule>window.x=1</script></head></html>"#);
+        let nomodule_sources = extract_script_sources_from_dom(&nomodule_dom.document, Some(&base));
+        assert!(nomodule_sources.is_empty());
+
+        let classic_dom = dom::parse_html(r#"<html><head><script>window.x=1</script></head></html>"#);
+        let classic_sources = extract_script_sources_from_dom(&classic_dom.document, Some(&base));
+        assert_eq!(
+            classic_sources,
+            vec![ScriptSource::InlineClassic("window.x=1".to_string())]
         );
     }
 
@@ -3216,6 +3268,107 @@ mod tests {
 
         let outcome = rt.execute_with_result("globalThis.__eval_order");
         assert_eq!(outcome.result.as_deref(), Some("ba"));
+    }
+
+    #[test]
+    fn test_import_meta_url_inline_module() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let url = Url::parse("https://example.com/app/main.js").unwrap();
+
+        rt.compile_module_source(
+            url.clone(),
+            "globalThis.__meta_url = import.meta.url;".to_string(),
+        );
+        rt.evaluate_module_graph(&[url.clone()]).unwrap();
+
+        let outcome = rt.execute_with_result("globalThis.__meta_url");
+        assert_eq!(outcome.error, None);
+        assert_eq!(
+            outcome.result.as_deref(),
+            Some("https://example.com/app/main.js")
+        );
+    }
+
+    #[test]
+    fn test_import_meta_url_external_module() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let url = Url::parse("https://cdn.example.com/lib/module.mjs").unwrap();
+
+        rt.compile_module_source(
+            url.clone(),
+            "globalThis.__cdn_meta_url = import.meta.url;".to_string(),
+        );
+        rt.evaluate_module_graph(&[url.clone()]).unwrap();
+
+        let outcome = rt.execute_with_result("globalThis.__cdn_meta_url");
+        assert_eq!(outcome.error, None);
+        assert_eq!(
+            outcome.result.as_deref(),
+            Some("https://cdn.example.com/lib/module.mjs")
+        );
+    }
+
+    #[test]
+    fn test_import_meta_url_dependency_module() {
+        let mut rt = make_runtime("<html><body></body></html>");
+
+        let dep_url = Url::parse("https://example.com/dep.js").unwrap();
+        rt.compile_module_source(
+            dep_url.clone(),
+            "globalThis.__dep_meta_url = import.meta.url;".to_string(),
+        );
+
+        let main_url = Url::parse("https://example.com/main.js").unwrap();
+        rt.compile_module_source(
+            main_url.clone(),
+            "import './dep.js';".to_string(),
+        );
+
+        rt.evaluate_module_graph(&[main_url]).unwrap();
+
+        let outcome = rt.execute_with_result("globalThis.__dep_meta_url");
+        assert_eq!(outcome.error, None);
+        assert_eq!(
+            outcome.result.as_deref(),
+            Some("https://example.com/dep.js")
+        );
+    }
+
+    #[test]
+    fn test_import_meta_url_with_imports() {
+        let mut rt = make_runtime("<html><body></body></html>");
+
+        let lib_url = Url::parse("https://example.com/lib/helpers.js").unwrap();
+        rt.compile_module_source(
+            lib_url.clone(),
+            "export const version = '1.0'; globalThis.__helpers_meta = import.meta.url;".to_string(),
+        );
+
+        let app_url = Url::parse("https://example.com/app/main.js").unwrap();
+        rt.compile_module_source(
+            app_url.clone(),
+            "import { version } from '../lib/helpers.js'; globalThis.__app_meta = import.meta.url; globalThis.__version = version;".to_string(),
+        );
+
+        rt.evaluate_module_graph(&[app_url]).unwrap();
+
+        let app_meta = rt.execute_with_result("globalThis.__app_meta");
+        assert_eq!(app_meta.error, None);
+        assert_eq!(
+            app_meta.result.as_deref(),
+            Some("https://example.com/app/main.js")
+        );
+
+        let helpers_meta = rt.execute_with_result("globalThis.__helpers_meta");
+        assert_eq!(helpers_meta.error, None);
+        assert_eq!(
+            helpers_meta.result.as_deref(),
+            Some("https://example.com/lib/helpers.js")
+        );
+
+        let version = rt.execute_with_result("globalThis.__version");
+        assert_eq!(version.error, None);
+        assert_eq!(version.result.as_deref(), Some("1.0"));
     }
 }
 
