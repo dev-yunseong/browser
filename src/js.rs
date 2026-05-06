@@ -4146,6 +4146,120 @@ mod tests {
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.result.as_deref(), Some("true"));
     }
+
+    #[test]
+    fn test_shadow_root_is_function() {
+        let mut rt = make_dom_runtime(
+            "<html><body></body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result("typeof ShadowRoot");
+        assert_eq!(outcome.result.as_deref(), Some("function"));
+    }
+
+    #[test]
+    fn test_intersection_observer_is_function() {
+        let mut rt = make_dom_runtime(
+            "<html><body></body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result("typeof IntersectionObserver");
+        assert_eq!(outcome.result.as_deref(), Some("function"));
+    }
+
+    #[test]
+    fn test_resize_observer_is_function() {
+        let mut rt = make_dom_runtime(
+            "<html><body></body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result("typeof ResizeObserver");
+        assert_eq!(outcome.result.as_deref(), Some("function"));
+    }
+
+    #[test]
+    fn test_mutation_observer_is_function() {
+        let mut rt = make_dom_runtime(
+            "<html><body></body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result("typeof MutationObserver");
+        assert_eq!(outcome.result.as_deref(), Some("function"));
+    }
+
+    #[test]
+    fn test_intersection_observer_has_take_records() {
+        let mut rt = make_dom_runtime(
+            "<html><body></body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result(
+            "var io = new IntersectionObserver(function() {}); \
+             typeof io.takeRecords === 'function' && io.takeRecords().length === 0",
+        );
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_mutation_observer_take_records_returns_array() {
+        let mut rt = make_dom_runtime(
+            "<html><body></body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result(
+            "var mo = new MutationObserver(function() {}); \
+             Array.isArray(mo.takeRecords())",
+        );
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_get_root_node_returns_document_for_element() {
+        let mut rt = make_dom_runtime(
+            "<html><body><div id='test'></div></body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result(
+            "document.getElementById('test').getRootNode() === document",
+        );
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_get_root_node_returns_document_for_body() {
+        let mut rt = make_dom_runtime(
+            "<html><body></body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result(
+            "document.body.getRootNode() === document",
+        );
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_get_root_node_on_document_element() {
+        let mut rt = make_dom_runtime(
+            "<html><body></body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result(
+            "document.documentElement.getRootNode() === document",
+        );
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_node_has_owner_document() {
+        let mut rt = make_dom_runtime(
+            "<html><body><div id='test'></div></body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result(
+            "document.getElementById('test').ownerDocument === document",
+        );
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
 }
 
 // ── DOM Helper Functions ──────────────────────────────────────────────────────

@@ -1177,6 +1177,12 @@ class Node extends EventTarget {
         }
         return false;
     }
+    get ownerDocument() {
+        return document;
+    }
+    getRootNode(options) {
+        return this.ownerDocument || document;
+    }
 }
 
 // -- CSSOM -------------------------------------------------------------------
@@ -3086,6 +3092,7 @@ class IntersectionObserver {
     observe(target) {}
     unobserve(target) {}
     disconnect() {}
+    takeRecords() { return []; }
 }
 
 // -- ResizeObserver stub -----------------------------------------------------
