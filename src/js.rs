@@ -4,6 +4,7 @@ use markup5ever_rcdom::{Handle, NodeData};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::num::NonZeroI32;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -69,6 +70,77 @@ thread_local! {
     static CONSOLE_BUFFER: RefCell<Option<ConsoleBuffer>> = const { RefCell::new(None) };
     static RUN_PENDING: RefCell<Vec<(v8::Global<v8::Function>, Option<f64>)>> = RefCell::new(Vec::new());
     static FETCH_PENDING: RefCell<VecDeque<(v8::Global<v8::Function>, String, bool)>> = RefCell::new(VecDeque::new());
+    /// Module source cache for resolve callback during instantiate_module.
+    static MODULE_SOURCES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    /// Maps module identity hash → URL, used by resolve callback when
+    /// get_source_url() is unavailable (rusty_v8 v147 limitation).
+    static MODULE_ID_TO_URL: RefCell<HashMap<NonZeroI32, String>> = RefCell::new(HashMap::new());
+    /// Cache of compiled dependency modules during instantiation.
+    /// Prevents re-compilation of the same module in cyclic import graphs.
+    static RESOLVED_MODULES: RefCell<HashMap<String, v8::Global<v8::Module>>> =
+        RefCell::new(HashMap::new());
+}
+
+fn resolve_module_callback<'s>(
+    context: v8::Local<'s, v8::Context>,
+    specifier: v8::Local<'s, v8::String>,
+    _import_attributes: v8::Local<'s, v8::FixedArray>,
+    referrer: v8::Local<'s, v8::Module>,
+) -> Option<v8::Local<'s, v8::Module>> {
+    v8::callback_scope!(unsafe scope, context);
+
+    let spec_str = specifier.to_rust_string_lossy(scope);
+    let base_url = {
+        let hash = referrer.get_identity_hash();
+        MODULE_ID_TO_URL.with(|map| map.borrow().get(&hash).cloned())
+    };
+
+    let resolved_url = match base_url.as_deref() {
+        Some(base) => match Url::parse(base).and_then(|b| b.join(&spec_str)) {
+            Ok(url) => url.to_string(),
+            Err(_) => return None,
+        },
+        None => return None,
+    };
+
+    let source = MODULE_SOURCES.with(|map| map.borrow().get(&resolved_url).cloned())?;
+
+    // Return cached module if already resolved (handles cyclic imports)
+    if let Some(cached) = RESOLVED_MODULES
+        .with(|map| map.borrow().get(&resolved_url).cloned())
+    {
+        return Some(v8::Local::new(scope, &cached));
+    }
+
+    let resource = v8::String::new(scope, &resolved_url)?;
+    let origin = v8::ScriptOrigin::new(
+        scope,
+        resource.into(),
+        0,
+        0,
+        false,
+        0,
+        None,
+        false,
+        false,
+        true,
+        None,
+    );
+    let code = v8::String::new(scope, &source)?;
+    let mut source_compiler = v8::script_compiler::Source::new(code, Some(&origin));
+    let dep_module = v8::script_compiler::compile_module(scope, &mut source_compiler)?;
+
+    let cached = v8::Global::new(scope, dep_module);
+    RESOLVED_MODULES.with(|map| {
+        map.borrow_mut().insert(resolved_url.clone(), cached);
+    });
+
+    MODULE_ID_TO_URL.with(|map| {
+        map.borrow_mut()
+            .insert(dep_module.get_identity_hash(), resolved_url);
+    });
+
+    Some(dep_module)
 }
 
 const MAX_CONSOLE_ENTRIES: usize = 200;
@@ -168,7 +240,7 @@ pub fn console_version(buffer: &ConsoleBuffer) -> u64 {
     buffer.version.load(Ordering::Relaxed)
 }
 
-fn push_console_entry(level: ConsoleLevel, message: String) {
+pub fn push_console_entry(level: ConsoleLevel, message: String) {
     CONSOLE_BUFFER.with(|cell| {
         if let Some(buffer) = cell.borrow().as_ref() {
             append_console_entry(buffer, level, message);
@@ -253,7 +325,6 @@ pub struct ModuleLoader {
     modules: HashMap<Url, ModuleRecord>,
 }
 
-#[derive(Clone, Debug)]
 struct ModuleRecord {
     source: String,
     requests: Vec<String>,
@@ -665,6 +736,259 @@ impl JsRuntime {
             .map(|record| record.source.as_str())
     }
 
+    pub fn cached_module_requests(&self, url: &Url) -> Option<&[String]> {
+        self.module_loader
+            .modules
+            .get(url)
+            .map(|record| record.requests.as_slice())
+    }
+
+    pub fn instantiate_module_graph(&mut self, root_urls: &[Url]) -> Result<(), Vec<String>> {
+        if root_urls.is_empty() {
+            return Ok(());
+        }
+
+        MODULE_SOURCES.with(|map| {
+            let mut map = map.borrow_mut();
+            map.clear();
+            for (url, record) in &self.module_loader.modules {
+                map.insert(url.to_string(), record.source.clone());
+            }
+        });
+        MODULE_ID_TO_URL.with(|map| map.borrow_mut().clear());
+
+        let mut errors = Vec::new();
+
+        let hs = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
+        let hs = &mut hs.init();
+        let local_context = v8::Local::new(hs, &self.global_context);
+        let scope = &mut v8::ContextScope::new(hs, local_context);
+
+        for root_url in root_urls {
+            let source = match self.module_loader.modules.get(root_url) {
+                Some(record) => record.source.clone(),
+                None => {
+                    errors.push(format!("Module not compiled: {root_url}"));
+                    continue;
+                }
+            };
+
+            let tc = std::pin::pin!(v8::TryCatch::new(scope));
+            let tc = &mut tc.init();
+
+            let code = v8::String::new(tc, &source)
+                .ok_or_else(|| "Failed to create V8 module source string".to_string());
+            let code = match code {
+                Ok(c) => c,
+                Err(e) => {
+                    errors.push(format!("{root_url}: {e}"));
+                    continue;
+                }
+            };
+
+            let resource = v8::String::new(tc, root_url.as_str())
+                .ok_or_else(|| "Failed to create V8 module resource name".to_string());
+            let resource = match resource {
+                Ok(r) => r,
+                Err(e) => {
+                    errors.push(format!("{root_url}: {e}"));
+                    continue;
+                }
+            };
+
+            let origin = v8::ScriptOrigin::new(
+                tc,
+                resource.into(),
+                0,
+                0,
+                false,
+                0,
+                None,
+                false,
+                false,
+                true,
+                None,
+            );
+            let mut source_compiler = v8::script_compiler::Source::new(code, Some(&origin));
+            let module = match v8::script_compiler::compile_module(tc, &mut source_compiler) {
+                Some(m) => m,
+                None => {
+                    let err_msg = tc
+                        .exception()
+                        .and_then(|e| e.to_string(tc))
+                        .map(|s| s.to_rust_string_lossy(tc))
+                        .unwrap_or_else(|| "Unknown compilation error".to_string());
+                    errors.push(format!("{root_url}: {err_msg}"));
+                    continue;
+                }
+            };
+
+            MODULE_ID_TO_URL.with(|map| {
+                map.borrow_mut()
+                    .insert(module.get_identity_hash(), root_url.to_string());
+            });
+
+            RESOLVED_MODULES.with(|map| {
+                map.borrow_mut()
+                    .insert(root_url.to_string(), v8::Global::new(tc, module));
+            });
+
+            let result = module.instantiate_module(tc, resolve_module_callback);
+            match result {
+                Some(true) => {}
+                Some(false) | None => {
+                    let err_msg = tc
+                        .exception()
+                        .and_then(|e| e.to_string(tc))
+                        .map(|s| s.to_rust_string_lossy(tc))
+                        .unwrap_or_else(|| "Unknown instantiation error".to_string());
+                    errors.push(format!("{root_url}: {err_msg}"));
+                }
+            }
+        }
+
+        MODULE_SOURCES.with(|map| map.borrow_mut().clear());
+        MODULE_ID_TO_URL.with(|map| map.borrow_mut().clear());
+        RESOLVED_MODULES.with(|map| map.borrow_mut().clear());
+
+        if errors.is_empty() { Ok(()) } else { Err(errors) }
+    }
+
+    pub fn evaluate_module_graph(&mut self, root_urls: &[Url]) -> Result<(), Vec<String>> {
+        if root_urls.is_empty() {
+            return Ok(());
+        }
+
+        MODULE_SOURCES.with(|map| {
+            let mut map = map.borrow_mut();
+            map.clear();
+            for (url, record) in &self.module_loader.modules {
+                map.insert(url.to_string(), record.source.clone());
+            }
+        });
+        MODULE_ID_TO_URL.with(|map| map.borrow_mut().clear());
+
+        let mut errors = Vec::new();
+
+        let hs = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
+        let hs = &mut hs.init();
+        let local_context = v8::Local::new(hs, &self.global_context);
+        let scope = &mut v8::ContextScope::new(hs, local_context);
+
+        for root_url in root_urls {
+            let source = match self.module_loader.modules.get(root_url) {
+                Some(record) => record.source.clone(),
+                None => {
+                    errors.push(format!("Module not compiled: {root_url}"));
+                    continue;
+                }
+            };
+
+            let tc = std::pin::pin!(v8::TryCatch::new(scope));
+            let tc = &mut tc.init();
+
+            let code = v8::String::new(tc, &source)
+                .ok_or_else(|| "Failed to create V8 module source string".to_string());
+            let code = match code {
+                Ok(c) => c,
+                Err(e) => {
+                    errors.push(format!("{root_url}: {e}"));
+                    continue;
+                }
+            };
+
+            let resource = v8::String::new(tc, root_url.as_str())
+                .ok_or_else(|| "Failed to create V8 module resource name".to_string());
+            let resource = match resource {
+                Ok(r) => r,
+                Err(e) => {
+                    errors.push(format!("{root_url}: {e}"));
+                    continue;
+                }
+            };
+
+            let origin = v8::ScriptOrigin::new(
+                tc,
+                resource.into(),
+                0,
+                0,
+                false,
+                0,
+                None,
+                false,
+                false,
+                true,
+                None,
+            );
+            let mut source_compiler = v8::script_compiler::Source::new(code, Some(&origin));
+            let module = match v8::script_compiler::compile_module(tc, &mut source_compiler) {
+                Some(m) => m,
+                None => {
+                    let err_msg = tc
+                        .exception()
+                        .and_then(|e| e.to_string(tc))
+                        .map(|s| s.to_rust_string_lossy(tc))
+                        .unwrap_or_else(|| "Unknown compilation error".to_string());
+                    errors.push(format!("{root_url}: {err_msg}"));
+                    continue;
+                }
+            };
+
+            MODULE_ID_TO_URL.with(|map| {
+                map.borrow_mut()
+                    .insert(module.get_identity_hash(), root_url.to_string());
+            });
+
+            // Cache root module so cyclic imports return this instance
+            RESOLVED_MODULES.with(|map| {
+                map.borrow_mut()
+                    .insert(root_url.to_string(), v8::Global::new(tc, module));
+            });
+
+            // Instantiate before evaluate — required by V8
+            let instantiate_ok = module
+                .instantiate_module(tc, resolve_module_callback)
+                .unwrap_or(false);
+            if !instantiate_ok {
+                let err_msg = tc
+                    .exception()
+                    .and_then(|e| e.to_string(tc))
+                    .map(|s| s.to_rust_string_lossy(tc))
+                    .unwrap_or_else(|| "Unknown instantiation error".to_string());
+                errors.push(format!("{root_url}: {err_msg}"));
+                continue;
+            }
+
+            let evaluate_result = module.evaluate(tc);
+            if evaluate_result.is_none()
+                || module.get_status() == v8::ModuleStatus::Errored
+            {
+                let err_msg = tc
+                    .exception()
+                    .and_then(|e| e.to_string(tc))
+                    .map(|s| s.to_rust_string_lossy(tc))
+                    .or_else(|| {
+                        if module.get_status() == v8::ModuleStatus::Errored {
+                            module
+                                .get_exception()
+                                .to_string(tc)
+                                .map(|s| s.to_rust_string_lossy(tc))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| "Unknown evaluation error".to_string());
+                errors.push(format!("{root_url}: {err_msg}"));
+            }
+        }
+
+        MODULE_SOURCES.with(|map| map.borrow_mut().clear());
+        MODULE_ID_TO_URL.with(|map| map.borrow_mut().clear());
+        RESOLVED_MODULES.with(|map| map.borrow_mut().clear());
+
+        if errors.is_empty() { Ok(()) } else { Err(errors) }
+    }
+
     fn compile_v8_module(&mut self, url: &Url, source: &str) -> Result<Vec<String>, String> {
         let hs = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
         let hs = &mut hs.init();
@@ -690,8 +1014,8 @@ impl JsRuntime {
             true,
             None,
         );
-        let mut source = v8::script_compiler::Source::new(code, Some(&origin));
-        let module = v8::script_compiler::compile_module(tc, &mut source).ok_or_else(|| {
+        let mut source_compiler = v8::script_compiler::Source::new(code, Some(&origin));
+        let module = v8::script_compiler::compile_module(tc, &mut source_compiler).ok_or_else(|| {
             tc.exception()
                 .and_then(|e| e.to_string(tc))
                 .map(|s| s.to_rust_string_lossy(tc))
@@ -2740,6 +3064,158 @@ mod tests {
         let referrer = Url::parse("https://example.com/app/modules/main.js").unwrap();
         let resolved = rt.resolve_module_specifier("./dep.js", &referrer).unwrap();
         assert_eq!(resolved.as_str(), "https://example.com/app/modules/dep.js");
+    }
+
+    #[test]
+    fn test_cached_module_requests_returns_import_specifiers() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let url = Url::parse("https://example.com/main.js").unwrap();
+        rt.compile_module_source(
+            url.clone(),
+            "import { a } from './a.js'; import { b } from './b.js';".to_string(),
+        );
+        let requests = rt.cached_module_requests(&url).unwrap();
+        assert_eq!(requests, &["./a.js", "./b.js"]);
+    }
+
+    #[test]
+    fn test_instantiate_module_graph_single_module() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let url = Url::parse("https://example.com/main.js").unwrap();
+        rt.compile_module_source(url.clone(), "export const answer = 42;".to_string());
+        let result = rt.instantiate_module_graph(&[url]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_instantiate_module_graph_nested_imports() {
+        let mut rt = make_runtime("<html><body></body></html>");
+
+        let dep_url = Url::parse("https://example.com/dep.js").unwrap();
+        rt.compile_module_source(dep_url.clone(), "export const value = 1;".to_string());
+
+        let main_url = Url::parse("https://example.com/main.js").unwrap();
+        rt.compile_module_source(
+            main_url.clone(),
+            "import { value } from './dep.js'; export const doubled = value * 2;".to_string(),
+        );
+
+        let result = rt.instantiate_module_graph(&[main_url]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_instantiate_module_graph_missing_dependency() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let main_url = Url::parse("https://example.com/main.js").unwrap();
+        rt.compile_module_source(
+            main_url.clone(),
+            "import { x } from './missing.js';".to_string(),
+        );
+        let result = rt.instantiate_module_graph(&[main_url]);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("main.js"));
+    }
+
+    #[test]
+    fn test_evaluate_module_graph_runs_top_level_code() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let url = Url::parse("https://example.com/main.js").unwrap();
+        rt.compile_module_source(
+            url.clone(),
+            "globalThis.__module_loaded = true; export const x = 1;".to_string(),
+        );
+        rt.evaluate_module_graph(&[url.clone()]).unwrap();
+
+        let outcome = rt.execute_with_result("globalThis.__module_loaded");
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_evaluate_module_graph_nested_imports() {
+        let mut rt = make_runtime("<html><body></body></html>");
+
+        let dep_url = Url::parse("https://example.com/dep.js").unwrap();
+        rt.compile_module_source(
+            dep_url.clone(),
+            "export const greeting = 'hello';".to_string(),
+        );
+
+        let main_url = Url::parse("https://example.com/main.js").unwrap();
+        rt.compile_module_source(
+            main_url.clone(),
+            "import { greeting } from './dep.js'; globalThis.__greeting = greeting;".to_string(),
+        );
+
+        rt.evaluate_module_graph(&[main_url.clone()]).unwrap();
+
+        let outcome = rt.execute_with_result("globalThis.__greeting");
+        assert_eq!(outcome.result.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn test_evaluate_module_graph_cyclic_imports() {
+        let mut rt = make_runtime("<html><body></body></html>");
+
+        let a_url = Url::parse("https://example.com/a.js").unwrap();
+        rt.compile_module_source(
+            a_url.clone(),
+            "import { bValue } from './b.js'; export const aValue = 'a'; globalThis.__readBValue = () => bValue;"
+                .to_string(),
+        );
+
+        let b_url = Url::parse("https://example.com/b.js").unwrap();
+        rt.compile_module_source(
+            b_url.clone(),
+            "import { aValue } from './a.js'; export const bValue = 'b'; globalThis.__readAValue = () => aValue;"
+                .to_string(),
+        );
+
+        rt.evaluate_module_graph(&[a_url.clone()]).unwrap();
+
+        let outcome = rt.execute_with_result("globalThis.__readBValue()");
+        assert_eq!(outcome.result.as_deref(), Some("b"));
+
+        let outcome = rt.execute_with_result("globalThis.__readAValue()");
+        assert_eq!(outcome.result.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn test_evaluate_module_graph_reports_runtime_error() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        let url = Url::parse("https://example.com/bad.js").unwrap();
+        rt.compile_module_source(url.clone(), "throw new Error('module error');".to_string());
+
+        let result = rt.evaluate_module_graph(&[url.clone()]);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("bad.js"));
+    }
+
+    #[test]
+    fn test_evaluate_module_graph_evaluation_order() {
+        let mut rt = make_runtime("<html><body></body></html>");
+
+        let a_url = Url::parse("https://example.com/a.js").unwrap();
+        rt.compile_module_source(
+            a_url.clone(),
+            "import './b.js'; globalThis.__eval_order = (globalThis.__eval_order || '') + 'a';"
+                .to_string(),
+        );
+
+        let b_url = Url::parse("https://example.com/b.js").unwrap();
+        rt.compile_module_source(
+            b_url.clone(),
+            "globalThis.__eval_order = (globalThis.__eval_order || '') + 'b';".to_string(),
+        );
+
+        rt.evaluate_module_graph(&[a_url.clone()]).unwrap();
+
+        let outcome = rt.execute_with_result("globalThis.__eval_order");
+        assert_eq!(outcome.result.as_deref(), Some("ba"));
     }
 }
 

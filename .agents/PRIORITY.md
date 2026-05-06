@@ -49,8 +49,8 @@ Must be done in order — each phase builds on the previous.
 | # | Issue | Why this order |
 |---|---|---|
 | #244 ✓ | [JS] V8 migration audit and compatibility matrix | Foundation. Clarifies stale phase issues and current support gaps. |
-| #245 | [JS] ES module loader foundation (in progress by codex:gpt-5) | Depends on #244. Needs resolver, fetch, CSP, cache, and V8 module compile path. |
-| #246 | [JS] ES module graph linking and evaluation | Depends on #245. Needs module graph/link/evaluate before browser semantics. |
+| #245 ✓ | [JS] ES module loader foundation | Depends on #244. Needs resolver, fetch, CSP, cache, and V8 module compile path. |
+| #246 ✓ | [JS] ES module graph linking and evaluation | Depends on #245. Needs module graph/link/evaluate before browser semantics. |
 | #247 | [JS] Browser ES module semantics | Depends on #246. Adds import.meta, dynamic import, nomodule, and script lifecycle behavior. |
 | #248 | [JS] Integrate ES modules with DOM mutation, style, and tick | Depends on #247. Modules must affect rendering and async work through the event loop. |
 | #249 | [JS] ES module real-world verification | Depends on #248. Final fixture and live-site verification. |
@@ -66,3 +66,36 @@ Must be done in order — each phase builds on the previous.
 | Domain issue | Closes when |
 |---|---|
 | Complete V8 + ES Modules | #244 #245 #246 #247 #248 #249 done |
+
+---
+
+## Priority 16 - Real-Site Playwright Visual Parity
+
+Umbrella tracker: #252 `[Real-site] Playwright visual parity for www.naver.com and yunseong.dev`
+
+Make `https://www.naver.com` and `https://yunseong.dev` visually close to Playwright/Chromium baselines. This depends on ES module work plus broader DOM/Web API compatibility.
+
+Must be done in order — API blockers first, then site fixtures.
+
+| # | Issue | Why this order |
+|---|---|---|
+| #253 | [DOM] Add CharacterData/Text/Comment constructor and prototype parity | Real bundles and polyfills fail early when DOM constructor globals are missing. |
+| #254 | [DOM] Add form APIs and event handler properties used by real sites | Fixes `onsubmit`/handler-property gaps that block form and framework initialization. |
+| #255 | [DOM] Implement iframe contentWindow/contentDocument foundation | Fixes Cloudflare-style hidden iframe scripts on yunseong.dev. |
+| #256 | [DOM] Add observer and ShadowRoot compatibility for modern bundles | Modern bundles probe ShadowRoot, getRootNode, IntersectionObserver, and ResizeObserver. |
+| #257 | [Real-site] Naver homepage Playwright parity fixture and first-pass rendering | Depends on #253-#256. Naver shell is mostly JS-populated. |
+| #258 | [Real-site] yunseong.dev dynamic JS parity against Playwright baseline | Depends on #149, #253-#256, and ES module graph/browser semantics. |
+
+## Dependency graph
+
+```
+#253 -> #254 -> #255 -> #256 -> #257
+                         └──────-> #258
+#246 -> #247 -> #248 ─────────────> #258
+```
+
+## Domain closure
+
+| Domain issue | Closes when |
+|---|---|
+| Real-site Playwright parity | #252 #253 #254 #255 #256 #257 #258 done |
