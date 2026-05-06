@@ -51,9 +51,9 @@ Must be done in order — each phase builds on the previous.
 | #244 ✓ | [JS] V8 migration audit and compatibility matrix | Foundation. Clarifies stale phase issues and current support gaps. |
 | #245 ✓ | [JS] ES module loader foundation | Depends on #244. Needs resolver, fetch, CSP, cache, and V8 module compile path. |
 | #246 ✓ | [JS] ES module graph linking and evaluation | Depends on #245. Needs module graph/link/evaluate before browser semantics. |
-| #260 | [JS] import.meta.url support (Part of #247) | Depends on #246. Module evaluation must supply metadata. |
+| #260 | [JS] import.meta.url support (Part of #247) (in progress by opencode:deepseek-v4-pro) | Depends on #246. Module evaluation must supply metadata. |
 | #261 | [JS] dynamic import() support (Part of #247) | Depends on #260. Needs import.meta pattern for module namespace access. |
-| #262 | [JS] Respect nomodule attribute (Part of #247) | Depends on #246. Script extraction must filter by attribute. |
+| #262 | [JS] Respect nomodule attribute (Part of #247) (in progress by opencode:deepseek-v4-pro) | Depends on #246. Script extraction must filter by attribute. |
 | #263 | [JS] Module script load/error lifecycle events (Part of #247) | Depends on #246. Events fire after module evaluation completes/fails. |
 | #264 | [JS] async/defer attribute and module execution ordering (Part of #247) | Depends on #260-#263. Execution ordering builds on full semantics. |
 | #247 | [JS] Browser ES module semantics (umbrella) | Closes when #260-#264 done. |
