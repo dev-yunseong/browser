@@ -2703,4 +2703,144 @@ mod tests {
         // async wins over defer → executes in async phase (after deferred)
         assert_eq!(result, r#"["sync","sync2","async-wins"]"#);
     }
+
+    #[test]
+    fn test_module_sets_text_content() {
+        let mut engine = engine_with_page_html(
+            r#"<html><body>
+                <div id='test'>old</div>
+                <script type="module">document.getElementById('test').textContent = 'new';</script>
+            </body></html>"#,
+        );
+        let result = engine.evaluate_js("document.getElementById('test').textContent");
+        assert_eq!(result, "new");
+    }
+
+    #[test]
+    fn test_module_sets_inner_html() {
+        let mut engine = engine_with_page_html(
+            r#"<html><body>
+                <div id='test'>old</div>
+                <script type="module">document.getElementById('test').innerHTML = '<span>new</span>';</script>
+            </body></html>"#,
+        );
+        let result = engine.evaluate_js("document.getElementById('test').innerHTML");
+        assert_eq!(result, "<span>new</span>");
+    }
+
+    #[test]
+    fn test_module_sets_attribute() {
+        let mut engine = engine_with_page_html(
+            r#"<html><body>
+                <div id='test' data-foo='old'>text</div>
+                <script type="module">document.getElementById('test').setAttribute('data-foo', 'new');</script>
+            </body></html>"#,
+        );
+        let result = engine.evaluate_js("document.getElementById('test').getAttribute('data-foo')");
+        assert_eq!(result, "new");
+    }
+
+    #[test]
+    fn test_module_sets_form_value() {
+        let mut engine = engine_with_page_html(
+            r#"<html><body>
+                <input id='test' value='old'>
+                <script type="module">document.getElementById('test').value = 'new';</script>
+            </body></html>"#,
+        );
+        let result = engine.evaluate_js("document.getElementById('test').value");
+        assert_eq!(result, "new");
+    }
+
+    #[test]
+    fn test_module_style_override_captured() {
+        let mut engine = engine_with_page_html(
+            r#"<html><body>
+                <div id='test'>text</div>
+                <script type="module">__aura_set_style('test', 'color', 'red');</script>
+            </body></html>"#,
+        );
+        let color = engine
+            .js_style_overrides
+            .get("test")
+            .and_then(|props| props.get("color").cloned());
+        assert_eq!(color, Some("red".to_string()));
+    }
+
+    #[test]
+    fn test_module_settimeout_during_tick() {
+        let mut engine = engine_with_page_html(
+            r#"<html><body>
+                <div id='test'>old</div>
+                <script type="module">
+                    globalThis.__timer_fired = false;
+                    setTimeout(function() {
+                        document.getElementById('test').textContent = 'delayed';
+                        globalThis.__timer_fired = true;
+                    }, 10);
+                </script>
+            </body></html>"#,
+        );
+        assert_eq!(engine.evaluate_js("globalThis.__timer_fired"), "false");
+        assert_eq!(
+            engine.evaluate_js("document.getElementById('test').textContent"),
+            "old"
+        );
+
+        engine.tick_js(Some(20.0), None);
+
+        assert_eq!(engine.evaluate_js("globalThis.__timer_fired"), "true");
+        assert_eq!(
+            engine.evaluate_js("document.getElementById('test').textContent"),
+            "delayed"
+        );
+    }
+
+    #[test]
+    fn test_module_multiple_mutations() {
+        let mut engine = engine_with_page_html(
+            r#"<html><body>
+                <div id='a'>text-a</div>
+                <div id='b'>text-b</div>
+                <div id='c'>text-c</div>
+                <script type="module">
+                    document.getElementById('a').textContent = 'new-a';
+                    document.getElementById('b').setAttribute('data-x', 'y');
+                    __aura_set_style('c', 'font-size', '20px');
+                </script>
+            </body></html>"#,
+        );
+        assert_eq!(
+            engine.evaluate_js("document.getElementById('a').textContent"),
+            "new-a"
+        );
+        assert_eq!(
+            engine.evaluate_js("document.getElementById('b').getAttribute('data-x')"),
+            "y"
+        );
+        assert_eq!(
+            engine.js_style_overrides
+                .get("c")
+                .and_then(|p| p.get("font-size").cloned()),
+            Some("20px".to_string())
+        );
+    }
+
+    #[test]
+    fn test_module_module_level_execution_integration() {
+        let mut engine = engine_with_page_html(
+            r#"<html><body>
+                <div id='test'>before</div>
+                <script type="module">
+                    document.getElementById('test').textContent = 'during-module';
+                </script>
+                <script>globalThis.__classic_ran = true;</script>
+            </body></html>"#,
+        );
+        assert_eq!(engine.evaluate_js("globalThis.__classic_ran"), "true");
+        assert_eq!(
+            engine.evaluate_js("document.getElementById('test').textContent"),
+            "during-module"
+        );
+    }
 }
