@@ -46,7 +46,7 @@ Must be done in order — API blockers first, then site fixtures.
 
 | # | Issue | Why this order |
 |---|---|---|
-| #253 | [DOM] Add CharacterData/Text/Comment constructor and prototype parity | Real bundles and polyfills fail early when DOM constructor globals are missing. |
+| #253 | [DOM] Add CharacterData/Text/Comment constructor and prototype parity (in progress by opencode:deepseek-v4-pro) | Real bundles and polyfills fail early when DOM constructor globals are missing. |
 | #254 | [DOM] Add form APIs and event handler properties used by real sites | Fixes `onsubmit`/handler-property gaps that block form and framework initialization. |
 | #255 | [DOM] Implement iframe contentWindow/contentDocument foundation | Fixes Cloudflare-style hidden iframe scripts on yunseong.dev. |
 | #256 | [DOM] Add observer and ShadowRoot compatibility for modern bundles | Modern bundles probe ShadowRoot, getRootNode, IntersectionObserver, and ResizeObserver. |
