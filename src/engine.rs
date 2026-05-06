@@ -1230,42 +1230,77 @@ impl BrowserEngine {
         });
 
         let scripts = js::extract_script_sources_from_dom(&dom.document, Some(&page.base_url));
-        let mut root_module_urls: Vec<Url> = Vec::new();
-        let mut module_script_targets: Vec<(Url, u32)> = Vec::new();
 
+        // ── Phase-bucketed collections ──────────────────────────────────────
+        let mut deferred_classics: Vec<String> = Vec::new();
+        let mut async_classics: Vec<String> = Vec::new();
+        let mut deferred_module_urls: Vec<Url> = Vec::new();
+        let mut deferred_module_targets: Vec<(Url, u32)> = Vec::new();
+        let mut async_module_urls: Vec<Url> = Vec::new();
+        let mut async_module_targets: Vec<(Url, u32)> = Vec::new();
+
+        // ── Helper: fetch external classic script source with CSP check ────
+        let fetch_classic_source = |this: &mut Self, url: &Url| -> Option<String> {
+            let allowed = this
+                .current_csp_policy
+                .as_ref()
+                .map(|p| p.is_allowed("script-src", url, Some(&page.base_url)))
+                .unwrap_or(true);
+            if !allowed {
+                println!("[CSP] Blocked external script execution: {}", url);
+                return None;
+            }
+            match reqwest::blocking::get(url.as_str()).and_then(|response| response.text()) {
+                Ok(source) => Some(source),
+                Err(err) => {
+                    println!("[JS] Failed to load external script {}: {}", url, err);
+                    None
+                }
+            }
+        };
+
+        // ── Phase 1: execute synchronous classics, bucket the rest ─────────
         for script in scripts {
             match script {
-                js::ScriptSource::InlineClassic(script) => {
+                js::ScriptSource::InlineClassic { source, is_defer } => {
                     let allowed = self
                         .current_csp_policy
                         .as_ref()
                         .map(|p| p.allows_inline_script())
                         .unwrap_or(true);
-                    if allowed {
-                        self.js_runtime.execute(&script);
-                    } else {
-                        println!("[CSP] Blocked inline script execution");
-                    }
-                }
-                js::ScriptSource::ExternalClassic(url) => {
-                    let allowed = self
-                        .current_csp_policy
-                        .as_ref()
-                        .map(|p| p.is_allowed("script-src", &url, Some(&page.base_url)))
-                        .unwrap_or(true);
                     if !allowed {
-                        println!("[CSP] Blocked external script execution: {}", url);
+                        println!("[CSP] Blocked inline script execution");
                         continue;
                     }
-                    match reqwest::blocking::get(url.as_str()).and_then(|response| response.text())
-                    {
-                        Ok(script) => self.js_runtime.execute(&script),
-                        Err(err) => {
-                            println!("[JS] Failed to load external script {}: {}", url, err)
+                    if is_defer {
+                        deferred_classics.push(source);
+                    } else {
+                        self.js_runtime.execute(&source);
+                    }
+                }
+                js::ScriptSource::ExternalClassic {
+                    url,
+                    is_async,
+                    is_defer,
+                } => {
+                    let source = fetch_classic_source(self, &url);
+                    if let Some(source) = source {
+                        if is_async {
+                            // async wins over defer per HTML spec
+                            async_classics.push(source);
+                        } else if is_defer {
+                            deferred_classics.push(source);
+                        } else {
+                            self.js_runtime.execute(&source);
                         }
                     }
                 }
-                js::ScriptSource::InlineModule { url, source, node_id } => {
+                js::ScriptSource::InlineModule {
+                    url,
+                    source,
+                    node_id,
+                    is_async,
+                } => {
                     let allowed = self
                         .current_csp_policy
                         .as_ref()
@@ -1276,38 +1311,68 @@ impl BrowserEngine {
                         continue;
                     }
                     let outcome = self.js_runtime.compile_module_source(url.clone(), source);
-                    if let Some(error) = outcome.error {
+                    if outcome.error.is_some() {
+                        let error = outcome.error.as_deref().unwrap_or("unknown");
                         println!("[JS] Failed to compile inline module {}: {}", url, error);
-                        js::push_console_entry(js::ConsoleLevel::Error, format!("Failed to compile inline module {url}: {error}"));
-                        module_script_targets.push((url, node_id));
+                        js::push_console_entry(
+                            js::ConsoleLevel::Error,
+                            format!("Failed to compile inline module {url}: {error}"),
+                        );
+                        // Still track for error events
+                        deferred_module_targets.push((url.clone(), node_id));
+                        continue;
+                    }
+                    if is_async {
+                        async_module_urls.push(url.clone());
+                        async_module_targets.push((url, node_id));
                     } else {
-                        root_module_urls.push(url.clone());
-                        module_script_targets.push((url, node_id));
+                        deferred_module_urls.push(url.clone());
+                        deferred_module_targets.push((url, node_id));
                     }
                 }
-                js::ScriptSource::ExternalModule { url, node_id } => {
-                    let outcome =
-                        self.load_external_module_with(url.clone(), &page.base_url, |module_url| {
+                js::ScriptSource::ExternalModule {
+                    url,
+                    node_id,
+                    is_async,
+                } => {
+                    let outcome = self.load_external_module_with(
+                        url.clone(),
+                        &page.base_url,
+                        |module_url| {
                             reqwest::blocking::get(module_url.as_str())
                                 .and_then(|response| response.text())
-                        });
-                    if let Some(error) = outcome.error {
+                        },
+                    );
+                    if let Some(error) = &outcome.error {
                         println!("[JS] Failed to load external module {}: {}", url, error);
-                        js::push_console_entry(js::ConsoleLevel::Error, format!("Failed to load external module {url}: {error}"));
-                        module_script_targets.push((url, node_id));
+                        js::push_console_entry(
+                            js::ConsoleLevel::Error,
+                            format!("Failed to load external module {url}: {error}"),
+                        );
+                        deferred_module_targets.push((url.clone(), node_id));
+                        continue;
+                    }
+                    if is_async {
+                        async_module_urls.push(url.clone());
+                        async_module_targets.push((url, node_id));
                     } else {
-                        root_module_urls.push(url.clone());
-                        module_script_targets.push((url, node_id));
+                        deferred_module_urls.push(url.clone());
+                        deferred_module_targets.push((url, node_id));
                     }
                 }
             }
         }
 
-        // Resolve and compile transitive module dependencies.
-        self.resolve_module_dependencies(&page.base_url, &mut root_module_urls);
+        // ── Phase 2: execute deferred classics, then evaluate deferred modules ──
+        for script in &deferred_classics {
+            self.js_runtime.execute(script);
+        }
 
-        if !root_module_urls.is_empty() {
-            let eval_result = self.js_runtime.evaluate_module_graph(&root_module_urls);
+        self.resolve_module_dependencies(&page.base_url, &mut deferred_module_urls);
+        if !deferred_module_urls.is_empty() {
+            let eval_result = self
+                .js_runtime
+                .evaluate_module_graph(&deferred_module_urls);
             if let Err(errors) = eval_result {
                 let failed_urls: Vec<&str> = errors
                     .iter()
@@ -1317,14 +1382,44 @@ impl BrowserEngine {
                     println!("[JS] Module evaluation error: {error}");
                     js::push_console_entry(js::ConsoleLevel::Error, error.clone());
                 }
-                for (url, node_id) in &module_script_targets {
+                for (url, node_id) in &deferred_module_targets {
                     if failed_urls.iter().any(|f| url.as_str() == *f) {
                         self.js_runtime
                             .trigger_event_on_node_id(*node_id, "error");
                     }
                 }
             }
-            for (_, node_id) in &module_script_targets {
+            for (_, node_id) in &deferred_module_targets {
+                self.js_runtime
+                    .trigger_event_on_node_id(*node_id, "load");
+            }
+        }
+
+        // ── Phase 3: execute async classics, then evaluate async modules ──
+        for script in &async_classics {
+            self.js_runtime.execute(script);
+        }
+
+        self.resolve_module_dependencies(&page.base_url, &mut async_module_urls);
+        if !async_module_urls.is_empty() {
+            let eval_result = self.js_runtime.evaluate_module_graph(&async_module_urls);
+            if let Err(errors) = eval_result {
+                let failed_urls: Vec<&str> = errors
+                    .iter()
+                    .filter_map(|e| e.split(": ").next())
+                    .collect();
+                for error in &errors {
+                    println!("[JS] Async module evaluation error: {error}");
+                    js::push_console_entry(js::ConsoleLevel::Error, error.clone());
+                }
+                for (url, node_id) in &async_module_targets {
+                    if failed_urls.iter().any(|f| url.as_str() == *f) {
+                        self.js_runtime
+                            .trigger_event_on_node_id(*node_id, "error");
+                    }
+                }
+            }
+            for (_, node_id) in &async_module_targets {
                 self.js_runtime
                     .trigger_event_on_node_id(*node_id, "load");
             }
@@ -2471,5 +2566,141 @@ mod tests {
     fn test_resolve_url_trims_and_encodes() {
         let result = resolve_url("  hello world  ");
         assert!(result.starts_with("https://www.google.com/search?q=hello+world"));
+    }
+
+    // ── async/defer script ordering tests ─────────────────────────────────
+
+    /// Helper: build a PageResult from inline HTML and run init_js_for_page,
+    /// then return the engine so callers can inspect the JS runtime state.
+    fn engine_with_page_html(html: &str) -> BrowserEngine {
+        let base = Url::parse("https://example.com/").unwrap();
+        let mut css_cache = HashMap::new();
+        let (page, _) = process_html_with_cache(
+            html,
+            &base,
+            &HashMap::new(),
+            &mut css_cache,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            800.0,
+        )
+        .expect("process_html_with_cache");
+        let mut engine = BrowserEngine::new();
+        engine.init_js_for_page(&page);
+        engine
+    }
+
+    #[test]
+    fn test_classic_inline_scripts_execute_in_dom_order() {
+        let mut engine = engine_with_page_html(
+            r#"<html><body>
+                <script>window.order = []; window.order.push('first')</script>
+                <script>window.order.push('second')</script>
+            </body></html>"#,
+        );
+        let result = engine.evaluate_js("JSON.stringify(window.order)");
+        assert_eq!(result, r#"["first","second"]"#);
+    }
+
+    #[test]
+    fn test_defer_classic_executes_after_sync_classics() {
+        let mut engine = engine_with_page_html(
+            r#"<html><body>
+                <script>window.order = []; window.order.push('sync1')</script>
+                <script defer>window.order.push('deferred')</script>
+                <script>window.order.push('sync2')</script>
+            </body></html>"#,
+        );
+        let result = engine.evaluate_js("JSON.stringify(window.order)");
+        assert_eq!(result, r#"["sync1","sync2","deferred"]"#);
+    }
+
+    #[test]
+    fn test_multiple_deferred_scripts_execute_in_dom_order() {
+        let mut engine = engine_with_page_html(
+            r#"<html><body>
+                <script>window.order = []</script>
+                <script defer>window.order.push('def1')</script>
+                <script defer>window.order.push('def2')</script>
+                <script defer>window.order.push('def3')</script>
+                <script>window.order.push('sync')</script>
+            </body></html>"#,
+        );
+        let result = engine.evaluate_js("JSON.stringify(window.order)");
+        assert_eq!(result, r#"["sync","def1","def2","def3"]"#);
+    }
+
+    #[test]
+    fn test_defer_script_without_src_has_no_effect_on_inline() {
+        // defer attribute only affects external scripts per HTML spec,
+        // but we still support it on inline for completeness.
+        let mut engine = engine_with_page_html(
+            r#"<html><body>
+                <script>window.order = []</script>
+                <script>window.order.push('sync1')</script>
+                <script defer>window.order.push('should_be_deferred')</script>
+                <script>window.order.push('sync2')</script>
+            </body></html>"#,
+        );
+        let result = engine.evaluate_js("JSON.stringify(window.order)");
+        // defer on inline pushes it to deferred phase
+        assert_eq!(result, r#"["sync1","sync2","should_be_deferred"]"#);
+    }
+
+    #[test]
+    fn test_module_default_defer_executes_after_classics() {
+        let mut engine = engine_with_page_html(
+            r#"<html><body>
+                <script>window.order = []; window.order.push('sync1')</script>
+                <script type="module">window.order.push('module')</script>
+                <script>window.order.push('sync2')</script>
+            </body></html>"#,
+        );
+        let result = engine.evaluate_js("JSON.stringify(window.order)");
+        // modules are defer-by-default: execute after all classic scripts
+        assert_eq!(result, r#"["sync1","sync2","module"]"#);
+    }
+
+    #[test]
+    fn test_async_module_does_not_execute_final_phase() {
+        let mut engine = engine_with_page_html(
+            r#"<html><body>
+                <script>window.order = []; window.order.push('sync')</script>
+                <script type="module" async>window.order.push('async-module')</script>
+                <script defer>window.order.push('deferred')</script>
+            </body></html>"#,
+        );
+        let result = engine.evaluate_js("JSON.stringify(window.order)");
+        // sync first, then deferred classics, then async module last
+        assert_eq!(result, r#"["sync","deferred","async-module"]"#);
+    }
+
+    #[test]
+    fn test_classic_behavior_does_not_regress_no_attrs() {
+        let mut engine = engine_with_page_html(
+            r#"<html><body>
+                <script>window.x = 1</script>
+                <script>window.x = window.x + 2</script>
+            </body></html>"#,
+        );
+        let result = engine.evaluate_js("window.x");
+        assert_eq!(result, "3");
+    }
+
+    #[test]
+    fn test_async_and_defer_on_same_script_async_wins() {
+        let mut engine = engine_with_page_html(
+            r#"<html><body>
+                <script>window.order = []; window.order.push('sync')</script>
+                <script async defer>window.order.push('async-wins')</script>
+                <script>window.order.push('sync2')</script>
+            </body></html>"#,
+        );
+        let result = engine.evaluate_js("JSON.stringify(window.order)");
+        // async wins over defer → executes in async phase (after deferred)
+        assert_eq!(result, r#"["sync","sync2","async-wins"]"#);
     }
 }

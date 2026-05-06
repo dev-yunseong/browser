@@ -2970,8 +2970,9 @@ pub fn extract_scripts_from_dom(handle: &Handle) -> Vec<String> {
     extract_script_sources_from_dom(handle, None)
         .into_iter()
         .filter_map(|source| match source {
-            ScriptSource::InlineClassic(script) => Some(script),
-            ScriptSource::ExternalClassic(_)
+            ScriptSource::InlineClassic { source, is_defer: false } => Some(source),
+            ScriptSource::InlineClassic { is_defer: true, .. }
+            | ScriptSource::ExternalClassic { .. }
             | ScriptSource::InlineModule { .. }
             | ScriptSource::ExternalModule { .. } => None,
         })
@@ -2980,10 +2981,29 @@ pub fn extract_scripts_from_dom(handle: &Handle) -> Vec<String> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScriptSource {
-    InlineClassic(String),
-    ExternalClassic(Url),
-    InlineModule { url: Url, source: String, node_id: u32 },
-    ExternalModule { url: Url, node_id: u32 },
+    /// Inline classic scripts are always synchronous in the HTML spec (neither async nor defer
+    /// should apply), but we track `is_defer` so that inline test cases can exercise defer semantics.
+    InlineClassic {
+        source: String,
+        is_defer: bool,
+    },
+    ExternalClassic {
+        url: Url,
+        is_async: bool,
+        is_defer: bool,
+    },
+    /// Modules are defer-by-default. `is_async` overrides; explicit `defer` attribute has no effect.
+    InlineModule {
+        url: Url,
+        source: String,
+        node_id: u32,
+        is_async: bool,
+    },
+    ExternalModule {
+        url: Url,
+        node_id: u32,
+        is_async: bool,
+    },
 }
 
 pub fn extract_script_sources_from_dom(
@@ -3006,6 +3026,8 @@ pub fn extract_script_sources_from_dom(
                 let mut src = None;
                 let mut script_type = None;
                 let mut has_nomodule = false;
+                let mut is_async = false;
+                let mut is_defer = false;
                 for attr in attrs.borrow().iter() {
                     let attr_name = attr.name.local.to_string();
                     if attr_name == "src" {
@@ -3014,6 +3036,10 @@ pub fn extract_script_sources_from_dom(
                         script_type = Some(attr.value.to_string().trim().to_lowercase());
                     } else if attr_name == "nomodule" {
                         has_nomodule = true;
+                    } else if attr_name == "async" {
+                        is_async = true;
+                    } else if attr_name == "defer" {
+                        is_defer = true;
                     }
                 }
 
@@ -3036,9 +3062,9 @@ pub fn extract_script_sources_from_dom(
                         if let Ok(url) = base.join(&src).or_else(|_| Url::parse(&src)) {
                             if is_module {
                                 let node_id = register_node(handle.clone());
-                                scripts.push(ScriptSource::ExternalModule { url, node_id });
+                                scripts.push(ScriptSource::ExternalModule { url, node_id, is_async });
                             } else if is_classic {
-                                scripts.push(ScriptSource::ExternalClassic(url));
+                                scripts.push(ScriptSource::ExternalClassic { url, is_async, is_defer });
                             }
                         }
                     }
@@ -3063,10 +3089,11 @@ pub fn extract_script_sources_from_dom(
                                     url,
                                     source: content,
                                     node_id,
+                                    is_async,
                                 });
                             }
                         } else if is_classic {
-                            scripts.push(ScriptSource::InlineClassic(content));
+                            scripts.push(ScriptSource::InlineClassic { source: content, is_defer });
                         }
                     }
                 }
@@ -3185,9 +3212,9 @@ mod tests {
         let base = Url::parse("https://example.com/app/").unwrap();
         let sources = extract_script_sources_from_dom(&dom.document, Some(&base));
         assert_eq!(sources.len(), 3);
-        assert!(matches!(&sources[0], ScriptSource::InlineClassic(s) if s == "window.a = 1;"));
-        assert!(matches!(&sources[1], ScriptSource::ExternalClassic(url) if url.as_str() == "https://example.com/bundle.js"));
-        assert!(matches!(&sources[2], ScriptSource::ExternalModule { url, node_id: _ } if url.as_str() == "https://example.com/module.js"));
+        assert!(matches!(&sources[0], ScriptSource::InlineClassic { source: s, is_defer: false } if s == "window.a = 1;"));
+        assert!(matches!(&sources[1], ScriptSource::ExternalClassic { url, is_async: false, is_defer: false } if url.as_str() == "https://example.com/bundle.js"));
+        assert!(matches!(&sources[2], ScriptSource::ExternalModule { url, is_async: false, .. } if url.as_str() == "https://example.com/module.js"));
     }
 
     #[test]
@@ -3199,7 +3226,7 @@ mod tests {
         );
         let module_sources = extract_script_sources_from_dom(&module_dom.document, Some(&base));
         assert_eq!(module_sources.len(), 1);
-        assert!(matches!(&module_sources[0], ScriptSource::ExternalModule { url, .. } if url.as_str() == "https://example.com/m.js"));
+        assert!(matches!(&module_sources[0], ScriptSource::ExternalModule { url, is_async: false, .. } if url.as_str() == "https://example.com/m.js"));
 
         let nomodule_dom = dom::parse_html(r#"<html><head><script nomodule>window.x=1</script></head></html>"#);
         let nomodule_sources = extract_script_sources_from_dom(&nomodule_dom.document, Some(&base));
@@ -3209,7 +3236,7 @@ mod tests {
         let classic_sources = extract_script_sources_from_dom(&classic_dom.document, Some(&base));
         assert_eq!(
             classic_sources,
-            vec![ScriptSource::InlineClassic("window.x=1".to_string())]
+            vec![ScriptSource::InlineClassic { source: "window.x=1".to_string(), is_defer: false }]
         );
     }
 
