@@ -98,6 +98,139 @@ unsafe extern "C" fn import_meta_callback(
     meta.set(scope, key.into(), value.into());
 }
 
+fn host_import_module_dynamically<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    _host_defined_options: v8::Local<'s, v8::Data>,
+    _resource_name: v8::Local<'s, v8::Value>,
+    specifier: v8::Local<'s, v8::String>,
+    _import_attributes: v8::Local<'s, v8::FixedArray>,
+) -> Option<v8::Local<'s, v8::Promise>> {
+    let spec_str = specifier.to_rust_string_lossy(scope);
+
+    let resolver = v8::PromiseResolver::new(scope)?;
+    let promise = resolver.get_promise(scope);
+
+    let reject = |msg: &str| {
+        let err = v8::String::new(scope, msg).unwrap();
+        resolver.reject(scope, err.into());
+    };
+
+    let resolved_url = CURRENT_ORIGIN.with(|origin| {
+        origin
+            .borrow()
+            .as_ref()
+            .and_then(|base| base.join(&spec_str).ok())
+            .map(|u| u.to_string())
+    });
+
+    let resolved_str = match resolved_url {
+        Some(url) => url,
+        None => {
+            reject(&format!("Failed to resolve module specifier: {spec_str}"));
+            return Some(promise);
+        }
+    };
+
+    let allowed = CSP_POLICY.with(|p| {
+        p.borrow()
+            .as_ref()
+            .map(|pol| {
+                let url =
+                    Url::parse(&resolved_str).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                let base = CURRENT_ORIGIN.with(|o| o.borrow().clone());
+                pol.is_allowed("script-src", &url, base.as_ref())
+            })
+            .unwrap_or(true)
+    });
+
+    if !allowed {
+        reject("CSP blocked dynamic import");
+        return Some(promise);
+    }
+
+    let source =
+        MODULE_SOURCES.with(|map| map.borrow().get(&resolved_str).cloned());
+
+    let source = match source {
+        Some(s) => s,
+        None => match reqwest::blocking::get(&resolved_str).and_then(|r| r.text()) {
+            Ok(s) => s,
+            Err(e) => {
+                reject(&format!("Failed to fetch module: {e}"));
+                return Some(promise);
+            }
+        },
+    };
+
+    MODULE_SOURCES.with(|map| {
+        map.borrow_mut()
+            .insert(resolved_str.clone(), source.clone());
+    });
+
+    let code = v8::String::new(scope, &source)?;
+    let resource = v8::String::new(scope, &resolved_str)?;
+    let origin = v8::ScriptOrigin::new(
+        scope,
+        resource.into(),
+        0,
+        0,
+        false,
+        0,
+        None,
+        false,
+        false,
+        true,
+        None,
+    );
+    let mut source_compiler = v8::script_compiler::Source::new(code, Some(&origin));
+
+    let module =
+        match v8::script_compiler::compile_module(scope, &mut source_compiler) {
+            Some(m) => m,
+            None => {
+                reject("Module compilation failed");
+                return Some(promise);
+            }
+        };
+
+    MODULE_ID_TO_URL.with(|map| {
+        map.borrow_mut()
+            .insert(module.get_identity_hash(), resolved_str.clone());
+    });
+    RESOLVED_MODULES.with(|map| {
+        map.borrow_mut()
+            .insert(resolved_str.clone(), v8::Global::new(scope, module));
+    });
+
+    let instantiate_ok = module
+        .instantiate_module(scope, resolve_module_callback)
+        .unwrap_or(false);
+    if !instantiate_ok {
+        reject("Module instantiation failed");
+        return Some(promise);
+    }
+
+    let eval_result = module.evaluate(scope);
+    if eval_result.is_none() || module.get_status() == v8::ModuleStatus::Errored {
+        let err_msg = if module.get_status() == v8::ModuleStatus::Errored {
+            module
+                .get_exception()
+                .to_string(scope)
+                .map(|s| s.to_rust_string_lossy(scope))
+                .unwrap_or_else(|| "Module evaluation error".to_string())
+        } else {
+            "Module evaluation failed".to_string()
+        };
+        reject(&err_msg);
+        return Some(promise);
+    }
+
+    let namespace = module.get_module_namespace();
+    resolver.resolve(scope, namespace);
+
+    Some(promise)
+}
+
 fn resolve_module_callback<'s>(
     context: v8::Local<'s, v8::Context>,
     specifier: v8::Local<'s, v8::String>,
@@ -378,6 +511,7 @@ impl JsRuntime {
 
         let mut isolate = v8::Isolate::new(v8::CreateParams::default());
         isolate.set_host_initialize_import_meta_object_callback(import_meta_callback);
+        isolate.set_host_import_module_dynamically_callback(host_import_module_dynamically);
         let (task_sender, task_receiver) = std::sync::mpsc::channel();
         TASK_SENDER.with(|s| *s.borrow_mut() = Some(task_sender));
 
@@ -3369,6 +3503,90 @@ mod tests {
         let version = rt.execute_with_result("globalThis.__version");
         assert_eq!(version.error, None);
         assert_eq!(version.result.as_deref(), Some("1.0"));
+    }
+
+    #[test]
+    fn test_dynamic_import_resolves_with_namespace() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        CURRENT_ORIGIN.with(|o| {
+            *o.borrow_mut() = Some(Url::parse("https://example.com/").unwrap());
+        });
+
+        MODULE_SOURCES.with(|map| {
+            map.borrow_mut().insert(
+                "https://example.com/answer.js".to_string(),
+                "export const answer = 42;".to_string(),
+            );
+        });
+
+        rt.execute(
+            "(async () => { const mod = await import('https://example.com/answer.js'); globalThis.__answer = mod.answer; })()",
+        );
+
+        rt.tick(Some(0.0), None);
+
+        let outcome = rt.execute_with_result("globalThis.__answer");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn test_dynamic_import_rejects_on_eval_error() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        CURRENT_ORIGIN.with(|o| {
+            *o.borrow_mut() = Some(Url::parse("https://example.com/").unwrap());
+        });
+
+        MODULE_SOURCES.with(|map| {
+            map.borrow_mut().insert(
+                "https://example.com/bad.js".to_string(),
+                "throw new Error('module error');".to_string(),
+            );
+        });
+
+        rt.execute(
+            "(async () => { try { await import('https://example.com/bad.js'); globalThis.__error = 'no error'; } catch(e) { globalThis.__error = e.toString(); } })()",
+        );
+
+        rt.tick(Some(0.0), None);
+
+        let outcome = rt.execute_with_result("globalThis.__error");
+        assert_eq!(outcome.error, None);
+        assert!(outcome.result.as_deref().unwrap_or("").contains("module error"));
+    }
+
+    #[test]
+    fn test_dynamic_import_resolve_failure_rejects() {
+        let mut rt = make_runtime("<html><body></body></html>");
+
+        rt.execute(
+            "(async () => { try { await import('./nonexistent.js'); globalThis.__err = 'no error'; } catch(e) { globalThis.__err = 'got error'; } })()",
+        );
+
+        rt.tick(Some(0.0), None);
+
+        let outcome = rt.execute_with_result("globalThis.__err");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("got error"));
+    }
+
+    #[test]
+    fn test_dynamic_import_returns_object() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        CURRENT_ORIGIN.with(|o| {
+            *o.borrow_mut() = Some(Url::parse("https://example.com/").unwrap());
+        });
+
+        MODULE_SOURCES.with(|map| {
+            map.borrow_mut().insert(
+                "https://example.com/answer.js".to_string(),
+                "export const answer = 42;".to_string(),
+            );
+        });
+
+        let outcome = rt.execute_with_result("typeof import('https://example.com/answer.js')");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("object"));
     }
 }
 
