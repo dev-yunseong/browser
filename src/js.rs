@@ -4033,6 +4033,119 @@ mod tests {
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.result.as_deref(), Some("true"));
     }
+
+    #[test]
+    fn test_iframe_element_has_content_document() {
+        let mut rt = make_dom_runtime(
+            "<html><body><iframe id='f'></iframe></body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt
+            .execute_with_result("document.getElementById('f').contentDocument !== null");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_iframe_content_window_has_document() {
+        let mut rt = make_dom_runtime(
+            "<html><body><iframe id='f'></iframe></body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt
+            .execute_with_result("document.getElementById('f').contentWindow.document !== null");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_iframe_content_document_create_element() {
+        let mut rt = make_dom_runtime(
+            "<html><body><iframe id='f'></iframe></body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result(
+            "var iframe = document.getElementById('f'); \
+             var doc = iframe.contentDocument; \
+             var s = doc.createElement('script'); \
+             s !== null",
+        );
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_iframe_append_child_to_content_document_head() {
+        let mut rt = make_dom_runtime(
+            "<html><body><iframe id='f'></iframe></body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result(
+            "var iframe = document.getElementById('f'); \
+             var doc = iframe.contentDocument; \
+             var s = doc.createElement('script'); \
+             doc.head.appendChild(s); \
+             s.parentNode !== null",
+        );
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_iframe_content_document_has_body() {
+        let mut rt = make_dom_runtime(
+            "<html><body><iframe id='f'></iframe></body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result(
+            "var iframe = document.getElementById('f'); \
+             iframe.contentDocument.body !== null",
+        );
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_iframe_content_window_self_reference() {
+        let mut rt = make_dom_runtime(
+            "<html><body><iframe id='f'></iframe></body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result(
+            "var cw = document.getElementById('f').contentWindow; \
+             cw === cw.self",
+        );
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_iframe_content_window_frame_element() {
+        let mut rt = make_dom_runtime(
+            "<html><body><iframe id='f'></iframe></body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result(
+            "var iframe = document.getElementById('f'); \
+             iframe.contentWindow.frameElement === iframe",
+        );
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_create_element_iframe_has_content_document() {
+        let mut rt = make_dom_runtime(
+            "<html><body></body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result(
+            "var iframe = document.createElement('iframe'); \
+             iframe.contentDocument !== null",
+        );
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
 }
 
 // ── DOM Helper Functions ──────────────────────────────────────────────────────

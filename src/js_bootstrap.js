@@ -169,7 +169,10 @@ function __get_or_create_node(id, tag, string_id, kind) {
     } else if (descriptor.kind === 'document') {
         node = document;
     } else if (descriptor.tag) {
-        if (descriptor.tag.toLowerCase() === 'form') {
+        let tagLower = descriptor.tag.toLowerCase();
+        if (tagLower === 'iframe') {
+            node = new HTMLIFrameElement(id, descriptor.tag, descriptor.id);
+        } else if (tagLower === 'form') {
             node = new HTMLFormElement(id, descriptor.tag, descriptor.id);
         } else {
             node = new Element(id, descriptor.tag, descriptor.id);
@@ -3694,6 +3697,134 @@ window.HTMLScriptElement = HTMLScriptElement;
 
 class HTMLStyleElement extends HTMLElement {}
 window.HTMLStyleElement = HTMLStyleElement;
+
+class HTMLIFrameElement extends HTMLElement {
+    constructor(id, tag, string_id) {
+        super(id, tag, string_id);
+        this._contentDocument = null;
+        this._contentWindow = null;
+        this._container = null;
+    }
+    get contentDocument() {
+        if (!this._contentDocument) {
+            var self = this;
+            this._contentDocument = {
+                createElement: function(tag) { return document.createElement(tag); },
+                createTextNode: function(text) { return document.createTextNode(text); },
+                createComment: function(data) { return document.createComment(data); },
+                createDocumentFragment: function() { return document.createDocumentFragment(); },
+                getElementById: function(id) {
+                    return self._container ? self._container.querySelector('#' + id) : null;
+                },
+                getElementsByClassName: function(cls) {
+                    return self._container ? self._container.getElementsByClassName(cls) : new NodeList([]);
+                },
+                getElementsByTagName: function(tag) {
+                    return self._container ? self._container.getElementsByTagName(String(tag).toLowerCase()) : new NodeList([]);
+                },
+                querySelector: function(sel) {
+                    return self._container ? self._container.querySelector(sel) : null;
+                },
+                querySelectorAll: function(sel) {
+                    return self._container ? self._container.querySelectorAll(sel) : new NodeList([]);
+                },
+                get head() {
+                    if (!self._head) {
+                        var html = self._container ? self._container.firstChild : null;
+                        while (html && html.tagName !== 'HTML') html = html.nextSibling;
+                        if (html) {
+                            var child = html.firstChild;
+                            while (child && child.tagName !== 'HEAD') child = child.nextSibling;
+                            self._head = child || document.createElement('head');
+                        } else {
+                            self._head = document.createElement('head');
+                        }
+                    }
+                    return self._head;
+                },
+                get body() {
+                    if (!self._body) {
+                        var html = self._container ? self._container.firstChild : null;
+                        while (html && html.tagName !== 'HTML') html = html.nextSibling;
+                        if (html) {
+                            var child = html.lastChild;
+                            while (child && child.tagName !== 'BODY') child = child.previousSibling;
+                            self._body = child || document.createElement('body');
+                        } else {
+                            self._body = document.createElement('body');
+                        }
+                    }
+                    return self._body;
+                },
+                get documentElement() {
+                    return self._container ? self._container.firstChild : null;
+                },
+                get title() { return ''; },
+                get readyState() { return 'complete'; },
+                get URL() { return document.URL; },
+                get baseURI() { return document.baseURI; },
+                get documentURI() { return document.documentURI; },
+                get nodeType() { return 9; },
+                get nodeName() { return '#document'; },
+                get cookie() { return ''; },
+                set cookie(v) {},
+                createTreeWalker: function(root, whatToShow, filter) {
+                    return new TreeWalker(root, whatToShow, filter);
+                },
+                createNodeIterator: function(root, whatToShow, filter) {
+                    return new NodeIterator(root, whatToShow, filter);
+                },
+                createRange: function() { return new Range(); },
+                importNode: function(node, deep) { return node; },
+                adoptNode: function(node) { return node; },
+                execCommand: function() { return false; },
+            };
+        }
+        return this._contentDocument;
+    }
+    get contentWindow() {
+        if (!this._contentWindow) {
+            var self = this;
+            this._contentWindow = {};
+            var doc = self.contentDocument;
+            Object.defineProperty(self._contentWindow, 'document', {
+                get: function() { return doc; },
+                enumerable: true,
+                configurable: true
+            });
+            self._contentWindow.self = self._contentWindow;
+            self._contentWindow.top = self._contentWindow;
+            self._contentWindow.parent = window;
+            self._contentWindow.frames = self._contentWindow;
+            self._contentWindow.length = 0;
+            self._contentWindow.name = '';
+            self._contentWindow.location = document.location;
+            self._contentWindow.closed = false;
+            self._contentWindow.opener = null;
+            self._contentWindow.frameElement = self;
+        }
+        return this._contentWindow;
+    }
+    appendChild(child) {
+        if (!this._container) {
+            this._container = document.createElement('div');
+            this._container.style.display = 'none';
+            var html = document.createElement('html');
+            var head = document.createElement('head');
+            var body = document.createElement('body');
+            html.appendChild(head);
+            html.appendChild(body);
+            this._container.appendChild(html);
+            this._head = head;
+            this._body = body;
+        }
+        if (child && child._id !== undefined && child._id !== null) {
+            return this._body.appendChild(child);
+        }
+        return child;
+    }
+}
+window.HTMLIFrameElement = HTMLIFrameElement;
 
 class HTMLFormElement extends HTMLElement {
     _controls() {
