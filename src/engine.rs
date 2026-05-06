@@ -1230,6 +1230,8 @@ impl BrowserEngine {
         });
 
         let scripts = js::extract_script_sources_from_dom(&dom.document, Some(&page.base_url));
+        let mut root_module_urls: Vec<Url> = Vec::new();
+
         for script in scripts {
             match script {
                 js::ScriptSource::InlineClassic(script) => {
@@ -1275,6 +1277,9 @@ impl BrowserEngine {
                     let outcome = self.js_runtime.compile_module_source(url.clone(), source);
                     if let Some(error) = outcome.error {
                         println!("[JS] Failed to compile inline module {}: {}", url, error);
+                        js::push_console_entry(js::ConsoleLevel::Error, format!("Failed to compile inline module {url}: {error}"));
+                    } else {
+                        root_module_urls.push(url);
                     }
                 }
                 js::ScriptSource::ExternalModule(url) => {
@@ -1285,7 +1290,23 @@ impl BrowserEngine {
                         });
                     if let Some(error) = outcome.error {
                         println!("[JS] Failed to load external module {}: {}", url, error);
+                        js::push_console_entry(js::ConsoleLevel::Error, format!("Failed to load external module {url}: {error}"));
+                    } else {
+                        root_module_urls.push(url);
                     }
+                }
+            }
+        }
+
+        // Resolve and compile transitive module dependencies.
+        self.resolve_module_dependencies(&page.base_url, &mut root_module_urls);
+
+        if !root_module_urls.is_empty() {
+            let eval_result = self.js_runtime.evaluate_module_graph(&root_module_urls);
+            if let Err(errors) = eval_result {
+                for error in &errors {
+                    println!("[JS] Module evaluation error: {error}");
+                    js::push_console_entry(js::ConsoleLevel::Error, error.clone());
                 }
             }
         }
@@ -1330,6 +1351,47 @@ impl BrowserEngine {
                 requests: Vec::new(),
                 error: Some(err.to_string()),
             },
+        }
+    }
+
+    fn resolve_module_dependencies(&mut self, page_base: &Url, root_urls: &mut Vec<Url>) {
+        let mut idx = 0;
+        while idx < root_urls.len() {
+            let url = root_urls[idx].clone();
+            let requests: Vec<String> = self
+                .js_runtime
+                .cached_module_requests(&url)
+                .map(|r| r.to_vec())
+                .unwrap_or_default();
+
+            for specifier in &requests {
+                let resolved = match page_base.join(specifier).or_else(|_| url.join(specifier)) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+
+                if !root_urls.contains(&resolved) {
+                    let outcome = self.load_external_module_with(
+                        resolved.clone(),
+                        page_base,
+                        |module_url| {
+                            reqwest::blocking::get(module_url.as_str())
+                                .and_then(|response| response.text())
+                        },
+                    );
+                    if outcome.error.is_none() {
+                        root_urls.push(resolved);
+                    } else if let Some(error) = outcome.error {
+                        println!("[JS] Failed to load module dependency {resolved}: {error}");
+                        js::push_console_entry(
+                            js::ConsoleLevel::Error,
+                            format!("Failed to load module dependency {resolved}: {error}"),
+                        );
+                    }
+                }
+            }
+
+            idx += 1;
         }
     }
 
