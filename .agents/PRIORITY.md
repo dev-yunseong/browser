@@ -48,8 +48,8 @@ Must be done in order — each phase builds on the previous.
 
 | # | Issue | Why this order |
 |---|---|---|
-| #244 | [JS] V8 migration audit and compatibility matrix (in progress by codex:gpt-5) | Foundation. Clarifies stale phase issues and current support gaps. |
-| #245 | [JS] ES module loader foundation | Depends on #244. Needs resolver, fetch, CSP, cache, and V8 module compile path. |
+| #244 ✓ | [JS] V8 migration audit and compatibility matrix | Foundation. Clarifies stale phase issues and current support gaps. |
+| #245 | [JS] ES module loader foundation (in progress by codex:gpt-5) | Depends on #244. Needs resolver, fetch, CSP, cache, and V8 module compile path. |
 | #246 | [JS] ES module graph linking and evaluation | Depends on #245. Needs module graph/link/evaluate before browser semantics. |
 | #247 | [JS] Browser ES module semantics | Depends on #246. Adds import.meta, dynamic import, nomodule, and script lifecycle behavior. |
 | #248 | [JS] Integrate ES modules with DOM mutation, style, and tick | Depends on #247. Modules must affect rendering and async work through the event loop. |
