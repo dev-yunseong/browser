@@ -1,7 +1,0 @@
-interface:
-  display_name: "Multi-Model Plan Review"
-  short_description: "Fast, medium, and heavy plan review protocol"
-  default_prompt: "Use $multi-model-plan-review to review my implementation plan with fast, medium, and heavy passes before coding."
-
-policy:
-  allow_implicit_invocation: true
