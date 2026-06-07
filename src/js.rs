@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 use v8;
 
@@ -137,8 +137,8 @@ fn host_import_module_dynamically<'s, 'i>(
         p.borrow()
             .as_ref()
             .map(|pol| {
-                let url =
-                    Url::parse(&resolved_str).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                let url = Url::parse(&resolved_str)
+                    .unwrap_or_else(|_| Url::parse("about:blank").unwrap());
                 let base = CURRENT_ORIGIN.with(|o| o.borrow().clone());
                 pol.is_allowed("script-src", &url, base.as_ref())
             })
@@ -150,12 +150,11 @@ fn host_import_module_dynamically<'s, 'i>(
         return Some(promise);
     }
 
-    let source =
-        MODULE_SOURCES.with(|map| map.borrow().get(&resolved_str).cloned());
+    let source = MODULE_SOURCES.with(|map| map.borrow().get(&resolved_str).cloned());
 
     let source = match source {
         Some(s) => s,
-        None => match reqwest::blocking::get(&resolved_str).and_then(|r| r.text()) {
+        None => match fetch_module_source_with_timeout(&resolved_str) {
             Ok(s) => s,
             Err(e) => {
                 reject(&format!("Failed to fetch module: {e}"));
@@ -186,14 +185,13 @@ fn host_import_module_dynamically<'s, 'i>(
     );
     let mut source_compiler = v8::script_compiler::Source::new(code, Some(&origin));
 
-    let module =
-        match v8::script_compiler::compile_module(scope, &mut source_compiler) {
-            Some(m) => m,
-            None => {
-                reject("Module compilation failed");
-                return Some(promise);
-            }
-        };
+    let module = match v8::script_compiler::compile_module(scope, &mut source_compiler) {
+        Some(m) => m,
+        None => {
+            reject("Module compilation failed");
+            return Some(promise);
+        }
+    };
 
     MODULE_ID_TO_URL.with(|map| {
         map.borrow_mut()
@@ -233,6 +231,15 @@ fn host_import_module_dynamically<'s, 'i>(
     Some(promise)
 }
 
+fn fetch_module_source_with_timeout(url: &str) -> Result<String, reqwest::Error> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?
+        .get(url)
+        .send()?
+        .text()
+}
+
 fn resolve_module_callback<'s>(
     context: v8::Local<'s, v8::Context>,
     specifier: v8::Local<'s, v8::String>,
@@ -258,9 +265,7 @@ fn resolve_module_callback<'s>(
     let source = MODULE_SOURCES.with(|map| map.borrow().get(&resolved_url).cloned())?;
 
     // Return cached module if already resolved (handles cyclic imports)
-    if let Some(cached) = RESOLVED_MODULES
-        .with(|map| map.borrow().get(&resolved_url).cloned())
-    {
+    if let Some(cached) = RESOLVED_MODULES.with(|map| map.borrow().get(&resolved_url).cloned()) {
         return Some(v8::Local::new(scope, &cached));
     }
 
@@ -600,13 +605,17 @@ impl JsRuntime {
     }
 
     pub fn tick(&mut self, timestamp: Option<f64>, deadline_ms: Option<f64>) -> bool {
+        const MAX_TASKS_PER_TICK: usize = 32;
         let mut did_work = false;
         if self.sync_focus() {
             did_work = true;
         }
 
-        while let Ok(task) = self.task_receiver.try_recv() {
-            MACRO_TASKS.with(|tasks| tasks.borrow_mut().push_back(task));
+        for _ in 0..MAX_TASKS_PER_TICK {
+            match self.task_receiver.try_recv() {
+                Ok(task) => MACRO_TASKS.with(|tasks| tasks.borrow_mut().push_back(task)),
+                Err(_) => break,
+            }
         }
 
         let macro_task = MACRO_TASKS.with(|tasks| tasks.borrow_mut().pop_front());
@@ -620,7 +629,11 @@ impl JsRuntime {
 
         if let Some(ts) = timestamp {
             let mut tasks = VecDeque::new();
-            RAF_TASKS.with(|t| tasks = t.borrow_mut().drain(..).collect());
+            RAF_TASKS.with(|t| {
+                let mut queue = t.borrow_mut();
+                let count = queue.len().min(MAX_TASKS_PER_TICK);
+                tasks = queue.drain(..count).collect();
+            });
             if !tasks.is_empty() {
                 did_work = true;
                 for task in tasks {
@@ -652,9 +665,11 @@ impl JsRuntime {
             }
         }
 
-        while let Some((callback, payload, is_resolve)) =
-            FETCH_PENDING.with(|p| p.borrow_mut().pop_front())
-        {
+        for _ in 0..MAX_TASKS_PER_TICK {
+            let pending = FETCH_PENDING.with(|p| p.borrow_mut().pop_front());
+            let Some((callback, payload, is_resolve)) = pending else {
+                break;
+            };
             did_work = true;
             self.call_with_payload(callback, &payload, is_resolve);
             self.run_microtasks();
@@ -664,8 +679,12 @@ impl JsRuntime {
     }
 
     fn run_pending_callbacks(&mut self) {
-        let pending: Vec<(v8::Global<v8::Function>, Option<f64>)> =
-            RUN_PENDING.with(|p| p.borrow_mut().drain(..).collect());
+        const MAX_PENDING_CALLBACKS_PER_DRAIN: usize = 64;
+        let pending: Vec<(v8::Global<v8::Function>, Option<f64>)> = RUN_PENDING.with(|p| {
+            let mut pending = p.borrow_mut();
+            let count = pending.len().min(MAX_PENDING_CALLBACKS_PER_DRAIN);
+            pending.drain(..count).collect()
+        });
         if pending.is_empty() {
             return;
         }
@@ -714,11 +733,21 @@ impl JsRuntime {
     }
 
     fn run_microtasks(&mut self) {
+        const MAX_MICROTASKS_PER_DRAIN: usize = 128;
+        let mut iterations = 0;
         loop {
             let mut micro_work_done = false;
             while let Some(task) = MICRO_TASKS.with(|tasks| tasks.borrow_mut().pop_front()) {
+                if iterations >= MAX_MICROTASKS_PER_DRAIN {
+                    push_console_entry(
+                        ConsoleLevel::Warn,
+                        "JS microtask drain limit reached; remaining tasks deferred".to_string(),
+                    );
+                    return;
+                }
                 task();
                 micro_work_done = true;
+                iterations += 1;
             }
             let hs = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
             let hs = &mut hs.init();
@@ -1013,7 +1042,11 @@ impl JsRuntime {
         MODULE_ID_TO_URL.with(|map| map.borrow_mut().clear());
         RESOLVED_MODULES.with(|map| map.borrow_mut().clear());
 
-        if errors.is_empty() { Ok(()) } else { Err(errors) }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
     pub fn evaluate_module_graph(&mut self, root_urls: &[Url]) -> Result<(), Vec<String>> {
@@ -1122,9 +1155,7 @@ impl JsRuntime {
             }
 
             let evaluate_result = module.evaluate(tc);
-            if evaluate_result.is_none()
-                || module.get_status() == v8::ModuleStatus::Errored
-            {
+            if evaluate_result.is_none() || module.get_status() == v8::ModuleStatus::Errored {
                 let err_msg = tc
                     .exception()
                     .and_then(|e| e.to_string(tc))
@@ -1148,7 +1179,11 @@ impl JsRuntime {
         MODULE_ID_TO_URL.with(|map| map.borrow_mut().clear());
         RESOLVED_MODULES.with(|map| map.borrow_mut().clear());
 
-        if errors.is_empty() { Ok(()) } else { Err(errors) }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
     fn compile_v8_module(&mut self, url: &Url, source: &str) -> Result<Vec<String>, String> {
@@ -1177,12 +1212,13 @@ impl JsRuntime {
             None,
         );
         let mut source_compiler = v8::script_compiler::Source::new(code, Some(&origin));
-        let module = v8::script_compiler::compile_module(tc, &mut source_compiler).ok_or_else(|| {
-            tc.exception()
-                .and_then(|e| e.to_string(tc))
-                .map(|s| s.to_rust_string_lossy(tc))
-                .unwrap_or_else(|| "Unknown module compilation error".to_string())
-        })?;
+        let module =
+            v8::script_compiler::compile_module(tc, &mut source_compiler).ok_or_else(|| {
+                tc.exception()
+                    .and_then(|e| e.to_string(tc))
+                    .map(|s| s.to_rust_string_lossy(tc))
+                    .unwrap_or_else(|| "Unknown module compilation error".to_string())
+            })?;
 
         let requests = module.get_module_requests();
         let mut specifiers = Vec::new();
@@ -2987,7 +3023,10 @@ pub fn extract_scripts_from_dom(handle: &Handle) -> Vec<String> {
     extract_script_sources_from_dom(handle, None)
         .into_iter()
         .filter_map(|source| match source {
-            ScriptSource::InlineClassic { source, is_defer: false } => Some(source),
+            ScriptSource::InlineClassic {
+                source,
+                is_defer: false,
+            } => Some(source),
             ScriptSource::InlineClassic { is_defer: true, .. }
             | ScriptSource::ExternalClassic { .. }
             | ScriptSource::InlineModule { .. }
@@ -3000,10 +3039,7 @@ pub fn extract_scripts_from_dom(handle: &Handle) -> Vec<String> {
 pub enum ScriptSource {
     /// Inline classic scripts are always synchronous in the HTML spec (neither async nor defer
     /// should apply), but we track `is_defer` so that inline test cases can exercise defer semantics.
-    InlineClassic {
-        source: String,
-        is_defer: bool,
-    },
+    InlineClassic { source: String, is_defer: bool },
     ExternalClassic {
         url: Url,
         is_async: bool,
@@ -3079,9 +3115,17 @@ pub fn extract_script_sources_from_dom(
                         if let Ok(url) = base.join(&src).or_else(|_| Url::parse(&src)) {
                             if is_module {
                                 let node_id = register_node(handle.clone());
-                                scripts.push(ScriptSource::ExternalModule { url, node_id, is_async });
+                                scripts.push(ScriptSource::ExternalModule {
+                                    url,
+                                    node_id,
+                                    is_async,
+                                });
                             } else if is_classic {
-                                scripts.push(ScriptSource::ExternalClassic { url, is_async, is_defer });
+                                scripts.push(ScriptSource::ExternalClassic {
+                                    url,
+                                    is_async,
+                                    is_defer,
+                                });
                             }
                         }
                     }
@@ -3110,7 +3154,10 @@ pub fn extract_script_sources_from_dom(
                                 });
                             }
                         } else if is_classic {
-                            scripts.push(ScriptSource::InlineClassic { source: content, is_defer });
+                            scripts.push(ScriptSource::InlineClassic {
+                                source: content,
+                                is_defer,
+                            });
                         }
                     }
                 }
@@ -3179,7 +3226,10 @@ mod tests {
     fn test_execute_with_result_does_not_prescan_import_text() {
         let mut rt = make_runtime("<html><body></body></html>");
         let outcome = rt.execute_with_result(r#""import value from './dep.js'""#);
-        assert_eq!(outcome.result.as_deref(), Some("import value from './dep.js'"));
+        assert_eq!(
+            outcome.result.as_deref(),
+            Some("import value from './dep.js'")
+        );
         assert_eq!(outcome.error, None);
     }
 
@@ -3229,9 +3279,15 @@ mod tests {
         let base = Url::parse("https://example.com/app/").unwrap();
         let sources = extract_script_sources_from_dom(&dom.document, Some(&base));
         assert_eq!(sources.len(), 3);
-        assert!(matches!(&sources[0], ScriptSource::InlineClassic { source: s, is_defer: false } if s == "window.a = 1;"));
-        assert!(matches!(&sources[1], ScriptSource::ExternalClassic { url, is_async: false, is_defer: false } if url.as_str() == "https://example.com/bundle.js"));
-        assert!(matches!(&sources[2], ScriptSource::ExternalModule { url, is_async: false, .. } if url.as_str() == "https://example.com/module.js"));
+        assert!(
+            matches!(&sources[0], ScriptSource::InlineClassic { source: s, is_defer: false } if s == "window.a = 1;")
+        );
+        assert!(
+            matches!(&sources[1], ScriptSource::ExternalClassic { url, is_async: false, is_defer: false } if url.as_str() == "https://example.com/bundle.js")
+        );
+        assert!(
+            matches!(&sources[2], ScriptSource::ExternalModule { url, is_async: false, .. } if url.as_str() == "https://example.com/module.js")
+        );
     }
 
     #[test]
@@ -3243,17 +3299,24 @@ mod tests {
         );
         let module_sources = extract_script_sources_from_dom(&module_dom.document, Some(&base));
         assert_eq!(module_sources.len(), 1);
-        assert!(matches!(&module_sources[0], ScriptSource::ExternalModule { url, is_async: false, .. } if url.as_str() == "https://example.com/m.js"));
+        assert!(
+            matches!(&module_sources[0], ScriptSource::ExternalModule { url, is_async: false, .. } if url.as_str() == "https://example.com/m.js")
+        );
 
-        let nomodule_dom = dom::parse_html(r#"<html><head><script nomodule>window.x=1</script></head></html>"#);
+        let nomodule_dom =
+            dom::parse_html(r#"<html><head><script nomodule>window.x=1</script></head></html>"#);
         let nomodule_sources = extract_script_sources_from_dom(&nomodule_dom.document, Some(&base));
         assert!(nomodule_sources.is_empty());
 
-        let classic_dom = dom::parse_html(r#"<html><head><script>window.x=1</script></head></html>"#);
+        let classic_dom =
+            dom::parse_html(r#"<html><head><script>window.x=1</script></head></html>"#);
         let classic_sources = extract_script_sources_from_dom(&classic_dom.document, Some(&base));
         assert_eq!(
             classic_sources,
-            vec![ScriptSource::InlineClassic { source: "window.x=1".to_string(), is_defer: false }]
+            vec![ScriptSource::InlineClassic {
+                source: "window.x=1".to_string(),
+                is_defer: false
+            }]
         );
     }
 
@@ -3500,10 +3563,7 @@ mod tests {
         );
 
         let main_url = Url::parse("https://example.com/main.js").unwrap();
-        rt.compile_module_source(
-            main_url.clone(),
-            "import './dep.js';".to_string(),
-        );
+        rt.compile_module_source(main_url.clone(), "import './dep.js';".to_string());
 
         rt.evaluate_module_graph(&[main_url]).unwrap();
 
@@ -3522,7 +3582,8 @@ mod tests {
         let lib_url = Url::parse("https://example.com/lib/helpers.js").unwrap();
         rt.compile_module_source(
             lib_url.clone(),
-            "export const version = '1.0'; globalThis.__helpers_meta = import.meta.url;".to_string(),
+            "export const version = '1.0'; globalThis.__helpers_meta = import.meta.url;"
+                .to_string(),
         );
 
         let app_url = Url::parse("https://example.com/app/main.js").unwrap();
@@ -3599,7 +3660,11 @@ mod tests {
 
         let outcome = rt.execute_with_result("globalThis.__error");
         assert_eq!(outcome.error, None);
-        assert!(outcome.result.as_deref().unwrap_or("").contains("module error"));
+        assert!(outcome
+            .result
+            .as_deref()
+            .unwrap_or("")
+            .contains("module error"));
     }
 
     #[test]
@@ -3638,10 +3703,7 @@ mod tests {
 
     #[test]
     fn test_character_data_constructor_exists() {
-        let mut rt = make_dom_runtime(
-            "<html><body>hello</body></html>",
-            "https://example.com/",
-        );
+        let mut rt = make_dom_runtime("<html><body>hello</body></html>", "https://example.com/");
         let outcome = rt.execute_with_result("typeof CharacterData");
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.result.as_deref(), Some("function"));
@@ -3649,10 +3711,7 @@ mod tests {
 
     #[test]
     fn test_character_data_is_window_property() {
-        let mut rt = make_dom_runtime(
-            "<html><body>hello</body></html>",
-            "https://example.com/",
-        );
+        let mut rt = make_dom_runtime("<html><body>hello</body></html>", "https://example.com/");
         let outcome = rt.execute_with_result("typeof window.CharacterData");
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.result.as_deref(), Some("function"));
@@ -3660,10 +3719,7 @@ mod tests {
 
     #[test]
     fn test_character_data_prototype_instanceof_node() {
-        let mut rt = make_dom_runtime(
-            "<html><body>hello</body></html>",
-            "https://example.com/",
-        );
+        let mut rt = make_dom_runtime("<html><body>hello</body></html>", "https://example.com/");
         let outcome = rt.execute_with_result("CharacterData.prototype instanceof Node");
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.result.as_deref(), Some("true"));
@@ -3671,21 +3727,16 @@ mod tests {
 
     #[test]
     fn test_text_node_is_instanceof_character_data() {
-        let mut rt = make_dom_runtime(
-            "<html><body>hello</body></html>",
-            "https://example.com/",
-        );
-        let outcome = rt.execute_with_result("document.createTextNode('x') instanceof CharacterData");
+        let mut rt = make_dom_runtime("<html><body>hello</body></html>", "https://example.com/");
+        let outcome =
+            rt.execute_with_result("document.createTextNode('x') instanceof CharacterData");
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.result.as_deref(), Some("true"));
     }
 
     #[test]
     fn test_text_node_is_instanceof_node() {
-        let mut rt = make_dom_runtime(
-            "<html><body>hello</body></html>",
-            "https://example.com/",
-        );
+        let mut rt = make_dom_runtime("<html><body>hello</body></html>", "https://example.com/");
         let outcome = rt.execute_with_result("document.createTextNode('x') instanceof Node");
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.result.as_deref(), Some("true"));
@@ -3693,21 +3744,16 @@ mod tests {
 
     #[test]
     fn test_comment_is_instanceof_character_data() {
-        let mut rt = make_dom_runtime(
-            "<html><body>hello</body></html>",
-            "https://example.com/",
-        );
-        let outcome = rt.execute_with_result("document.createComment('x') instanceof CharacterData");
+        let mut rt = make_dom_runtime("<html><body>hello</body></html>", "https://example.com/");
+        let outcome =
+            rt.execute_with_result("document.createComment('x') instanceof CharacterData");
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.result.as_deref(), Some("true"));
     }
 
     #[test]
     fn test_comment_is_instanceof_node() {
-        let mut rt = make_dom_runtime(
-            "<html><body>hello</body></html>",
-            "https://example.com/",
-        );
+        let mut rt = make_dom_runtime("<html><body>hello</body></html>", "https://example.com/");
         let outcome = rt.execute_with_result("document.createComment('x') instanceof Node");
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.result.as_deref(), Some("true"));
@@ -3715,10 +3761,7 @@ mod tests {
 
     #[test]
     fn test_text_prototype_instanceof_character_data() {
-        let mut rt = make_dom_runtime(
-            "<html><body>hello</body></html>",
-            "https://example.com/",
-        );
+        let mut rt = make_dom_runtime("<html><body>hello</body></html>", "https://example.com/");
         let outcome = rt.execute_with_result("Text.prototype instanceof CharacterData");
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.result.as_deref(), Some("true"));
@@ -3726,10 +3769,7 @@ mod tests {
 
     #[test]
     fn test_comment_prototype_instanceof_character_data() {
-        let mut rt = make_dom_runtime(
-            "<html><body>hello</body></html>",
-            "https://example.com/",
-        );
+        let mut rt = make_dom_runtime("<html><body>hello</body></html>", "https://example.com/");
         let outcome = rt.execute_with_result("Comment.prototype instanceof CharacterData");
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.result.as_deref(), Some("true"));
@@ -3737,10 +3777,7 @@ mod tests {
 
     #[test]
     fn test_text_node_has_data_property() {
-        let mut rt = make_dom_runtime(
-            "<html><body>hello</body></html>",
-            "https://example.com/",
-        );
+        let mut rt = make_dom_runtime("<html><body>hello</body></html>", "https://example.com/");
         let outcome = rt.execute_with_result("document.createTextNode('hello').data");
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.result.as_deref(), Some("hello"));
@@ -3748,10 +3785,7 @@ mod tests {
 
     #[test]
     fn test_text_node_has_length_property() {
-        let mut rt = make_dom_runtime(
-            "<html><body>hello</body></html>",
-            "https://example.com/",
-        );
+        let mut rt = make_dom_runtime("<html><body>hello</body></html>", "https://example.com/");
         let outcome = rt.execute_with_result("document.createTextNode('hello').length");
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.result.as_deref(), Some("5"));
@@ -3759,10 +3793,7 @@ mod tests {
 
     #[test]
     fn test_character_data_append_data() {
-        let mut rt = make_dom_runtime(
-            "<html><body>hello</body></html>",
-            "https://example.com/",
-        );
+        let mut rt = make_dom_runtime("<html><body>hello</body></html>", "https://example.com/");
         let outcome = rt.execute_with_result(
             "var n = document.createTextNode('hello'); n.appendData(' world'); n.data",
         );
@@ -3772,10 +3803,7 @@ mod tests {
 
     #[test]
     fn test_character_data_delete_data() {
-        let mut rt = make_dom_runtime(
-            "<html><body>hello</body></html>",
-            "https://example.com/",
-        );
+        let mut rt = make_dom_runtime("<html><body>hello</body></html>", "https://example.com/");
         let outcome = rt.execute_with_result(
             "var n = document.createTextNode('hello'); n.deleteData(1, 3); n.data",
         );
@@ -3785,10 +3813,7 @@ mod tests {
 
     #[test]
     fn test_character_data_insert_data() {
-        let mut rt = make_dom_runtime(
-            "<html><body>hello</body></html>",
-            "https://example.com/",
-        );
+        let mut rt = make_dom_runtime("<html><body>hello</body></html>", "https://example.com/");
         let outcome = rt.execute_with_result(
             "var n = document.createTextNode('ho'); n.insertData(1, 'ell'); n.data",
         );
@@ -3798,10 +3823,7 @@ mod tests {
 
     #[test]
     fn test_character_data_replace_data() {
-        let mut rt = make_dom_runtime(
-            "<html><body>hello</body></html>",
-            "https://example.com/",
-        );
+        let mut rt = make_dom_runtime("<html><body>hello</body></html>", "https://example.com/");
         let outcome = rt.execute_with_result(
             "var n = document.createTextNode('hello world'); n.replaceData(0, 5, 'goodbye'); n.data",
         );
@@ -3811,13 +3833,9 @@ mod tests {
 
     #[test]
     fn test_character_data_substring_data() {
-        let mut rt = make_dom_runtime(
-            "<html><body>hello</body></html>",
-            "https://example.com/",
-        );
-        let outcome = rt.execute_with_result(
-            "document.createTextNode('hello world').substringData(0, 5)",
-        );
+        let mut rt = make_dom_runtime("<html><body>hello</body></html>", "https://example.com/");
+        let outcome =
+            rt.execute_with_result("document.createTextNode('hello world').substringData(0, 5)");
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.result.as_deref(), Some("hello"));
     }
@@ -3856,10 +3874,7 @@ mod tests {
 
     #[test]
     fn test_onload_handler_dispatch() {
-        let mut rt = make_dom_runtime(
-            r#"<html><body></body></html>"#,
-            "https://example.com/",
-        );
+        let mut rt = make_dom_runtime(r#"<html><body></body></html>"#, "https://example.com/");
         rt.execute(
             "window.onload = function() { window.__loadFired = true; }; \
              var ev = new Event('load', { bubbles: false }); \
@@ -4023,10 +4038,7 @@ mod tests {
 
     #[test]
     fn test_form_create_element_creates_html_form_element() {
-        let mut rt = make_dom_runtime(
-            "<html><body></body></html>",
-            "https://example.com/",
-        );
+        let mut rt = make_dom_runtime("<html><body></body></html>", "https://example.com/");
         let outcome = rt.execute_with_result(
             "var f = document.createElement('form'); typeof f.submit === 'function'",
         );
@@ -4040,8 +4052,8 @@ mod tests {
             "<html><body><iframe id='f'></iframe></body></html>",
             "https://example.com/",
         );
-        let outcome = rt
-            .execute_with_result("document.getElementById('f').contentDocument !== null");
+        let outcome =
+            rt.execute_with_result("document.getElementById('f').contentDocument !== null");
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.result.as_deref(), Some("true"));
     }
@@ -4052,8 +4064,8 @@ mod tests {
             "<html><body><iframe id='f'></iframe></body></html>",
             "https://example.com/",
         );
-        let outcome = rt
-            .execute_with_result("document.getElementById('f').contentWindow.document !== null");
+        let outcome =
+            rt.execute_with_result("document.getElementById('f').contentWindow.document !== null");
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.result.as_deref(), Some("true"));
     }
@@ -4135,10 +4147,7 @@ mod tests {
 
     #[test]
     fn test_create_element_iframe_has_content_document() {
-        let mut rt = make_dom_runtime(
-            "<html><body></body></html>",
-            "https://example.com/",
-        );
+        let mut rt = make_dom_runtime("<html><body></body></html>", "https://example.com/");
         let outcome = rt.execute_with_result(
             "var iframe = document.createElement('iframe'); \
              iframe.contentDocument !== null",
@@ -4149,50 +4158,35 @@ mod tests {
 
     #[test]
     fn test_shadow_root_is_function() {
-        let mut rt = make_dom_runtime(
-            "<html><body></body></html>",
-            "https://example.com/",
-        );
+        let mut rt = make_dom_runtime("<html><body></body></html>", "https://example.com/");
         let outcome = rt.execute_with_result("typeof ShadowRoot");
         assert_eq!(outcome.result.as_deref(), Some("function"));
     }
 
     #[test]
     fn test_intersection_observer_is_function() {
-        let mut rt = make_dom_runtime(
-            "<html><body></body></html>",
-            "https://example.com/",
-        );
+        let mut rt = make_dom_runtime("<html><body></body></html>", "https://example.com/");
         let outcome = rt.execute_with_result("typeof IntersectionObserver");
         assert_eq!(outcome.result.as_deref(), Some("function"));
     }
 
     #[test]
     fn test_resize_observer_is_function() {
-        let mut rt = make_dom_runtime(
-            "<html><body></body></html>",
-            "https://example.com/",
-        );
+        let mut rt = make_dom_runtime("<html><body></body></html>", "https://example.com/");
         let outcome = rt.execute_with_result("typeof ResizeObserver");
         assert_eq!(outcome.result.as_deref(), Some("function"));
     }
 
     #[test]
     fn test_mutation_observer_is_function() {
-        let mut rt = make_dom_runtime(
-            "<html><body></body></html>",
-            "https://example.com/",
-        );
+        let mut rt = make_dom_runtime("<html><body></body></html>", "https://example.com/");
         let outcome = rt.execute_with_result("typeof MutationObserver");
         assert_eq!(outcome.result.as_deref(), Some("function"));
     }
 
     #[test]
     fn test_intersection_observer_has_take_records() {
-        let mut rt = make_dom_runtime(
-            "<html><body></body></html>",
-            "https://example.com/",
-        );
+        let mut rt = make_dom_runtime("<html><body></body></html>", "https://example.com/");
         let outcome = rt.execute_with_result(
             "var io = new IntersectionObserver(function() {}); \
              typeof io.takeRecords === 'function' && io.takeRecords().length === 0",
@@ -4202,10 +4196,7 @@ mod tests {
 
     #[test]
     fn test_mutation_observer_take_records_returns_array() {
-        let mut rt = make_dom_runtime(
-            "<html><body></body></html>",
-            "https://example.com/",
-        );
+        let mut rt = make_dom_runtime("<html><body></body></html>", "https://example.com/");
         let outcome = rt.execute_with_result(
             "var mo = new MutationObserver(function() {}); \
              Array.isArray(mo.takeRecords())",
@@ -4219,33 +4210,22 @@ mod tests {
             "<html><body><div id='test'></div></body></html>",
             "https://example.com/",
         );
-        let outcome = rt.execute_with_result(
-            "document.getElementById('test').getRootNode() === document",
-        );
+        let outcome =
+            rt.execute_with_result("document.getElementById('test').getRootNode() === document");
         assert_eq!(outcome.result.as_deref(), Some("true"));
     }
 
     #[test]
     fn test_get_root_node_returns_document_for_body() {
-        let mut rt = make_dom_runtime(
-            "<html><body></body></html>",
-            "https://example.com/",
-        );
-        let outcome = rt.execute_with_result(
-            "document.body.getRootNode() === document",
-        );
+        let mut rt = make_dom_runtime("<html><body></body></html>", "https://example.com/");
+        let outcome = rt.execute_with_result("document.body.getRootNode() === document");
         assert_eq!(outcome.result.as_deref(), Some("true"));
     }
 
     #[test]
     fn test_get_root_node_on_document_element() {
-        let mut rt = make_dom_runtime(
-            "<html><body></body></html>",
-            "https://example.com/",
-        );
-        let outcome = rt.execute_with_result(
-            "document.documentElement.getRootNode() === document",
-        );
+        let mut rt = make_dom_runtime("<html><body></body></html>", "https://example.com/");
+        let outcome = rt.execute_with_result("document.documentElement.getRootNode() === document");
         assert_eq!(outcome.result.as_deref(), Some("true"));
     }
 
@@ -4255,9 +4235,8 @@ mod tests {
             "<html><body><div id='test'></div></body></html>",
             "https://example.com/",
         );
-        let outcome = rt.execute_with_result(
-            "document.getElementById('test').ownerDocument === document",
-        );
+        let outcome =
+            rt.execute_with_result("document.getElementById('test').ownerDocument === document");
         assert_eq!(outcome.result.as_deref(), Some("true"));
     }
 }

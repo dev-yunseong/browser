@@ -1,7 +1,7 @@
 use markup5ever_rcdom;
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use url::Url;
 
 use crate::{css, dom, js, layout, render, style};
@@ -61,6 +61,25 @@ pub enum ClickResult {
     /// No interactive element at the given position.
     Nothing,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EngineRequestError {
+    Busy,
+    Disconnected,
+    Failed(String),
+}
+
+impl std::fmt::Display for EngineRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EngineRequestError::Busy => write!(f, "engine busy"),
+            EngineRequestError::Disconnected => write!(f, "engine disconnected"),
+            EngineRequestError::Failed(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for EngineRequestError {}
 
 // ── HTTP API response types ───────────────────────────────────────────────────
 
@@ -825,6 +844,15 @@ pub fn process_html_with_cache(
     ))
 }
 
+fn fetch_text_with_timeout(url: &Url) -> Result<String, reqwest::Error> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?
+        .get(url.as_str())
+        .send()?
+        .text()
+}
+
 fn collect_layout_metrics(
     layout_tree: &layout::LayoutBox,
     out: &mut HashMap<String, js::LayoutMetrics>,
@@ -1250,7 +1278,7 @@ impl BrowserEngine {
                 println!("[CSP] Blocked external script execution: {}", url);
                 return None;
             }
-            match reqwest::blocking::get(url.as_str()).and_then(|response| response.text()) {
+            match fetch_text_with_timeout(url) {
                 Ok(source) => Some(source),
                 Err(err) => {
                     println!("[JS] Failed to load external script {}: {}", url, err);
@@ -1338,10 +1366,7 @@ impl BrowserEngine {
                     let outcome = self.load_external_module_with(
                         url.clone(),
                         &page.base_url,
-                        |module_url| {
-                            reqwest::blocking::get(module_url.as_str())
-                                .and_then(|response| response.text())
-                        },
+                        fetch_text_with_timeout,
                     );
                     if let Some(error) = &outcome.error {
                         println!("[JS] Failed to load external module {}: {}", url, error);
@@ -1370,28 +1395,22 @@ impl BrowserEngine {
 
         self.resolve_module_dependencies(&page.base_url, &mut deferred_module_urls);
         if !deferred_module_urls.is_empty() {
-            let eval_result = self
-                .js_runtime
-                .evaluate_module_graph(&deferred_module_urls);
+            let eval_result = self.js_runtime.evaluate_module_graph(&deferred_module_urls);
             if let Err(errors) = eval_result {
-                let failed_urls: Vec<&str> = errors
-                    .iter()
-                    .filter_map(|e| e.split(": ").next())
-                    .collect();
+                let failed_urls: Vec<&str> =
+                    errors.iter().filter_map(|e| e.split(": ").next()).collect();
                 for error in &errors {
                     println!("[JS] Module evaluation error: {error}");
                     js::push_console_entry(js::ConsoleLevel::Error, error.clone());
                 }
                 for (url, node_id) in &deferred_module_targets {
                     if failed_urls.iter().any(|f| url.as_str() == *f) {
-                        self.js_runtime
-                            .trigger_event_on_node_id(*node_id, "error");
+                        self.js_runtime.trigger_event_on_node_id(*node_id, "error");
                     }
                 }
             }
             for (_, node_id) in &deferred_module_targets {
-                self.js_runtime
-                    .trigger_event_on_node_id(*node_id, "load");
+                self.js_runtime.trigger_event_on_node_id(*node_id, "load");
             }
         }
 
@@ -1404,24 +1423,20 @@ impl BrowserEngine {
         if !async_module_urls.is_empty() {
             let eval_result = self.js_runtime.evaluate_module_graph(&async_module_urls);
             if let Err(errors) = eval_result {
-                let failed_urls: Vec<&str> = errors
-                    .iter()
-                    .filter_map(|e| e.split(": ").next())
-                    .collect();
+                let failed_urls: Vec<&str> =
+                    errors.iter().filter_map(|e| e.split(": ").next()).collect();
                 for error in &errors {
                     println!("[JS] Async module evaluation error: {error}");
                     js::push_console_entry(js::ConsoleLevel::Error, error.clone());
                 }
                 for (url, node_id) in &async_module_targets {
                     if failed_urls.iter().any(|f| url.as_str() == *f) {
-                        self.js_runtime
-                            .trigger_event_on_node_id(*node_id, "error");
+                        self.js_runtime.trigger_event_on_node_id(*node_id, "error");
                     }
                 }
             }
             for (_, node_id) in &async_module_targets {
-                self.js_runtime
-                    .trigger_event_on_node_id(*node_id, "load");
+                self.js_runtime.trigger_event_on_node_id(*node_id, "load");
             }
         }
 
@@ -1488,10 +1503,7 @@ impl BrowserEngine {
                     let outcome = self.load_external_module_with(
                         resolved.clone(),
                         page_base,
-                        |module_url| {
-                            reqwest::blocking::get(module_url.as_str())
-                                .and_then(|response| response.text())
-                        },
+                        fetch_text_with_timeout,
                     );
                     if outcome.error.is_none() {
                         root_urls.push(resolved);
@@ -1731,6 +1743,16 @@ pub struct EngineHandle {
     pub console_buffer: js::ConsoleBuffer,
 }
 
+const ENGINE_CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn recv_control<T>(reply_rx: mpsc::Receiver<T>) -> Result<T, EngineRequestError> {
+    match reply_rx.recv_timeout(ENGINE_CONTROL_TIMEOUT) {
+        Ok(value) => Ok(value),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(EngineRequestError::Busy),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(EngineRequestError::Disconnected),
+    }
+}
+
 impl EngineHandle {
     /// Create a new engine actor and return a handle to it.
     pub fn spawn() -> Self {
@@ -1782,10 +1804,36 @@ impl EngineHandle {
             .map_err(|_| "engine disconnected".to_string())?
     }
 
+    pub fn send_re_render_control(
+        &self,
+        hovered_id: Option<String>,
+        focused_id: Option<String>,
+        width: f32,
+    ) -> Result<PageResult, EngineRequestError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .send(EngineCmd::ReRender {
+                hovered_id,
+                focused_id,
+                width,
+                reply: reply_tx,
+            })
+            .map_err(|_| EngineRequestError::Disconnected)?;
+        recv_control(reply_rx)?.map_err(EngineRequestError::Failed)
+    }
+
     pub fn send_get_page(&self) -> Option<ApiPageResponse> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.tx.send(EngineCmd::GetPage { reply: reply_tx }).ok()?;
         reply_rx.recv().ok()?
+    }
+
+    pub fn send_get_page_control(&self) -> Result<Option<ApiPageResponse>, EngineRequestError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .send(EngineCmd::GetPage { reply: reply_tx })
+            .map_err(|_| EngineRequestError::Disconnected)?;
+        recv_control(reply_rx)
     }
 
     pub fn send_get_console(&self) -> Vec<js::ConsoleEntry> {
@@ -1869,6 +1917,14 @@ impl EngineHandle {
         reply_rx.recv().ok()?
     }
 
+    pub fn send_screenshot_control(&self) -> Result<Option<Vec<u8>>, EngineRequestError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .send(EngineCmd::Screenshot { reply: reply_tx })
+            .map_err(|_| EngineRequestError::Disconnected)?;
+        recv_control(reply_rx)
+    }
+
     pub fn send_dom_tree(&self) -> String {
         let (reply_tx, reply_rx) = mpsc::channel();
         if self
@@ -1922,6 +1978,22 @@ impl EngineHandle {
             return false;
         }
         reply_rx.recv().unwrap_or(false)
+    }
+
+    pub fn send_tick_control(
+        &self,
+        timestamp: f64,
+        deadline: Option<f64>,
+    ) -> Result<bool, EngineRequestError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .send(EngineCmd::Tick {
+                timestamp,
+                deadline,
+                reply: reply_tx,
+            })
+            .map_err(|_| EngineRequestError::Disconnected)?;
+        recv_control(reply_rx)
     }
 
     pub fn send_submit(&self) -> Option<String> {
@@ -2819,7 +2891,8 @@ mod tests {
             "y"
         );
         assert_eq!(
-            engine.js_style_overrides
+            engine
+                .js_style_overrides
                 .get("c")
                 .and_then(|p| p.get("font-size").cloned()),
             Some("20px".to_string())

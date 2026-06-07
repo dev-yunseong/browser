@@ -84,6 +84,8 @@ Links:
 | `submit` | Submit the current form |
 | `back` / `forward` | Navigate browser history |
 | `screenshot [file]` | Save PNG (default: `screenshot.png`) |
+| `logs` | Print browser console entries captured during page load |
+| `tick [count]` | Advance daemon JavaScript tasks and re-render if needed |
 | `help` | Show all commands |
 | `quit` | Exit |
 
