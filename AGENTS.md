@@ -45,6 +45,7 @@ Pipeline: `Network -> DOM -> Style -> Layout -> Render -> GUI`
 
 ### Project Rules
 - Use `./.agents/PRIORITY.md` to choose the next issue.
+- Follow the development workflow in `./.agents/docs/development-workflow.md`.
 - Render width is fixed to `800px` unless changed in code.
 - Build/check/lint on host. For daemon/CLI execution, use `drun rust:latest` (resource-limited).
 - Never run long render/integration loops without timeout.
