@@ -37,7 +37,7 @@ test/278
    - The plan must include goal, non-goals, context, checklist, validation, risks, rollback, and open questions.
 
 4. Run plan review.
-   - Use the project-local `multi-model-plan-review` skill before implementation.
+   - Use the project-local `plan-review` skill before implementation.
    - Apply must-fix feedback to the plan before coding.
    - Record rejected feedback with a short reason when useful.
 
@@ -63,7 +63,7 @@ test/278
 Project-local copies of the workflow skills live in `./.agents/skills/`:
 
 - `writing-plan`
-- `multi-model-plan-review`
+- `plan-review`
 - `pair-review`
 
 Prefer these project-local copies for this repository so workflow behavior stays stable even if user-level skills change.

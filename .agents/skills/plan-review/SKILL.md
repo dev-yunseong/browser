@@ -1,14 +1,14 @@
 ---
-name: multi-model-plan-review
+name: plan-review
 description: >
-  Multi-model plan review protocol. Use before non-trivial implementation when
+  Plan review protocol. Use before non-trivial implementation when
   the user asks for plan review, peer plan review, fast/medium/heavy review, or
   wants ambiguity and overengineering checked before coding. Runs fast and
   medium first-pass reviews, then a heavy second-pass verification, then folds
   findings back into the plan.
 ---
 
-# Multi-Model Plan Review
+# Plan Review
 
 Use this skill before non-trivial implementation when plan quality matters.
 
