@@ -933,7 +933,25 @@ impl BrowserEngine {
         self.current_csp_policy = page.csp_policy.clone();
         self.last_page = Some(page.clone());
         self.init_js_for_page(&page);
-        self.refresh_after_image_loads(page, width)
+
+        // After JS runs and may have modified the DOM (e.g. React/Vue rendering
+        // into #root), serialize the live DOM and re-render using post-JS HTML.
+        let js_modified = if let Some(live_html) = self.js_runtime.get_document_html() {
+            if let Some(ref mut last) = self.last_page {
+                last.body = live_html;
+            }
+            true
+        } else {
+            false
+        };
+
+        // If JS modified the DOM or images need loading, force a re-render.
+        let post_js_page = if js_modified || self.cache_missing_images(&page.image_urls) {
+            self.re_render(None, None, width)?
+        } else {
+            page
+        };
+        Ok(post_js_page)
     }
 
     /// Re-render the current page (e.g. after JS style changes or hover state).
@@ -1303,7 +1321,9 @@ impl BrowserEngine {
                     if is_defer {
                         deferred_classics.push(source);
                     } else {
+                        eprintln!("[JS DEBUG] Executing inline classic script (len={})", source.len());
                         self.js_runtime.execute(&source);
+                        eprintln!("[JS DEBUG] Inline classic script finished");
                     }
                 }
                 js::ScriptSource::ExternalClassic {
@@ -1311,7 +1331,9 @@ impl BrowserEngine {
                     is_async,
                     is_defer,
                 } => {
+                    eprintln!("[JS DEBUG] Fetching external classic script: {}", url);
                     let source = fetch_classic_source(self, &url);
+                    eprintln!("[JS DEBUG] External classic script fetch returned");
                     if let Some(source) = source {
                         if is_async {
                             // async wins over defer per HTML spec
@@ -1319,7 +1341,9 @@ impl BrowserEngine {
                         } else if is_defer {
                             deferred_classics.push(source);
                         } else {
+                            eprintln!("[JS DEBUG] Executing external classic script: {}", url);
                             self.js_runtime.execute(&source);
+                            eprintln!("[JS DEBUG] External classic script finished: {}", url);
                         }
                     }
                 }
@@ -1338,7 +1362,9 @@ impl BrowserEngine {
                         println!("[CSP] Blocked inline module compilation: {}", url);
                         continue;
                     }
+                    eprintln!("[JS DEBUG] Compiling inline module: {}", url);
                     let outcome = self.js_runtime.compile_module_source(url.clone(), source);
+                    eprintln!("[JS DEBUG] Inline module compiled");
                     if outcome.error.is_some() {
                         let error = outcome.error.as_deref().unwrap_or("unknown");
                         println!("[JS] Failed to compile inline module {}: {}", url, error);
@@ -1363,11 +1389,13 @@ impl BrowserEngine {
                     node_id,
                     is_async,
                 } => {
+                    eprintln!("[JS DEBUG] Loading external module: {}", url);
                     let outcome = self.load_external_module_with(
                         url.clone(),
                         &page.base_url,
                         fetch_text_with_timeout,
                     );
+                    eprintln!("[JS DEBUG] External module loaded");
                     if let Some(error) = &outcome.error {
                         println!("[JS] Failed to load external module {}: {}", url, error);
                         js::push_console_entry(
@@ -1389,13 +1417,20 @@ impl BrowserEngine {
         }
 
         // ── Phase 2: execute deferred classics, then evaluate deferred modules ──
-        for script in &deferred_classics {
+        for (idx, script) in deferred_classics.iter().enumerate() {
+            let preview = if script.len() > 200 { &script[..200] } else { script };
+            eprintln!("[JS DEBUG] Executing deferred classic script #{} (len={}, preview={})", idx, script.len(), preview);
             self.js_runtime.execute(script);
+            eprintln!("[JS DEBUG] Deferred classic script #{} finished", idx);
         }
 
+        eprintln!("[JS DEBUG] Resolving deferred module dependencies");
         self.resolve_module_dependencies(&page.base_url, &mut deferred_module_urls);
+        eprintln!("[JS DEBUG] Deferred module dependencies resolved");
         if !deferred_module_urls.is_empty() {
+            eprintln!("[JS DEBUG] Evaluating deferred module graph (count={})", deferred_module_urls.len());
             let eval_result = self.js_runtime.evaluate_module_graph(&deferred_module_urls);
+            eprintln!("[JS DEBUG] Deferred module graph evaluation finished");
             if let Err(errors) = eval_result {
                 let failed_urls: Vec<&str> =
                     errors.iter().filter_map(|e| e.split(": ").next()).collect();
@@ -1415,13 +1450,19 @@ impl BrowserEngine {
         }
 
         // ── Phase 3: execute async classics, then evaluate async modules ──
-        for script in &async_classics {
+        for (idx, script) in async_classics.iter().enumerate() {
+            eprintln!("[JS DEBUG] Executing async classic script #{}", idx);
             self.js_runtime.execute(script);
+            eprintln!("[JS DEBUG] Async classic script #{} finished", idx);
         }
 
+        eprintln!("[JS DEBUG] Resolving async module dependencies");
         self.resolve_module_dependencies(&page.base_url, &mut async_module_urls);
+        eprintln!("[JS DEBUG] Async module dependencies resolved");
         if !async_module_urls.is_empty() {
+            eprintln!("[JS DEBUG] Evaluating async module graph (count={})", async_module_urls.len());
             let eval_result = self.js_runtime.evaluate_module_graph(&async_module_urls);
+            eprintln!("[JS DEBUG] Async module graph evaluation finished");
             if let Err(errors) = eval_result {
                 let failed_urls: Vec<&str> =
                     errors.iter().filter_map(|e| e.split(": ").next()).collect();

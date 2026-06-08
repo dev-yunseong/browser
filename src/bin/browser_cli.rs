@@ -124,7 +124,7 @@ struct DaemonClient {
 impl DaemonClient {
     fn new(port: u16) -> Self {
         Self {
-            base_url: format!("http://localhost:{}", port),
+            base_url: format!("http://127.0.0.1:{}", port),
             client: reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
@@ -941,13 +941,13 @@ mod tests {
     #[test]
     fn test_daemon_client_default_port() {
         let client = DaemonClient::new(7070);
-        assert_eq!(client.base_url, "http://localhost:7070");
+        assert_eq!(client.base_url, "http://127.0.0.1:7070");
     }
 
     #[test]
     fn test_daemon_client_custom_port() {
         let client = DaemonClient::new(8080);
-        assert_eq!(client.base_url, "http://localhost:8080");
+        assert_eq!(client.base_url, "http://127.0.0.1:8080");
     }
 
     // -- CliHistory tests --

@@ -174,6 +174,24 @@ function __get_or_create_node(id, tag, string_id, kind) {
             node = new HTMLIFrameElement(id, descriptor.tag, descriptor.id);
         } else if (tagLower === 'form') {
             node = new HTMLFormElement(id, descriptor.tag, descriptor.id);
+        } else if (tagLower === 'a') {
+            node = new HTMLAnchorElement(id, descriptor.tag, descriptor.id);
+        } else if (tagLower === 'script') {
+            node = new HTMLScriptElement(id, descriptor.tag, descriptor.id);
+        } else if (tagLower === 'img') {
+            node = new HTMLImageElement(id, descriptor.tag, descriptor.id);
+        } else if (tagLower === 'input') {
+            node = new HTMLInputElement(id, descriptor.tag, descriptor.id);
+        } else if (tagLower === 'button') {
+            node = new HTMLButtonElement(id, descriptor.tag, descriptor.id);
+        } else if (tagLower === 'div') {
+            node = new HTMLDivElement(id, descriptor.tag, descriptor.id);
+        } else if (tagLower === 'span') {
+            node = new HTMLSpanElement(id, descriptor.tag, descriptor.id);
+        } else if (tagLower === 'style') {
+            node = new HTMLStyleElement(id, descriptor.tag, descriptor.id);
+        } else if (tagLower === 'canvas') {
+            node = new HTMLCanvasElement(id, descriptor.tag, descriptor.id);
         } else {
             node = new Element(id, descriptor.tag, descriptor.id);
         }
@@ -967,6 +985,14 @@ class Node extends EventTarget {
         this._id = id;
         this._kind = kind;
     }
+    getAttribute(name) { return null; }
+    setAttribute(name, value) {}
+    removeAttribute(name) {}
+    hasAttribute(name) { return false; }
+    closest(selector) { return null; }
+    matches(selector) { return false; }
+    querySelector(selector) { return null; }
+    querySelectorAll(selector) { return new NodeList([]); }
     get nodeType() {
         if (this._kind === 'element') return 1;
         if (this._kind === 'text') return 3;
@@ -1372,6 +1398,48 @@ var CSS = {
     }
 };
 
+class Attr {
+    constructor(element, name, value) {
+        this.name = name;
+        this.value = value;
+        this.ownerElement = element;
+    }
+}
+
+class NamedNodeMap {
+    constructor(element) {
+        this._element = element;
+    }
+    get length() {
+        let attrs = typeof __aura_get_attributes === 'function'
+            ? JSON.parse(__aura_get_attributes(this._element._id))
+            : [];
+        return attrs.length;
+    }
+    item(index) {
+        let attrs = typeof __aura_get_attributes === 'function'
+            ? JSON.parse(__aura_get_attributes(this._element._id))
+            : [];
+        if (index >= 0 && index < attrs.length) {
+            return new Attr(this._element, attrs[index].name, attrs[index].value);
+        }
+        return null;
+    }
+    getNamedItem(name) {
+        let value = __aura_get_attribute(this._element._id, name);
+        if (value !== null) {
+            return new Attr(this._element, name, value);
+        }
+        return null;
+    }
+    setNamedItem(attr) {
+        this._element.setAttribute(attr.name, attr.value);
+    }
+    removeNamedItem(name) {
+        this._element.removeAttribute(name);
+    }
+}
+
 class Element extends Node {
     constructor(id, tag, string_id) {
         super(id, 'element');
@@ -1383,6 +1451,27 @@ class Element extends Node {
     get classList() {
         if (!this._classList) this._classList = new DOMTokenList(this._id);
         return this._classList;
+    }
+    get attributes() {
+        let map = new NamedNodeMap(this);
+        return new Proxy(map, {
+            get: function(target, prop) {
+                if (typeof prop === 'string' && /^\d+$/.test(prop)) {
+                    return target.item(Number(prop));
+                }
+                if (prop in target) {
+                    let value = target[prop];
+                    if (typeof value === 'function') {
+                        return value.bind(target);
+                    }
+                    return value;
+                }
+                if (typeof prop === 'string') {
+                    return target.getNamedItem(prop);
+                }
+                return undefined;
+            }
+        });
     }
     get className() {
         return __aura_get_attribute(this._id, 'class') || '';
@@ -1755,7 +1844,7 @@ class Element extends Node {
     }
 }
 
-// -- IDL Event Handler Properties (Element.prototype) -------------------------
+// -- IDL Event Handler Properties (Element.prototype, document, globalThis) ----
 (function() {
     var handlers = [
         'onclick', 'onkeydown', 'onkeyup',
@@ -1772,7 +1861,25 @@ class Element extends Node {
             };
         })(handlers[i]);
     }
-    Object.defineProperties(Element.prototype, defs);
+    try {
+        Object.defineProperties(Element.prototype, defs);
+    } catch (e) {
+        console.warn('Failed to define handlers on Element: ' + e);
+    }
+    try {
+        Object.defineProperties(document, defs);
+    } catch (e) {
+        console.warn('Failed to define handlers on document: ' + e);
+    }
+    for (var key in defs) {
+        try {
+            Object.defineProperty(globalThis, key, defs[key]);
+        } catch (e) {
+            try {
+                globalThis[key] = null;
+            } catch (err) {}
+        }
+    }
 })();
 
 class CharacterData extends Node {
@@ -1987,6 +2094,16 @@ var document = {
         return __aura_dispatch_event(this, event);
     },
 
+    get currentScript() {
+        let scripts = document.scripts;
+        if (!scripts || scripts.length === 0) return null;
+        return scripts[scripts.length - 1] || null;
+    },
+    getAttribute: function(name) { return null; },
+    setAttribute: function(name, value) {},
+    removeAttribute: function(name) {},
+    hasAttribute: function(name) { return false; },
+
     getElementById: function(id) {
         let res = __aura_get_element_by_id(id);
         return res ? __get_or_create_node(res.nid, res.tag, id, res.kind) : null;
@@ -1994,6 +2111,9 @@ var document = {
     createElement: function(tag) {
         let nativeId = __aura_create_element(tag);
         return __get_or_create_node(nativeId, tag, null, 'element');
+    },
+    createElementNS: function(ns, tag) {
+        return document.createElement(tag);
     },
     createTextNode: function(text) {
         let nativeId = __aura_create_text_node(String(text));
@@ -2764,6 +2884,24 @@ window.close = function() {};
 window.focus = function() {};
 window.blur = function() {};
 
+function __aura_post_message_impl(target, message, targetOrigin) {
+    if (typeof target.dispatchEvent !== 'function') return;
+    setTimeout(function() {
+        try {
+            var ev = new Event('message');
+            ev.data = message;
+            ev.origin = typeof targetOrigin === 'string' ? targetOrigin : '*';
+            ev.source = target;
+            target.dispatchEvent(ev);
+        } catch (e) {
+            console.error('Error dispatching message event: ' + e);
+        }
+    }, 0);
+}
+window.postMessage = function(message, targetOrigin, transfer) {
+    __aura_post_message_impl(globalThis, message, targetOrigin);
+};
+
 // -- Timers ------------------------------------------------------------------
 window.setTimeout = function(fn, delay) {
     if (typeof fn === 'function') {
@@ -3009,6 +3147,20 @@ function __aura_execute_classic_script(script, code) {
     }
 }
 
+function __aura_execute_module_script(script, url, code) {
+    try {
+        let success = __aura_execute_module_script_in_host(url, code);
+        if (success) {
+            __aura_script_fire(script, 'load');
+        } else {
+            __aura_script_fire(script, 'error');
+        }
+    } catch (e) {
+        console.error('Module script execution error: ' + e);
+        __aura_script_fire(script, 'error');
+    }
+}
+
 function __aura_maybe_run_script(node) {
     if (!node || node.nodeType !== Node.ELEMENT_NODE || String(node.tagName || '').toLowerCase() !== 'script') return;
     let script = node;
@@ -3016,11 +3168,9 @@ function __aura_maybe_run_script(node) {
     script._alreadyStarted = true;
 
     let type = __aura_script_type(script);
-    if (type && type !== 'text/javascript' && type !== 'application/javascript' && type !== 'classic') {
-        script._auraModuleUnsupported = type === 'module';
-        console.warn(type === 'module'
-            ? 'Module scripts are not supported yet; dynamic module script signaled error.'
-            : 'Unsupported script type skipped: ' + type);
+    let isModule = type === 'module';
+    if (type && type !== 'text/javascript' && type !== 'application/javascript' && type !== 'classic' && !isModule) {
+        console.warn('Unsupported script type skipped: ' + type);
         __aura_script_fire(script, 'error');
         return;
     }
@@ -3034,20 +3184,31 @@ function __aura_maybe_run_script(node) {
         }
         fetch(src)
             .then(response => response.ok ? response.text() : Promise.reject(new Error('HTTP ' + response.status)))
-            .then(code => __aura_execute_classic_script(script, code))
+            .then(code => {
+                if (isModule) {
+                    __aura_execute_module_script(script, src, code);
+                } else {
+                    __aura_execute_classic_script(script, code);
+                }
+            })
             .catch(error => {
-                console.error('Script load error: ' + error);
+                console.error((isModule ? 'Module script' : 'Script') + ' load error: ' + error);
                 __aura_script_fire(script, 'error');
             });
         return;
     }
 
-    if (!window.__aura_inline_script_allowed) {
+    if (!isModule && !window.__aura_inline_script_allowed) {
         console.warn('CSP blocked inline dynamic script');
         __aura_script_fire(script, 'error');
         return;
     }
-    __aura_execute_classic_script(script, script.text || script.textContent || '');
+    if (isModule) {
+        let inline_url = window.location.href;
+        __aura_execute_module_script(script, inline_url, script.text || script.textContent || '');
+    } else {
+        __aura_execute_classic_script(script, script.text || script.textContent || '');
+    }
 }
 
 // -- MutationObserver --------------------------------------------------------
@@ -3678,6 +3839,47 @@ window.HTMLButtonElement = HTMLButtonElement;
 class HTMLAnchorElement extends HTMLElement {
     get href() { return __aura_resolve_url_attribute(__aura_get_attribute(this._id, 'href') || ''); }
     set href(v) { __aura_set_attribute(this._id, 'href', String(v)); }
+
+    _getURL(for_write) {
+        var raw = __aura_get_attribute(this._id, 'href');
+        if (raw === null && !for_write) {
+            return null;
+        }
+        try {
+            return new URL(raw || '', location.href || document.baseURI || undefined);
+        } catch (e) {
+            return null;
+        }
+    }
+    _setURLProp(prop, value) {
+        var url = this._getURL(true);
+        if (!url) return;
+        url[prop] = value;
+        this.href = url.href;
+    }
+
+    get protocol() { var url = this._getURL(); return url ? url.protocol : ''; }
+    set protocol(v) { this._setURLProp('protocol', v); }
+
+    get host() { var url = this._getURL(); return url ? url.host : ''; }
+    set host(v) { this._setURLProp('host', v); }
+
+    get hostname() { var url = this._getURL(); return url ? url.hostname : ''; }
+    set hostname(v) { this._setURLProp('hostname', v); }
+
+    get port() { var url = this._getURL(); return url ? url.port : ''; }
+    set port(v) { this._setURLProp('port', v); }
+
+    get pathname() { var url = this._getURL(); return url ? url.pathname : ''; }
+    set pathname(v) { this._setURLProp('pathname', v); }
+
+    get search() { var url = this._getURL(); return url ? url.search : ''; }
+    set search(v) { this._setURLProp('search', v); }
+
+    get hash() { var url = this._getURL(); return url ? url.hash : ''; }
+    set hash(v) { this._setURLProp('hash', v); }
+
+    get origin() { var url = this._getURL(); return url ? url.origin : ''; }
 }
 window.HTMLAnchorElement = HTMLAnchorElement;
 
@@ -3717,6 +3919,7 @@ class HTMLIFrameElement extends HTMLElement {
             var self = this;
             this._contentDocument = {
                 createElement: function(tag) { return document.createElement(tag); },
+                createElementNS: function(ns, tag) { return document.createElement(tag); },
                 createTextNode: function(text) { return document.createTextNode(text); },
                 createComment: function(data) { return document.createComment(data); },
                 createDocumentFragment: function() { return document.createDocumentFragment(); },
@@ -3792,7 +3995,7 @@ class HTMLIFrameElement extends HTMLElement {
     get contentWindow() {
         if (!this._contentWindow) {
             var self = this;
-            this._contentWindow = {};
+            this._contentWindow = new EventTarget();
             var doc = self.contentDocument;
             Object.defineProperty(self._contentWindow, 'document', {
                 get: function() { return doc; },
@@ -3809,6 +4012,9 @@ class HTMLIFrameElement extends HTMLElement {
             self._contentWindow.closed = false;
             self._contentWindow.opener = null;
             self._contentWindow.frameElement = self;
+            self._contentWindow.postMessage = function(message, targetOrigin, transfer) {
+                __aura_post_message_impl(self._contentWindow, message, targetOrigin);
+            };
         }
         return this._contentWindow;
     }
@@ -4014,12 +4220,6 @@ class HTMLCanvasElement extends HTMLElement {
 }
 window.HTMLCanvasElement = HTMLCanvasElement;
 
-// -- window.queueMicrotask ---------------------------------------------------
-window.queueMicrotask = function(fn) {
-    if (typeof fn === 'function') {
-        Promise.resolve().then(fn);
-    }
-};
 
 // -- atob / btoa stubs -------------------------------------------------------
 window.atob = function(s) { return ''; };

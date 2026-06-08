@@ -108,14 +108,17 @@ fn host_import_module_dynamically<'s, 'i>(
     _import_attributes: v8::Local<'s, v8::FixedArray>,
 ) -> Option<v8::Local<'s, v8::Promise>> {
     let spec_str = specifier.to_rust_string_lossy(scope);
+    eprintln!("[JS DEBUG] host_import_module_dynamically called for specifier: {}", spec_str);
 
     let resolver = v8::PromiseResolver::new(scope)?;
     let promise = resolver.get_promise(scope);
 
-    let reject = |msg: &str| {
-        let err = v8::String::new(scope, msg).unwrap();
-        resolver.reject(scope, err.into());
-    };
+    macro_rules! reject {
+        ($scope:expr, $msg:expr) => {{
+            let err = v8::String::new($scope, $msg).unwrap();
+            resolver.reject($scope, err.into());
+        }};
+    }
 
     let resolved_url = CURRENT_ORIGIN.with(|origin| {
         origin
@@ -128,7 +131,7 @@ fn host_import_module_dynamically<'s, 'i>(
     let resolved_str = match resolved_url {
         Some(url) => url,
         None => {
-            reject(&format!("Failed to resolve module specifier: {spec_str}"));
+            reject!(scope, &format!("Failed to resolve module specifier: {spec_str}"));
             return Some(promise);
         }
     };
@@ -146,67 +149,36 @@ fn host_import_module_dynamically<'s, 'i>(
     });
 
     if !allowed {
-        reject("CSP blocked dynamic import");
+        reject!(scope, "CSP blocked dynamic import");
         return Some(promise);
     }
 
-    let source = MODULE_SOURCES.with(|map| map.borrow().get(&resolved_str).cloned());
-
-    let source = match source {
-        Some(s) => s,
-        None => match fetch_module_source_with_timeout(&resolved_str) {
-            Ok(s) => s,
-            Err(e) => {
-                reject(&format!("Failed to fetch module: {e}"));
-                return Some(promise);
-            }
-        },
-    };
-
-    MODULE_SOURCES.with(|map| {
-        map.borrow_mut()
-            .insert(resolved_str.clone(), source.clone());
-    });
-
-    let code = v8::String::new(scope, &source)?;
-    let resource = v8::String::new(scope, &resolved_str)?;
-    let origin = v8::ScriptOrigin::new(
-        scope,
-        resource.into(),
-        0,
-        0,
-        false,
-        0,
-        None,
-        false,
-        false,
-        true,
-        None,
-    );
-    let mut source_compiler = v8::script_compiler::Source::new(code, Some(&origin));
-
-    let module = match v8::script_compiler::compile_module(scope, &mut source_compiler) {
-        Some(m) => m,
-        None => {
-            reject("Module compilation failed");
+    let resolved_url_parsed = match Url::parse(&resolved_str) {
+        Ok(u) => u,
+        Err(_) => {
+            reject!(scope, &format!("Failed to parse resolved URL: {resolved_str}"));
             return Some(promise);
         }
     };
+    if let Err(e) = resolve_and_fetch_module_dependencies_rec(scope, &resolved_url_parsed) {
+        reject!(scope, &e);
+        return Some(promise);
+    }
 
-    MODULE_ID_TO_URL.with(|map| {
-        map.borrow_mut()
-            .insert(module.get_identity_hash(), resolved_str.clone());
-    });
-    RESOLVED_MODULES.with(|map| {
-        map.borrow_mut()
-            .insert(resolved_str.clone(), v8::Global::new(scope, module));
-    });
+    let global_module = RESOLVED_MODULES.with(|map| map.borrow().get(&resolved_str).cloned());
+    let module = match global_module {
+        Some(m) => v8::Local::new(scope, m),
+        None => {
+            reject!(scope, "Module not found in resolved cache");
+            return Some(promise);
+        }
+    };
 
     let instantiate_ok = module
         .instantiate_module(scope, resolve_module_callback)
         .unwrap_or(false);
     if !instantiate_ok {
-        reject("Module instantiation failed");
+        reject!(scope, "Module instantiation failed");
         return Some(promise);
     }
 
@@ -221,7 +193,7 @@ fn host_import_module_dynamically<'s, 'i>(
         } else {
             "Module evaluation failed".to_string()
         };
-        reject(&err_msg);
+        reject!(scope, &err_msg);
         return Some(promise);
     }
 
@@ -238,6 +210,168 @@ fn fetch_module_source_with_timeout(url: &str) -> Result<String, reqwest::Error>
         .get(url)
         .send()?
         .text()
+}
+
+fn resolve_and_fetch_module_dependencies_rec(
+    scope: &mut v8::PinScope,
+    root_url: &Url,
+) -> Result<(), String> {
+    let mut queue = vec![root_url.clone()];
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(root_url.clone());
+
+    while let Some(current_url) = queue.pop() {
+        eprintln!("[JS DEBUG] processing dependency: {} (queue len: {})", current_url, queue.len());
+        let source = MODULE_SOURCES.with(|map| map.borrow().get(current_url.as_str()).cloned());
+        let source = match source {
+            Some(s) => s,
+            None => {
+                match fetch_module_source_with_timeout(current_url.as_str()) {
+                    Ok(s) => {
+                        MODULE_SOURCES.with(|map| {
+                            map.borrow_mut().insert(current_url.to_string(), s.clone());
+                        });
+                        s
+                    }
+                    Err(e) => return Err(format!("Failed to fetch module {current_url}: {e}")),
+                }
+            }
+        };
+
+        let is_cached = RESOLVED_MODULES.with(|map| map.borrow().contains_key(current_url.as_str()));
+        let module = if is_cached {
+            let global_mod = RESOLVED_MODULES.with(|map| map.borrow().get(current_url.as_str()).cloned()).unwrap();
+            v8::Local::new(scope, global_mod)
+        } else {
+            let tc = std::pin::pin!(v8::TryCatch::new(scope));
+            let tc = &mut tc.init();
+            let code = v8::String::new(tc, &source)
+                .ok_or_else(|| "Failed to create V8 module source string".to_string())?;
+            let resource = v8::String::new(tc, current_url.as_str())
+                .ok_or_else(|| "Failed to create V8 module resource name".to_string())?;
+            let origin = v8::ScriptOrigin::new(
+                tc,
+                resource.into(),
+                0,
+                0,
+                false,
+                0,
+                None,
+                false,
+                false,
+                true,
+                None,
+            );
+            let mut source_compiler = v8::script_compiler::Source::new(code, Some(&origin));
+            let module = match v8::script_compiler::compile_module(tc, &mut source_compiler) {
+                Some(m) => m,
+                None => {
+                    let err_msg = tc
+                        .exception()
+                        .and_then(|e| e.to_string(tc))
+                        .map(|s| s.to_rust_string_lossy(tc))
+                        .unwrap_or_else(|| "Unknown compilation error".to_string());
+                    return Err(format!("Failed to compile module {current_url}: {err_msg}"));
+                }
+            };
+
+            MODULE_ID_TO_URL.with(|map| {
+                map.borrow_mut()
+                    .insert(module.get_identity_hash(), current_url.to_string());
+            });
+            RESOLVED_MODULES.with(|map| {
+                map.borrow_mut()
+                    .insert(current_url.to_string(), v8::Global::new(tc, module));
+            });
+            module
+        };
+
+        let requests = module.get_module_requests();
+        for i in 0..requests.length() {
+            if let Some(data) = requests.get(scope, i) {
+                if let Ok(request) = data.try_cast::<v8::ModuleRequest>() {
+                    let specifier = request.get_specifier().to_rust_string_lossy(scope);
+                    let resolved = match current_url.join(&specifier) {
+                        Ok(u) => u,
+                        Err(_) => return Err(format!("Failed to resolve specifier {specifier} from {current_url}")),
+                    };
+                    if !visited.contains(&resolved) {
+                        visited.insert(resolved.clone());
+                        queue.push(resolved);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn execute_module_script_in_host_cb(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let url_str = args.get(0).to_rust_string_lossy(scope);
+    let code_str = args.get(1).to_rust_string_lossy(scope);
+    eprintln!("[JS DEBUG] execute_module_script_in_host_cb called for url: {}", url_str);
+
+    let base_url = CURRENT_ORIGIN.with(|o| (*o.borrow()).clone());
+    let target_url = if let Some(ref base) = base_url {
+        base.join(&url_str)
+            .unwrap_or_else(|_| Url::parse(&url_str).unwrap_or(base.clone()))
+    } else {
+        match Url::parse(&url_str) {
+            Ok(u) => u,
+            Err(_) => {
+                rv.set_bool(false);
+                return;
+            }
+        }
+    };
+
+    MODULE_SOURCES.with(|map| {
+        map.borrow_mut().insert(target_url.to_string(), code_str.clone());
+    });
+
+    if let Err(e) = resolve_and_fetch_module_dependencies_rec(scope, &target_url) {
+        println!("[JS] Failed to resolve module dependencies for {target_url}: {e}");
+        rv.set_bool(false);
+        return;
+    }
+
+    let global_module = RESOLVED_MODULES.with(|map| map.borrow().get(target_url.as_str()).cloned());
+    let module = match global_module {
+        Some(m) => v8::Local::new(scope, m),
+        None => {
+            println!("[JS] Root module not found in resolved cache for {target_url}");
+            rv.set_bool(false);
+            return;
+        }
+    };
+
+    let instantiate_ok = module.instantiate_module(scope, resolve_module_callback).unwrap_or(false);
+    if !instantiate_ok {
+        println!("[JS] Failed to instantiate root module {target_url}");
+        rv.set_bool(false);
+        return;
+    }
+
+    let eval_result = module.evaluate(scope);
+    if eval_result.is_none() || module.get_status() == v8::ModuleStatus::Errored {
+        let err_msg = if module.get_status() == v8::ModuleStatus::Errored {
+            module.get_exception()
+                .to_string(scope)
+                .map(|s| s.to_rust_string_lossy(scope))
+                .unwrap_or_else(|| "Module evaluation error".to_string())
+        } else {
+            "Module evaluation failed".to_string()
+        };
+        println!("[JS] Module evaluation error for {target_url}: {err_msg}");
+        rv.set_bool(false);
+        return;
+    }
+
+    rv.set_bool(true);
 }
 
 fn resolve_module_callback<'s>(
@@ -493,6 +627,38 @@ pub struct ModuleCompileOutcome {
     pub from_cache: bool,
     pub requests: Vec<String>,
     pub error: Option<String>,
+}
+
+extern "C" fn interrupt_callback(mut isolate_ptr: v8::UnsafeRawIsolatePtr, _data: *mut std::ffi::c_void) {
+    let isolate = unsafe { v8::Isolate::ref_from_raw_isolate_ptr_mut(&mut isolate_ptr) };
+    let hs = std::pin::pin!(v8::HandleScope::new(isolate));
+    let hs = &mut hs.init();
+    
+    // Safety: PinnedRef<'_, HandleScope<'_, ()>> and PinnedRef<'_, HandleScope<'_, Context>>
+    // have the identical layout (context type parameter is a zero-sized phantom marker).
+    let hs_context: &mut v8::PinnedRef<'_, v8::HandleScope<'_, v8::Context>> = unsafe {
+        std::mem::transmute(hs)
+    };
+    
+    let context = hs_context.get_current_context();
+    let mut cs = v8::ContextScope::new(hs_context, context);
+    let scope = &mut cs;
+    if let Some(stack) = v8::StackTrace::current_stack_trace(scope, 20) {
+        eprintln!("[JS WATCHDOG INTERRUPT] V8 Call Stack:");
+        for i in 0..stack.get_frame_count() {
+            if let Some(frame) = stack.get_frame(&**scope, i) {
+                let script_name = frame.get_script_name_or_source_url(&**scope)
+                    .map(|s| s.to_rust_string_lossy(&**scope))
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                let function_name = frame.get_function_name(&**scope)
+                    .map(|s| s.to_rust_string_lossy(&**scope))
+                    .unwrap_or_else(|| "<anonymous>".to_string());
+                let line = frame.get_line_number();
+                let col = frame.get_column();
+                eprintln!("  at {} ({}:{}:{})", function_name, script_name, line, col);
+            }
+        }
+    }
 }
 
 impl JsRuntime {
@@ -803,6 +969,15 @@ impl JsRuntime {
         self.execute(&code);
     }
 
+    /// Serialize the live DOM (as modified by JS) back to an HTML string
+    /// so the layout engine can re-render using the post-JS DOM state.
+    pub fn get_document_html(&self) -> Option<String> {
+        DOM_ROOT.with(|root| {
+            root.borrow().as_ref().map(|r| serialize_inner_html(r))
+        })
+    }
+
+
     pub fn execute(&mut self, source: &str) {
         let outcome = self.execute_with_result(source);
         if let Some(error) = outcome.error {
@@ -811,63 +986,117 @@ impl JsRuntime {
     }
 
     pub fn execute_with_result(&mut self, source: &str) -> EvalOutcome {
-        let hs = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
-        let hs = &mut hs.init();
-        let local_context = v8::Local::new(hs, &self.global_context);
-        let scope = &mut v8::ContextScope::new(hs, local_context);
-
-        let code = match v8::String::new(scope, source) {
-            Some(s) => s,
-            None => {
-                return EvalOutcome {
-                    result: None,
-                    error: Some("Failed to create V8 string".to_string()),
+        // Watchdog: terminate execution if it takes more than 10 seconds.
+        // Also sends periodic interrupts for debugging purposes.
+        let isolate_handle = self.isolate.thread_safe_handle();
+        let done_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_flag_clone = Arc::clone(&done_flag);
+        let src_preview = source.chars().take(80).collect::<String>().replace('\n', " ");
+        let watchdog = std::thread::spawn(move || {
+            for elapsed in 1..=10u64 {
+                std::thread::sleep(Duration::from_secs(1));
+                if done_flag_clone.load(Ordering::Relaxed) { return; }
+                if elapsed == 3 || elapsed == 6 || elapsed == 9 {
+                    eprintln!("[JS WATCHDOG] Script still running at {}s: {}...", elapsed, src_preview);
+                    isolate_handle.request_interrupt(interrupt_callback, std::ptr::null_mut());
                 }
             }
-        };
-
-        let tc = std::pin::pin!(v8::TryCatch::new(scope));
-        let tc = &mut tc.init();
-
-        match v8::Script::compile(tc, code, None) {
-            None => {
-                let error_msg = tc
-                    .exception()
-                    .and_then(|e| e.to_string(tc))
-                    .map(|s| s.to_rust_string_lossy(tc))
-                    .unwrap_or_else(|| "Unknown compilation error".to_string());
-                EvalOutcome {
-                    result: None,
-                    error: Some(error_msg),
-                }
+            if !done_flag_clone.load(Ordering::Relaxed) {
+                eprintln!("[JS WATCHDOG] Script execution exceeded 10s — terminating V8 execution");
+                isolate_handle.terminate_execution();
             }
-            Some(script) => match script.run(tc) {
+        });
+
+        let outcome = {
+            let hs = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
+            let hs = &mut hs.init();
+            let local_context = v8::Local::new(hs, &self.global_context);
+            let scope = &mut v8::ContextScope::new(hs, local_context);
+
+            let code = match v8::String::new(scope, source) {
+                Some(s) => s,
+                None => {
+                    done_flag.store(true, Ordering::Relaxed);
+                    drop(watchdog);
+                    return EvalOutcome {
+                        result: None,
+                        error: Some("Failed to create V8 string".to_string()),
+                    };
+                }
+            };
+
+            let tc = std::pin::pin!(v8::TryCatch::new(scope));
+            let tc = &mut tc.init();
+
+            match v8::Script::compile(tc, code, None) {
                 None => {
                     let error_msg = tc
                         .exception()
                         .and_then(|e| e.to_string(tc))
                         .map(|s| s.to_rust_string_lossy(tc))
-                        .unwrap_or_else(|| "Unknown runtime error".to_string());
+                        .unwrap_or_else(|| "Unknown compilation error".to_string());
                     EvalOutcome {
                         result: None,
                         error: Some(error_msg),
                     }
                 }
-                Some(value) => {
-                    let result = if value.is_undefined() {
-                        Some("undefined".to_string())
-                    } else if value.is_null() {
-                        Some("null".to_string())
-                    } else {
-                        value.to_string(tc).map(|s| s.to_rust_string_lossy(tc))
-                    };
-                    EvalOutcome {
-                        result,
-                        error: None,
+                Some(script) => match script.run(tc) {
+                    None => {
+                        let terminated = tc.has_terminated();
+                        let mut error_msg = if terminated {
+                            "[JS WATCHDOG] Script terminated after 10s timeout".to_string()
+                        } else {
+                            tc
+                                .exception()
+                                .and_then(|e| e.to_string(tc))
+                                .map(|s| s.to_rust_string_lossy(tc))
+                                .unwrap_or_else(|| "Unknown runtime error".to_string())
+                        };
+                        if !terminated {
+                            if let Some(stack) = tc.stack_trace() {
+                                let stack_str = stack.to_rust_string_lossy(tc);
+                                error_msg = format!("{}\nStack trace:\n{}", error_msg, stack_str);
+                            }
+                            if let Some(message) = tc.message() {
+                                let resource = message.get_script_resource_name(tc)
+                                    .and_then(|v| v.to_string(tc))
+                                    .map(|s| s.to_rust_string_lossy(tc))
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                let line = message.get_line_number(tc).unwrap_or(0);
+                                let source_line = message.get_source_line(tc)
+                                    .map(|s| s.to_rust_string_lossy(tc))
+                                    .unwrap_or_else(|| "".to_string());
+                                error_msg = format!("{}\nLocation: {}:{}\nSource line: {}", error_msg, resource, line, source_line);
+                            }
+                        }
+                        EvalOutcome {
+                            result: None,
+                            error: Some(error_msg),
+                        }
                     }
-                }
-            },
-        }
+                    Some(value) => {
+                        let result = if value.is_undefined() {
+                            Some("undefined".to_string())
+                        } else if value.is_null() {
+                            Some("null".to_string())
+                        } else {
+                            value.to_string(tc).map(|s| s.to_rust_string_lossy(tc))
+                        };
+                        EvalOutcome {
+                            result,
+                            error: None,
+                        }
+                    }
+                },
+            }
+        }; // Drop all V8 scopes here
+
+        // Signal watchdog to stop and cancel any pending termination.
+        done_flag.store(true, Ordering::Relaxed);
+        // Cancel termination in case watchdog already fired but we finished.
+        self.isolate.cancel_terminate_execution();
+        drop(watchdog); // Let the thread run out naturally.
+        outcome
     }
 
     pub fn resolve_module_specifier(&self, specifier: &str, referrer: &Url) -> Result<Url, String> {
@@ -1458,6 +1687,13 @@ fn register_native_functions(
     register_fn(scope, global, "requestIdleCallback", ric_cb);
     register_fn(scope, global, "cancelIdleCallback", cic_cb);
     register_fn(scope, global, "__aura_submit_form", submit_form_cb);
+    register_fn(
+        scope,
+        global,
+        "__aura_execute_module_script_in_host",
+        execute_module_script_in_host_cb,
+    );
+    register_fn(scope, global, "queueMicrotask", queue_microtask_cb);
 }
 
 fn console_log(
@@ -1838,7 +2074,12 @@ fn get_outer_html_cb(
             .get(&nid)
             .map(|n| {
                 let mut o = String::new();
-                serialize_node(n, &mut o);
+                let parent_tag = get_parent_handle(n).and_then(|p| match &p.data {
+                    NodeData::Element { name, .. } => Some(name.local.to_string()),
+                    _ => None,
+                });
+                let parent_tag_lower = parent_tag.as_ref().map(|t| t.to_ascii_lowercase());
+                serialize_node(n, &mut o, parent_tag_lower.as_deref());
                 o
             })
             .unwrap_or_default()
@@ -2569,6 +2810,17 @@ fn queue_task_cb(
         });
     }
 }
+fn queue_microtask_cb(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let cb = args.get(0);
+    if cb.is_function() {
+        let cb_func: v8::Local<v8::Function> = unsafe { std::mem::transmute(cb) };
+        scope.enqueue_microtask(cb_func);
+    }
+}
 fn resolve_url_cb(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -2985,7 +3237,20 @@ fn console_impl(
         if i > 0 {
             output.push(' ');
         }
-        output.push_str(&args.get(i).to_rust_string_lossy(scope));
+        let val = args.get(i);
+        let mut stringified = val.to_rust_string_lossy(scope);
+        if val.is_object() {
+            if let Some(obj) = val.to_object(scope) {
+                let stack_key = v8::String::new(scope, "stack").unwrap();
+                if let Some(stack_val) = obj.get(scope, stack_key.into()) {
+                    if !stack_val.is_undefined() {
+                        let stack_str = stack_val.to_rust_string_lossy(scope);
+                        stringified = format!("{}\nStack trace:\n{}", stringified, stack_str);
+                    }
+                }
+            }
+        }
+        output.push_str(&stringified);
     }
     push_console_entry(level, output);
 }
@@ -2993,8 +3258,14 @@ fn console_impl(
 pub fn node_path_key(node: &Handle) -> String {
     let mut indices = Vec::new();
     let mut current = node.clone();
+    let mut visited = std::collections::HashSet::new();
 
     loop {
+        let current_ptr = std::rc::Rc::as_ptr(&current) as usize;
+        if !visited.insert(current_ptr) {
+            eprintln!("[JS WARNING] Cycle detected in node_path_key! breaking loop.");
+            break;
+        }
         let parent_weak = current.parent.take();
         let Some(parent_weak) = parent_weak else {
             break;
@@ -3003,7 +3274,6 @@ pub fn node_path_key(node: &Handle) -> String {
             break;
         };
 
-        let current_ptr = std::rc::Rc::as_ptr(&current) as usize;
         let index = parent
             .children
             .borrow()
@@ -3550,6 +3820,16 @@ mod tests {
             outcome.result.as_deref(),
             Some("https://cdn.example.com/lib/module.mjs")
         );
+    }
+
+    #[test]
+    fn test_preload_hang_debug() {
+        let mut rt = make_runtime("<html><body></body></html>");
+        if let Ok(code) = std::fs::read_to_string("/tmp/preload.js") {
+            println!("Starting execution of preload.js");
+            rt.execute(&code);
+            println!("Finished execution of preload.js");
+        }
     }
 
     #[test]
@@ -4239,6 +4519,237 @@ mod tests {
             rt.execute_with_result("document.getElementById('test').ownerDocument === document");
         assert_eq!(outcome.result.as_deref(), Some("true"));
     }
+
+    #[test]
+    fn test_html_anchor_element_url_properties() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><a id="link" href="/foo/bar?baz=1#hash"></a><a id="empty"></a></body></html>"#,
+            "https://example.com/path/page.html",
+        );
+        
+        // 1. Test relative URL resolution (getting properties)
+        let outcome = rt.execute_with_result(
+            r#"JSON.stringify({
+                href: document.getElementById('link').href,
+                protocol: document.getElementById('link').protocol,
+                host: document.getElementById('link').host,
+                hostname: document.getElementById('link').hostname,
+                port: document.getElementById('link').port,
+                pathname: document.getElementById('link').pathname,
+                search: document.getElementById('link').search,
+                hash: document.getElementById('link').hash,
+                origin: document.getElementById('link').origin
+            })"#
+        );
+        assert_eq!(outcome.error, None);
+        println!("RESULT: {:?}", outcome.result);
+        let val: serde_json::Value = serde_json::from_str(outcome.result.as_deref().unwrap()).unwrap();
+        assert_eq!(val["href"], "https://example.com/foo/bar?baz=1#hash");
+        assert_eq!(val["protocol"], "https:");
+        assert_eq!(val["host"], "example.com");
+        assert_eq!(val["hostname"], "example.com");
+        assert_eq!(val["port"], "");
+        assert_eq!(val["pathname"], "/foo/bar");
+        assert_eq!(val["search"], "?baz=1");
+        assert_eq!(val["hash"], "#hash");
+        assert_eq!(val["origin"], "https://example.com");
+
+        // 2. Test setter for pathname updates href attribute
+        rt.execute(
+            r#"var a = document.getElementById('link');
+               a.pathname = '/new/path';
+               a.search = '?new=2';
+               a.hash = '#newhash';
+               a.protocol = 'http';"#
+        );
+        let outcome = rt.execute_with_result("document.getElementById('link').href");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("http://example.com/new/path?new=2#newhash"));
+
+        // 3. Test empty anchor (no href attribute)
+        let outcome = rt.execute_with_result(
+            r#"JSON.stringify({
+                href: document.getElementById('empty').href,
+                pathname: document.getElementById('empty').pathname,
+                search: document.getElementById('empty').search,
+                hash: document.getElementById('empty').hash
+            })"#
+        );
+        assert_eq!(outcome.error, None);
+        let val: serde_json::Value = serde_json::from_str(outcome.result.as_deref().unwrap()).unwrap();
+        assert_eq!(val["href"], "");
+        assert_eq!(val["pathname"], "");
+        assert_eq!(val["search"], "");
+        assert_eq!(val["hash"], "");
+
+        // 4. Test setting properties on empty anchor creates a valid URL
+        rt.execute(
+            r#"var a = document.getElementById('empty');
+               a.pathname = '/initialized';"#
+        );
+        let outcome = rt.execute_with_result("document.getElementById('empty').href");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("https://example.com/initialized"));
+    }
+
+    #[test]
+    fn test_dom_compatibility_stubs() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><iframe id="ifr"></iframe></body></html>"#,
+            "https://example.com/",
+        );
+
+        // 1. Verify document.createElementNS and iframe contentDocument.createElementNS exist and return an element
+        let outcome = rt.execute_with_result(
+            r#"var el1 = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+               var ifr = document.getElementById('ifr');
+               var el2 = ifr.contentDocument.createElementNS('http://www.w3.org/2000/svg', 'path');
+               JSON.stringify({
+                   el1: el1 !== null && el1.tagName === 'SVG',
+                   el2: el2 !== null && el2.tagName === 'PATH'
+               })"#
+        );
+        assert_eq!(outcome.error, None);
+        let val: serde_json::Value = serde_json::from_str(outcome.result.as_deref().unwrap()).unwrap();
+        assert_eq!(val["el1"], true);
+        assert_eq!(val["el2"], true);
+
+        // 2. Verify window.postMessage and contentWindow.postMessage exist
+        let outcome = rt.execute_with_result(
+            r#"JSON.stringify({
+                win_pm: typeof window.postMessage === 'function',
+                ifr_pm: typeof document.getElementById('ifr').contentWindow.postMessage === 'function'
+            })"#
+        );
+        assert_eq!(outcome.error, None);
+        let val: serde_json::Value = serde_json::from_str(outcome.result.as_deref().unwrap()).unwrap();
+        assert_eq!(val["win_pm"], true);
+        assert_eq!(val["ifr_pm"], true);
+
+        // 3. Verify contentWindow is an EventTarget and supports addEventListener + asynchronous postMessage dispatching
+        rt.execute(
+            r#"var win = document.getElementById('ifr').contentWindow;
+               win.addEventListener('message', function(e) {
+                   window.__messageData = e.data;
+                   window.__messageOrigin = e.origin;
+               });
+               win.postMessage('hello', '*');"#
+        );
+
+        // Run the event loop (which runs setTimeouts / queued tasks)
+        rt.tick(Some(0.0), None);
+
+        let outcome = rt.execute_with_result(
+            r#"JSON.stringify({
+                data: window.__messageData,
+                origin: window.__messageOrigin
+            })"#
+        );
+        assert_eq!(outcome.error, None);
+        let val: serde_json::Value = serde_json::from_str(outcome.result.as_deref().unwrap()).unwrap();
+        assert_eq!(val["data"], "hello");
+        assert_eq!(val["origin"], "*");
+
+        // 4. Verify global window postMessage works similarly
+        rt.execute(
+            r#"window.addEventListener('message', function(e) {
+                   window.__globalMessage = e.data;
+               });
+               window.postMessage('global-hello', '*');"#
+        );
+
+        rt.tick(Some(0.0), None);
+
+        let outcome = rt.execute_with_result("window.__globalMessage");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("global-hello"));
+    }
+
+    #[test]
+    fn test_raw_text_element_serialization() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><script id="json">{"test": true}</script><div id="escaped">"hello"</div></body></html>"#,
+            "https://example.com/",
+        );
+
+        // 1. Verify that script element's innerHTML returns raw text without escaping quotes
+        let outcome = rt.execute_with_result("document.getElementById('json').innerHTML");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some(r#"{"test": true}"#));
+
+        // 2. Verify that div element's innerHTML returns properly escaped quotes
+        let outcome = rt.execute_with_result("document.getElementById('escaped').innerHTML");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("&quot;hello&quot;"));
+
+        // 3. Verify JSON.parse works on script innerHTML
+        let outcome = rt.execute_with_result("JSON.parse(document.getElementById('json').innerHTML).test");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+        
+        // 4. Verify script outerHTML has raw script contents but escaped attributes
+        let outcome = rt.execute_with_result("document.getElementById('json').outerHTML");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some(r#"<script id="json">{"test": true}</script>"#));
+    }
+
+    #[test]
+    fn test_document_current_script_and_attribute_stubs() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><script id="first"></script><script id="second"></script></body></html>"#,
+            "https://example.com/",
+        );
+
+        // 1. Verify document.currentScript returns the last script element
+        let outcome = rt.execute_with_result("document.currentScript.id");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("second"));
+
+        // 2. Verify document.getAttribute, setAttribute, hasAttribute, removeAttribute exist and return safe defaults
+        let outcome = rt.execute_with_result(
+            r#"JSON.stringify({
+                has: document.hasAttribute('class'),
+                get: document.getAttribute('class'),
+                set: typeof document.setAttribute === 'function',
+                remove: typeof document.removeAttribute === 'function'
+            })"#
+        );
+        assert_eq!(outcome.error, None);
+        let val: serde_json::Value = serde_json::from_str(outcome.result.as_deref().unwrap()).unwrap();
+        assert_eq!(val["has"], false);
+        assert_eq!(val["get"], serde_json::Value::Null);
+        assert_eq!(val["set"], true);
+        assert_eq!(val["remove"], true);
+    }
+
+    #[test]
+    fn test_node_prototype_compatibility_stubs() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body>hello</body></html>"#,
+            "https://example.com/",
+        );
+
+        // 1. Get a TextNode and verify element-like methods exist and return safe defaults
+        let outcome = rt.execute_with_result(
+            r#"var textNode = document.body.firstChild;
+               JSON.stringify({
+                   get: textNode.getAttribute('class'),
+                   has: textNode.hasAttribute('class'),
+                   closest: textNode.closest('div'),
+                   matches: textNode.matches('div'),
+                   querySelector: textNode.querySelector('div'),
+                   querySelectorAll: textNode.querySelectorAll('div') !== null && textNode.querySelectorAll('div').length === 0
+               })"#
+        );
+        assert_eq!(outcome.error, None);
+        let val: serde_json::Value = serde_json::from_str(outcome.result.as_deref().unwrap()).unwrap();
+        assert_eq!(val["get"], serde_json::Value::Null);
+        assert_eq!(val["has"], false);
+        assert_eq!(val["closest"], serde_json::Value::Null);
+        assert_eq!(val["matches"], false);
+        assert_eq!(val["querySelector"], serde_json::Value::Null);
+        assert_eq!(val["querySelectorAll"], true);
+    }
 }
 
 // ── DOM Helper Functions ──────────────────────────────────────────────────────
@@ -4466,13 +4977,18 @@ fn steal_fragment_children(doc: &Handle) -> Vec<Handle> {
 
 fn serialize_inner_html(node: &Handle) -> String {
     let mut out = String::new();
+    let parent_tag = match &node.data {
+        NodeData::Element { ref name, .. } => Some(name.local.to_string()),
+        _ => None,
+    };
+    let parent_tag_lower = parent_tag.as_ref().map(|t| t.to_ascii_lowercase());
     for child in node.children.borrow().iter() {
-        serialize_node(child, &mut out);
+        serialize_node(child, &mut out, parent_tag_lower.as_deref());
     }
     out
 }
 
-fn serialize_node(node: &Handle, out: &mut String) {
+fn serialize_node(node: &Handle, out: &mut String, parent_tag: Option<&str>) {
     match &node.data {
         NodeData::Element {
             ref name,
@@ -4490,14 +5006,28 @@ fn serialize_node(node: &Handle, out: &mut String) {
                 out.push('"');
             }
             out.push('>');
+            let tag_lower = tag.to_ascii_lowercase();
             for child in node.children.borrow().iter() {
-                serialize_node(child, out);
+                serialize_node(child, out, Some(&tag_lower));
             }
             out.push_str("</");
             out.push_str(&tag);
             out.push('>');
         }
         NodeData::Text { ref contents } => {
+            if let Some(p) = parent_tag {
+                if p == "script"
+                    || p == "style"
+                    || p == "iframe"
+                    || p == "xmp"
+                    || p == "noembed"
+                    || p == "noframes"
+                    || p == "plaintext"
+                {
+                    out.push_str(&contents.borrow());
+                    return;
+                }
+            }
             out.push_str(&html_escape(&contents.borrow()));
         }
         NodeData::Comment { ref contents } => {
@@ -4526,7 +5056,7 @@ fn serialize_node(node: &Handle, out: &mut String) {
         }
         NodeData::Document => {
             for child in node.children.borrow().iter() {
-                serialize_node(child, out);
+                serialize_node(child, out, parent_tag);
             }
         }
         _ => {}
