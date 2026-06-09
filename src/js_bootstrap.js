@@ -467,14 +467,20 @@ function __aura_collection_node(item) {
 
 class HTMLCollection {
     constructor(resolver) {
-        this._resolver = resolver;
+        Object.defineProperty(this, '_resolver', {
+            value: resolver,
+            writable: true,
+            configurable: true,
+            enumerable: false
+        });
         return new Proxy(this, {
             get(target, prop, receiver) {
                 if (prop === 'length') return target._items().length;
                 if (prop === Symbol.iterator) return target[Symbol.iterator].bind(target);
-                if (typeof prop === 'string') {
-                    if (/^(0|[1-9]\d*)$/.test(prop)) return target.item(Number(prop));
-                    if (!(prop in target)) {
+                if (typeof prop === 'string' || typeof prop === 'number') {
+                    let propStr = String(prop);
+                    if (/^(0|[1-9]\d*)$/.test(propStr)) return target.item(Number(propStr));
+                    if (typeof prop === 'string' && !(prop in target)) {
                         let named = target.namedItem(prop);
                         if (named) return named;
                     }
@@ -483,10 +489,47 @@ class HTMLCollection {
                 return typeof value === 'function' ? value.bind(target) : value;
             },
             has(target, prop) {
-                if (typeof prop === 'string' && /^(0|[1-9]\d*)$/.test(prop)) {
-                    return Number(prop) < target.length;
+                if (typeof prop === 'string' || typeof prop === 'number') {
+                    let propStr = String(prop);
+                    if (/^(0|[1-9]\d*)$/.test(propStr)) {
+                        return Number(propStr) < target._items().length;
+                    }
                 }
                 return prop in target;
+            },
+            ownKeys(target) {
+                let keys = [];
+                let len = target._items().length;
+                for (let i = 0; i < len; i++) {
+                    keys.push(String(i));
+                }
+                keys.push('length');
+                return keys;
+            },
+            getOwnPropertyDescriptor(target, prop) {
+                if (typeof prop === 'string' || typeof prop === 'number') {
+                    let propStr = String(prop);
+                    if (/^(0|[1-9]\d*)$/.test(propStr)) {
+                        let index = Number(propStr);
+                        if (index < target._items().length) {
+                            return {
+                                value: target.item(index),
+                                writable: true,
+                                enumerable: true,
+                                configurable: true
+                            };
+                        }
+                    }
+                }
+                if (prop === 'length') {
+                    return {
+                        value: target._items().length,
+                        writable: false,
+                        enumerable: false,
+                        configurable: true
+                    };
+                }
+                return Reflect.getOwnPropertyDescriptor(target, prop);
             }
         });
     }
@@ -1367,13 +1410,64 @@ class CSSStyleSheet {
 
 class StyleSheetList {
     constructor(resolver) {
-        this._resolver = resolver;
+        Object.defineProperty(this, '_resolver', {
+            value: resolver,
+            writable: true,
+            configurable: true,
+            enumerable: false
+        });
         return new Proxy(this, {
             get(target, prop, receiver) {
                 if (prop === 'length') return target._items().length;
-                if (typeof prop === 'string' && /^(0|[1-9]\d*)$/.test(prop)) return target.item(Number(prop));
+                if (typeof prop === 'string' || typeof prop === 'number') {
+                    let propStr = String(prop);
+                    if (/^(0|[1-9]\d*)$/.test(propStr)) return target.item(Number(propStr));
+                }
                 let value = Reflect.get(target, prop, receiver);
                 return typeof value === 'function' ? value.bind(target) : value;
+            },
+            has(target, prop) {
+                if (typeof prop === 'string' || typeof prop === 'number') {
+                    let propStr = String(prop);
+                    if (/^(0|[1-9]\d*)$/.test(propStr)) {
+                        return Number(propStr) < target._items().length;
+                    }
+                }
+                return prop in target;
+            },
+            ownKeys(target) {
+                let keys = [];
+                let len = target._items().length;
+                for (let i = 0; i < len; i++) {
+                    keys.push(String(i));
+                }
+                keys.push('length');
+                return keys;
+            },
+            getOwnPropertyDescriptor(target, prop) {
+                if (typeof prop === 'string' || typeof prop === 'number') {
+                    let propStr = String(prop);
+                    if (/^(0|[1-9]\d*)$/.test(propStr)) {
+                        let index = Number(propStr);
+                        if (index < target._items().length) {
+                            return {
+                                value: target.item(index),
+                                writable: true,
+                                enumerable: true,
+                                configurable: true
+                            };
+                        }
+                    }
+                }
+                if (prop === 'length') {
+                    return {
+                        value: target._items().length,
+                        writable: false,
+                        enumerable: false,
+                        configurable: true
+                    };
+                }
+                return Reflect.getOwnPropertyDescriptor(target, prop);
             }
         });
     }
@@ -1408,7 +1502,12 @@ class Attr {
 
 class NamedNodeMap {
     constructor(element) {
-        this._element = element;
+        Object.defineProperty(this, '_element', {
+            value: element,
+            writable: true,
+            configurable: true,
+            enumerable: false
+        });
     }
     get length() {
         let attrs = typeof __aura_get_attributes === 'function'
