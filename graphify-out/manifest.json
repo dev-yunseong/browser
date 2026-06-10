@@ -1,0 +1,697 @@
+{
+  "/home/yunseong/dev/browser/.agents/skills/handoff/handoff.sh": {
+    "mtime": 1781058725.5778365,
+    "ast_hash": "7ca5519db79d6b3ebddd42e6bc3a06ba",
+    "semantic_hash": "7ca5519db79d6b3ebddd42e6bc3a06ba"
+  },
+  "/home/yunseong/dev/browser/.claude/settings.local.json": {
+    "mtime": 1776663052.1657212,
+    "ast_hash": "9dc971057f93fc7cc9817c64adb237fd",
+    "semantic_hash": "9dc971057f93fc7cc9817c64adb237fd"
+  },
+  "/home/yunseong/dev/browser/docs/tokscale-export-20260412-063222.json": {
+    "mtime": 1775975950.6339436,
+    "ast_hash": "00970759f891cadbb1b603fdfaf651bd",
+    "semantic_hash": "00970759f891cadbb1b603fdfaf651bd"
+  },
+  "/home/yunseong/dev/browser/docs/tokscale-export-20260412-063224.json": {
+    "mtime": 1775975950.6339436,
+    "ast_hash": "00970759f891cadbb1b603fdfaf651bd",
+    "semantic_hash": "00970759f891cadbb1b603fdfaf651bd"
+  },
+  "/home/yunseong/dev/browser/docs/tokscale-export-20260412-100907.json": {
+    "mtime": 1775990328.2922082,
+    "ast_hash": "6235855f0805c2f61d566c39754e1b4a",
+    "semantic_hash": "6235855f0805c2f61d566c39754e1b4a"
+  },
+  "/home/yunseong/dev/browser/src/bin/browser_cli.rs": {
+    "mtime": 1781058399.831011,
+    "ast_hash": "c56f0e9e33c4e419d7719031b49cb251",
+    "semantic_hash": "c56f0e9e33c4e419d7719031b49cb251"
+  },
+  "/home/yunseong/dev/browser/src/bin/browser_daemon.rs": {
+    "mtime": 1781058399.831693,
+    "ast_hash": "488c606b32dfcb8c7518a376454e63d7",
+    "semantic_hash": "488c606b32dfcb8c7518a376454e63d7"
+  },
+  "/home/yunseong/dev/browser/src/css.rs": {
+    "mtime": 1780829853.1081817,
+    "ast_hash": "a86f8a36545b94820b437b0233e5757a",
+    "semantic_hash": "a86f8a36545b94820b437b0233e5757a"
+  },
+  "/home/yunseong/dev/browser/src/dom.rs": {
+    "mtime": 1780829853.1081817,
+    "ast_hash": "42d5f0d8e83403c66318ad83e76ea4e6",
+    "semantic_hash": "42d5f0d8e83403c66318ad83e76ea4e6"
+  },
+  "/home/yunseong/dev/browser/src/engine.rs": {
+    "mtime": 1781058399.831693,
+    "ast_hash": "87baa037d757f92b0ac6a6e0e3fe398e",
+    "semantic_hash": "87baa037d757f92b0ac6a6e0e3fe398e"
+  },
+  "/home/yunseong/dev/browser/src/js.rs": {
+    "mtime": 1781058399.832693,
+    "ast_hash": "d5f1512fec1914ef3ef5d599ef2fd56a",
+    "semantic_hash": "d5f1512fec1914ef3ef5d599ef2fd56a"
+  },
+  "/home/yunseong/dev/browser/src/js_bootstrap.js": {
+    "mtime": 1781058399.833693,
+    "ast_hash": "120fcf9f18b5fb48b9d4342831b52bf0",
+    "semantic_hash": "120fcf9f18b5fb48b9d4342831b52bf0"
+  },
+  "/home/yunseong/dev/browser/src/layer_tree.rs": {
+    "mtime": 1780829853.1081817,
+    "ast_hash": "72bc28bcfcd2a26de1ef5db51c77bd35",
+    "semantic_hash": "72bc28bcfcd2a26de1ef5db51c77bd35"
+  },
+  "/home/yunseong/dev/browser/src/layout.rs": {
+    "mtime": 1780829853.109182,
+    "ast_hash": "61aef37a991287fac2044ced39856859",
+    "semantic_hash": "61aef37a991287fac2044ced39856859"
+  },
+  "/home/yunseong/dev/browser/src/main.rs": {
+    "mtime": 1780829853.1101818,
+    "ast_hash": "dd9d7081a3842e53a7b84c63cf30ee34",
+    "semantic_hash": "dd9d7081a3842e53a7b84c63cf30ee34"
+  },
+  "/home/yunseong/dev/browser/src/matrix.rs": {
+    "mtime": 1780829853.1101818,
+    "ast_hash": "d8bd148f6de7bcde10b2408883300f70",
+    "semantic_hash": "d8bd148f6de7bcde10b2408883300f70"
+  },
+  "/home/yunseong/dev/browser/src/render.rs": {
+    "mtime": 1780829853.1101818,
+    "ast_hash": "e04d6f8434ab4d3b6aa64ca40e6ce619",
+    "semantic_hash": "e04d6f8434ab4d3b6aa64ca40e6ce619"
+  },
+  "/home/yunseong/dev/browser/src/style.rs": {
+    "mtime": 1780829853.1111817,
+    "ast_hash": "2db9f6aa72f347de852d5e0c24bdbab7",
+    "semantic_hash": "2db9f6aa72f347de852d5e0c24bdbab7"
+  },
+  "/home/yunseong/dev/browser/storage.json": {
+    "mtime": 1781058744.2973511,
+    "ast_hash": "c01923971f9e42743da8a5b1e05a441b",
+    "semantic_hash": "c01923971f9e42743da8a5b1e05a441b"
+  },
+  "/home/yunseong/dev/browser/test_cssparser.rs": {
+    "mtime": 1775697719.6404335,
+    "ast_hash": "4d2109c57ec34fa6659c83165ff41e1b",
+    "semantic_hash": "4d2109c57ec34fa6659c83165ff41e1b"
+  },
+  "/home/yunseong/dev/browser/tests/repro_failures.rs": {
+    "mtime": 1781058399.834693,
+    "ast_hash": "47e07fbb56d0667e84e3d04a408d3120",
+    "semantic_hash": "47e07fbb56d0667e84e3d04a408d3120"
+  },
+  "/home/yunseong/dev/browser/tests/repro_sizing.rs": {
+    "mtime": 1780829853.112182,
+    "ast_hash": "ade62b3580636d1039b998b734699e7a",
+    "semantic_hash": "ade62b3580636d1039b998b734699e7a"
+  },
+  "/home/yunseong/dev/browser/tests/test_fixtures.rs": {
+    "mtime": 1781058399.834693,
+    "ast_hash": "fb13eaeec5c918b8d2c30c27ba3df17e",
+    "semantic_hash": "fb13eaeec5c918b8d2c30c27ba3df17e"
+  },
+  "/home/yunseong/dev/browser/tests/test_html_compliance.rs": {
+    "mtime": 1780829853.112182,
+    "ast_hash": "716bd45fc53fec027510b8e9f78d8dd5",
+    "semantic_hash": "716bd45fc53fec027510b8e9f78d8dd5"
+  },
+  "/home/yunseong/dev/browser/tests/test_perf_large_css.rs": {
+    "mtime": 1780829853.112182,
+    "ast_hash": "a62e21cf37160a2ad8c698da0e5a194c",
+    "semantic_hash": "a62e21cf37160a2ad8c698da0e5a194c"
+  },
+  "/home/yunseong/dev/browser/tests/test_pipeline.rs": {
+    "mtime": 1780829853.112182,
+    "ast_hash": "02edb716662549a2517b52bcbcbf3170",
+    "semantic_hash": "02edb716662549a2517b52bcbcbf3170"
+  },
+  "/home/yunseong/dev/browser/.agents/PRIORITY-ARCHIVE.md": {
+    "mtime": 1777968400.9435167,
+    "ast_hash": "b4b274ad69dfc633ce11d2d18e0c9a48",
+    "semantic_hash": "b4b274ad69dfc633ce11d2d18e0c9a48"
+  },
+  "/home/yunseong/dev/browser/.agents/PRIORITY.md": {
+    "mtime": 1781059209.1327527,
+    "ast_hash": "61042b6a1758ec8e905f78d005e9d934",
+    "semantic_hash": "61042b6a1758ec8e905f78d005e9d934"
+  },
+  "/home/yunseong/dev/browser/.agents/agents/developer.md": {
+    "mtime": 1781058730.7172492,
+    "ast_hash": "284efaa9a988f36048a31602498a6c2c",
+    "semantic_hash": "284efaa9a988f36048a31602498a6c2c"
+  },
+  "/home/yunseong/dev/browser/.agents/agents/pair-review-critic.md": {
+    "mtime": 1781058730.7177896,
+    "ast_hash": "f1f5b20dfa6dc66c804597a91115683e",
+    "semantic_hash": "f1f5b20dfa6dc66c804597a91115683e"
+  },
+  "/home/yunseong/dev/browser/.agents/docs/development-workflow.md": {
+    "mtime": 1780833750.2612662,
+    "ast_hash": "792b8ad210517a4b247b92a880775992",
+    "semantic_hash": "792b8ad210517a4b247b92a880775992"
+  },
+  "/home/yunseong/dev/browser/.agents/handoffs/2026-04-22_08-25.md": {
+    "mtime": 1776829396.9961653,
+    "ast_hash": "8bda24cc1de02f984dc33013462f8146",
+    "semantic_hash": "8bda24cc1de02f984dc33013462f8146"
+  },
+  "/home/yunseong/dev/browser/.agents/handoffs/2026-04-22_08-52.md": {
+    "mtime": 1776829396.9962814,
+    "ast_hash": "b9594e4823ffd0d6da570b948bf59fed",
+    "semantic_hash": "b9594e4823ffd0d6da570b948bf59fed"
+  },
+  "/home/yunseong/dev/browser/.agents/handoffs/2026-04-23_12-52.md": {
+    "mtime": 1777038659.9865086,
+    "ast_hash": "c6e7c743e58d02fcac9bb34bf43bb2f9",
+    "semantic_hash": "c6e7c743e58d02fcac9bb34bf43bb2f9"
+  },
+  "/home/yunseong/dev/browser/.agents/handoffs/2026-04-23_17-34.md": {
+    "mtime": 1777038659.9865086,
+    "ast_hash": "cac71ca6c540885d0987f925e1b91c11",
+    "semantic_hash": "cac71ca6c540885d0987f925e1b91c11"
+  },
+  "/home/yunseong/dev/browser/.agents/handoffs/2026-04-24_16-57.md": {
+    "mtime": 1777038659.9865086,
+    "ast_hash": "76e72ce57af8a066366e069bbec15539",
+    "semantic_hash": "76e72ce57af8a066366e069bbec15539"
+  },
+  "/home/yunseong/dev/browser/.agents/handoffs/2026-04-24_17-44.md": {
+    "mtime": 1777038659.9865086,
+    "ast_hash": "e637afce678797989cd64badf7a7a3ea",
+    "semantic_hash": "e637afce678797989cd64badf7a7a3ea"
+  },
+  "/home/yunseong/dev/browser/.agents/handoffs/2026-04-24_20-24.md": {
+    "mtime": 1777038659.9865086,
+    "ast_hash": "65fea813a81c87a578b0682998102f49",
+    "semantic_hash": "65fea813a81c87a578b0682998102f49"
+  },
+  "/home/yunseong/dev/browser/.agents/handoffs/2026-04-24_21-10.md": {
+    "mtime": 1777038659.9865086,
+    "ast_hash": "d8519d8882c8a6fd67a343dffd6e818a",
+    "semantic_hash": "d8519d8882c8a6fd67a343dffd6e818a"
+  },
+  "/home/yunseong/dev/browser/.agents/handoffs/2026-04-24_22-11.md": {
+    "mtime": 1777038659.9865086,
+    "ast_hash": "311710131cc8c9d519f1606b0fdd20c6",
+    "semantic_hash": "311710131cc8c9d519f1606b0fdd20c6"
+  },
+  "/home/yunseong/dev/browser/.agents/handoffs/2026-04-24_22-49.md": {
+    "mtime": 1777038659.9875088,
+    "ast_hash": "8cfc78922f3889ab80349c23657d3b9a",
+    "semantic_hash": "8cfc78922f3889ab80349c23657d3b9a"
+  },
+  "/home/yunseong/dev/browser/.agents/handoffs/2026-06-10_11-36.md": {
+    "mtime": 1781058990.5785973,
+    "ast_hash": "9b088ce3d311d4dfffaaed1a8dc8ba87",
+    "semantic_hash": "9b088ce3d311d4dfffaaed1a8dc8ba87"
+  },
+  "/home/yunseong/dev/browser/.agents/handoffs/LATEST.md": {
+    "mtime": 1781058990.5785973,
+    "ast_hash": "9b088ce3d311d4dfffaaed1a8dc8ba87",
+    "semantic_hash": "9b088ce3d311d4dfffaaed1a8dc8ba87"
+  },
+  "/home/yunseong/dev/browser/.agents/prompts/develop-priority.md": {
+    "mtime": 1776958028.5347915,
+    "ast_hash": "15d2a5607093b6f065d242f1dc7aef71",
+    "semantic_hash": "15d2a5607093b6f065d242f1dc7aef71"
+  },
+  "/home/yunseong/dev/browser/.agents/prompts/update-priority.md": {
+    "mtime": 1776958028.5347915,
+    "ast_hash": "a9ec0eb311b618a16ba7b55191074420",
+    "semantic_hash": "a9ec0eb311b618a16ba7b55191074420"
+  },
+  "/home/yunseong/dev/browser/.agents/skills/archive-priority/SKILL.md": {
+    "mtime": 1781058725.5759983,
+    "ast_hash": "d20e4b915abbeac8a65f5b1f0e7eb559",
+    "semantic_hash": "d20e4b915abbeac8a65f5b1f0e7eb559"
+  },
+  "/home/yunseong/dev/browser/.agents/skills/browser-tester/SKILL.md": {
+    "mtime": 1777038659.9885747,
+    "ast_hash": "25e871b6428b528595b3c74dab737ef3",
+    "semantic_hash": "25e871b6428b528595b3c74dab737ef3"
+  },
+  "/home/yunseong/dev/browser/.agents/skills/browser-tester/agents/openai.yaml": {
+    "mtime": 1777038659.988768,
+    "ast_hash": "a226054037b27b353f4a69f7bce69718",
+    "semantic_hash": "a226054037b27b353f4a69f7bce69718"
+  },
+  "/home/yunseong/dev/browser/.agents/skills/develop-priority/SKILL.md": {
+    "mtime": 1781058725.5765464,
+    "ast_hash": "b589c36c89d006b3cf002fa7642cb98f",
+    "semantic_hash": "b589c36c89d006b3cf002fa7642cb98f"
+  },
+  "/home/yunseong/dev/browser/.agents/skills/handoff/SKILL.md": {
+    "mtime": 1781058725.5770245,
+    "ast_hash": "9892a3e666ea3158d41e768845402924",
+    "semantic_hash": "9892a3e666ea3158d41e768845402924"
+  },
+  "/home/yunseong/dev/browser/.agents/skills/handoff/agents/openai.yaml": {
+    "mtime": 1781058725.5774198,
+    "ast_hash": "db862f2e4c73ddc59ec081706f08e96b",
+    "semantic_hash": "db862f2e4c73ddc59ec081706f08e96b"
+  },
+  "/home/yunseong/dev/browser/.agents/skills/pair-review/SKILL.md": {
+    "mtime": 1781058725.5779824,
+    "ast_hash": "1fecb43741fd4b65d78bd7d2a2d36109",
+    "semantic_hash": "1fecb43741fd4b65d78bd7d2a2d36109"
+  },
+  "/home/yunseong/dev/browser/.agents/skills/pair-review/agents/openai.yaml": {
+    "mtime": 1781058725.5781133,
+    "ast_hash": "e80f7704a5b4cc88eaae791868044823",
+    "semantic_hash": "e80f7704a5b4cc88eaae791868044823"
+  },
+  "/home/yunseong/dev/browser/.agents/skills/plan-review/SKILL.md": {
+    "mtime": 1781058725.5782106,
+    "ast_hash": "311e8e66f674b89eca0ce6048462d70c",
+    "semantic_hash": "311e8e66f674b89eca0ce6048462d70c"
+  },
+  "/home/yunseong/dev/browser/.agents/skills/plan-review/agents/openai.yaml": {
+    "mtime": 1781058725.5790248,
+    "ast_hash": "ef1b40b8d4991c3f88ee8c8f54b9ff33",
+    "semantic_hash": "ef1b40b8d4991c3f88ee8c8f54b9ff33"
+  },
+  "/home/yunseong/dev/browser/.agents/skills/update-priority/SKILL.md": {
+    "mtime": 1781058725.579717,
+    "ast_hash": "998c294eba6beb86a336c22b18e187d8",
+    "semantic_hash": "998c294eba6beb86a336c22b18e187d8"
+  },
+  "/home/yunseong/dev/browser/.agents/skills/writing-plan/SKILL.md": {
+    "mtime": 1781058725.579817,
+    "ast_hash": "51ecf821800e6e54039d220640d53cd1",
+    "semantic_hash": "51ecf821800e6e54039d220640d53cd1"
+  },
+  "/home/yunseong/dev/browser/.agents/skills/writing-plan/assets/PLAN_TEMPLATE.md": {
+    "mtime": 1781058725.5798957,
+    "ast_hash": "7652b2c8ef2060a1c648934b3d4a12a8",
+    "semantic_hash": "7652b2c8ef2060a1c648934b3d4a12a8"
+  },
+  "/home/yunseong/dev/browser/.claude/agents/browser-cli-reviewer.md": {
+    "mtime": 1780829525.9551878,
+    "ast_hash": "6c63e70c0fb932807ae39beb9a004003",
+    "semantic_hash": "6c63e70c0fb932807ae39beb9a004003"
+  },
+  "/home/yunseong/dev/browser/.claude/agents/developer.md": {
+    "mtime": 1781058730.720025,
+    "ast_hash": "284efaa9a988f36048a31602498a6c2c",
+    "semantic_hash": "284efaa9a988f36048a31602498a6c2c"
+  },
+  "/home/yunseong/dev/browser/.claude/agents/pair-review-critic.md": {
+    "mtime": 1781058730.7201777,
+    "ast_hash": "f1f5b20dfa6dc66c804597a91115683e",
+    "semantic_hash": "f1f5b20dfa6dc66c804597a91115683e"
+  },
+  "/home/yunseong/dev/browser/.claude/handoffs/2026-04-14_10-35.md": {
+    "mtime": 1776829396.9778092,
+    "ast_hash": "72dfc962bf2edfbb1ebf79d1ffc96e75",
+    "semantic_hash": "72dfc962bf2edfbb1ebf79d1ffc96e75"
+  },
+  "/home/yunseong/dev/browser/.claude/handoffs/2026-04-15_13-00.md": {
+    "mtime": 1776829396.9778092,
+    "ast_hash": "54e4ad57f67ca4bdb5199ca9929d4854",
+    "semantic_hash": "54e4ad57f67ca4bdb5199ca9929d4854"
+  },
+  "/home/yunseong/dev/browser/.claude/handoffs/2026-04-16_00-00.md": {
+    "mtime": 1776829396.9778092,
+    "ast_hash": "74a3ca6b757a215066ce801c913c8b08",
+    "semantic_hash": "74a3ca6b757a215066ce801c913c8b08"
+  },
+  "/home/yunseong/dev/browser/.claude/handoffs/2026-04-16_11-41.md": {
+    "mtime": 1776829396.9778092,
+    "ast_hash": "06ea8d1cdf0d5e459ebcf0e153cfa8e3",
+    "semantic_hash": "06ea8d1cdf0d5e459ebcf0e153cfa8e3"
+  },
+  "/home/yunseong/dev/browser/.claude/handoffs/2026-04-17_00-00.md": {
+    "mtime": 1776829396.9788094,
+    "ast_hash": "aa4563c0ddc374e5e07ea2b1d6c0a9f5",
+    "semantic_hash": "aa4563c0ddc374e5e07ea2b1d6c0a9f5"
+  },
+  "/home/yunseong/dev/browser/.claude/handoffs/2026-04-17_16-53.md": {
+    "mtime": 1776829396.9788094,
+    "ast_hash": "97a98781b633ad30dd16374ce90dfe1d",
+    "semantic_hash": "97a98781b633ad30dd16374ce90dfe1d"
+  },
+  "/home/yunseong/dev/browser/.claude/handoffs/2026-04-17_19-19.md": {
+    "mtime": 1776829396.9788094,
+    "ast_hash": "e7ad75336baff42399ae5377a20fb196",
+    "semantic_hash": "e7ad75336baff42399ae5377a20fb196"
+  },
+  "/home/yunseong/dev/browser/.claude/handoffs/2026-04-17_19-20.md": {
+    "mtime": 1776829396.9788094,
+    "ast_hash": "cb254eb49cd498f1dba579b3faaa9756",
+    "semantic_hash": "cb254eb49cd498f1dba579b3faaa9756"
+  },
+  "/home/yunseong/dev/browser/.claude/handoffs/2026-04-18_12-44.md": {
+    "mtime": 1776829396.9788094,
+    "ast_hash": "082bf675d5490659465cd082cf165d20",
+    "semantic_hash": "082bf675d5490659465cd082cf165d20"
+  },
+  "/home/yunseong/dev/browser/.claude/handoffs/2026-04-21_12-49.md": {
+    "mtime": 1776829396.979794,
+    "ast_hash": "20a5c546007aa41bbca2669e6d7c3143",
+    "semantic_hash": "20a5c546007aa41bbca2669e6d7c3143"
+  },
+  "/home/yunseong/dev/browser/.claude/handoffs/2026-04-21_14-35.md": {
+    "mtime": 1776829396.979794,
+    "ast_hash": "e6396cc404bbfbebec0433adad72181e",
+    "semantic_hash": "e6396cc404bbfbebec0433adad72181e"
+  },
+  "/home/yunseong/dev/browser/.claude/handoffs/LATEST.md": {
+    "mtime": 1776829396.979794,
+    "ast_hash": "e6396cc404bbfbebec0433adad72181e",
+    "semantic_hash": "e6396cc404bbfbebec0433adad72181e"
+  },
+  "/home/yunseong/dev/browser/.claude/skills/browser-tester.md": {
+    "mtime": 1776420966.2324884,
+    "ast_hash": "b0ea8f53b374e9a9e846bd2310bce6a5",
+    "semantic_hash": "b0ea8f53b374e9a9e846bd2310bce6a5"
+  },
+  "/home/yunseong/dev/browser/.plan/issues/2026-06-07-issue-257-naver-homepage-rendering.md": {
+    "mtime": 1781058399.8308547,
+    "ast_hash": "656a3bc73dfb8014f82021de91d970f1",
+    "semantic_hash": "656a3bc73dfb8014f82021de91d970f1"
+  },
+  "/home/yunseong/dev/browser/.plan/issues/2026-06-07-issue-279-prevent-naver-daemon-hang.md": {
+    "mtime": 1781058399.831011,
+    "ast_hash": "0be50a0546ba12956a9610bba7d4d524",
+    "semantic_hash": "0be50a0546ba12956a9610bba7d4d524"
+  },
+  "/home/yunseong/dev/browser/.plan/issues/2026-06-08-issue-257-fix-script-innerhtml-escaping.md": {
+    "mtime": 1781058399.831011,
+    "ast_hash": "ef803cfa815abc878590890d02489ac6",
+    "semantic_hash": "ef803cfa815abc878590890d02489ac6"
+  },
+  "/home/yunseong/dev/browser/.plan/issues/2026-06-08-issue-257-implement-anchor-url-properties.md": {
+    "mtime": 1781058399.831011,
+    "ast_hash": "0a781b4369d3fbe81b8efba5deb7780e",
+    "semantic_hash": "0a781b4369d3fbe81b8efba5deb7780e"
+  },
+  "/home/yunseong/dev/browser/.plan/issues/2026-06-08-issue-257-implement-currentscript-and-document-stubs.md": {
+    "mtime": 1781058399.831011,
+    "ast_hash": "c6fe6995c4f735ce5241a5540621750c",
+    "semantic_hash": "c6fe6995c4f735ce5241a5540621750c"
+  },
+  "/home/yunseong/dev/browser/.plan/issues/2026-06-08-issue-257-implement-dom-compatibility-stubs.md": {
+    "mtime": 1781058399.831011,
+    "ast_hash": "475be78f87bbd5f6e11897b72ee469d0",
+    "semantic_hash": "475be78f87bbd5f6e11897b72ee469d0"
+  },
+  "/home/yunseong/dev/browser/.plan/issues/2026-06-08-issue-257-implement-node-prototype-compatibility-stubs.md": {
+    "mtime": 1781058399.831011,
+    "ast_hash": "8bd1d799cc999db85da0fba7b0b6989a",
+    "semantic_hash": "8bd1d799cc999db85da0fba7b0b6989a"
+  },
+  "/home/yunseong/dev/browser/.plan/issues/2026-06-09-issue-256-observer-shadowroot-raf-compat.md": {
+    "mtime": 1781058399.831011,
+    "ast_hash": "9d6ad7d0a1842d89c35c592a666c486a",
+    "semantic_hash": "9d6ad7d0a1842d89c35c592a666c486a"
+  },
+  "/home/yunseong/dev/browser/.plan/issues/2026-06-09-issue-257-debug-and-fix-getattribute-typeerror.md": {
+    "mtime": 1781058399.831011,
+    "ast_hash": "769baf0c095a1a9a8bc919474ad46df6",
+    "semantic_hash": "769baf0c095a1a9a8bc919474ad46df6"
+  },
+  "/home/yunseong/dev/browser/.plan/issues/2026-06-09-issue-257-debug-getattribute-typeerror.md": {
+    "mtime": 1781058399.831011,
+    "ast_hash": "e9107eb0e813ac0310eda3580de8b07f",
+    "semantic_hash": "e9107eb0e813ac0310eda3580de8b07f"
+  },
+  "/home/yunseong/dev/browser/.plan/issues/2026-06-09-issue-257-fix-dynamic-script-cors.md": {
+    "mtime": 1781058399.831011,
+    "ast_hash": "fa954af8f0611c5e5c858c8fbe52e0c7",
+    "semantic_hash": "fa954af8f0611c5e5c858c8fbe52e0c7"
+  },
+  "/home/yunseong/dev/browser/.plan/issues/2026-06-09-issue-257-fix-htmlcollection-proxy-keys.md": {
+    "mtime": 1781058399.831011,
+    "ast_hash": "ed74503534f0e12be5e64a4c23c64839",
+    "semantic_hash": "ed74503534f0e12be5e64a4c23c64839"
+  },
+  "/home/yunseong/dev/browser/.plan/issues/2026-06-09-issue-257-fix-htmlcollection-proxy-traps.md": {
+    "mtime": 1781058399.831011,
+    "ast_hash": "220cdde63e16ca6869cc7b9f03f91cf5",
+    "semantic_hash": "220cdde63e16ca6869cc7b9f03f91cf5"
+  },
+  "/home/yunseong/dev/browser/AGENTS.md": {
+    "mtime": 1781060305.40221,
+    "ast_hash": "986caf09887a334135d0e1ca859d8718",
+    "semantic_hash": "986caf09887a334135d0e1ca859d8718"
+  },
+  "/home/yunseong/dev/browser/MEMORY.md": {
+    "mtime": 1776829412.0328438,
+    "ast_hash": "fdf927795c13de423b232bb41bf75f6a",
+    "semantic_hash": "fdf927795c13de423b232bb41bf75f6a"
+  },
+  "/home/yunseong/dev/browser/README.md": {
+    "mtime": 1781058399.831011,
+    "ast_hash": "bedec9c06b97c2e684726a5fd5bac8c7",
+    "semantic_hash": "bedec9c06b97c2e684726a5fd5bac8c7"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN.md": {
+    "mtime": 1776228526.2657018,
+    "ast_hash": "9d6f454b752fca696085423e6dd574d7",
+    "semantic_hash": "9d6f454b752fca696085423e6dd574d7"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_COMPLEX_ELEMENTS.md": {
+    "mtime": 1776228526.266349,
+    "ast_hash": "7f55fafcbe48f2dce35901ad71f6ef79",
+    "semantic_hash": "7f55fafcbe48f2dce35901ad71f6ef79"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_FIX_NAVIGATION.md": {
+    "mtime": 1776228526.266349,
+    "ast_hash": "a149a1e453efadacf0d0b46028f29fc9",
+    "semantic_hash": "a149a1e453efadacf0d0b46028f29fc9"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_FLOW_LAYOUT.md": {
+    "mtime": 1776228526.266349,
+    "ast_hash": "4bf8256450c8815aac0c074e9b10229d",
+    "semantic_hash": "4bf8256450c8815aac0c074e9b10229d"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_FUTURE_ROADMAP.md": {
+    "mtime": 1776228526.266349,
+    "ast_hash": "76e8a041d9643eb23104578af5708838",
+    "semantic_hash": "76e8a041d9643eb23104578af5708838"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_HIGH_FIDELITY_RENDERING.md": {
+    "mtime": 1776228526.266349,
+    "ast_hash": "06d2987ed7cd7bc2f894fc662aaec1a7",
+    "semantic_hash": "06d2987ed7cd7bc2f894fc662aaec1a7"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_HTML_CSS_PERFECTION.md": {
+    "mtime": 1776228526.266349,
+    "ast_hash": "f513504d26250e4c15673fa4e7e03dbc",
+    "semantic_hash": "f513504d26250e4c15673fa4e7e03dbc"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_INLINE_BLOCK_REFINEMENT.md": {
+    "mtime": 1776228526.266349,
+    "ast_hash": "416882af46a160578dfc830392bb4c96",
+    "semantic_hash": "416882af46a160578dfc830392bb4c96"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_INTERACTIVE_JS.md": {
+    "mtime": 1776228526.2667017,
+    "ast_hash": "e96d0db9b9fa92d45af5c3c15ec49e71",
+    "semantic_hash": "e96d0db9b9fa92d45af5c3c15ec49e71"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_INTERACTIVE_REFINEMENT.md": {
+    "mtime": 1776228526.2667017,
+    "ast_hash": "b8dba2a4a00d2aaa2515ba28e1226eb5",
+    "semantic_hash": "b8dba2a4a00d2aaa2515ba28e1226eb5"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_ISSUE_12_FLEXBOX.md": {
+    "mtime": 1776228526.2667017,
+    "ast_hash": "bbd3052482030a96e13b4c0ac984c71c",
+    "semantic_hash": "bbd3052482030a96e13b4c0ac984c71c"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_ISSUE_26.md": {
+    "mtime": 1776228526.2667017,
+    "ast_hash": "b665b3a1d2621afd574e3d74a850e0be",
+    "semantic_hash": "b665b3a1d2621afd574e3d74a850e0be"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_ISSUE_35_36.md": {
+    "mtime": 1776228526.2667017,
+    "ast_hash": "b2e15230264d2fdd338538533357d524",
+    "semantic_hash": "b2e15230264d2fdd338538533357d524"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_ISSUE_37.md": {
+    "mtime": 1776228526.2667017,
+    "ast_hash": "84209f4f95c1b9f80dffd1c06310fc21",
+    "semantic_hash": "84209f4f95c1b9f80dffd1c06310fc21"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_ISSUE_43.md": {
+    "mtime": 1776228526.2667017,
+    "ast_hash": "8ae4eb373ca4f5c936e193150c0a0f2a",
+    "semantic_hash": "8ae4eb373ca4f5c936e193150c0a0f2a"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_ISSUE_7_SUBISSUES.md": {
+    "mtime": 1776228526.2667017,
+    "ast_hash": "a41db037de2fc0f20be1a7203282c47b",
+    "semantic_hash": "a41db037de2fc0f20be1a7203282c47b"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_JS_INTEGRATION.md": {
+    "mtime": 1776228526.2667017,
+    "ast_hash": "ee88932ddd6d19e157ad6f9c763bd2a2",
+    "semantic_hash": "ee88932ddd6d19e157ad6f9c763bd2a2"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_KOREAN_STYLING.md": {
+    "mtime": 1776228526.2677016,
+    "ast_hash": "10286c97572f6994842aa3c648aee151",
+    "semantic_hash": "10286c97572f6994842aa3c648aee151"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_LAYOUT_CSS_FINALIZE.md": {
+    "mtime": 1776228526.2677016,
+    "ast_hash": "2757e5bec7e7058382b3baa6d629d281",
+    "semantic_hash": "2757e5bec7e7058382b3baa6d629d281"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_LIVING_ENGINE.md": {
+    "mtime": 1776228526.2677016,
+    "ast_hash": "a0aea60848b594b15ec960ba787dbe4a",
+    "semantic_hash": "a0aea60848b594b15ec960ba787dbe4a"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_MASTER_HIGH_LEVEL.md": {
+    "mtime": 1776228526.2677016,
+    "ast_hash": "5955c7937a7840275f306590189c26f2",
+    "semantic_hash": "5955c7937a7840275f306590189c26f2"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_RENDERING_CONTAINMENT.md": {
+    "mtime": 1776228526.2677016,
+    "ast_hash": "bcbbbc1e4844027c7c64ab4ad54c93d0",
+    "semantic_hash": "bcbbbc1e4844027c7c64ab4ad54c93d0"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_RENDERING_UPGRADE.md": {
+    "mtime": 1776228526.2677016,
+    "ast_hash": "4ba17ad8345db8fae9f696226c553d91",
+    "semantic_hash": "4ba17ad8345db8fae9f696226c553d91"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_SCROLLING.md": {
+    "mtime": 1776228526.2677016,
+    "ast_hash": "59e1c93ed41ac6df7879e4b39de07aa9",
+    "semantic_hash": "59e1c93ed41ac6df7879e4b39de07aa9"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_STABILITY_FIX.md": {
+    "mtime": 1776228526.2677016,
+    "ast_hash": "017a290d9e13489320cbfba9e8881aa3",
+    "semantic_hash": "017a290d9e13489320cbfba9e8881aa3"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_STYLE_FINAL_UPGRADE.md": {
+    "mtime": 1776228526.2677016,
+    "ast_hash": "04ace9f6629c0f7b2ed67baeaa8efb91",
+    "semantic_hash": "04ace9f6629c0f7b2ed67baeaa8efb91"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_UPGRADE.md": {
+    "mtime": 1776228526.2677016,
+    "ast_hash": "2a49dba3e736b56e416517b0d18a0ecf",
+    "semantic_hash": "2a49dba3e736b56e416517b0d18a0ecf"
+  },
+  "/home/yunseong/dev/browser/docs/archived/PLAN_WEB_STANDARDS_UPGRADE.md": {
+    "mtime": 1776228526.2677016,
+    "ast_hash": "9c380f1f7b7341073e32a530568b2d13",
+    "semantic_hash": "9c380f1f7b7341073e32a530568b2d13"
+  },
+  "/home/yunseong/dev/browser/docs/archived/issue_21_plan.md": {
+    "mtime": 1776228526.2687018,
+    "ast_hash": "f5de34b53b35ea50915e7b138b8186a3",
+    "semantic_hash": "f5de34b53b35ea50915e7b138b8186a3"
+  },
+  "/home/yunseong/dev/browser/docs/archived/issue_22_plan_review_request.md": {
+    "mtime": 1776228526.2687018,
+    "ast_hash": "79c7ae870fb83acd133cf1abd475b455",
+    "semantic_hash": "79c7ae870fb83acd133cf1abd475b455"
+  },
+  "/home/yunseong/dev/browser/docs/archived/issue_23_plan.md": {
+    "mtime": 1776228526.2687018,
+    "ast_hash": "c0f86bc9a4c0575edfd2db981eba16a0",
+    "semantic_hash": "c0f86bc9a4c0575edfd2db981eba16a0"
+  },
+  "/home/yunseong/dev/browser/docs/es-module-verification.md": {
+    "mtime": 1778063909.858136,
+    "ast_hash": "0c28b6145137991fcc86af48a5708328",
+    "semantic_hash": "0c28b6145137991fcc86af48a5708328"
+  },
+  "/home/yunseong/dev/browser/docs/js-v8-compatibility.md": {
+    "mtime": 1778040808.6357346,
+    "ast_hash": "8e557012275f5ee74968b46607b67274",
+    "semantic_hash": "8e557012275f5ee74968b46607b67274"
+  },
+  "/home/yunseong/dev/browser/docs/reports/DESIGN_REPORT.md": {
+    "mtime": 1776228526.2687018,
+    "ast_hash": "68416446e17dcb9108dba9be81a4872e",
+    "semantic_hash": "68416446e17dcb9108dba9be81a4872e"
+  },
+  "/home/yunseong/dev/browser/docs/reports/FUNDAMENTAL_ARCHITECTURE_FLAWS.md": {
+    "mtime": 1776228526.2696059,
+    "ast_hash": "8cfcd7f5c22fee3d53acc77248a8724e",
+    "semantic_hash": "8cfcd7f5c22fee3d53acc77248a8724e"
+  },
+  "/home/yunseong/dev/browser/docs/reports/REARCHITECTURE_REPORT.md": {
+    "mtime": 1776228526.2696059,
+    "ast_hash": "0163c8f7edac6e969efe45d2cbd53e7b",
+    "semantic_hash": "0163c8f7edac6e969efe45d2cbd53e7b"
+  },
+  "/home/yunseong/dev/browser/docs/reports/RENDER_LAYOUT_FAILURE_ANALYSIS_2026-04-08.md": {
+    "mtime": 1776228526.2696059,
+    "ast_hash": "8edae43aa70e35fedc7689eb7d50e140",
+    "semantic_hash": "8edae43aa70e35fedc7689eb7d50e140"
+  },
+  "/home/yunseong/dev/browser/docs/research/METHODOLOGY_INCREMENTAL_REFINEMENT.md": {
+    "mtime": 1776228526.2696059,
+    "ast_hash": "630166341eba5d3d7566a9f88895726b",
+    "semantic_hash": "630166341eba5d3d7566a9f88895726b"
+  },
+  "/home/yunseong/dev/browser/docs/research/STUDY_WEB_STANDARDS.md": {
+    "mtime": 1776228526.2701495,
+    "ast_hash": "ef0caf55a11f3ba29af9ba29971cf9d2",
+    "semantic_hash": "ef0caf55a11f3ba29af9ba29971cf9d2"
+  },
+  "/home/yunseong/dev/browser/tests/fixtures/classic-module-hybrid.html": {
+    "mtime": 1778063909.8591359,
+    "ast_hash": "8d2f40de0b047c8584864e1655f9f03b",
+    "semantic_hash": "8d2f40de0b047c8584864e1655f9f03b"
+  },
+  "/home/yunseong/dev/browser/tests/fixtures/defer-async-ordering.html": {
+    "mtime": 1778063909.859714,
+    "ast_hash": "f4a55dc800fedd18955f7a3839cbe495",
+    "semantic_hash": "f4a55dc800fedd18955f7a3839cbe495"
+  },
+  "/home/yunseong/dev/browser/tests/fixtures/import-meta.html": {
+    "mtime": 1778063909.859714,
+    "ast_hash": "67cddd6f3283c440ecd77e38695726a0",
+    "semantic_hash": "67cddd6f3283c440ecd77e38695726a0"
+  },
+  "/home/yunseong/dev/browser/tests/fixtures/inline-classic.html": {
+    "mtime": 1778063909.859714,
+    "ast_hash": "243a10aaf8f5c47be744197f7e17ff0b",
+    "semantic_hash": "243a10aaf8f5c47be744197f7e17ff0b"
+  },
+  "/home/yunseong/dev/browser/tests/fixtures/inline-module.html": {
+    "mtime": 1778063909.859714,
+    "ast_hash": "c3dcd2f9efb0ed9ae0620bf5db98a34a",
+    "semantic_hash": "c3dcd2f9efb0ed9ae0620bf5db98a34a"
+  },
+  "/home/yunseong/dev/browser/tests/fixtures/module-console-log.html": {
+    "mtime": 1778063909.859714,
+    "ast_hash": "6d98ea2e512c04c4c38ce7799fe0189e",
+    "semantic_hash": "6d98ea2e512c04c4c38ce7799fe0189e"
+  },
+  "/home/yunseong/dev/browser/tests/fixtures/module-dom-mutation.html": {
+    "mtime": 1778063909.860136,
+    "ast_hash": "f64dc4e53b723133426f34c5daa29e72",
+    "semantic_hash": "f64dc4e53b723133426f34c5daa29e72"
+  },
+  "/home/yunseong/dev/browser/tests/fixtures/module-style-override.html": {
+    "mtime": 1778063909.860136,
+    "ast_hash": "5e7a50b62acbed840d9b665b40c56ea7",
+    "semantic_hash": "5e7a50b62acbed840d9b665b40c56ea7"
+  },
+  "/home/yunseong/dev/browser/tests/fixtures/module-tick-timer.html": {
+    "mtime": 1778063909.860136,
+    "ast_hash": "b351bfe360601aa92555bc3104fa3dfb",
+    "semantic_hash": "b351bfe360601aa92555bc3104fa3dfb"
+  },
+  "/home/yunseong/dev/browser/tests/fixtures/nomodule-fallback.html": {
+    "mtime": 1778063909.860136,
+    "ast_hash": "928a88c9090d1845c55c6e5c55dd4402",
+    "semantic_hash": "928a88c9090d1845c55c6e5c55dd4402"
+  }
+}
