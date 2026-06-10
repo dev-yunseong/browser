@@ -12,6 +12,8 @@
 //!   browser-cli js <script>              # Evaluate JavaScript and print result
 //!   browser-cli style [<selector>]       # Print computed CSS styles
 //!   browser-cli layout                   # Print the layout tree
+//!   browser-cli logs                     # Print browser console entries
+//!   browser-cli tick [count]             # Advance daemon JS tasks
 //!   browser-cli --port 7071 <command>    # Custom daemon port
 
 use std::fmt;
@@ -62,6 +64,20 @@ struct ApiPageResponse {
 }
 
 #[derive(serde::Deserialize, Debug, Clone)]
+struct ApiConsoleEntry {
+    pub level: String,
+    pub message: String,
+    pub timestamp: u64,
+}
+
+#[derive(serde::Deserialize, Debug, Clone)]
+struct ApiTickResponse {
+    pub ticks: u32,
+    pub worked: bool,
+    pub rerendered: bool,
+}
+
+#[derive(serde::Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 enum ClickResult {
     Navigate { url: String },
@@ -108,7 +124,7 @@ struct DaemonClient {
 impl DaemonClient {
     fn new(port: u16) -> Self {
         Self {
-            base_url: format!("http://localhost:{}", port),
+            base_url: format!("http://127.0.0.1:{}", port),
             client: reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
@@ -141,7 +157,11 @@ impl DaemonClient {
         // deserialization fails (e.g. because the daemon panicked and sent garbage).
         let body = resp.text().map_err(|e| CliError::Parse(e.to_string()))?;
         serde_json::from_str::<ApiPageResponse>(&body).map_err(|e| {
-            let preview = if body.len() > 200 { &body[..200] } else { &body };
+            let preview = if body.len() > 200 {
+                &body[..200]
+            } else {
+                &body
+            };
             CliError::Parse(format!("{} (raw body: {})", e, preview))
         })
     }
@@ -159,7 +179,11 @@ impl DaemonClient {
         // deserialization fails.
         let body = resp.text().map_err(|e| CliError::Parse(e.to_string()))?;
         serde_json::from_str::<ApiPageResponse>(&body).map_err(|e| {
-            let preview = if body.len() > 200 { &body[..200] } else { &body };
+            let preview = if body.len() > 200 {
+                &body[..200]
+            } else {
+                &body
+            };
             CliError::Parse(format!("{} (raw body: {})", e, preview))
         })
     }
@@ -213,9 +237,7 @@ impl DaemonClient {
             .json(&serde_json::json!({ "script": script }))
             .send()
             .map_err(Self::check_error)?;
-        let v: serde_json::Value = resp
-            .json()
-            .map_err(|e| CliError::Parse(e.to_string()))?;
+        let v: serde_json::Value = resp.json().map_err(|e| CliError::Parse(e.to_string()))?;
         Ok(v["result"].as_str().unwrap_or("").to_string())
     }
 
@@ -229,9 +251,7 @@ impl DaemonClient {
             .json(&serde_json::json!({ "code": code }))
             .send()
             .map_err(Self::check_error)?;
-        let v: serde_json::Value = resp
-            .json()
-            .map_err(|e| CliError::Parse(e.to_string()))?;
+        let v: serde_json::Value = resp.json().map_err(|e| CliError::Parse(e.to_string()))?;
         let result = v["result"].as_str().map(|s| s.to_string());
         let error = v["error"].as_str().map(|s| s.to_string());
         Ok((result, error))
@@ -244,14 +264,8 @@ impl DaemonClient {
         } else {
             format!("{}/style", self.base_url)
         };
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .map_err(Self::check_error)?;
-        let v: serde_json::Value = resp
-            .json()
-            .map_err(|e| CliError::Parse(e.to_string()))?;
+        let resp = self.client.get(&url).send().map_err(Self::check_error)?;
+        let v: serde_json::Value = resp.json().map_err(|e| CliError::Parse(e.to_string()))?;
         serde_json::to_string_pretty(&v).map_err(|e| CliError::Parse(e.to_string()))
     }
 
@@ -263,6 +277,30 @@ impl DaemonClient {
             .send()
             .map_err(Self::check_error)?;
         resp.text().map_err(|e| CliError::Http(e.to_string()))
+    }
+
+    fn get_console(&self) -> Result<Vec<ApiConsoleEntry>, CliError> {
+        let resp = self
+            .client
+            .get(format!("{}/console", self.base_url))
+            .send()
+            .map_err(Self::check_error)?;
+        resp.json::<Vec<ApiConsoleEntry>>()
+            .map_err(|e| CliError::Parse(e.to_string()))
+    }
+
+    fn tick(&self, count: u32) -> Result<ApiTickResponse, CliError> {
+        let resp = self
+            .client
+            .post(format!("{}/tick", self.base_url))
+            .json(&serde_json::json!({ "count": count, "width": 800.0 }))
+            .send()
+            .map_err(Self::check_error)?;
+        if !resp.status().is_success() {
+            return Err(CliError::Http(format!("tick returned {}", resp.status())));
+        }
+        resp.json::<ApiTickResponse>()
+            .map_err(|e| CliError::Parse(e.to_string()))
     }
 }
 
@@ -505,8 +543,14 @@ enum ClickTarget {
 enum Command {
     Navigate(String),
     Click(ClickTarget),
-    Type { field: String, value: String },
-    Select { field: String, option: String },
+    Type {
+        field: String,
+        value: String,
+    },
+    Select {
+        field: String,
+        option: String,
+    },
     Submit,
     Back,
     Forward,
@@ -514,8 +558,12 @@ enum Command {
     Js(String),
     /// Evaluate JS via the DevTools console REPL — result/error is echoed into the console buffer.
     Console(String),
-    Style { selector: Option<String> },
+    Style {
+        selector: Option<String>,
+    },
     Layout,
+    Logs,
+    Tick(u32),
     Help,
     Quit,
     Unknown(String),
@@ -613,6 +661,15 @@ fn parse_command(line: &str) -> Command {
             },
         },
         "layout" => Command::Layout,
+        "logs" | "console-log" | "console-logs" => Command::Logs,
+        "tick" => {
+            let count = if rest.is_empty() {
+                1
+            } else {
+                rest.parse::<u32>().unwrap_or(1)
+            };
+            Command::Tick(count.clamp(1, 120))
+        }
         "help" | "?" | "h" => Command::Help,
         "quit" | "exit" | "q" => Command::Quit,
         other => Command::Unknown(other.to_string()),
@@ -633,11 +690,27 @@ fn print_help() {
     println!("  screenshot [<file>]     Save a PNG screenshot (default: screenshot.png)");
     println!("  js <script>             Evaluate JavaScript and print the result");
     println!("  console <expr>          Evaluate JS via DevTools console REPL (echoes in console buffer)");
-    println!("  style [<selector>]      Print computed CSS styles (optionally filtered by selector)");
+    println!(
+        "  style [<selector>]      Print computed CSS styles (optionally filtered by selector)"
+    );
     println!("  layout                  Print the current layout tree");
+    println!("  logs                    Print browser console entries");
+    println!("  tick [count]            Advance daemon JS tasks and re-render if needed");
     println!("  help                    Show this help");
     println!("  quit                    Exit the REPL");
     println!();
+}
+
+fn render_console_entries(entries: &[ApiConsoleEntry]) {
+    if entries.is_empty() {
+        println!("Console: (empty)");
+        return;
+    }
+
+    println!("Console:");
+    for entry in entries {
+        println!("[{}] {} {}", entry.level, entry.timestamp, entry.message);
+    }
 }
 
 // ── REPL ──────────────────────────────────────────────────────────────────────
@@ -698,32 +771,35 @@ fn dispatch_command(cmd: Command, state: &mut CliState) -> bool {
                 eprintln!("Error: {}", e);
             }
         }
-        Command::Js(script) => {
-            match state.client.evaluate_js(&script) {
-                Ok(result) => println!("js result: {}", result),
-                Err(e) => eprintln!("Error: {}", e),
-            }
-        }
-        Command::Console(code) => {
-            match state.client.console_eval(&code) {
-                Ok((Some(result), _)) => println!("< {}", result),
-                Ok((_, Some(error))) => eprintln!("< [error] {}", error),
-                Ok((None, None)) => {}
-                Err(e) => eprintln!("Error: {}", e),
-            }
-        }
-        Command::Style { selector } => {
-            match state.client.get_style(selector.as_deref()) {
-                Ok(text) => println!("{}", text),
-                Err(e) => eprintln!("Error: {}", e),
-            }
-        }
-        Command::Layout => {
-            match state.client.get_layout() {
-                Ok(text) => println!("{}", text),
-                Err(e) => eprintln!("Error: {}", e),
-            }
-        }
+        Command::Js(script) => match state.client.evaluate_js(&script) {
+            Ok(result) => println!("js result: {}", result),
+            Err(e) => eprintln!("Error: {}", e),
+        },
+        Command::Console(code) => match state.client.console_eval(&code) {
+            Ok((Some(result), _)) => println!("< {}", result),
+            Ok((_, Some(error))) => eprintln!("< [error] {}", error),
+            Ok((None, None)) => {}
+            Err(e) => eprintln!("Error: {}", e),
+        },
+        Command::Style { selector } => match state.client.get_style(selector.as_deref()) {
+            Ok(text) => println!("{}", text),
+            Err(e) => eprintln!("Error: {}", e),
+        },
+        Command::Layout => match state.client.get_layout() {
+            Ok(text) => println!("{}", text),
+            Err(e) => eprintln!("Error: {}", e),
+        },
+        Command::Logs => match state.client.get_console() {
+            Ok(entries) => render_console_entries(&entries),
+            Err(e) => eprintln!("Error: {}", e),
+        },
+        Command::Tick(count) => match state.client.tick(count) {
+            Ok(resp) => println!(
+                "tick: ticks={} worked={} rerendered={}",
+                resp.ticks, resp.worked, resp.rerendered
+            ),
+            Err(e) => eprintln!("Error: {}", e),
+        },
         Command::Help => print_help(),
         Command::Quit => {
             println!("Goodbye.");
@@ -865,13 +941,13 @@ mod tests {
     #[test]
     fn test_daemon_client_default_port() {
         let client = DaemonClient::new(7070);
-        assert_eq!(client.base_url, "http://localhost:7070");
+        assert_eq!(client.base_url, "http://127.0.0.1:7070");
     }
 
     #[test]
     fn test_daemon_client_custom_port() {
         let client = DaemonClient::new(8080);
-        assert_eq!(client.base_url, "http://localhost:8080");
+        assert_eq!(client.base_url, "http://127.0.0.1:8080");
     }
 
     // -- CliHistory tests --
@@ -1074,6 +1150,20 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_command_logs() {
+        assert_eq!(parse_command("logs"), Command::Logs);
+        assert_eq!(parse_command("console-logs"), Command::Logs);
+    }
+
+    #[test]
+    fn test_parse_command_tick() {
+        assert_eq!(parse_command("tick"), Command::Tick(1));
+        assert_eq!(parse_command("tick 3"), Command::Tick(3));
+        assert_eq!(parse_command("tick nope"), Command::Tick(1));
+        assert_eq!(parse_command("tick 500"), Command::Tick(120));
+    }
+
+    #[test]
     fn test_parse_command_quit_variants() {
         assert_eq!(parse_command("quit"), Command::Quit);
         assert_eq!(parse_command("exit"), Command::Quit);
@@ -1127,14 +1217,24 @@ mod tests {
                     element_type: "link".to_string(),
                     text: "More information".to_string(),
                     href: Some("https://www.iana.org/domains/reserved".to_string()),
-                    rect: ApiRect { x: 100.0, y: 200.0, w: 120.0, h: 20.0 },
+                    rect: ApiRect {
+                        x: 100.0,
+                        y: 200.0,
+                        w: 120.0,
+                        h: 20.0,
+                    },
                 },
                 ApiElement {
                     id: "e1".to_string(),
                     element_type: "link".to_string(),
                     text: String::new(),
                     href: Some("https://another.com".to_string()),
-                    rect: ApiRect { x: 0.0, y: 0.0, w: 50.0, h: 20.0 },
+                    rect: ApiRect {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 50.0,
+                        h: 20.0,
+                    },
                 },
             ],
             forms: vec![],
@@ -1198,13 +1298,25 @@ mod tests {
         let invalid_json = "thread 'tokio-runtime' panicked at 'byte index 5...'";
         let err = serde_json::from_str::<ApiPageResponse>(invalid_json)
             .map_err(|e| {
-                let preview = if invalid_json.len() > 200 { &invalid_json[..200] } else { invalid_json };
+                let preview = if invalid_json.len() > 200 {
+                    &invalid_json[..200]
+                } else {
+                    invalid_json
+                };
                 CliError::Parse(format!("{} (raw body: {})", e, preview))
             })
             .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("Parse error:"), "expected 'Parse error:' in: {}", msg);
-        assert!(msg.contains("raw body:"), "expected 'raw body:' in: {}", msg);
+        assert!(
+            msg.contains("Parse error:"),
+            "expected 'Parse error:' in: {}",
+            msg
+        );
+        assert!(
+            msg.contains("raw body:"),
+            "expected 'raw body:' in: {}",
+            msg
+        );
         assert!(msg.contains("panicked"), "expected panic text in: {}", msg);
     }
 }

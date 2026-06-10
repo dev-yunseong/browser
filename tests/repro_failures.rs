@@ -35,11 +35,17 @@ fn test_interleaved_block_inline_stacking() {
         println!("Child {}: {:?} at y={}", i, child.display, child.dimensions.y);
     }
 
-    assert_eq!(layout.children.len(), 3);
+    let element_children: Vec<&browser::layout::LayoutBox> = layout.children.iter()
+        .filter(|child| {
+            matches!(child.style_node.node.data, NodeData::Element { .. })
+        })
+        .collect();
+
+    assert_eq!(element_children.len(), 3);
     
-    let inline1 = &layout.children[0];
-    let block1 = &layout.children[1];
-    let inline2 = &layout.children[2];
+    let inline1 = element_children[0];
+    let block1 = element_children[1];
+    let inline2 = element_children[2];
 
     // Check vertical stacking
     assert!(block1.dimensions.y >= inline1.dimensions.y + inline1.dimensions.height, 

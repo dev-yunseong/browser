@@ -1,7 +1,7 @@
 use markup5ever_rcdom;
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use url::Url;
 
 use crate::{css, dom, js, layout, render, style};
@@ -61,6 +61,25 @@ pub enum ClickResult {
     /// No interactive element at the given position.
     Nothing,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EngineRequestError {
+    Busy,
+    Disconnected,
+    Failed(String),
+}
+
+impl std::fmt::Display for EngineRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EngineRequestError::Busy => write!(f, "engine busy"),
+            EngineRequestError::Disconnected => write!(f, "engine disconnected"),
+            EngineRequestError::Failed(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for EngineRequestError {}
 
 // ── HTTP API response types ───────────────────────────────────────────────────
 
@@ -825,6 +844,15 @@ pub fn process_html_with_cache(
     ))
 }
 
+fn fetch_text_with_timeout(url: &Url) -> Result<String, reqwest::Error> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?
+        .get(url.as_str())
+        .send()?
+        .text()
+}
+
 fn collect_layout_metrics(
     layout_tree: &layout::LayoutBox,
     out: &mut HashMap<String, js::LayoutMetrics>,
@@ -905,7 +933,36 @@ impl BrowserEngine {
         self.current_csp_policy = page.csp_policy.clone();
         self.last_page = Some(page.clone());
         self.init_js_for_page(&page);
-        self.refresh_after_image_loads(page, width)
+
+        // Drain macro-tasks and requestAnimationFrame callbacks that scripts
+        // (e.g. React 18) registered during init_js_for_page.  Without this
+        // the RAF queue is never flushed before we read the live DOM, so SPA
+        // frameworks that rely on rAF for their first render produce an empty
+        // body.  Cap at 10 ticks to avoid infinite render-loop drain.
+        for _ in 0..10 {
+            if !self.tick_js(Some(0.0), None) {
+                break;
+            }
+        }
+
+        // After JS runs and may have modified the DOM (e.g. React/Vue rendering
+        // into #root), serialize the live DOM and re-render using post-JS HTML.
+        let js_modified = if let Some(live_html) = self.js_runtime.get_document_html() {
+            if let Some(ref mut last) = self.last_page {
+                last.body = live_html;
+            }
+            true
+        } else {
+            false
+        };
+
+        // If JS modified the DOM or images need loading, force a re-render.
+        let post_js_page = if js_modified || self.cache_missing_images(&page.image_urls) {
+            self.re_render(None, None, width)?
+        } else {
+            page
+        };
+        Ok(post_js_page)
     }
 
     /// Re-render the current page (e.g. after JS style changes or hover state).
@@ -1250,7 +1307,7 @@ impl BrowserEngine {
                 println!("[CSP] Blocked external script execution: {}", url);
                 return None;
             }
-            match reqwest::blocking::get(url.as_str()).and_then(|response| response.text()) {
+            match fetch_text_with_timeout(url) {
                 Ok(source) => Some(source),
                 Err(err) => {
                     println!("[JS] Failed to load external script {}: {}", url, err);
@@ -1275,7 +1332,9 @@ impl BrowserEngine {
                     if is_defer {
                         deferred_classics.push(source);
                     } else {
+                        eprintln!("[JS DEBUG] Executing inline classic script (len={})", source.len());
                         self.js_runtime.execute(&source);
+                        eprintln!("[JS DEBUG] Inline classic script finished");
                     }
                 }
                 js::ScriptSource::ExternalClassic {
@@ -1283,7 +1342,9 @@ impl BrowserEngine {
                     is_async,
                     is_defer,
                 } => {
+                    eprintln!("[JS DEBUG] Fetching external classic script: {}", url);
                     let source = fetch_classic_source(self, &url);
+                    eprintln!("[JS DEBUG] External classic script fetch returned");
                     if let Some(source) = source {
                         if is_async {
                             // async wins over defer per HTML spec
@@ -1291,7 +1352,9 @@ impl BrowserEngine {
                         } else if is_defer {
                             deferred_classics.push(source);
                         } else {
+                            eprintln!("[JS DEBUG] Executing external classic script: {}", url);
                             self.js_runtime.execute(&source);
+                            eprintln!("[JS DEBUG] External classic script finished: {}", url);
                         }
                     }
                 }
@@ -1310,7 +1373,9 @@ impl BrowserEngine {
                         println!("[CSP] Blocked inline module compilation: {}", url);
                         continue;
                     }
+                    eprintln!("[JS DEBUG] Compiling inline module: {}", url);
                     let outcome = self.js_runtime.compile_module_source(url.clone(), source);
+                    eprintln!("[JS DEBUG] Inline module compiled");
                     if outcome.error.is_some() {
                         let error = outcome.error.as_deref().unwrap_or("unknown");
                         println!("[JS] Failed to compile inline module {}: {}", url, error);
@@ -1335,14 +1400,13 @@ impl BrowserEngine {
                     node_id,
                     is_async,
                 } => {
+                    eprintln!("[JS DEBUG] Loading external module: {}", url);
                     let outcome = self.load_external_module_with(
                         url.clone(),
                         &page.base_url,
-                        |module_url| {
-                            reqwest::blocking::get(module_url.as_str())
-                                .and_then(|response| response.text())
-                        },
+                        fetch_text_with_timeout,
                     );
+                    eprintln!("[JS DEBUG] External module loaded");
                     if let Some(error) = &outcome.error {
                         println!("[JS] Failed to load external module {}: {}", url, error);
                         js::push_console_entry(
@@ -1364,64 +1428,67 @@ impl BrowserEngine {
         }
 
         // ── Phase 2: execute deferred classics, then evaluate deferred modules ──
-        for script in &deferred_classics {
+        for (idx, script) in deferred_classics.iter().enumerate() {
+            let preview = if script.len() > 200 { &script[..200] } else { script };
+            eprintln!("[JS DEBUG] Executing deferred classic script #{} (len={}, preview={})", idx, script.len(), preview);
             self.js_runtime.execute(script);
+            eprintln!("[JS DEBUG] Deferred classic script #{} finished", idx);
         }
 
+        eprintln!("[JS DEBUG] Resolving deferred module dependencies");
         self.resolve_module_dependencies(&page.base_url, &mut deferred_module_urls);
+        eprintln!("[JS DEBUG] Deferred module dependencies resolved");
         if !deferred_module_urls.is_empty() {
-            let eval_result = self
-                .js_runtime
-                .evaluate_module_graph(&deferred_module_urls);
+            eprintln!("[JS DEBUG] Evaluating deferred module graph (count={})", deferred_module_urls.len());
+            let eval_result = self.js_runtime.evaluate_module_graph(&deferred_module_urls);
+            eprintln!("[JS DEBUG] Deferred module graph evaluation finished");
             if let Err(errors) = eval_result {
-                let failed_urls: Vec<&str> = errors
-                    .iter()
-                    .filter_map(|e| e.split(": ").next())
-                    .collect();
+                let failed_urls: Vec<&str> =
+                    errors.iter().filter_map(|e| e.split(": ").next()).collect();
                 for error in &errors {
                     println!("[JS] Module evaluation error: {error}");
                     js::push_console_entry(js::ConsoleLevel::Error, error.clone());
                 }
                 for (url, node_id) in &deferred_module_targets {
                     if failed_urls.iter().any(|f| url.as_str() == *f) {
-                        self.js_runtime
-                            .trigger_event_on_node_id(*node_id, "error");
+                        self.js_runtime.trigger_event_on_node_id(*node_id, "error");
                     }
                 }
             }
             for (_, node_id) in &deferred_module_targets {
-                self.js_runtime
-                    .trigger_event_on_node_id(*node_id, "load");
+                self.js_runtime.trigger_event_on_node_id(*node_id, "load");
             }
         }
 
         // ── Phase 3: execute async classics, then evaluate async modules ──
-        for script in &async_classics {
+        for (idx, script) in async_classics.iter().enumerate() {
+            eprintln!("[JS DEBUG] Executing async classic script #{}", idx);
             self.js_runtime.execute(script);
+            eprintln!("[JS DEBUG] Async classic script #{} finished", idx);
         }
 
+        eprintln!("[JS DEBUG] Resolving async module dependencies");
         self.resolve_module_dependencies(&page.base_url, &mut async_module_urls);
+        eprintln!("[JS DEBUG] Async module dependencies resolved");
         if !async_module_urls.is_empty() {
+            eprintln!("[JS DEBUG] Evaluating async module graph (count={})", async_module_urls.len());
             let eval_result = self.js_runtime.evaluate_module_graph(&async_module_urls);
+            eprintln!("[JS DEBUG] Async module graph evaluation finished");
             if let Err(errors) = eval_result {
-                let failed_urls: Vec<&str> = errors
-                    .iter()
-                    .filter_map(|e| e.split(": ").next())
-                    .collect();
+                let failed_urls: Vec<&str> =
+                    errors.iter().filter_map(|e| e.split(": ").next()).collect();
                 for error in &errors {
                     println!("[JS] Async module evaluation error: {error}");
                     js::push_console_entry(js::ConsoleLevel::Error, error.clone());
                 }
                 for (url, node_id) in &async_module_targets {
                     if failed_urls.iter().any(|f| url.as_str() == *f) {
-                        self.js_runtime
-                            .trigger_event_on_node_id(*node_id, "error");
+                        self.js_runtime.trigger_event_on_node_id(*node_id, "error");
                     }
                 }
             }
             for (_, node_id) in &async_module_targets {
-                self.js_runtime
-                    .trigger_event_on_node_id(*node_id, "load");
+                self.js_runtime.trigger_event_on_node_id(*node_id, "load");
             }
         }
 
@@ -1488,10 +1555,7 @@ impl BrowserEngine {
                     let outcome = self.load_external_module_with(
                         resolved.clone(),
                         page_base,
-                        |module_url| {
-                            reqwest::blocking::get(module_url.as_str())
-                                .and_then(|response| response.text())
-                        },
+                        fetch_text_with_timeout,
                     );
                     if outcome.error.is_none() {
                         root_urls.push(resolved);
@@ -1731,6 +1795,16 @@ pub struct EngineHandle {
     pub console_buffer: js::ConsoleBuffer,
 }
 
+const ENGINE_CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn recv_control<T>(reply_rx: mpsc::Receiver<T>) -> Result<T, EngineRequestError> {
+    match reply_rx.recv_timeout(ENGINE_CONTROL_TIMEOUT) {
+        Ok(value) => Ok(value),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(EngineRequestError::Busy),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(EngineRequestError::Disconnected),
+    }
+}
+
 impl EngineHandle {
     /// Create a new engine actor and return a handle to it.
     pub fn spawn() -> Self {
@@ -1782,10 +1856,36 @@ impl EngineHandle {
             .map_err(|_| "engine disconnected".to_string())?
     }
 
+    pub fn send_re_render_control(
+        &self,
+        hovered_id: Option<String>,
+        focused_id: Option<String>,
+        width: f32,
+    ) -> Result<PageResult, EngineRequestError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .send(EngineCmd::ReRender {
+                hovered_id,
+                focused_id,
+                width,
+                reply: reply_tx,
+            })
+            .map_err(|_| EngineRequestError::Disconnected)?;
+        recv_control(reply_rx)?.map_err(EngineRequestError::Failed)
+    }
+
     pub fn send_get_page(&self) -> Option<ApiPageResponse> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.tx.send(EngineCmd::GetPage { reply: reply_tx }).ok()?;
         reply_rx.recv().ok()?
+    }
+
+    pub fn send_get_page_control(&self) -> Result<Option<ApiPageResponse>, EngineRequestError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .send(EngineCmd::GetPage { reply: reply_tx })
+            .map_err(|_| EngineRequestError::Disconnected)?;
+        recv_control(reply_rx)
     }
 
     pub fn send_get_console(&self) -> Vec<js::ConsoleEntry> {
@@ -1869,6 +1969,14 @@ impl EngineHandle {
         reply_rx.recv().ok()?
     }
 
+    pub fn send_screenshot_control(&self) -> Result<Option<Vec<u8>>, EngineRequestError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .send(EngineCmd::Screenshot { reply: reply_tx })
+            .map_err(|_| EngineRequestError::Disconnected)?;
+        recv_control(reply_rx)
+    }
+
     pub fn send_dom_tree(&self) -> String {
         let (reply_tx, reply_rx) = mpsc::channel();
         if self
@@ -1922,6 +2030,22 @@ impl EngineHandle {
             return false;
         }
         reply_rx.recv().unwrap_or(false)
+    }
+
+    pub fn send_tick_control(
+        &self,
+        timestamp: f64,
+        deadline: Option<f64>,
+    ) -> Result<bool, EngineRequestError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .send(EngineCmd::Tick {
+                timestamp,
+                deadline,
+                reply: reply_tx,
+            })
+            .map_err(|_| EngineRequestError::Disconnected)?;
+        recv_control(reply_rx)
     }
 
     pub fn send_submit(&self) -> Option<String> {
@@ -2819,7 +2943,8 @@ mod tests {
             "y"
         );
         assert_eq!(
-            engine.js_style_overrides
+            engine
+                .js_style_overrides
                 .get("c")
                 .and_then(|p| p.get("font-size").cloned()),
             Some("20px".to_string())

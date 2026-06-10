@@ -273,3 +273,63 @@ fn test_fixture_spans_script_types() {
         );
     }
 }
+
+#[test]
+fn test_aura_fetch_cors_bypass() {
+    let mut engine = engine_with_fixture("inline-classic.html");
+
+    // 1. Fetch with bypass_cors = false (should fail due to CORS check on cross-origin request)
+    engine.evaluate_js(
+        "globalThis.fetchResult = null; \
+         globalThis.fetchError = null; \
+         __aura_fetch( \
+             'https://www.google.com/', \
+             'GET', \
+             '', \
+             '', \
+             function(r) { globalThis.fetchResult = 'success'; }, \
+             function(e) { globalThis.fetchError = String(e); }, \
+             false \
+         );"
+    );
+
+    let mut passed = false;
+    for _ in 0..100 {
+        engine.tick_js(Some(1.0), None);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let error = engine.evaluate_js("globalThis.fetchError");
+        if error.contains("CORS Error") {
+            passed = true;
+            break;
+        }
+    }
+    assert!(passed, "CORS should be enforced when bypassCors is false");
+
+    // 2. Fetch with bypass_cors = true (should succeed)
+    engine.evaluate_js(
+        "globalThis.fetchResult = null; \
+         globalThis.fetchError = null; \
+         __aura_fetch( \
+             'https://www.google.com/', \
+             'GET', \
+             '', \
+             '', \
+             function(r) { globalThis.fetchResult = 'success'; }, \
+             function(e) { globalThis.fetchError = String(e); }, \
+             true \
+         );"
+    );
+
+    let mut passed = false;
+    for _ in 0..100 {
+        engine.tick_js(Some(1.0), None);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let res = engine.evaluate_js("globalThis.fetchResult");
+        if res == "success" {
+            passed = true;
+            break;
+        }
+    }
+    assert!(passed, "CORS should be bypassed when bypassCors is true");
+}
+

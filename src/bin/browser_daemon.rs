@@ -7,8 +7,8 @@
 
 use std::collections::HashMap;
 
-use browser::{engine, layout};
 use browser::engine::{EngineCmd, EngineHandle};
+use browser::{engine, layout};
 use eframe::egui;
 use poll_promise::Promise;
 
@@ -45,7 +45,6 @@ fn parse_args() -> DaemonArgs {
     let refs: Vec<&str> = raw.iter().map(|s| s.as_str()).collect();
     parse_args_from(&refs)
 }
-
 
 // ── axum HTTP server ──────────────────────────────────────────────────────────
 
@@ -84,6 +83,12 @@ struct ConsoleEvalRequest {
 }
 
 #[derive(serde::Deserialize)]
+struct TickRequest {
+    count: Option<u32>,
+    width: Option<f32>,
+}
+
+#[derive(serde::Deserialize)]
 struct StyleQuery {
     selector: Option<String>,
 }
@@ -111,6 +116,18 @@ struct OkResponse {
 }
 
 #[derive(serde::Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+#[derive(serde::Serialize)]
+struct TickResponse {
+    ticks: u32,
+    worked: bool,
+    rerendered: bool,
+}
+
+#[derive(serde::Serialize)]
 struct SubmitResponse {
     url: String,
 }
@@ -123,6 +140,21 @@ macro_rules! blocking {
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         }
     };
+}
+
+fn engine_error_response(error: engine::EngineRequestError) -> axum::response::Response {
+    let status = match error {
+        engine::EngineRequestError::Busy => StatusCode::SERVICE_UNAVAILABLE,
+        engine::EngineRequestError::Disconnected => StatusCode::INTERNAL_SERVER_ERROR,
+        engine::EngineRequestError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (
+        status,
+        Json(ErrorResponse {
+            error: error.to_string(),
+        }),
+    )
+        .into_response()
 }
 
 async fn navigate_handler(
@@ -144,17 +176,30 @@ async fn navigate_handler(
 }
 
 async fn page_handler(State(handle): State<EngineHandle>) -> impl IntoResponse {
-    let resp = blocking!(move || handle.send_get_page());
+    let resp = blocking!(move || handle.send_get_page_control());
     match resp {
-        Some(page) => (StatusCode::OK, Json(page)).into_response(),
-        None => (StatusCode::NOT_FOUND, "No page loaded").into_response(),
+        Ok(Some(page)) => (StatusCode::OK, Json(page)).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "No page loaded").into_response(),
+        Err(error) => engine_error_response(error),
     }
 }
 
 async fn status_handler(State(handle): State<EngineHandle>) -> impl IntoResponse {
-    let page_opt = blocking!(move || handle.send_get_page());
-    let url = page_opt.map(|p| p.url).unwrap_or_default();
-    (StatusCode::OK, Json(StatusResponse { url, loading: false })).into_response()
+    let page_opt = blocking!(move || handle.send_get_page_control());
+    match page_opt {
+        Ok(page_opt) => {
+            let url = page_opt.map(|p| p.url).unwrap_or_default();
+            (
+                StatusCode::OK,
+                Json(StatusResponse {
+                    url,
+                    loading: false,
+                }),
+            )
+                .into_response()
+        }
+        Err(error) => engine_error_response(error),
+    }
 }
 
 async fn health_handler() -> impl IntoResponse {
@@ -173,7 +218,9 @@ async fn type_handler(
     State(handle): State<EngineHandle>,
     Json(req): Json<TypeRequest>,
 ) -> impl IntoResponse {
-    blocking!(move || { let _ = handle.tx.send(EngineCmd::TypeText { text: req.text }); });
+    blocking!(move || {
+        let _ = handle.tx.send(EngineCmd::TypeText { text: req.text });
+    });
     (StatusCode::OK, Json(OkResponse { ok: true })).into_response()
 }
 
@@ -201,26 +248,71 @@ async fn console_eval_handler(
 }
 
 async fn screenshot_handler(State(handle): State<EngineHandle>) -> impl IntoResponse {
-    let png_opt = blocking!(move || handle.send_screenshot());
+    let png_opt = blocking!(move || handle.send_screenshot_control());
     match png_opt {
-        Some(bytes) => (
+        Ok(Some(bytes)) => (
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "image/png")],
             bytes,
         )
             .into_response(),
-        None => (StatusCode::NOT_FOUND, "No page loaded").into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "No page loaded").into_response(),
+        Err(error) => engine_error_response(error),
+    }
+}
+
+async fn tick_handler(
+    State(handle): State<EngineHandle>,
+    Json(req): Json<TickRequest>,
+) -> impl IntoResponse {
+    let count = req.count.unwrap_or(1).clamp(1, 120);
+    let width = req.width.unwrap_or(800.0);
+    let result = blocking!(move || {
+        let mut worked = false;
+        for i in 0..count {
+            match handle.send_tick_control(i as f64, None) {
+                Ok(did_work) => worked |= did_work,
+                Err(error) => return Err(error),
+            }
+        }
+        let rerendered = if worked {
+            match handle.send_re_render_control(None, None, width) {
+                Ok(_) => true,
+                Err(error) => return Err(error),
+            }
+        } else {
+            false
+        };
+        Ok(TickResponse {
+            ticks: count,
+            worked,
+            rerendered,
+        })
+    });
+    match result {
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Err(error) => engine_error_response(error),
     }
 }
 
 async fn dom_handler(State(handle): State<EngineHandle>) -> impl IntoResponse {
     let text = blocking!(move || handle.send_dom_tree());
-    (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "text/plain")], text).into_response()
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/plain")],
+        text,
+    )
+        .into_response()
 }
 
 async fn layout_handler(State(handle): State<EngineHandle>) -> impl IntoResponse {
     let text = blocking!(move || handle.send_layout_tree());
-    (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "text/plain")], text).into_response()
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/plain")],
+        text,
+    )
+        .into_response()
 }
 
 async fn style_handler(
@@ -248,7 +340,11 @@ async fn submit_handler(State(handle): State<EngineHandle>) -> impl IntoResponse
     let url = blocking!(move || { handle.send_submit() });
     match url {
         Some(nav_url) => (StatusCode::OK, Json(SubmitResponse { url: nav_url })).into_response(),
-        None => (StatusCode::NOT_FOUND, Json(SubmitResponse { url: String::new() })).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(SubmitResponse { url: String::new() }),
+        )
+            .into_response(),
     }
 }
 
@@ -263,6 +359,7 @@ pub fn build_router(handle: EngineHandle) -> Router {
         .route("/type", post(type_handler))
         .route("/js", post(js_handler))
         .route("/console/eval", post(console_eval_handler))
+        .route("/tick", post(tick_handler))
         .route("/screenshot", get(screenshot_handler))
         .route("/dom", get(dom_handler))
         .route("/layout", get(layout_handler))
@@ -323,10 +420,9 @@ impl DaemonBrowserApp {
         // Load Korean font (same as BrowserApp)
         let mut fonts = egui::FontDefinitions::default();
         let nanum_data = include_bytes!("../../assets/fonts/NanumGothic.ttf");
-        fonts.font_data.insert(
-            "nanum".to_owned(),
-            egui::FontData::from_static(nanum_data),
-        );
+        fonts
+            .font_data
+            .insert("nanum".to_owned(), egui::FontData::from_static(nanum_data));
         fonts
             .families
             .get_mut(&egui::FontFamily::Proportional)
@@ -468,7 +564,10 @@ impl eframe::App for DaemonBrowserApp {
         if let Some(eval_promise) = &self.console_eval_promise {
             if eval_promise.ready().is_some() {
                 self.console_eval_promise = None;
-                if self.has_page && self.re_render_promise.is_none() && self.content_promise.is_none() {
+                if self.has_page
+                    && self.re_render_promise.is_none()
+                    && self.content_promise.is_none()
+                {
                     self.trigger_re_render(ctx, 800.0);
                 } else {
                     ctx.request_repaint();
@@ -480,9 +579,10 @@ impl eframe::App for DaemonBrowserApp {
         if ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
             let focusables = &self.current_focusable_elements;
             if !focusables.is_empty() {
-                let current_index = self.focused_id.as_ref().and_then(|id| {
-                    focusables.iter().position(|(_, fid)| fid == id)
-                });
+                let current_index = self
+                    .focused_id
+                    .as_ref()
+                    .and_then(|id| focusables.iter().position(|(_, fid)| fid == id));
                 let next_index = if ctx.input(|i| i.modifiers.shift) {
                     match current_index {
                         Some(i) if i > 0 => i - 1,
@@ -557,9 +657,7 @@ impl eframe::App for DaemonBrowserApp {
                             .frame(false)
                             .font(egui::TextStyle::Monospace);
                         let resp = ui.add(edit);
-                        if resp.lost_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                        {
+                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             let url = self.url.clone();
                             self.load_url(url, 800.0);
                         }
@@ -612,9 +710,10 @@ impl eframe::App for DaemonBrowserApp {
             |code| {
                 if self.console_eval_promise.is_none() {
                     let handle = self.handle.clone();
-                    self.console_eval_promise = Some(Promise::spawn_thread("daemon-console-eval", move || {
-                        handle.send_console_eval_result(code)
-                    }));
+                    self.console_eval_promise =
+                        Some(Promise::spawn_thread("daemon-console-eval", move || {
+                            handle.send_console_eval_result(code)
+                        }));
                 }
             },
         );
@@ -981,7 +1080,10 @@ fn render_console_panel(
                         .color(egui::Color32::GRAY)
                         .small(),
                 );
-                if ui.add_enabled(!entries.is_empty(), egui::Button::new("Clear")).clicked() {
+                if ui
+                    .add_enabled(!entries.is_empty(), egui::Button::new("Clear"))
+                    .clicked()
+                {
                     clear_console();
                     entries.clear();
                 }
@@ -1000,8 +1102,7 @@ fn render_console_panel(
                 .show(ui, |ui| {
                     if entries.is_empty() {
                         ui.label(
-                            egui::RichText::new("No console output")
-                                .color(egui::Color32::GRAY),
+                            egui::RichText::new("No console output").color(egui::Color32::GRAY),
                         );
                         return;
                     }
@@ -1080,7 +1181,10 @@ fn main() {
         .expect("failed to start HTTP server thread");
 
     if args.no_gui {
-        println!("[browser-daemon] Running headless on http://127.0.0.1:{}", port);
+        println!(
+            "[browser-daemon] Running headless on http://127.0.0.1:{}",
+            port
+        );
         println!("[browser-daemon] Press Ctrl+C to stop.");
         // Block main thread forever; signal handlers (Ctrl+C) terminate the process
         loop {
@@ -1149,7 +1253,10 @@ mod tests {
     fn test_engine_actor_get_page_empty() {
         let handle = make_test_handle();
         let (reply_tx, reply_rx) = mpsc::channel();
-        handle.tx.send(EngineCmd::GetPage { reply: reply_tx }).unwrap();
+        handle
+            .tx
+            .send(EngineCmd::GetPage { reply: reply_tx })
+            .unwrap();
         let result = reply_rx.recv().unwrap();
         assert!(result.is_none());
     }
@@ -1232,7 +1339,9 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["loading"], false);
     }
@@ -1248,7 +1357,9 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(&body[..], b"ok");
     }
 
@@ -1279,6 +1390,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_http_tick_returns_status() {
+        let handle = make_test_handle();
+        let app = build_router(handle);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/tick")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(r#"{"count":2}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ticks"], 2);
+    }
+
+    #[tokio::test]
     async fn test_http_elements_empty() {
         let handle = make_test_handle();
         let app = build_router(handle);
@@ -1289,67 +1419,69 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.as_array().unwrap().is_empty());
     }
 
-//     #[tokio::test]
-//     async fn test_http_console_returns_entries() {
-//         let handle = make_test_handle();
-//         handle.send_evaluate_js("console.warn('watch out')".to_string());
-// 
-//         let app = build_router(handle);
-//         let req = axum::http::Request::builder()
-//             .method("GET")
-//             .uri("/console")
-//             .body(axum::body::Body::empty())
-//             .unwrap();
-//         let resp = app.oneshot(req).await.unwrap();
-//         assert_eq!(resp.status(), StatusCode::OK);
-//         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-//         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-//         let entries = json.as_array().unwrap();
-//         assert_eq!(entries.len(), 1);
-//         assert_eq!(entries[0]["level"], "warn");
-//         assert_eq!(entries[0]["message"], "watch out");
-//     }
+    //     #[tokio::test]
+    //     async fn test_http_console_returns_entries() {
+    //         let handle = make_test_handle();
+    //         handle.send_evaluate_js("console.warn('watch out')".to_string());
+    //
+    //         let app = build_router(handle);
+    //         let req = axum::http::Request::builder()
+    //             .method("GET")
+    //             .uri("/console")
+    //             .body(axum::body::Body::empty())
+    //             .unwrap();
+    //         let resp = app.oneshot(req).await.unwrap();
+    //         assert_eq!(resp.status(), StatusCode::OK);
+    //         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    //         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    //         let entries = json.as_array().unwrap();
+    //         assert_eq!(entries.len(), 1);
+    //         assert_eq!(entries[0]["level"], "warn");
+    //         assert_eq!(entries[0]["message"], "watch out");
+    //     }
 
-//     #[tokio::test]
-//     async fn test_http_console_eval_returns_result() {
-//         let handle = make_test_handle();
-//         let app = build_router(handle);
-//         let req = axum::http::Request::builder()
-//             .method("POST")
-//             .uri("/console/eval")
-//             .header(axum::http::header::CONTENT_TYPE, "application/json")
-//             .body(axum::body::Body::from(r#"{"code":"1+1"}"#))
-//             .unwrap();
-//         let resp = app.oneshot(req).await.unwrap();
-//         assert_eq!(resp.status(), StatusCode::OK);
-//         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-//         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-//         assert_eq!(json["result"], "2");
-//         assert!(json["error"].is_null());
-//     }
+    //     #[tokio::test]
+    //     async fn test_http_console_eval_returns_result() {
+    //         let handle = make_test_handle();
+    //         let app = build_router(handle);
+    //         let req = axum::http::Request::builder()
+    //             .method("POST")
+    //             .uri("/console/eval")
+    //             .header(axum::http::header::CONTENT_TYPE, "application/json")
+    //             .body(axum::body::Body::from(r#"{"code":"1+1"}"#))
+    //             .unwrap();
+    //         let resp = app.oneshot(req).await.unwrap();
+    //         assert_eq!(resp.status(), StatusCode::OK);
+    //         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    //         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    //         assert_eq!(json["result"], "2");
+    //         assert!(json["error"].is_null());
+    //     }
 
-//     #[tokio::test]
-//     async fn test_http_console_eval_returns_error() {
-//         let handle = make_test_handle();
-//         let app = build_router(handle);
-//         let req = axum::http::Request::builder()
-//             .method("POST")
-//             .uri("/console/eval")
-//             .header(axum::http::header::CONTENT_TYPE, "application/json")
-//             .body(axum::body::Body::from(r#"{"code":"missingVariable"}"#))
-//             .unwrap();
-//         let resp = app.oneshot(req).await.unwrap();
-//         assert_eq!(resp.status(), StatusCode::OK);
-//         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-//         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-//         assert!(json["result"].is_null());
-//         assert!(json["error"].is_string());
-//     }
+    //     #[tokio::test]
+    //     async fn test_http_console_eval_returns_error() {
+    //         let handle = make_test_handle();
+    //         let app = build_router(handle);
+    //         let req = axum::http::Request::builder()
+    //             .method("POST")
+    //             .uri("/console/eval")
+    //             .header(axum::http::header::CONTENT_TYPE, "application/json")
+    //             .body(axum::body::Body::from(r#"{"code":"missingVariable"}"#))
+    //             .unwrap();
+    //         let resp = app.oneshot(req).await.unwrap();
+    //         assert_eq!(resp.status(), StatusCode::OK);
+    //         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    //         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    //         assert!(json["result"].is_null());
+    //         assert!(json["error"].is_string());
+    //     }
 
     #[tokio::test]
     async fn test_http_dom_empty() {
@@ -1375,7 +1507,9 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.as_object().unwrap().is_empty());
     }
