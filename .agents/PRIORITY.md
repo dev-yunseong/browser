@@ -49,7 +49,7 @@ Must be done in order — API blockers first, then site fixtures.
 | #253 ✓ | [DOM] Add CharacterData/Text/Comment constructor and prototype parity | Real bundles and polyfills fail early when DOM constructor globals are missing. |
 | #254 ✓ | [DOM] Add form APIs and event handler properties used by real sites | Fixes `onsubmit`/handler-property gaps that block form and framework initialization. |
 | #255 ✓ | [DOM] Implement iframe contentWindow/contentDocument foundation | Fixes Cloudflare-style hidden iframe scripts on yunseong.dev. |
-| #256 | [DOM] Add observer and ShadowRoot compatibility for modern bundles (in progress by opencode:deepseek-v4-pro) | Modern bundles probe ShadowRoot, getRootNode, IntersectionObserver, and ResizeObserver. |
+| #256 ✓ | ~~[DOM] Add observer and ShadowRoot compatibility for modern bundles~~ ✓ | Modern bundles probe ShadowRoot, getRootNode, IntersectionObserver, and ResizeObserver. |
 | #257 | [Real-site] Naver homepage Playwright parity fixture and first-pass rendering | Depends on #253-#256. Naver shell is mostly JS-populated. |
 | #258 | [Real-site] yunseong.dev dynamic JS parity against Playwright baseline | Depends on #149, #253-#256, and ES module graph/browser semantics. |
 
