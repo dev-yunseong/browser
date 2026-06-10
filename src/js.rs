@@ -53,6 +53,7 @@ thread_local! {
     static RAF_TASKS: RefCell<VecDeque<Box<dyn FnOnce(f64)>>> = RefCell::new(VecDeque::new());
     static IDLE_TASKS: RefCell<VecDeque<(u32, Box<dyn FnOnce(f64)>)>> = RefCell::new(VecDeque::new());
     static NEXT_IDLE_ID: RefCell<u32> = RefCell::new(1);
+    static NEXT_RAF_ID: RefCell<u32> = RefCell::new(1);
     static DOM_ROOT: RefCell<Option<Handle>> = RefCell::new(None);
     static NODE_REGISTRY: RefCell<HashMap<u32, Handle>> = RefCell::new(HashMap::new());
     static REVERSE_NODE_REGISTRY: RefCell<HashMap<usize, u32>> = RefCell::new(HashMap::new());
@@ -3033,6 +3034,11 @@ fn fetch_cb(
     let body = args.get(3).to_rust_string_lossy(scope);
     let resolve_val = args.get(4);
     let reject_val = args.get(5);
+    let bypass_cors = if args.length() > 6 {
+        args.get(6).is_true()
+    } else {
+        false
+    };
 
     let base_url = CURRENT_ORIGIN.with(|o| (*o.borrow()).clone());
     let target_url = if let Some(ref base) = base_url {
@@ -3107,7 +3113,7 @@ fn fetch_cb(
                         let response_url = response.url().to_string();
                         let status = response.status().as_u16();
                         let status_text = response.status().canonical_reason().unwrap_or("").to_string();
-                        if is_cross_origin {
+                        if is_cross_origin && !bypass_cors {
                             let acao = response.headers().get("access-control-allow-origin").and_then(|h| h.to_str().ok());
                             let allowed = match acao { Some("*") => true, Some(val) if val == origin_str => true, _ => false };
                             if !allowed {
@@ -3178,7 +3184,7 @@ fn setTimeout_cb(
 fn raf_cb(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
+    mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cb = args.get(0);
     if cb.is_function() {
@@ -3190,6 +3196,12 @@ fn raf_cb(
             }))
         });
     }
+    let id = NEXT_RAF_ID.with(|c| {
+        let id = *c.borrow();
+        *c.borrow_mut() += 1;
+        id
+    });
+    rv.set_uint32(id);
 }
 
 fn ric_cb(
@@ -4749,6 +4761,82 @@ mod tests {
         assert_eq!(val["matches"], false);
         assert_eq!(val["querySelector"], serde_json::Value::Null);
         assert_eq!(val["querySelectorAll"], true);
+    }
+
+    #[test]
+    fn test_raf_behavior() {
+        let mut rt = make_dom_runtime("<html><body></body></html>", "https://example.com/");
+        // 1. Verify requestAnimationFrame returns an integer handle
+        let outcome = rt.execute_with_result(
+            "var id = requestAnimationFrame(function(ts) { window.__raf_ts = ts; }); typeof id"
+        );
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("number"));
+
+        // 2. Verify cancelAnimationFrame is a function
+        let outcome = rt.execute_with_result("typeof cancelAnimationFrame");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("function"));
+
+        // 3. Verify RAF callback is fired on tick with a timestamp
+        let outcome = rt.execute_with_result("window.__raf_ts");
+        assert_eq!(outcome.error, None);
+        // It shouldn't have fired yet
+        assert_eq!(outcome.result.as_deref(), Some("undefined"));
+
+        // Tick with Some(123.45) timestamp
+        rt.tick(Some(123.45), None);
+
+        let outcome = rt.execute_with_result("window.__raf_ts");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("123.45"));
+    }
+
+    #[test]
+    fn test_intersection_observer_properties() {
+        let mut rt = make_dom_runtime("<html><body></body></html>", "https://example.com/");
+        let outcome = rt.execute_with_result(
+            r#"var obs = new IntersectionObserver(function() {}, { threshold: [0.1, 0.2] });
+               JSON.stringify({
+                   root: obs.root,
+                   rootMargin: obs.rootMargin,
+                   thresholds: obs.thresholds
+               })"#
+        );
+        assert_eq!(outcome.error, None);
+        let val: serde_json::Value = serde_json::from_str(outcome.result.as_deref().unwrap()).unwrap();
+        assert_eq!(val["root"], serde_json::Value::Null);
+        assert_eq!(val["rootMargin"], "0px");
+        assert_eq!(val["thresholds"], serde_json::json!([0.1, 0.2]));
+
+        // Default thresholds
+        let outcome = rt.execute_with_result(
+            r#"var obs2 = new IntersectionObserver(function() {});
+               JSON.stringify(obs2.thresholds)"#
+        );
+        assert_eq!(outcome.error, None);
+        let thresholds: serde_json::Value = serde_json::from_str(outcome.result.as_deref().unwrap()).unwrap();
+        assert_eq!(thresholds, serde_json::json!([0]));
+    }
+
+    #[test]
+    fn test_shadow_root_get_root_node() {
+        let mut rt = make_dom_runtime(
+            "<html><body><div id='host'></div></body></html>",
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result(
+            r#"var host = document.getElementById('host');
+               var shadow = host.attachShadow({ mode: 'open' });
+               JSON.stringify({
+                   shadow_itself: shadow.getRootNode() === shadow,
+                   shadow_composed: shadow.getRootNode({ composed: true }) === document
+               })"#
+        );
+        assert_eq!(outcome.error, None);
+        let val: serde_json::Value = serde_json::from_str(outcome.result.as_deref().unwrap()).unwrap();
+        assert_eq!(val["shadow_itself"], true);
+        assert_eq!(val["shadow_composed"], true);
     }
 }
 

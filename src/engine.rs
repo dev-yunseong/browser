@@ -934,6 +934,17 @@ impl BrowserEngine {
         self.last_page = Some(page.clone());
         self.init_js_for_page(&page);
 
+        // Drain macro-tasks and requestAnimationFrame callbacks that scripts
+        // (e.g. React 18) registered during init_js_for_page.  Without this
+        // the RAF queue is never flushed before we read the live DOM, so SPA
+        // frameworks that rely on rAF for their first render produce an empty
+        // body.  Cap at 10 ticks to avoid infinite render-loop drain.
+        for _ in 0..10 {
+            if !self.tick_js(Some(0.0), None) {
+                break;
+            }
+        }
+
         // After JS runs and may have modified the DOM (e.g. React/Vue rendering
         // into #root), serialize the live DOM and re-render using post-JS HTML.
         let js_modified = if let Some(live_html) = self.js_runtime.get_document_html() {

@@ -2145,6 +2145,10 @@ class ShadowRoot extends DocumentFragment {
     get parentElement() {
         return this.host;
     }
+    getRootNode(options) {
+        if (options && options.composed) return document;
+        return this;
+    }
 }
 
 // -- Node static constants ---------------------------------------------------
@@ -2461,6 +2465,35 @@ window.frames = window;
 window.length = 0;
 window.name = '';
 window.status = '';
+
+// -- Debug hooks -------------------------------------------------------------
+let _gladsdk = undefined;
+Object.defineProperty(window, 'gladsdk', {
+    get() {
+        console.log('[DEBUG] get gladsdk: ' + (_gladsdk ? ('defined, cmd is ' + typeof _gladsdk.cmd) : 'undefined'));
+        return _gladsdk;
+    },
+    set(v) {
+        console.log('[DEBUG] set gladsdk to: ' + typeof v + ', cmd is ' + (v ? typeof v.cmd : 'n/a'));
+        _gladsdk = v;
+    },
+    configurable: true,
+    enumerable: true
+});
+
+let _ndpsdk = undefined;
+Object.defineProperty(window, 'ndpsdk', {
+    get() {
+        console.log('[DEBUG] get ndpsdk: ' + (_ndpsdk ? ('defined, cmd is ' + typeof _ndpsdk.cmd) : 'undefined'));
+        return _ndpsdk;
+    },
+    set(v) {
+        console.log('[DEBUG] set ndpsdk to: ' + typeof v + ', cmd is ' + (v ? typeof v.cmd : 'n/a'));
+        _ndpsdk = v;
+    },
+    configurable: true,
+    enumerable: true
+});
 window.closed = false;
 window.opener = null;
 window.frameElement = null;
@@ -3281,17 +3314,22 @@ function __aura_maybe_run_script(node) {
             __aura_script_fire(script, 'error');
             return;
         }
-        fetch(src)
-            .then(response => response.ok ? response.text() : Promise.reject(new Error('HTTP ' + response.status)))
-            .then(code => {
-                if (isModule) {
-                    __aura_execute_module_script(script, src, code);
-                } else {
-                    __aura_execute_classic_script(script, code);
-                }
+        let hasCrossOrigin = typeof script.hasAttribute === 'function' ? script.hasAttribute('crossorigin') : false;
+        let bypassCors = !isModule && !hasCrossOrigin;
+        new Promise((resolve, reject) => {
+            __aura_fetch(src, 'GET', '', '', resolve, reject, bypassCors);
+        })
+            .then(response => {
+                return response.text().then(code => {
+                    if (isModule) {
+                        __aura_execute_module_script(script, src, code);
+                    } else {
+                        __aura_execute_classic_script(script, code);
+                    }
+                });
             })
             .catch(error => {
-                console.error((isModule ? 'Module script' : 'Script') + ' load error: ' + error);
+                console.error((isModule ? 'Module' : 'Classic') + ' script load error for ' + src + ': ' + error);
                 __aura_script_fire(script, 'error');
             });
         return;
@@ -3348,7 +3386,16 @@ class MutationObserver {
 
 // -- IntersectionObserver stub -----------------------------------------------
 class IntersectionObserver {
-    constructor(callback, options) { this._callback = callback; }
+    constructor(callback, options) {
+        this._callback = callback;
+        this._options = options || {};
+    }
+    get root() { return this._options.root || null; }
+    get rootMargin() { return this._options.rootMargin || '0px'; }
+    get thresholds() {
+        var t = this._options.threshold;
+        return t !== undefined ? [].concat(t) : [0];
+    }
     observe(target) {}
     unobserve(target) {}
     disconnect() {}
