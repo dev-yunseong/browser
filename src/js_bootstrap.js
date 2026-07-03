@@ -2384,6 +2384,74 @@ var document = {
     }
 };
 
+function __aura_valid_named_property_key(prop) {
+    return typeof prop === 'string' && prop.length > 0 && prop !== '__proto__' && prop !== 'prototype' && prop !== 'constructor';
+}
+
+function __aura_resolve_document_named_property(target, prop) {
+    if (!__aura_valid_named_property_key(prop)) return undefined;
+    var byId = null;
+    try {
+        byId = target.getElementById(prop);
+    } catch (e) {}
+    if (byId) return byId;
+
+    var forms = null;
+    try {
+        forms = Reflect.get(target, 'forms', target);
+    } catch (e) {}
+    if (forms && typeof forms.namedItem === 'function') {
+        var form = forms.namedItem(prop);
+        if (form) return form;
+    }
+    return undefined;
+}
+
+document = new Proxy(document, {
+    get: function(target, prop, receiver) {
+        if (typeof prop !== 'string' || prop in target) {
+            var value = Reflect.get(target, prop, receiver);
+            return typeof value === 'function' ? value.bind(target) : value;
+        }
+        var named = __aura_resolve_document_named_property(target, prop);
+        return named === undefined ? undefined : named;
+    },
+    has: function(target, prop) {
+        return prop in target || __aura_resolve_document_named_property(target, prop) !== undefined;
+    },
+    getOwnPropertyDescriptor: function(target, prop) {
+        var descriptor = Reflect.getOwnPropertyDescriptor(target, prop);
+        if (descriptor || typeof prop !== 'string') return descriptor;
+        var named = __aura_resolve_document_named_property(target, prop);
+        if (named === undefined) return undefined;
+        return { value: named, writable: false, enumerable: false, configurable: true };
+    }
+});
+
+function __aura_install_window_named_properties() {
+    var names = [];
+    var forms = document.forms;
+    for (var i = 0; i < forms.length; i++) {
+        var form = forms.item(i);
+        if (!form) continue;
+        if (__aura_valid_named_property_key(form.id)) names.push(form.id);
+        var name = form.getAttribute('name');
+        if (__aura_valid_named_property_key(name)) names.push(name);
+    }
+    for (var j = 0; j < names.length; j++) {
+        (function(name) {
+            if (name in globalThis) return;
+            try {
+                Object.defineProperty(globalThis, name, {
+                    get: function() { return __aura_resolve_document_named_property(document, name) || undefined; },
+                    configurable: true,
+                    enumerable: false
+                });
+            } catch (e) {}
+        })(names[j]);
+    }
+}
+
 var window = globalThis;
 window.document = document;
 window.localStorage = localStorage;
@@ -4421,3 +4489,5 @@ if (typeof Intl === 'undefined') {
         Collator: function() { return { compare: function(a, b) { return a < b ? -1 : a > b ? 1 : 0; } }; },
     };
 }
+
+__aura_install_window_named_properties();
