@@ -4211,6 +4211,62 @@ mod tests {
     }
 
     #[test]
+    fn test_document_named_form_property_supports_onsubmit() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><form id='sform' name='search'></form></body></html>"#,
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result(
+            "document.search.onsubmit = function(e) { e.preventDefault(); window.__documentSearchSubmit = true; }; \
+             document.search.submit(); \
+             window.__documentSearchSubmit",
+        );
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_window_named_form_property_supports_onsubmit() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><form id='sform' name='search'></form></body></html>"#,
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result(
+            "window.search.onsubmit = function(e) { e.preventDefault(); window.__windowSearchSubmit = true; }; \
+             window.search.submit(); \
+             window.__windowSearchSubmit",
+        );
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_document_named_property_does_not_shadow_existing_member() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><form id='forms' name='getElementById'></form></body></html>"#,
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result(
+            "typeof document.getElementById === 'function' && document.forms.length === 1 && document.forms !== document.getElementById('forms')",
+        );
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_document_named_property_has_but_does_not_enumerate() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><form id='sform' name='search'></form></body></html>"#,
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result(
+            "'search' in document && Object.keys(document).indexOf('search') === -1 && document.missingNamedElement === undefined",
+        );
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("true"));
+    }
+
+    #[test]
     fn test_form_elements_returns_controls() {
         let mut rt = make_dom_runtime(
             r#"<html><body><form id='f'><input name='a'><input name='b'></form></body></html>"#,
