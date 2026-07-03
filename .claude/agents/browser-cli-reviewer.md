@@ -60,6 +60,19 @@ Check for:
 
 If visual defects are found → return **NONPASS** and describe exactly what is wrong and where.
 
+### 5.5. Naver parity check
+
+For Naver parity issues (`#257`, `#252`, or follow-up Naver visual drift work), run the dedicated commands in `docs/naver-playwright-parity.md`.
+
+The reviewer must confirm:
+- Playwright baseline screenshot was generated.
+- Browser-daemon screenshot was generated at the same viewport width.
+- Naver shell content appears beyond raw placeholders.
+- `browser-cli logs` shows no critical startup blocker.
+- Remaining visual drift is documented in the PR or linked follow-up issue.
+
+For #257 fixture work, documented remaining drift does not fail the review by itself. For follow-up Naver visual drift issues, block on any regression or unresolved drift that the issue claims to fix.
+
 ### 6. Return verdict
 
 **PASS** — daemon started, both URLs rendered, no crashes, no visual defects.

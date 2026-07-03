@@ -46,6 +46,9 @@ Pipeline: `Network -> DOM -> Style -> Layout -> Render -> GUI`
 ### Project Rules
 - Use `./.agents/PRIORITY.md` to choose the next issue.
 - Follow the development workflow in `./.agents/docs/development-workflow.md`.
+- Treat GitHub issue acceptance criteria as the completion contract. Do not open a PR after only fixing a sub-blocker unless the issue explicitly allows partial delivery, or a narrower follow-up issue is created and linked.
+- Before PR creation, verify that the implemented behavior satisfies the issue goal, not only that tests pass. For visual/rendering issues, compare screenshots against the target/baseline and document remaining visual drift in the PR or a linked follow-up issue.
+- Run project-local `pair-review` before PR creation for non-trivial implementation work. Address must-fix findings before opening the PR.
 - Render width is fixed to `800px` unless changed in code.
 - Build/check/lint on host. For daemon/CLI execution, use `drun rust:latest` (resource-limited).
 - Never run long render/integration loops without timeout.
