@@ -46,15 +46,20 @@ test/278
    - Prefer existing project patterns over new abstractions.
    - Run targeted tests as the implementation progresses.
    - Keep long browser/daemon/site checks wrapped in `timeout`.
+   - Treat the issue acceptance criteria as the completion contract. If only a sub-blocker is fixed, do not present the issue as complete unless the issue explicitly allows partial delivery.
+   - For visual/rendering issues, capture the target/baseline image and the browser output image at the same viewport. Compare them before deciding the issue is solved.
+   - If meaningful visual drift remains, document it in the plan and PR, and create or link a focused follow-up issue before opening the PR.
 
 6. Run pair review.
    - Use the project-local `pair-review` skill before final validation.
    - Focus review on YAGNI, DRY, maintainability, scope control, correctness, and validation gaps.
    - Fix must-fix findings before PR.
+   - Pair review must explicitly check whether the issue acceptance criteria were actually satisfied, not just whether the code is clean.
 
 7. Validate and open PR.
    - Run build/tests relevant to touched scope.
    - Run `browser-cli-reviewer` before PR creation for browser implementation changes.
+   - Open the PR only after acceptance criteria are satisfied or any remaining scope is explicitly documented with linked follow-up issues.
    - Push the branch and open a PR linked to the issue.
    - PR body should include issue link, summary, validation, and remaining risks.
 
