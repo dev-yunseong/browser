@@ -730,55 +730,201 @@ pub fn parse_css(source: &str) -> Stylesheet {
 /// The render canvas is fixed at 800 px (see `src/main.rs`). All `@media`
 /// conditions are evaluated against this value so that responsive stylesheets
 /// activate the rules that were authored for an ~800 px viewport.
+/// Viewport the media queries are evaluated against.
+///
+/// Rendering happens at a fixed page width with no scrolling, so these stand in
+/// for a real viewport.
 const VIEWPORT_WIDTH_PX: f32 = 800.0;
+const VIEWPORT_HEIGHT_PX: f32 = 768.0;
 
-/// Parse a single media condition string like "(min-width: 992px)" or
-/// "(max-width: 768px)".  Returns `true` if the VIEWPORT_WIDTH_PX satisfies
-/// the condition.  Unknown/unsupported queries return `false` so their blocks
-/// are safely skipped.
-fn media_query_matches(query: &str) -> bool {
-    let q = query.trim().to_lowercase();
-    // Strip surrounding parens if present
-    let q = q.trim_start_matches('(').trim_end_matches(')');
-    if let Some(rest) = q.strip_prefix("min-width:") {
-        let val_str = rest.trim().trim_end_matches("px").trim();
-        if let Ok(min) = val_str.parse::<f32>() {
-            return VIEWPORT_WIDTH_PX >= min;
-        }
-    } else if let Some(rest) = q.strip_prefix("max-width:") {
-        let val_str = rest.trim().trim_end_matches("px").trim();
-        if let Ok(max) = val_str.parse::<f32>() {
-            return VIEWPORT_WIDTH_PX <= max;
-        }
-    } else if let Some(rest) = q.strip_prefix("prefers-color-scheme:") {
-        // Headless renderer defaults to dark preference.
-        let scheme = rest.trim();
-        return scheme == "dark";
-    }
-    false
+/// Evaluate a media query list — the text between `@media` and the opening `{`.
+///
+/// A list is comma-separated and matches if any of its queries does; each query
+/// is an optional `not`, an optional media type, and `and`-joined conditions.
+/// Both the legacy `(min-width: 768px)` form and the range form
+/// `(width >= 768px)` are handled, since modern stylesheets mix them freely and
+/// treating an unrecognised query as "no match" silently drops whole responsive
+/// layers of a design.
+fn evaluate_media_query(query_str: &str) -> bool {
+    split_top_level_commas(&query_str.to_lowercase())
+        .iter()
+        .any(|q| evaluate_single_media_query(q))
 }
 
-/// Returns true if the @media query string (the part after `@media` before the
-/// opening `{`) should be treated as matching given VIEWPORT_WIDTH_PX.
-/// Handles simple single-condition queries like `(min-width: 992px)` and
-/// compound `screen and (min-width: 992px)` queries.
-fn evaluate_media_query(query_str: &str) -> bool {
-    // Strip "screen"/"all"/"print" type tokens and "and" keywords, then evaluate
-    // whatever condition remains.
-    let q = query_str.trim().to_lowercase();
-    // Skip print-only queries
-    if q.starts_with("print") { return false; }
-    // Extract the parenthesised portion
-    if let Some(start) = q.find('(') {
-        let sub = &q[start..];
-        if let Some(end) = sub.rfind(')') {
-            let condition = &sub[..=end];
-            return media_query_matches(condition);
+fn split_top_level_commas(text: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut current = String::new();
+    for c in text.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                current.push(c);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                current.push(c);
+            }
+            ',' if depth == 0 => parts.push(std::mem::take(&mut current)),
+            _ => current.push(c),
         }
     }
-    // Bare "all" or "screen" without a condition → always match
-    if q == "all" || q == "screen" { return true; }
-    false
+    parts.push(current);
+    parts.into_iter().map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect()
+}
+
+fn evaluate_single_media_query(query: &str) -> bool {
+    let query = query.trim();
+    let (negated, rest) = match query.strip_prefix("not ") {
+        Some(rest) => (true, rest.trim()),
+        None => (false, query),
+    };
+
+    let mut matches = true;
+    let mut remainder = rest;
+
+    // A leading media type, if any, comes before the first condition.
+    if !remainder.starts_with('(') {
+        let type_end = remainder.find('(').unwrap_or(remainder.len());
+        let media_type = remainder[..type_end].trim_end().trim_end_matches("and").trim();
+        if !media_type.is_empty() && !matches!(media_type, "all" | "screen") {
+            return negated;
+        }
+        remainder = remainder[type_end..].trim();
+    }
+
+    for condition in split_conditions(remainder) {
+        if !media_condition_matches(&condition) {
+            matches = false;
+            break;
+        }
+    }
+
+    matches != negated
+}
+
+/// Split the `and`-joined conditions of one query. `and` inside parentheses (as
+/// in `(width >= 100px) and (width <= 200px)`) is only a separator at depth 0.
+fn split_conditions(text: &str) -> Vec<String> {
+    let mut conditions = Vec::new();
+    let mut depth = 0usize;
+    let mut current = String::new();
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '(' => {
+                depth += 1;
+                current.push(c);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                current.push(c);
+            }
+            'a' if depth == 0 && text[i..].starts_with("and") => {
+                conditions.push(std::mem::take(&mut current));
+                for _ in 0..2 {
+                    chars.next();
+                }
+            }
+            _ => current.push(c),
+        }
+    }
+    conditions.push(current);
+    conditions.into_iter().map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect()
+}
+
+/// Parse a media-feature length such as `768px`, `48em` or `1.5dppx`.
+fn media_length(value: &str) -> Option<f32> {
+    let value = value.trim();
+    for (suffix, scale) in [("px", 1.0), ("rem", 16.0), ("em", 16.0), ("dppx", 1.0), ("x", 1.0)] {
+        if let Some(num) = value.strip_suffix(suffix) {
+            return num.trim().parse::<f32>().ok().map(|n| n * scale);
+        }
+    }
+    value.parse::<f32>().ok()
+}
+
+/// Evaluate one parenthesised media condition.
+///
+/// An unrecognised feature does not match. That is the conservative direction:
+/// applying a rule guarded by a condition this engine cannot evaluate would
+/// change the layout on a guess.
+fn media_condition_matches(condition: &str) -> bool {
+    let c = condition.trim().trim_start_matches('(').trim_end_matches(')').trim();
+
+    // Range form: `width >= 768px`, `768px <= width <= 1011px`.
+    if c.contains('<') || c.contains('>') {
+        return media_range_matches(c);
+    }
+
+    let Some((feature, value)) = c.split_once(':') else {
+        // A bare feature is true when the feature has a non-zero value.
+        return matches!(c, "width" | "height" | "color" | "hover" | "pointer" | "any-hover" | "any-pointer");
+    };
+    let (feature, value) = (feature.trim(), value.trim());
+
+    match feature {
+        "min-width" | "min-device-width" => media_length(value).is_some_and(|v| VIEWPORT_WIDTH_PX >= v),
+        "max-width" | "max-device-width" => media_length(value).is_some_and(|v| VIEWPORT_WIDTH_PX <= v),
+        "width" | "device-width" => media_length(value).is_some_and(|v| VIEWPORT_WIDTH_PX == v),
+        "min-height" | "min-device-height" => media_length(value).is_some_and(|v| VIEWPORT_HEIGHT_PX >= v),
+        "max-height" | "max-device-height" => media_length(value).is_some_and(|v| VIEWPORT_HEIGHT_PX <= v),
+        "height" | "device-height" => media_length(value).is_some_and(|v| VIEWPORT_HEIGHT_PX == v),
+        // Defaults chosen to match a headless Chromium with no user overrides,
+        // which is what the reference screenshots are taken with.
+        "prefers-color-scheme" => value == "light",
+        "prefers-reduced-motion" => value == "no-preference",
+        "prefers-contrast" => value == "no-preference",
+        "forced-colors" => value == "none",
+        "hover" | "any-hover" => value == "hover",
+        "pointer" | "any-pointer" => value == "fine",
+        "orientation" => value == "landscape",
+        "display-mode" => value == "browser",
+        "min-resolution" => media_length(value).is_some_and(|v| v <= 1.0),
+        "max-resolution" => media_length(value).is_some_and(|v| v >= 1.0),
+        "resolution" => media_length(value).is_some_and(|v| v == 1.0),
+        "scripting" => value == "enabled",
+        _ => false,
+    }
+}
+
+/// Evaluate the range syntax, in both its one-sided and two-sided forms.
+fn media_range_matches(condition: &str) -> bool {
+    let tokens: Vec<&str> = condition.split_whitespace().collect();
+    let feature_value = |name: &str| -> Option<f32> {
+        match name {
+            "width" | "device-width" => Some(VIEWPORT_WIDTH_PX),
+            "height" | "device-height" => Some(VIEWPORT_HEIGHT_PX),
+            "resolution" => Some(1.0),
+            _ => None,
+        }
+    };
+    let compare = |lhs: f32, op: &str, rhs: f32| match op {
+        "<" => lhs < rhs,
+        "<=" => lhs <= rhs,
+        ">" => lhs > rhs,
+        ">=" => lhs >= rhs,
+        "=" | "==" => lhs == rhs,
+        _ => false,
+    };
+
+    match tokens.as_slice() {
+        [lhs, op, rhs] => match (feature_value(lhs), media_length(rhs)) {
+            (Some(v), Some(bound)) => compare(v, op, bound),
+            _ => match (media_length(lhs), feature_value(rhs)) {
+                (Some(bound), Some(v)) => compare(bound, op, v),
+                _ => false,
+            },
+        },
+        [low, op1, feature, op2, high] => {
+            let Some(v) = feature_value(feature) else { return false };
+            let (Some(low), Some(high)) = (media_length(low), media_length(high)) else {
+                return false;
+            };
+            compare(low, op1, v) && compare(v, op2, high)
+        }
+        _ => false,
+    }
 }
 
 fn strip_at_rules(source: &str) -> String {
@@ -2103,6 +2249,28 @@ mod tests {
     }
 
     #[test]
+    fn test_media_range_syntax_and_compound_queries() {
+        // Modern stylesheets mix the range form with the legacy one, and guard
+        // whole responsive layers behind multi-condition queries.
+        let applies = |q: &str| !parse_css(&format!("{q} {{ p {{ color: green; }} }}")).all_rules().is_empty();
+
+        assert!(applies("@media (width >= 768px)"), "800px satisfies width >= 768px");
+        assert!(!applies("@media (width <= 767px)"), "800px does not satisfy width <= 767px");
+        assert!(applies("@media (768px <= width <= 1011px)"), "800px is inside the range");
+        assert!(!applies("@media (1012px <= width <= 1279px)"), "800px is outside the range");
+        assert!(
+            applies("@media screen and (min-width: 600px) and (max-width: 900px)"),
+            "both conditions hold at 800px"
+        );
+        assert!(
+            !applies("@media (min-width: 600px) and (min-height: 2000px)"),
+            "a compound query fails when any condition fails"
+        );
+        assert!(applies("@media (max-width: 100px), (min-width: 700px)"), "a list matches if any query does");
+        assert!(!applies("@media (unknown-feature: 3)"), "an unevaluable feature must not apply");
+    }
+
+    #[test]
     fn test_media_screen_and_min_width_applies_at_800px() {
         // @media screen and (min-width: 600px) must apply when viewport >= 600px.
         let ss = parse_css("@media screen and (min-width: 600px) { p { color: green; } }");
@@ -2111,13 +2279,15 @@ mod tests {
     }
 
     #[test]
-    fn test_media_prefers_color_scheme_dark_activates() {
-        // @media (prefers-color-scheme: dark) must activate (headless renderer is dark).
-        let ss = parse_css("@media (prefers-color-scheme: dark) { body { background: black; } }");
+    fn test_media_prefers_color_scheme_light_activates() {
+        // The renderer reports no colour-scheme preference, which resolves to
+        // light — the same default a browser with untouched settings reports, and
+        // the one the Chromium reference screenshots are taken under.
+        let ss = parse_css("@media (prefers-color-scheme: light) { body { background: white; } }");
         let rules = ss.all_rules();
         assert!(
             !rules.is_empty(),
-            "@media (prefers-color-scheme: dark) should be included"
+            "@media (prefers-color-scheme: light) should be included"
         );
         assert!(rules.iter().any(|r| r.declarations.iter().any(|d| {
             d.name.as_ref() == "background"
@@ -2125,13 +2295,14 @@ mod tests {
     }
 
     #[test]
-    fn test_media_prefers_color_scheme_light_does_not_activate() {
-        // @media (prefers-color-scheme: light) must NOT activate.
-        let ss = parse_css("@media (prefers-color-scheme: light) { body { background: white; } }");
+    fn test_media_prefers_color_scheme_dark_does_not_activate() {
+        // A site's dark-mode layer must stay off, or it paints dark surfaces
+        // under text coloured for a light one.
+        let ss = parse_css("@media (prefers-color-scheme: dark) { body { background: black; } }");
         let rules = ss.all_rules();
         assert!(
             rules.is_empty(),
-            "@media (prefers-color-scheme: light) should be excluded, got {} rules",
+            "@media (prefers-color-scheme: dark) should be excluded, got {} rules",
             rules.len()
         );
     }

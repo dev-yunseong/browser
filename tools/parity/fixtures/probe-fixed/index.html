@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixed and out-of-flow probe</title>
+<style>
+  body { margin: 0; font: 16px/1.4 sans-serif; background: #fff; color: #000; }
+  .intro { background: linear-gradient(to bottom, #000240, #ffffff 117%); position: relative; overflow: hidden; }
+  .spacer { height: 114px; }
+  .fixedhero { position: fixed; width: 100%; display: flex; flex-direction: column; align-items: center; z-index: 0; }
+  .abshero { position: absolute; width: 100%; display: flex; flex-direction: column; align-items: center; top: 400px; }
+  h1 { color: #fff; font-size: 48px; margin: 0; text-align: center; }
+  h2 { color: #ffd; font-size: 28px; margin: 0; }
+  .after { background: #eee; padding: 20px; }
+  .sticky { position: sticky; top: 0; background: #cfc; padding: 8px; }
+</style>
+</head>
+<body>
+  <div class="intro">
+    <div class="spacer"></div>
+    <div class="fixedhero"><h1>FIXED hero heading</h1></div>
+    <div class="spacer"></div>
+    <div class="abshero"><h2>ABSOLUTE hero heading</h2></div>
+    <div class="spacer"></div>
+    <div class="spacer"></div>
+  </div>
+  <div class="sticky">STICKY bar</div>
+  <div class="after">Normal flow content after the intro</div>
+</body>
+</html>

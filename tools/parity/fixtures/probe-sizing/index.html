@@ -17,6 +17,11 @@
   .flexmin > .b { flex: 1 1 0; min-width: 0; }
   .colflex { display: flex; flex-direction: column; gap: 4px; }
   .pcttext { width: 60%; }
+  .g12 { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 8px; }
+  .span12 { grid-column: auto / span 12; background: #fee; outline: 1px solid #f66; }
+  .span6 { grid-column: span 6; background: #efe; }
+  .span4 { grid-column: span 4; background: #eef; }
+  .startline { grid-column: 3 / 9; background: #ffe; }
 </style>
 </head>
 <body>
@@ -28,5 +33,9 @@
   <section><b>flex 1 1 0 min-width:0</b><div class="flexmin"><div class="b">Alpha bravo charlie delta echo foxtrot golf hotel</div><div class="b">Second</div></div></section>
   <section><b>column flex</b><div class="colflex"><div class="b">Row one in a column flex container</div><div class="b">Row two</div></div></section>
   <section><b>width 60%</b><div class="b pcttext">Sixty percent wide paragraph that should wrap at 60% of 784px</div></section>
+  <section><b>grid 12-col span 12</b><div class="g12"><div class="span12">A twelve column span should fill the whole grid width and wrap like normal prose rather than one word per line</div></div></section>
+  <section><b>grid 12-col span 6 + 6</b><div class="g12"><div class="span6">Left half of the twelve column grid</div><div class="span6">Right half of the twelve column grid</div></div></section>
+  <section><b>grid 12-col span 4 x3</b><div class="g12"><div class="span4">One third</div><div class="span4">Two thirds</div><div class="span4">Three thirds</div></div></section>
+  <section><b>grid explicit lines 3/9</b><div class="g12"><div class="startline">Placed from line 3 to line 9</div></div></section>
 </body>
 </html>

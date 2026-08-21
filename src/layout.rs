@@ -304,6 +304,68 @@ fn measure_text_width(text: &str, font_size: f32, wrap_width: f32) -> f32 {
 /// Read a raw `px` value from `specified_values` for a single property.
 /// Returns 0.0 for anything that isn't an explicit pixel length.
 /// Read `aspect-ratio` as width-over-height, accepting both `16 / 9` and `1.777`.
+/// Where a grid item sits on one axis: an optional explicit start line
+/// (zero-based) and how many tracks it spans.
+#[derive(Clone, Copy)]
+struct GridPlacement {
+    start: Option<usize>,
+    span: usize,
+}
+
+/// Read `grid-column` / `grid-row` (or their `-start` / `-end` longhands).
+///
+/// Twelve-column systems place every item with `grid-column: auto / span 12`;
+/// ignoring the span puts each item in a single 1/12-wide cell, which wraps body
+/// text to one word per line and hides it under the container's overflow clip.
+/// Named lines are not resolved — those fall back to auto placement.
+fn read_grid_placement(sn: &StyledNode, axis: &str) -> GridPlacement {
+    let read = |prop: &str| -> Option<String> {
+        match sn.specified_values.get(&crate::css::intern(prop)) {
+            Some(Value::Keyword(k)) => Some(k.trim().to_lowercase()),
+            Some(Value::Number(n)) => Some(n.to_string()),
+            _ => None,
+        }
+    };
+
+    let (start_text, end_text) = match read(&format!("grid-{axis}")) {
+        Some(shorthand) => match shorthand.split_once('/') {
+            Some((a, b)) => (Some(a.trim().to_string()), Some(b.trim().to_string())),
+            None => (Some(shorthand), None),
+        },
+        None => (read(&format!("grid-{axis}-start")), read(&format!("grid-{axis}-end"))),
+    };
+
+    // `span N` on the start side is a span with no explicit line.
+    let parse_line = |text: &Option<String>| -> Option<i32> {
+        let text = text.as_ref()?;
+        if text.starts_with("span") || text == "auto" {
+            return None;
+        }
+        text.parse::<i32>().ok()
+    };
+    let parse_span = |text: &Option<String>| -> Option<usize> {
+        let rest = text.as_ref()?.strip_prefix("span")?.trim();
+        rest.parse::<usize>().ok().filter(|n| *n > 0)
+    };
+
+    let start_line = parse_line(&start_text);
+    let end_line = parse_line(&end_text);
+    let span = parse_span(&start_text)
+        .or_else(|| parse_span(&end_text))
+        .or_else(|| match (start_line, end_line) {
+            (Some(a), Some(b)) if b > a => Some((b - a) as usize),
+            _ => None,
+        })
+        .unwrap_or(1);
+
+    GridPlacement {
+        // CSS grid lines are 1-based; a negative line counts from the end, which
+        // needs the track count and is left to auto placement instead.
+        start: start_line.filter(|l| *l >= 1).map(|l| (l - 1) as usize),
+        span: span.max(1),
+    }
+}
+
 fn read_aspect_ratio(sn: &StyledNode) -> Option<f32> {
     let value = sn.specified_values.get(&crate::css::intern("aspect-ratio"))?;
     let ratio = match value {
@@ -1868,11 +1930,77 @@ impl<'a> LayoutBox<'a> {
                 grid_children.push(child_node);
             }
 
-            let num_children = grid_children.len();
-            let num_rows_needed = if num_children == 0 {
-                0
-            } else {
-                (num_children + num_cols - 1) / num_cols
+            // Auto-placement, honouring explicit lines and spans. Occupancy is
+            // tracked so an item with an explicit line does not get overwritten by
+            // the item that follows it.
+            struct Placement {
+                col: usize,
+                row: usize,
+                col_span: usize,
+                row_span: usize,
+            }
+
+            let mut occupied: Vec<Vec<bool>> = Vec::new();
+            let mut placements: Vec<Placement> = Vec::with_capacity(grid_children.len());
+            let (mut cursor_row, mut cursor_col) = (0usize, 0usize);
+
+            for child_node in &grid_children {
+                let col_place = read_grid_placement(child_node, "column");
+                let row_place = read_grid_placement(child_node, "row");
+                let col_span = col_place.span.min(num_cols).max(1);
+                let row_span = row_place.span.max(1);
+
+                let (col, row) = match (col_place.start, row_place.start) {
+                    (Some(c), Some(r)) => (c.min(num_cols.saturating_sub(1)), r),
+                    (Some(c), None) => (c.min(num_cols.saturating_sub(1)), cursor_row),
+                    _ => {
+                        if let Some(r) = row_place.start {
+                            cursor_row = r;
+                            cursor_col = 0;
+                        }
+                        // Walk forward to the first run of free tracks that fits.
+                        loop {
+                            if cursor_col + col_span > num_cols {
+                                cursor_row += 1;
+                                cursor_col = 0;
+                                continue;
+                            }
+                            while occupied.len() <= cursor_row {
+                                occupied.push(vec![false; num_cols]);
+                            }
+                            if (cursor_col..cursor_col + col_span).any(|c| occupied[cursor_row][c]) {
+                                cursor_col += 1;
+                                continue;
+                            }
+                            break;
+                        }
+                        (cursor_col, cursor_row)
+                    }
+                };
+
+                while occupied.len() < row + row_span {
+                    occupied.push(vec![false; num_cols]);
+                }
+                for r in row..row + row_span {
+                    for c in col..(col + col_span).min(num_cols) {
+                        occupied[r][c] = true;
+                    }
+                }
+                if col + col_span >= cursor_col {
+                    cursor_row = row;
+                    cursor_col = col + col_span;
+                }
+                placements.push(Placement { col, row, col_span, row_span });
+            }
+
+            let num_rows_needed = occupied.len();
+
+            // Width of a run of tracks, gaps between them included.
+            let span_width = |col: usize, span: usize| -> f32 {
+                let end = (col + span).min(col_widths.len());
+                let tracks: f32 = col_widths[col.min(col_widths.len())..end].iter().sum();
+                let gaps = end.saturating_sub(col + 1) as f32 * col_gap;
+                tracks + gaps
             };
 
             // Pass 1: lay out each child at its cell width to determine natural heights.
@@ -1880,13 +2008,13 @@ impl<'a> LayoutBox<'a> {
                 cb: LayoutBox<'gi>,
                 col: usize,
                 row: usize,
+                col_span: usize,
+                row_span: usize,
             }
 
             let mut grid_items: Vec<GridItem<'_>> = Vec::new();
-            for (child_idx, child_node) in grid_children.iter().enumerate() {
-                let col = child_idx % num_cols;
-                let row = child_idx / num_cols;
-                let cell_width = col_widths.get(col).copied().unwrap_or(inner_width);
+            for (child_node, placement) in grid_children.iter().zip(&placements) {
+                let cell_width = span_width(placement.col, placement.col_span);
 
                 let (cb_opt, _, _) = build_layout_tree_with_cb_cached(
                     child_node,
@@ -1897,19 +2025,31 @@ impl<'a> LayoutBox<'a> {
                     intrinsic_cache,
                 );
                 if let Some(cb) = cb_opt {
-                    grid_items.push(GridItem { cb, col, row });
+                    grid_items.push(GridItem {
+                        cb,
+                        col: placement.col,
+                        row: placement.row,
+                        col_span: placement.col_span,
+                        row_span: placement.row_span,
+                    });
                 }
             }
 
             // Pass 2: compute implicit row heights (max of all cells in each row).
             let mut row_heights: Vec<f32> = vec![0.0_f32; num_rows_needed];
             for item in &grid_items {
-                if item.row < row_heights.len() {
-                    let item_h = item.cb.dimensions.height
-                        + item.cb.padding.top + item.cb.padding.bottom
-                        + item.cb.border.top + item.cb.border.bottom
-                        + item.cb.margin.top + item.cb.margin.bottom;
-                    row_heights[item.row] = row_heights[item.row].max(item_h);
+                if item.row >= row_heights.len() {
+                    continue;
+                }
+                let item_h = item.cb.dimensions.height
+                    + item.cb.padding.top + item.cb.padding.bottom
+                    + item.cb.border.top + item.cb.border.bottom
+                    + item.cb.margin.top + item.cb.margin.bottom;
+                // A row-spanning item's height is shared across the rows it covers
+                // rather than forced onto the first of them.
+                let per_row = item_h / item.row_span as f32;
+                for r in item.row..(item.row + item.row_span).min(row_heights.len()) {
+                    row_heights[r] = row_heights[r].max(per_row);
                 }
             }
 
@@ -1955,8 +2095,12 @@ impl<'a> LayoutBox<'a> {
             for item in &mut grid_items {
                 let cell_x = col_lefts.get(item.col).copied().unwrap_or(content_left);
                 let cell_y = row_tops.get(item.row).copied().unwrap_or(content_top);
-                let cell_w = col_widths.get(item.col).copied().unwrap_or(inner_width);
-                let cell_h = row_heights.get(item.row).copied().unwrap_or(0.0);
+                let cell_w = span_width(item.col, item.col_span);
+                let cell_h: f32 = row_heights
+                    [item.row.min(row_heights.len())..(item.row + item.row_span).min(row_heights.len())]
+                    .iter()
+                    .sum::<f32>()
+                    + item.row_span.saturating_sub(1) as f32 * row_gap;
 
                 // Default alignment: stretch (item fills cell on both axes).
                 let item_x = cell_x + item.cb.margin.left;
