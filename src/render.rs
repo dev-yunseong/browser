@@ -1,6 +1,6 @@
 use tiny_skia::{Pixmap, Paint, Transform, Stroke, PathBuilder, PixmapPaint, Mask, FillRule,
     LinearGradient, RadialGradient, GradientStop, SpreadMode, Point as SkPoint};
-use ab_glyph::{Font, FontRef, PxScale, point};
+use ab_glyph::{Font, point};
 use crate::layout::{LayoutBox, Rect as LayoutRect};
 use crate::css::{Color, CssColorStop, LinearDirection};
 use crate::layer_tree::{LayerTree, LayerTreeBuilder, PaintCommand, ObjectFit};
@@ -11,7 +11,6 @@ use lazy_static::lazy_static;
 use std::time::Instant;
 use url::Url;
 
-const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/NanumGothic.ttf");
 
 // ── Glyph Cache ───────────────────────────────────────────────────────────────
 
@@ -23,6 +22,9 @@ const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/NanumGothic.ttf");
 /// size collapse to the same entry.
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 struct GlyphKey {
+    /// Glyph ids are only meaningful within one face, so the face is part of
+    /// the key — otherwise two faces' glyph 42 would share a cache entry.
+    face: crate::font::FaceId,
     glyph_id: u16,
     /// `(font_size * 2.0).round() as u32` — rounds to nearest 0.5 px.
     font_size_half_px: u32,
@@ -638,8 +640,6 @@ fn create_rounded_rect_path(r: LayoutRect, radius: f32) -> Option<tiny_skia::Pat
     pb.finish()
 }
 
-use std::sync::OnceLock;
-static FONT: OnceLock<FontRef<'static>> = OnceLock::new();
 
 /// Render a text run into `pixmap`.
 ///
@@ -671,15 +671,11 @@ fn render_text_raw(
 ) {
     let trimmed = text.trim();
     if trimmed.is_empty() { return; }
-    let font = FONT.get_or_init(|| {
-        FontRef::try_from_slice(FONT_DATA).expect("Failed to parse embedded font")
-    });
-    let scale = PxScale::from(font_size);
-    let units = font.units_per_em().unwrap_or(1000.0) as f32;
+    let fonts = crate::font::fonts();
     let baseline_offset = font_size * 0.85;
     let mut current_y = rect.y + baseline_offset;
     let mut current_x = rect.x;
-    let space_w = font.h_advance_unscaled(font.glyph_id(' ')) * (scale.x / units);
+    let space_w = fonts.advance(' ', font_size);
 
     // Shear coefficient for italic synthesis: shifts pixels ~12° (tan 12° ≈ 0.213)
     const ITALIC_SHEAR: f32 = 0.213;
@@ -698,9 +694,9 @@ fn render_text_raw(
         let mut word_w = 0.0;
         let mut glyphs = Vec::new();
         for c in word.chars() {
-            let gid = font.glyph_id(c);
-            let adv = font.h_advance_unscaled(gid) * (scale.x / units);
-            glyphs.push((gid, adv));
+            let (face, gid) = fonts.glyph(c);
+            let adv = fonts.advance(c, font_size);
+            glyphs.push((face, gid, adv));
             word_w += adv;
         }
         if current_x + word_w > rect.x + rect.width + 1.0 && current_x > rect.x {
@@ -711,8 +707,9 @@ fn render_text_raw(
             line_start_x = current_x;
             line_end_x = current_x;
         }
-        for (gid, adv) in glyphs {
+        for (face, gid, adv) in glyphs {
             let key = GlyphKey {
+                face,
                 glyph_id: gid.0,
                 font_size_half_px,
                 bold,
@@ -737,8 +734,9 @@ fn render_text_raw(
                 } else {
                     // Cache miss — rasterize using a canonical origin (0, 0) so
                     // that bx_delta/by_delta are position-independent.
-                    let canonical = gid.with_scale_and_position(scale, point(0.0, 0.0));
-                    let entry = if let Some(outline) = font.outline_glyph(canonical) {
+                    let canonical =
+                        gid.with_scale_and_position(fonts.scale(face, font_size), point(0.0, 0.0));
+                    let entry = if let Some(outline) = fonts.face(face).outline_glyph(canonical) {
                         let bounds = outline.px_bounds();
                         let bx_delta = bounds.min.x.floor() as i32;
                         let by_delta = bounds.min.y.floor() as i32;

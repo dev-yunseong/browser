@@ -1,6 +1,5 @@
 use crate::css::{Unit, Value};
 use crate::style::StyledNode;
-use ab_glyph::{Font, FontRef, PxScale};
 use markup5ever_rcdom::NodeData;
 use std::collections::HashMap;
 extern crate stacker;
@@ -276,19 +275,15 @@ fn measure_text_width(text: &str, font_size: f32, wrap_width: f32) -> f32 {
     if trimmed.is_empty() {
         return 0.0;
     }
-    let font = FontRef::try_from_slice(FONT_DATA).unwrap();
-    let scale = PxScale::from(font_size.max(1.0));
-    let units = font.units_per_em().unwrap_or(1000.0) as f32;
-    let space_w = font.h_advance_unscaled(font.glyph_id(' ')) * (scale.x / units);
+    let fonts = crate::font::fonts();
+    let font_size = font_size.max(1.0);
+    let space_w = fonts.advance(' ', font_size);
 
     let mut max_w: f32 = 0.0;
     let mut line_w: f32 = 0.0;
 
     for word in trimmed.split_whitespace() {
-        let mut word_w = 0.0f32;
-        for c in word.chars() {
-            word_w += font.h_advance_unscaled(font.glyph_id(c)) * (scale.x / units);
-        }
+        let word_w = fonts.measure(word, font_size);
         if wrap_width.is_finite() && line_w + word_w > wrap_width && line_w > 0.0 {
             max_w = max_w.max(line_w);
             line_w = 0.0;
@@ -530,7 +525,6 @@ impl FloatContext {
     }
 }
 
-const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/NanumGothic.ttf");
 
 #[derive(Default, Debug, Clone, Copy, PartialEq)]
 pub struct Rect {
@@ -2742,11 +2736,9 @@ impl<'a> LayoutBox<'a> {
             Some(Value::Length(v, Unit::Px)) => v.max(1.0),
             _ => 16.0,
         };
-        let font = FontRef::try_from_slice(FONT_DATA).unwrap();
-        let scale = PxScale::from(font_size);
-        let units = font.units_per_em().unwrap_or(1000.0) as f32;
+        let fonts = crate::font::fonts();
         let line_height = font_size * 1.4;
-        let space_w = font.h_advance_unscaled(font.glyph_id(' ')) * (scale.x / units);
+        let space_w = fonts.advance(' ', font_size);
         let white_space = self
             .style_node
             .specified_values
@@ -2794,10 +2786,7 @@ impl<'a> LayoutBox<'a> {
         }
 
         for word in trimmed.split_whitespace() {
-            let mut word_w = 0.0;
-            for c in word.chars() {
-                word_w += font.h_advance_unscaled(font.glyph_id(c)) * (scale.x / units);
-            }
+            let word_w = fonts.measure(word, font_size);
 
             if no_wrap {
                 if line_w > 0.0 {
@@ -2817,7 +2806,7 @@ impl<'a> LayoutBox<'a> {
             // If a single word is LONGER than the entire container, we must break it char-by-char
             if container_width.is_finite() && word_w > container_width {
                 for c in word.chars() {
-                    let char_w = font.h_advance_unscaled(font.glyph_id(c)) * (scale.x / units);
+                    let char_w = fonts.advance(c, font_size);
                     if line_w + char_w > container_width && line_w > 0.0 {
                         max_w = max_w.max(line_w);
                         line_w = 0.0;
@@ -3103,6 +3092,18 @@ fn should_skip(child: &StyledNode) -> bool {
     }
     if let NodeData::Element { ref name, ref attrs, .. } = child.node.data {
         let t = name.local.to_string();
+        // The `hidden` attribute is `display: none` in every UA stylesheet, and
+        // pages lean on that default rather than writing the rule themselves —
+        // dismissed banners and flash-message templates ship in the markup and
+        // stay in it. `<template>` holds inert content that is never rendered.
+        if t == "template" {
+            return true;
+        }
+        if attrs.borrow().iter().any(|a| {
+            a.name.local.as_ref() == "hidden" && !a.value.as_ref().eq_ignore_ascii_case("until-found")
+        }) {
+            return true;
+        }
         if matches!(
             t.as_str(),
             "head" | "style" | "meta" | "title" | "script" | "link" | "noscript"

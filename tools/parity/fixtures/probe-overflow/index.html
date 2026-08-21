@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Overflow width probe</title>
+<style>
+  body { margin: 0; font: 16px/1.4 sans-serif; background: #fff; }
+  section { border-bottom: 2px solid #333; padding: 8px; }
+  .frame { background: #eef; }
+  .wide { width: 1200px; height: 24px; background: #fcc; }
+  .padded { padding: 0 24px; background: #efe; }
+  .inner { background: #ffe; }
+  .nowrap { white-space: nowrap; background: #fef; }
+  .imgbox { width: 120px; background: #eee; }
+  .imgbox img { width: 100%; }
+</style>
+</head>
+<body>
+  <section><b>child wider than viewport</b><div class="frame"><div class="wide">1200px wide child</div></div></section>
+  <section><b>nested padding</b><div class="padded"><div class="padded"><div class="inner">Nested padding should shrink this box, not push it past the viewport</div></div></div></section>
+  <section><b>nowrap long line</b><div class="frame"><div class="nowrap">A very long single line that cannot wrap and therefore overflows its container horizontally by a lot</div></div></section>
+  <section><b>broken image with long alt</b><div class="imgbox"><img src="/does-not-exist.png" alt="A long alternative text describing an illustration that never loads and must not stretch the layout"></div></section>
+</body>
+</html>

@@ -3,6 +3,7 @@ use poll_promise::Promise;
 use std::collections::HashMap;
 
 pub mod dom;
+pub mod font;
 pub mod css;
 pub mod style;
 pub mod layout;

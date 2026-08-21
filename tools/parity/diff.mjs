@@ -125,6 +125,44 @@ async function renderEngine(url) {
 }
 
 /**
+ * Mean colour difference over coarse blocks, as a fraction of full scale.
+ *
+ * The exact-pixel ratio is dominated by text: this engine and Chromium do not
+ * ship the same faces, so every glyph differs at the pixel level even when the
+ * layout is identical. Averaging over blocks keeps that noise bounded while
+ * staying sensitive to what parity work is actually about — boxes in the wrong
+ * place, wrong size, or the wrong colour.
+ */
+function blockDiff(a, b, width, height, block = 16) {
+  const cols = Math.ceil(width / block);
+  const rows = Math.ceil(height / block);
+  let total = 0;
+  for (let by = 0; by < rows; by += 1) {
+    for (let bx = 0; bx < cols; bx += 1) {
+      const sums = [0, 0, 0, 0, 0, 0];
+      let count = 0;
+      for (let y = by * block; y < Math.min((by + 1) * block, height); y += 1) {
+        for (let x = bx * block; x < Math.min((bx + 1) * block, width); x += 1) {
+          const i = (width * y + x) << 2;
+          sums[0] += a.data[i];
+          sums[1] += a.data[i + 1];
+          sums[2] += a.data[i + 2];
+          sums[3] += b.data[i];
+          sums[4] += b.data[i + 1];
+          sums[5] += b.data[i + 2];
+          count += 1;
+        }
+      }
+      if (!count) continue;
+      for (let c = 0; c < 3; c += 1) {
+        total += Math.abs(sums[c] - sums[c + 3]) / count;
+      }
+    }
+  }
+  return total / (rows * cols * 3 * 255);
+}
+
+/**
  * Pad a raster to `height` with white so two rasters of different page heights
  * can still be compared row-for-row. Height drift is reported separately rather
  * than being allowed to smear the pixel ratio.
@@ -184,6 +222,7 @@ async function compare(name, browser) {
     engineHeight: engine.height,
     page: mismatched / (WIDTH * height),
     fold: foldMismatched / (WIDTH * foldHeight),
+    layout: blockDiff(foldA, foldB, WIDTH, foldHeight),
   };
 }
 
@@ -218,8 +257,8 @@ try {
 }
 
 const pct = (v) => `${(v * 100).toFixed(2)}%`;
-console.log('\nfixture         fold-diff   page-diff   height (chromium -> engine)');
-console.log('-'.repeat(72));
+console.log('\nfixture          layout   fold-px   page-px   height (chromium -> engine)');
+console.log('-'.repeat(78));
 for (const r of results) {
   if (r.error) {
     console.log(`${r.name.padEnd(15)} ERROR  ${r.error}`);
@@ -227,7 +266,7 @@ for (const r of results) {
   }
   const drift = r.engineHeight - r.referenceHeight;
   console.log(
-    `${r.name.padEnd(15)} ${pct(r.fold).padStart(9)}   ${pct(r.page).padStart(9)}   ` +
+    `${r.name.padEnd(15)} ${pct(r.layout).padStart(7)}  ${pct(r.fold).padStart(8)}  ${pct(r.page).padStart(8)}   ` +
       `${r.referenceHeight} -> ${r.engineHeight} (${drift >= 0 ? '+' : ''}${drift})`,
   );
 }
