@@ -6,11 +6,18 @@
  *   <name>.reference.png   full-page Chromium screenshot at the project viewport
  *   <name>.viewport.png    first-viewport-only screenshot (easier to eyeball)
  *   <name>.html            a self-contained snapshot of the *rendered* DOM with
- *                          every stylesheet inlined and small images embedded,
- *                          so the engine can be pointed at the exact same input
+ *                          every stylesheet inlined and images embedded, so the
+ *                          engine can be pointed at the exact same input
  *
  * The self-contained HTML is the important artefact: a screenshot alone cannot
  * be re-rendered, so without it a parity diff has nothing to diff against.
+ *
+ * Cross-origin stylesheets and images are fetched through Playwright's request
+ * context rather than from inside the page. A site that serves its CSS from a
+ * separate asset domain — which is most large sites — exposes neither
+ * `cssRules` nor a CORS-allowed `fetch` to page scripts, so an in-page fetch
+ * yields a snapshot with no CSS at all, and a diff against it silently compares
+ * two unstyled pages.
  *
  * Usage:
  *   npm --prefix tools/parity install
@@ -31,26 +38,24 @@ const TARGETS = [
   { name: 'yunseong', url: 'https://yunseong.dev' },
 ];
 
-/**
- * Runs inside the page. Serialises the live DOM with all CSS inlined.
- *
- * Same-origin sheets are read straight off `cssRules`; cross-origin sheets throw
- * on that access, so they are re-fetched by href and their relative url() refs
- * are absolutised against the sheet's own URL.
- */
-async function serialise(maxInlineBytes) {
-  const absolutise = (cssText, baseHref) => {
-    if (!baseHref) return cssText;
-    return cssText.replace(/url\((['"]?)([^'")]+)\1\)/g, (match, quote, ref) => {
-      if (/^(data:|https?:|\/\/)/i.test(ref)) return match;
-      try {
-        return `url(${quote}${new URL(ref, baseHref).href}${quote})`;
-      } catch {
-        return match;
-      }
-    });
-  };
+/** Rewrite relative `url()` references against the stylesheet's own URL. */
+function absolutiseCss(cssText, baseHref) {
+  if (!baseHref) return cssText;
+  return cssText.replace(/url\((['"]?)([^'")]+)\1\)/g, (match, quote, ref) => {
+    if (/^(data:|https?:|\/\/|#)/i.test(ref)) return match;
+    try {
+      return `url(${quote}${new URL(ref, baseHref).href}${quote})`;
+    } catch {
+      return match;
+    }
+  });
+}
 
+/**
+ * Runs inside the page. Returns the serialised DOM plus the work Node has to
+ * finish: stylesheets and images it could not read itself.
+ */
+function collect() {
   const sheets = [];
   for (const sheet of Array.from(document.styleSheets)) {
     let rules = null;
@@ -60,59 +65,42 @@ async function serialise(maxInlineBytes) {
       rules = null;
     }
     if (rules) {
-      sheets.push(absolutise(Array.from(rules).map((r) => r.cssText).join('\n'), sheet.href));
-      continue;
-    }
-    if (!sheet.href) continue;
-    try {
-      const res = await fetch(sheet.href);
-      if (res.ok) sheets.push(absolutise(await res.text(), sheet.href));
-    } catch {
-      /* unreachable sheet: skip, the diff will show it as missing style */
+      sheets.push({ css: Array.from(rules).map((r) => r.cssText).join('\n'), href: sheet.href });
+    } else if (sheet.href) {
+      // Unreadable from here: cross-origin without CORS. Node fetches it.
+      sheets.push({ href: sheet.href });
     }
   }
 
-  const toDataUri = async (url) => {
-    try {
-      const res = await fetch(url);
-      if (!res.ok) return null;
-      const blob = await res.blob();
-      if (blob.size > maxInlineBytes) return null;
-      const buf = new Uint8Array(await blob.arrayBuffer());
-      let binary = '';
-      for (const byte of buf) binary += String.fromCharCode(byte);
-      return `data:${blob.type || 'application/octet-stream'};base64,${btoa(binary)}`;
-    } catch {
-      return null;
-    }
-  };
-
   const doc = document.documentElement.cloneNode(true);
-
   // Scripts are dropped on purpose: the snapshot is of the post-script DOM, so
   // re-running them would mutate an already-settled tree.
   doc.querySelectorAll('script, link[rel~="stylesheet"], link[rel="preload"], style').forEach((el) => el.remove());
 
-  const head = doc.querySelector('head') || doc.insertBefore(document.createElement('head'), doc.firstChild);
-  const base = document.createElement('base');
-  base.setAttribute('href', location.href);
-  head.insertBefore(base, head.firstChild);
-  const styleEl = document.createElement('style');
-  styleEl.textContent = sheets.join('\n');
-  head.appendChild(styleEl);
-
-  const live = Array.from(document.images);
   const cloned = Array.from(doc.querySelectorAll('img'));
-  for (let i = 0; i < cloned.length; i += 1) {
+  const live = Array.from(document.images);
+  const images = [];
+  cloned.forEach((img, i) => {
+    img.removeAttribute('srcset');
+    img.removeAttribute('loading');
     const src = live[i] && live[i].currentSrc;
-    cloned[i].removeAttribute('srcset');
-    cloned[i].removeAttribute('loading');
-    if (!src) continue;
-    const data = await toDataUri(src);
-    cloned[i].setAttribute('src', data || new URL(src, location.href).href);
-  }
+    if (!src) return;
+    img.setAttribute('data-capture-index', String(images.length));
+    images.push(src);
+  });
 
-  return `<!DOCTYPE html>\n${doc.outerHTML}`;
+  return { html: doc.outerHTML, sheets, images, baseHref: location.href };
+}
+
+/** Fetch a URL through Playwright's request context, which ignores CORS. */
+async function fetchAsset(request, url) {
+  try {
+    const res = await request.get(url, { timeout: 20000 });
+    if (!res.ok()) return null;
+    return await res.body();
+  } catch {
+    return null;
+  }
 }
 
 async function capture(browser, target, outDir) {
@@ -129,10 +117,59 @@ async function capture(browser, target, outDir) {
     await page.screenshot({ path: path.join(outDir, `${target.name}.viewport.png`) });
     await page.screenshot({ path: path.join(outDir, `${target.name}.reference.png`), fullPage: true });
 
-    const html = await page.evaluate(serialise, MAX_INLINE_BYTES);
-    await writeFile(path.join(outDir, `${target.name}.html`), html, 'utf8');
+    const { html, sheets, images, baseHref } = await page.evaluate(collect);
 
-    console.log(`ok   ${target.name.padEnd(9)} ${(html.length / 1024).toFixed(0)} KB snapshot`);
+    // Fill in the stylesheets the page could not read, keeping document order
+    // so the cascade still resolves the way it did in the browser.
+    let fetched = 0;
+    const css = [];
+    for (const sheet of sheets) {
+      if (sheet.css !== undefined) {
+        css.push(absolutiseCss(sheet.css, sheet.href));
+        continue;
+      }
+      const body = await fetchAsset(context.request, sheet.href);
+      if (body) {
+        fetched += 1;
+        css.push(absolutiseCss(body.toString('utf8'), sheet.href));
+      }
+    }
+
+    const dataUris = await Promise.all(
+      images.map(async (src) => {
+        const url = new URL(src, baseHref).href;
+        if (url.startsWith('data:')) return url;
+        const body = await fetchAsset(context.request, url);
+        if (!body || body.length > MAX_INLINE_BYTES) return url;
+        const type = /\.svg(\?|$)/i.test(url) ? 'image/svg+xml' : 'image/png';
+        return `data:${type};base64,${body.toString('base64')}`;
+      }),
+    );
+
+    // Substitute by the index stamped on each img during collection.
+    const withImages = html.replace(
+      /<img\b[^>]*\bdata-capture-index="(\d+)"[^>]*>/g,
+      (tag, index) => {
+        const uri = dataUris[Number(index)];
+        return uri ? tag.replace(/\bsrc="[^"]*"/, `src="${uri.replace(/"/g, '&quot;')}"`) : tag;
+      },
+    );
+
+    const head = `<base href="${baseHref}"><style>${css.join('\n')}</style>`;
+    const out = withImages.includes('<head>')
+      ? withImages.replace('<head>', `<head>${head}`)
+      : `<head>${head}</head>${withImages}`;
+
+    await writeFile(path.join(outDir, `${target.name}.html`), `<!DOCTYPE html>\n${out}`, 'utf8');
+
+    const cssBytes = css.reduce((n, c) => n + c.length, 0);
+    console.log(
+      `ok   ${target.name.padEnd(9)} ${(out.length / 1024).toFixed(0)} KB snapshot, ` +
+        `${(cssBytes / 1024).toFixed(0)} KB CSS (${fetched} sheet(s) fetched server-side)`,
+    );
+    if (cssBytes === 0) {
+      console.error(`WARN ${target.name}: no CSS captured — the snapshot will render unstyled`);
+    }
   } catch (err) {
     console.error(`FAIL ${target.name.padEnd(9)} ${err.message}`);
   } finally {
