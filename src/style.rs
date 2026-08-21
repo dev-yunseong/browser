@@ -289,6 +289,14 @@ fn matches_pseudo_class(
 }
 
 fn matches_selector_arena(selector: &Selector, idx: usize, arena: &[NodeDataSend], hovered_id: Option<&str>, focused_id: Option<&str>) -> bool {
+    // A `::before` / `::after` rule targets the generated box, never its subject.
+    // Applying it to the element as well lets a decorative rule rewrite the real
+    // element's style — `.foo::before { position: fixed }` was taking `.foo` out
+    // of flow, collapsing its height and clipping away everything inside it.
+    // The generated boxes are built separately by `inject_pseudo_elements`.
+    if selector.pseudo_element.is_some() {
+        return false;
+    }
     let node = &arena[idx];
     
     let has_constraint = selector.tag.is_some() || selector.id.is_some() || !selector.class.is_empty() || !selector.attributes.is_empty() || !selector.pseudo_classes.is_empty();

@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Custom property probe</title>
+<style>
+  body { margin: 0; font: 20px/1.6 sans-serif; background: #fff; }
+  :root, [data-color-mode="light"] { --scale-white: #fff; --scale-black: #000; --text-default: var(--scale-black); }
+  [data-color-mode="dark"] { --scale-white: #fff; --text-default: var(--scale-white); }
+  .panel { background: #001a4d; padding: 12px; }
+  .title { color: var(--text-default); margin: 0; }
+  .chained { color: var(--a, var(--b, #f0f)); }
+  .fallback { color: var(--nope, #0a0); }
+  section { padding: 6px 12px; }
+</style>
+</head>
+<body>
+  <div data-color-mode="light">
+    <section><p class="title">LIGHT should be black</p></section>
+    <div data-color-mode="dark">
+      <div class="panel"><p class="title">DARK should be white on navy</p></div>
+    </div>
+    <section><p class="chained">CHAINED fallback should be magenta</p></section>
+    <section><p class="fallback">FALLBACK should be green</p></section>
+  </div>
+</body>
+</html>
