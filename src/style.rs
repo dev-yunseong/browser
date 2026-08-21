@@ -1569,8 +1569,38 @@ pub fn parse_inline_style_into_vec(style_str: &str, list: &mut Vec<crate::css::D
             "border" => {
                 let mut temp_map = HashMap::new();
                 crate::css::parse_border_shorthand_pub(val, &mut temp_map);
-                for (k, v) in temp_map {
-                    list.push(crate::css::Declaration { name: intern(&k), value: v, important });
+                for (k, v) in &temp_map {
+                    list.push(crate::css::Declaration { name: intern(k), value: v.clone(), important });
+                }
+                for side in crate::css::BORDER_SIDES {
+                    for part in ["width", "style", "color"] {
+                        if let Some(v) = temp_map.get(&format!("border-{part}")) {
+                            list.push(crate::css::Declaration {
+                                name: intern(&format!("border-{side}-{part}")),
+                                value: v.clone(),
+                                important,
+                            });
+                        }
+                    }
+                }
+            }
+            // Single-edge shorthand in an inline style, expanded the same way the
+            // stylesheet parser expands it.
+            "border-top" | "border-right" | "border-bottom" | "border-left" => {
+                let side = key.rsplit('-').next().unwrap_or("top").to_string();
+                let mut temp_map = HashMap::new();
+                crate::css::parse_border_shorthand_pub(val, &mut temp_map);
+                temp_map
+                    .entry("border-width".to_string())
+                    .or_insert(Value::Length(3.0, crate::css::Unit::Px));
+                for part in ["width", "style", "color"] {
+                    if let Some(v) = temp_map.get(&format!("border-{part}")) {
+                        list.push(crate::css::Declaration {
+                            name: intern(&format!("border-{side}-{part}")),
+                            value: v.clone(),
+                            important,
+                        });
+                    }
                 }
             }
             "padding" => {

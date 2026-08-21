@@ -319,6 +319,9 @@ fn strip_comments(source: &str) -> String {
     out
 }
 
+/// The four border edges in CSS quad order (top, right, bottom, left).
+pub const BORDER_SIDES: [&str; 4] = ["top", "right", "bottom", "left"];
+
 pub fn parse_css(source: &str) -> Stylesheet {
     let mut items = Vec::new();
     // Comments must go before anything else looks at the text: this parser splits
@@ -373,8 +376,74 @@ pub fn parse_css(source: &str) -> Stylesheet {
                 "border" => {
                     let mut temp_map = HashMap::new();
                     parse_border_shorthand(&val_raw, &mut temp_map);
-                    for (k, v) in temp_map {
-                        declarations.push(Declaration { name: intern(&k), value: v, important });
+                    for (k, v) in &temp_map {
+                        declarations.push(Declaration { name: intern(k), value: v.clone(), important });
+                    }
+                    // Also emit the per-side longhands, so a later `border-bottom`
+                    // can override one edge without discarding the other three.
+                    for side in BORDER_SIDES {
+                        for part in ["width", "style", "color"] {
+                            if let Some(v) = temp_map.get(&format!("border-{part}")) {
+                                declarations.push(Declaration {
+                                    name: intern(&format!("border-{side}-{part}")),
+                                    value: v.clone(),
+                                    important,
+                                });
+                            }
+                        }
+                    }
+                }
+                // Single-edge shorthand: `border-bottom: 1px solid #ccc`. Hairline
+                // rules on one edge are how most page furniture is drawn, so an
+                // unexpanded value here loses a large share of a site's structure.
+                "border-top" | "border-right" | "border-bottom" | "border-left" => {
+                    let side = key.rsplit('-').next().unwrap_or("top").to_string();
+                    let mut temp_map = HashMap::new();
+                    parse_border_shorthand(&val_raw, &mut temp_map);
+                    // A one-edge shorthand resets the parts it does not mention.
+                    if !temp_map.contains_key("border-width") {
+                        temp_map.insert("border-width".to_string(), Value::Length(3.0, Unit::Px));
+                    }
+                    for part in ["width", "style", "color"] {
+                        if let Some(v) = temp_map.get(&format!("border-{part}")) {
+                            declarations.push(Declaration {
+                                name: intern(&format!("border-{side}-{part}")),
+                                value: v.clone(),
+                                important,
+                            });
+                        }
+                    }
+                }
+                // Quad forms: `border-width: 1px 2px`, `border-color: red blue`.
+                "border-width" | "border-color" | "border-style" => {
+                    let part = key.rsplit('-').next().unwrap_or("width").to_string();
+                    let values = split_respecting_parens(&val_raw);
+                    let resolved: Vec<Value> = values.iter().map(|v| {
+                        if part == "color" {
+                            parse_color(v).map(Value::Color).unwrap_or_else(|| parse_value(v))
+                        } else {
+                            parse_value(v)
+                        }
+                    }).collect();
+                    let quad: [&Value; 4] = match resolved.len() {
+                        1 => [&resolved[0], &resolved[0], &resolved[0], &resolved[0]],
+                        2 => [&resolved[0], &resolved[1], &resolved[0], &resolved[1]],
+                        3 => [&resolved[0], &resolved[1], &resolved[2], &resolved[1]],
+                        _ if resolved.len() >= 4 => [&resolved[0], &resolved[1], &resolved[2], &resolved[3]],
+                        _ => {
+                            declarations.push(Declaration { name: key, value: parse_value(&val_raw), important });
+                            continue;
+                        }
+                    };
+                    // Keep the uniform property for the existing consumers, then the
+                    // per-side longhands.
+                    declarations.push(Declaration { name: key.clone(), value: quad[0].clone(), important });
+                    for (side, value) in BORDER_SIDES.iter().zip(quad) {
+                        declarations.push(Declaration {
+                            name: intern(&format!("border-{side}-{part}")),
+                            value: value.clone(),
+                            important,
+                        });
                     }
                 }
                 // border-radius shorthand: "border-radius: <tl> [<tr> [<br> [<bl>]]]"
@@ -2031,12 +2100,56 @@ pub fn parse_track_list(val: &str) -> Vec<Value> {
     // Expand repeat(...) before splitting on spaces.
     let expanded = expand_repeat_tracks(val);
 
-    for token in expanded.split_whitespace() {
-        let token = token.trim();
-        if token.is_empty() { continue; }
+    for token in split_track_tokens(&expanded) {
         tracks.push(parse_track_token(token));
     }
     tracks
+}
+
+/// Split a track list into tokens, keeping bracketed functions whole.
+///
+/// Splitting on plain whitespace tears `minmax(0, 1fr)` into `minmax(0,` and
+/// `1fr)`, which turns a two-column template into three junk tracks and
+/// collapses the grid. Line names in `[...]` are dropped, as this engine has no
+/// use for them.
+fn split_track_tokens(list: &str) -> Vec<&str> {
+    let bytes = list.as_bytes();
+    let mut tokens = Vec::new();
+    let mut depth = 0usize;
+    let mut start: Option<usize> = None;
+    let mut in_line_names = false;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'[' if depth == 0 => {
+                if let Some(s) = start.take() {
+                    tokens.push(&list[s..i]);
+                }
+                in_line_names = true;
+            }
+            b']' if in_line_names => in_line_names = false,
+            _ if in_line_names => {}
+            b'(' => {
+                depth += 1;
+                start.get_or_insert(i);
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+            }
+            b if b.is_ascii_whitespace() && depth == 0 => {
+                if let Some(s) = start.take() {
+                    tokens.push(&list[s..i]);
+                }
+            }
+            _ => {
+                start.get_or_insert(i);
+            }
+        }
+    }
+    if let Some(s) = start {
+        tokens.push(&list[s..]);
+    }
+    tokens.into_iter().map(str::trim).filter(|t| !t.is_empty()).collect()
 }
 
 /// Expand `repeat(N, <track-list>)` within a track value string.
@@ -2090,6 +2203,19 @@ fn expand_repeat_tracks(val: &str) -> String {
 
 fn parse_track_token(token: &str) -> Value {
     let t = token.trim().to_ascii_lowercase();
+    // `minmax(min, max)` is sized by its growth limit here: the common forms on
+    // real pages are `minmax(0, 1fr)` and `minmax(auto, 1fr)`, where the max is
+    // what decides the track and the min only guards against overflow.
+    if let Some(args) = t.strip_prefix("minmax(").and_then(|r| r.strip_suffix(')')) {
+        if let Some((_, max)) = args.rsplit_once(',') {
+            return parse_track_token(max);
+        }
+    }
+    // `fit-content(x)` sizes to content up to a cap; `auto` is the closest track
+    // this engine models.
+    if t.starts_with("fit-content(") {
+        return Value::Keyword(intern("auto"));
+    }
     if t == "auto" {
         Value::Keyword(intern("auto"))
     } else if t == "min-content" || t == "max-content" {

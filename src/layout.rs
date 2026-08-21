@@ -312,9 +312,11 @@ fn read_px_direct(sn: &StyledNode, prop: &str) -> f32 {
 
 /// Horizontal padding + border contribution for intrinsic sizing (px only).
 fn horiz_padding_border(sn: &StyledNode) -> f32 {
-    read_px_direct(sn, "padding-left")
-        + read_px_direct(sn, "padding-right")
-        + read_px_direct(sn, "border-width") * 2.0
+    let side = |side: &str| {
+        let w = read_px_direct(sn, &format!("border-{side}-width"));
+        if w > 0.0 { w } else { read_px_direct(sn, "border-width") }
+    };
+    read_px_direct(sn, "padding-left") + read_px_direct(sn, "padding-right") + side("left") + side("right")
 }
 
 fn horiz_margin(sn: &StyledNode) -> f32 {
@@ -801,21 +803,33 @@ impl<'a> LayoutBox<'a> {
         self.padding.left = get_prop(sn, "padding-left", "padding", container_width, vw, vh);
         self.padding.right = get_prop(sn, "padding-right", "padding", container_width, vw, vh);
 
-        let b_width = match sn.specified_values.get(&crate::css::intern("border-width")) {
-            Some(Value::Length(v, Unit::Px)) => *v,
-            _ => {
-                if self.display == DisplayType::Input {
-                    1.0
-                } else {
-                    0.0
-                }
+        let uniform = match sn.specified_values.get(&crate::css::intern("border-width")) {
+            Some(Value::Length(v, Unit::Px)) => Some(*v),
+            _ => None,
+        };
+        let default_width = if self.display == DisplayType::Input { 1.0 } else { 0.0 };
+        let side_width = |side: &str| -> f32 {
+            // `border-style: none` wins over any width, which is what makes
+            // `border-bottom: none` on top of a shared rule actually remove the
+            // rule instead of leaving a hairline behind.
+            let style = sn
+                .specified_values
+                .get(&crate::css::intern(&format!("border-{side}-style")))
+                .or_else(|| sn.specified_values.get(&crate::css::intern("border-style")));
+            if matches!(style, Some(Value::Keyword(k)) if matches!(&**k, "none" | "hidden")) {
+                return 0.0;
+            }
+            match sn.specified_values.get(&crate::css::intern(&format!("border-{side}-width"))) {
+                Some(Value::Length(v, Unit::Px)) => *v,
+                Some(Value::Number(v)) => *v,
+                _ => uniform.unwrap_or(default_width),
             }
         };
         self.border = EdgeSizes {
-            left: b_width,
-            right: b_width,
-            top: b_width,
-            bottom: b_width,
+            top: side_width("top"),
+            right: side_width("right"),
+            bottom: side_width("bottom"),
+            left: side_width("left"),
         };
     }
 

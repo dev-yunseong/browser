@@ -627,12 +627,49 @@ impl LayerTreeBuilder {
         }
 
         // Border
-        if layout.border.left > 0.0 {
-            let color = match sv.get(&crate::css::intern("border-color")) {
+        //
+        // A uniform border on a rounded box is stroked as one rounded path so the
+        // corners stay round. Every other case is painted edge by edge: a box may
+        // carry a rule on one side only, or a different colour per side, and a
+        // single stroke can express neither.
+        {
+            let uniform_color = || match sv.get(&crate::css::intern("border-color")) {
                 Some(Value::Color(c)) => c.clone(),
                 _ => Color { r: 180, g: 180, b: 180, a: 255 },
             };
-            commands.push(PaintCommand::Border(d, layout.border.left, color, radius));
+            let side_color = |side: &str| match sv.get(&crate::css::intern(&format!("border-{side}-color"))) {
+                Some(Value::Color(c)) => c.clone(),
+                // An edge with no colour of its own takes the element's text
+                // colour, as `border-color`'s initial value `currentColor` says.
+                _ => match sv.get(&crate::css::intern("border-color")) {
+                    Some(Value::Color(c)) => c.clone(),
+                    _ => match sv.get(&crate::css::intern("color")) {
+                        Some(Value::Color(c)) => c.clone(),
+                        _ => Color { r: 0, g: 0, b: 0, a: 255 },
+                    },
+                },
+            };
+            let b = &layout.border;
+            let uniform = b.top == b.right && b.right == b.bottom && b.bottom == b.left;
+
+            if uniform && b.top > 0.0 && radius > 0.0 {
+                commands.push(PaintCommand::Border(d, b.top, uniform_color(), radius));
+            } else {
+                // Edges are drawn as filled rectangles that meet at the corners.
+                // Mitring is skipped: at the 1-2px widths pages actually use, the
+                // overlap is a single corner pixel.
+                let edges: [(f32, crate::layout::Rect, &str); 4] = [
+                    (b.top, crate::layout::Rect { x: d.x, y: d.y, width: d.width, height: b.top }, "top"),
+                    (b.right, crate::layout::Rect { x: d.x + d.width - b.right, y: d.y, width: b.right, height: d.height }, "right"),
+                    (b.bottom, crate::layout::Rect { x: d.x, y: d.y + d.height - b.bottom, width: d.width, height: b.bottom }, "bottom"),
+                    (b.left, crate::layout::Rect { x: d.x, y: d.y, width: b.left, height: d.height }, "left"),
+                ];
+                for (width, rect, side) in edges {
+                    if width > 0.0 && rect.width > 0.0 && rect.height > 0.0 {
+                        commands.push(PaintCommand::Rect(rect, side_color(side), 0.0));
+                    }
+                }
+            }
         }
 
         // Image
