@@ -252,9 +252,81 @@ impl Stylesheet {
     }
 }
 
+/// Remove `/* ... */` comments from a stylesheet.
+///
+/// Each comment becomes a single space rather than nothing: CSS treats a comment
+/// as a token boundary, so `a/**/b` is two identifiers and must not be joined
+/// into one. Quoted strings and unquoted `url(...)` tokens are copied through
+/// verbatim, so a `/*` inside `content: "/*"` or inside an inline SVG data URI
+/// is not mistaken for the start of a comment. An unterminated comment runs to
+/// end of input, as the spec requires.
+fn strip_comments(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' => {
+                let quote = bytes[i];
+                let start = i;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == quote {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                out.push_str(&source[start..i.min(bytes.len())]);
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i < bytes.len() {
+                    if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                out.push(' ');
+            }
+            b'u' | b'U' if source[i..].len() >= 4 && source[i..i + 4].eq_ignore_ascii_case("url(") => {
+                let start = i;
+                i += 4;
+                // An unquoted url() ends at the first ')'; a quoted one is handled
+                // by the string arm on the next pass, so stop at the quote.
+                while i < bytes.len() && bytes[i] != b')' && bytes[i] != b'"' && bytes[i] != b'\'' {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b')' {
+                    i += 1;
+                }
+                out.push_str(&source[start..i]);
+            }
+            _ => {
+                // Advance one whole character so multi-byte text survives intact.
+                let ch = source[i..].chars().next().unwrap_or('\0');
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    out
+}
+
 pub fn parse_css(source: &str) -> Stylesheet {
     let mut items = Vec::new();
-    // Pre-processing to handle comments and whitespace better
+    // Comments must go before anything else looks at the text: this parser splits
+    // on `{`, `}` and `;`, and a comment is not a token to it, so an un-stripped
+    // `/* ... */` ends up glued to the following selector and silently discards
+    // the rule. Real stylesheets are full of comments, so that one omission drops
+    // most of a hand-written sheet on the floor.
+    let source = strip_comments(source);
     let source = source.replace('\n', " ");
     
     // Simple @rule preservation (Issue #21)
@@ -664,13 +736,47 @@ pub struct AttributeSelector {
     pub value: AttributeMatch,
 }
 
+/// A pseudo-class in a form the matcher can evaluate without re-parsing text.
+///
+/// Anything this engine does not implement becomes `Unsupported`, which never
+/// matches. That is the safe direction: treating an unknown pseudo-class as
+/// "matches" would widen a rule like `input::-webkit-outer-spin-button {
+/// display: none }` to every input on the page.
+#[derive(Debug, Clone)]
+pub enum PseudoClass {
+    Hover,
+    Focus,
+    Root,
+    /// `:not(a, b)` — matches when none of the inner selectors match.
+    Not(Vec<Selector>),
+    /// `:is()` / `:where()` / legacy `:matches()` — matches when any inner does.
+    Is(Vec<Selector>),
+    FirstChild,
+    LastChild,
+    OnlyChild,
+    FirstOfType,
+    LastOfType,
+    /// `:nth-child(an+b)`, stored as `(a, b)`.
+    NthChild(i32, i32),
+    AnyLink,
+    Enabled,
+    Disabled,
+    Checked,
+    Empty,
+    Unsupported,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Selector {
     pub tag: Option<String>,
     pub id: Option<String>,
     pub class: Vec<String>,
     pub attributes: Vec<AttributeSelector>,
+    /// Raw pseudo-class text, kept for specificity and debugging. The evaluated
+    /// form lives in `pseudo_classes`.
     pub pseudo_class: Option<String>,
+    /// Every pseudo-class on this compound selector, parsed. All must match.
+    pub pseudo_classes: Vec<PseudoClass>,
     /// Pseudo-element (`"before"` or `"after"`), set when the selector ends with
     /// `::before` or `::after`.  Single-colon pseudo-classes (`:hover`, `:focus`,
     /// `:root`) stay in `pseudo_class`.
@@ -699,7 +805,20 @@ impl Selector {
         if self.id.is_some() { a += 1; }
         b += self.class.len();
         b += self.attributes.len();
-        if self.pseudo_class.is_some() { b += 1; }
+        // `:not()` and `:is()` contribute their most specific argument instead of
+        // themselves; every other pseudo-class counts as one class.
+        for pc in &self.pseudo_classes {
+            match pc {
+                PseudoClass::Not(inner) | PseudoClass::Is(inner) => {
+                    if let Some((ia, ib, ic)) = inner.iter().map(|s| s.specificity()).max() {
+                        a += ia;
+                        b += ib;
+                        c += ic;
+                    }
+                }
+                _ => b += 1,
+            }
+        }
         if self.tag.is_some() { c += 1; }
 
         if let Some(ref d) = self.ancestor {
@@ -725,6 +844,105 @@ impl Selector {
     }
 }
 
+/// Split a pseudo-class remainder such as `not(.a):first-child` on top-level
+/// colons, so a nested `:not(:hover)` is not torn apart.
+fn split_pseudo_classes(rest: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let bytes = rest.as_bytes();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b':' if depth == 0 => {
+                if i > start {
+                    parts.push(&rest[start..i]);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < rest.len() {
+        parts.push(&rest[start..]);
+    }
+    parts
+}
+
+/// Split a selector list on top-level commas (`:not(.a, .b)`).
+fn split_selector_list(arg: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let bytes = arg.as_bytes();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                parts.push(&arg[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&arg[start..]);
+    parts.into_iter().map(str::trim).filter(|p| !p.is_empty()).collect()
+}
+
+/// Parse the `an+b` micro-syntax used by `:nth-child()`.
+fn parse_nth(arg: &str) -> Option<(i32, i32)> {
+    let arg = arg.trim().to_lowercase();
+    match arg.as_str() {
+        "odd" => return Some((2, 1)),
+        "even" => return Some((2, 0)),
+        _ => {}
+    }
+    if let Ok(b) = arg.parse::<i32>() {
+        return Some((0, b));
+    }
+    let (a_part, b_part) = arg.split_once('n')?;
+    let a = match a_part.trim() {
+        "" | "+" => 1,
+        "-" => -1,
+        other => other.parse::<i32>().ok()?,
+    };
+    let b_part = b_part.trim();
+    let b = if b_part.is_empty() { 0 } else { b_part.replace(' ', "").parse::<i32>().ok()? };
+    Some((a, b))
+}
+
+/// Turn one pseudo-class token (`hover`, `not(.show)`, `nth-child(2n+1)`) into
+/// its evaluated form.
+fn parse_pseudo_class(token: &str) -> PseudoClass {
+    let token = token.trim();
+    let (name, arg) = match token.split_once('(') {
+        Some((n, rest)) => (n.trim().to_lowercase(), rest.strip_suffix(')').unwrap_or(rest)),
+        None => (token.to_lowercase(), ""),
+    };
+    let inner = || split_selector_list(arg).into_iter().map(parse_selector).collect::<Vec<_>>();
+    match name.as_str() {
+        "hover" => PseudoClass::Hover,
+        "focus" => PseudoClass::Focus,
+        "root" => PseudoClass::Root,
+        "not" => PseudoClass::Not(inner()),
+        "is" | "where" | "matches" | "any" | "-webkit-any" => PseudoClass::Is(inner()),
+        "first-child" => PseudoClass::FirstChild,
+        "last-child" => PseudoClass::LastChild,
+        "only-child" => PseudoClass::OnlyChild,
+        "first-of-type" => PseudoClass::FirstOfType,
+        "last-of-type" => PseudoClass::LastOfType,
+        "nth-child" => parse_nth(arg).map_or(PseudoClass::Unsupported, |(a, b)| PseudoClass::NthChild(a, b)),
+        "link" | "any-link" => PseudoClass::AnyLink,
+        "enabled" => PseudoClass::Enabled,
+        "disabled" => PseudoClass::Disabled,
+        "checked" => PseudoClass::Checked,
+        "empty" => PseudoClass::Empty,
+        _ => PseudoClass::Unsupported,
+    }
+}
+
 pub fn parse_selector(s: &str) -> Selector {
     // Pre-process string to ensure spaces around combinators for easy splitting
     let s = s.replace('>', " > ").replace('+', " + ").replace('~', " ~ ");
@@ -747,29 +965,37 @@ pub fn parse_selector(s: &str) -> Selector {
                 // pseudo-elements (::before, ::after) or be a plain pseudo-class name.
                 let pseudo_rest = p_parts.next();
 
-                let (pseudo_class, pseudo_element): (Option<String>, Option<String>) = match pseudo_rest {
-                    None => (None, None),
-                    Some(rest) => {
-                        if let Some(pe) = rest.strip_prefix(':') {
-                            // Double-colon pseudo-element: ::before / ::after
-                            let name = pe.to_lowercase();
-                            if name == "before" || name == "after" {
-                                (None, Some(name))
+                let (pseudo_class, pseudo_element, pseudo_classes): (Option<String>, Option<String>, Vec<PseudoClass>) =
+                    match pseudo_rest {
+                        None => (None, None, Vec::new()),
+                        Some(rest) => {
+                            if let Some(pe) = rest.strip_prefix(':') {
+                                // Double-colon pseudo-element: ::before / ::after
+                                let name = pe.to_lowercase();
+                                if name == "before" || name == "after" {
+                                    (None, Some(name), Vec::new())
+                                } else {
+                                    // An unimplemented pseudo-element must not decay into
+                                    // its bare subject: `input::-webkit-outer-spin-button
+                                    // { display: none }` would then hide every input.
+                                    (None, None, vec![PseudoClass::Unsupported])
+                                }
                             } else {
-                                // Unknown pseudo-element — skip.
-                                (None, None)
+                                // Single-colon pseudo-classes, possibly several in a row.
+                                let parsed = split_pseudo_classes(rest)
+                                    .into_iter()
+                                    .map(parse_pseudo_class)
+                                    .collect();
+                                (Some(rest.to_string()), None, parsed)
                             }
-                        } else {
-                            // Single-colon pseudo-class: :hover, :focus, :root, etc.
-                            (Some(rest.to_string()), None)
                         }
-                    }
-                };
+                    };
 
-                if base_part.is_empty() && pseudo_class.is_none() && pseudo_element.is_none() { continue; }
+                if base_part.is_empty() && pseudo_class.is_none() && pseudo_element.is_none() && pseudo_classes.is_empty() { continue; }
 
                 let mut current_sel = Selector::new();
                 current_sel.pseudo_class = pseudo_class;
+                current_sel.pseudo_classes = pseudo_classes;
                 current_sel.pseudo_element = pseudo_element;
                 let mut current_token = String::new();
                 let mut last_char = ' ';

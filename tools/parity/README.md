@@ -33,3 +33,14 @@ node tools/parity/diff.mjs
 
 This serves the snapshots over localhost, drives `browser-daemon` to screenshot
 each one, and reports the per-site mismatched-pixel ratio.
+
+## Fixtures
+
+`fixtures/` holds hand-written probes that isolate one renderer feature each, so
+a regression points at a mechanism rather than at "github.com looks wrong":
+
+| Fixture | Covers |
+|---|---|
+| `smoke` | block/inline flow, flex row, borders, radii |
+| `probe-hiding` | every idiom real sites use to hide content |
+| `probe-sizing` | grid track sizing, flex basis, percentage widths |

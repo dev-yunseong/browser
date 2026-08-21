@@ -1239,7 +1239,13 @@ impl<'a> LayoutBox<'a> {
                     // Flex items that come out with width=0 (e.g. inline <a> elements) need
                     // an intrinsic size so they participate correctly in the flex algorithm.
                     // Use max-content width capped to inner_width as the shrink-wrap fallback.
-                    if cb.dimensions.width == 0.0 {
+                    //
+                    // `flex-basis: 0` is a zero width the author asked for, not a failure to
+                    // measure, so it must survive this fallback: `flex: 1` expands to
+                    // `1 1 0%`, and sizing those items by max-content instead makes every
+                    // equal-width row (cards, columns, nav bars) come out proportional to
+                    // its text and overflow the container.
+                    if cb.dimensions.width == 0.0 && flex_basis.is_none() {
                         let max_c = intrinsic_cache.max_content_width(child_node, vw, vh);
                         cb.dimensions.width = max_c.min(inner_width).max(0.0);
                     }

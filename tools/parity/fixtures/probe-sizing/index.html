@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sizing probe</title>
+<style>
+  body { margin: 0; font: 14px/1.4 sans-serif; background: #fff; color: #000; }
+  section { border-bottom: 2px solid #333; padding: 8px; }
+  .b { background: #eef; outline: 1px solid #66f; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .gridmm { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; }
+  .gridfix { display: grid; grid-template-columns: 200px 1fr; gap: 8px; }
+  .gridauto { display: grid; grid-template-columns: auto 1fr; gap: 8px; }
+  .flexrow { display: flex; gap: 8px; }
+  .flexrow > .b { flex: 1; }
+  .flexmin { display: flex; gap: 8px; }
+  .flexmin > .b { flex: 1 1 0; min-width: 0; }
+  .colflex { display: flex; flex-direction: column; gap: 4px; }
+  .pcttext { width: 60%; }
+</style>
+</head>
+<body>
+  <section><b>grid 1fr 1fr</b><div class="grid2"><div class="b">Alpha bravo charlie delta echo foxtrot golf hotel india</div><div class="b">Second column text that also wraps naturally</div></div></section>
+  <section><b>grid minmax(0,1fr)</b><div class="gridmm"><div class="b">Alpha bravo charlie delta echo foxtrot golf hotel india</div><div class="b">Second column</div></div></section>
+  <section><b>grid 200px 1fr</b><div class="gridfix"><div class="b">Fixed 200</div><div class="b">Rest of the space fills here with enough words to wrap</div></div></section>
+  <section><b>grid auto 1fr</b><div class="gridauto"><div class="b">Auto</div><div class="b">Remaining space column with several words to wrap around</div></div></section>
+  <section><b>flex:1</b><div class="flexrow"><div class="b">Alpha bravo charlie delta echo foxtrot golf hotel</div><div class="b">Second</div></div></section>
+  <section><b>flex 1 1 0 min-width:0</b><div class="flexmin"><div class="b">Alpha bravo charlie delta echo foxtrot golf hotel</div><div class="b">Second</div></div></section>
+  <section><b>column flex</b><div class="colflex"><div class="b">Row one in a column flex container</div><div class="b">Row two</div></div></section>
+  <section><b>width 60%</b><div class="b pcttext">Sixty percent wide paragraph that should wrap at 60% of 784px</div></section>
+</body>
+</html>

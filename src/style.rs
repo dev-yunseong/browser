@@ -1,4 +1,4 @@
-use crate::css::{Stylesheet, Value, Selector, parse_value, parse_color, Combinator, intern, SelectorKey};
+use crate::css::{Stylesheet, Value, Selector, parse_value, parse_color, Combinator, intern, SelectorKey, PseudoClass};
 
 use markup5ever_rcdom::{Handle, NodeData};
 use std::collections::{HashMap, HashSet};
@@ -212,10 +212,86 @@ fn flatten_dom(root: &Handle, arena: &mut Vec<NodeDataSend>, root_parent_idx: Op
     start_idx
 }
 
+/// Element siblings of `idx`, in document order, together with `idx`'s position
+/// among them. Structural pseudo-classes count elements only, never text nodes.
+fn element_siblings(idx: usize, arena: &[NodeDataSend]) -> (Vec<usize>, usize) {
+    let Some(parent) = arena[idx].parent_idx else {
+        return (vec![idx], 0);
+    };
+    let siblings: Vec<usize> = arena[parent]
+        .children_idx
+        .iter()
+        .copied()
+        .filter(|&c| arena[c].is_element)
+        .collect();
+    let position = siblings.iter().position(|&c| c == idx).unwrap_or(0);
+    (siblings, position)
+}
+
+fn has_attr(node: &NodeDataSend, name: &str) -> bool {
+    node.attrs.iter().any(|(k, _)| k == name)
+}
+
+fn matches_pseudo_class(
+    pseudo: &PseudoClass,
+    idx: usize,
+    arena: &[NodeDataSend],
+    hovered_id: Option<&str>,
+    focused_id: Option<&str>,
+) -> bool {
+    let node = &arena[idx];
+    match pseudo {
+        PseudoClass::Hover => node.id.is_some() && node.id.as_deref() == hovered_id,
+        PseudoClass::Focus => node.id.is_some() && node.id.as_deref() == focused_id,
+        PseudoClass::Root => node.tag == "html",
+        PseudoClass::Not(inner) => !inner
+            .iter()
+            .any(|sel| matches_selector_arena(sel, idx, arena, hovered_id, focused_id)),
+        PseudoClass::Is(inner) => inner
+            .iter()
+            .any(|sel| matches_selector_arena(sel, idx, arena, hovered_id, focused_id)),
+        PseudoClass::FirstChild => element_siblings(idx, arena).1 == 0,
+        PseudoClass::LastChild => {
+            let (siblings, pos) = element_siblings(idx, arena);
+            pos + 1 == siblings.len()
+        }
+        PseudoClass::OnlyChild => element_siblings(idx, arena).0.len() == 1,
+        PseudoClass::FirstOfType | PseudoClass::LastOfType => {
+            let (siblings, _) = element_siblings(idx, arena);
+            let same_type: Vec<usize> = siblings
+                .into_iter()
+                .filter(|&c| arena[c].tag == node.tag)
+                .collect();
+            match pseudo {
+                PseudoClass::FirstOfType => same_type.first() == Some(&idx),
+                _ => same_type.last() == Some(&idx),
+            }
+        }
+        PseudoClass::NthChild(a, b) => {
+            // `:nth-child(an+b)` is 1-based, and n runs over the non-negative
+            // integers, so a match needs (position - b) to be a non-negative
+            // multiple of a. a == 0 degenerates to a single fixed position.
+            let position = element_siblings(idx, arena).1 as i32 + 1;
+            let offset = position - b;
+            if *a == 0 {
+                offset == 0
+            } else {
+                offset % a == 0 && offset / a >= 0
+            }
+        }
+        PseudoClass::AnyLink => node.tag == "a" && has_attr(node, "href"),
+        PseudoClass::Enabled => !has_attr(node, "disabled"),
+        PseudoClass::Disabled => has_attr(node, "disabled"),
+        PseudoClass::Checked => has_attr(node, "checked") || has_attr(node, "selected"),
+        PseudoClass::Empty => arena[idx].children_idx.is_empty(),
+        PseudoClass::Unsupported => false,
+    }
+}
+
 fn matches_selector_arena(selector: &Selector, idx: usize, arena: &[NodeDataSend], hovered_id: Option<&str>, focused_id: Option<&str>) -> bool {
     let node = &arena[idx];
     
-    let has_constraint = selector.tag.is_some() || selector.id.is_some() || !selector.class.is_empty() || !selector.attributes.is_empty() || selector.pseudo_class.is_some();
+    let has_constraint = selector.tag.is_some() || selector.id.is_some() || !selector.class.is_empty() || !selector.attributes.is_empty() || !selector.pseudo_classes.is_empty();
     if !has_constraint { return false; }
 
     if let Some(ref s_tag) = selector.tag {
@@ -227,15 +303,10 @@ fn matches_selector_arena(selector: &Selector, idx: usize, arena: &[NodeDataSend
     for s_class in &selector.class {
         if !node.classes.contains(s_class) { return false; }
     }
-    if let Some(ref pseudo) = selector.pseudo_class {
-        if pseudo == "hover" {
-            if Some(node.id.as_deref()) != Some(hovered_id) || node.id.is_none() { return false; }
-        } else if pseudo == "focus" {
-            if Some(node.id.as_deref()) != Some(focused_id) || node.id.is_none() { return false; }
-        } else if pseudo == "root" {
-            // :root matches the root element of the document — the <html> element.
-            if node.tag != "html" { return false; }
-        } else { return false; }
+    for pseudo in &selector.pseudo_classes {
+        if !matches_pseudo_class(pseudo, idx, arena, hovered_id, focused_id) {
+            return false;
+        }
     }
     for attr_sel in &selector.attributes {
         let mut matched = false;
@@ -644,6 +715,17 @@ fn build_final_tree(
                         "text-align",
                         "list-style-type",
                         "white-space",
+                        // `visibility` inherits, which is what lets a subtree be
+                        // hidden by setting it once on an ancestor — the form
+                        // sites actually use.
+                        "visibility",
+                        "text-indent",
+                        "letter-spacing",
+                        "word-spacing",
+                        "text-transform",
+                        "word-break",
+                        "overflow-wrap",
+                        "direction",
                     ];
                     for prop in inheritable {
                         let prop_arc = intern(prop);
@@ -966,6 +1048,8 @@ fn make_pseudo_styled_node(
     let inheritable = [
         "color", "font-size", "font-family", "font-weight",
         "font-style", "line-height", "text-align", "white-space",
+        "visibility", "text-indent", "letter-spacing", "word-spacing",
+        "text-transform", "word-break", "overflow-wrap", "direction",
     ];
     for prop in &inheritable {
         let key = intern(prop);

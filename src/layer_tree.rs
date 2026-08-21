@@ -326,6 +326,14 @@ impl LayerTreeBuilder {
                     // a mandatory per-glyph clip.
                     let next_clip = frame_clip;
 
+                    // A subtree clipped to nothing paints nothing. The
+                    // `clip: rect(0, 0, 0, 0)` + `position: absolute` pair is how
+                    // screen-reader-only text is kept out of the visual page, and
+                    // sites lean on it heavily for skip links and icon labels.
+                    if Self::is_clipped_away(frame_layout) {
+                        continue;
+                    }
+
                     // Skip zero-sized boxes but still visit children.
                     if d.width < 0.1 || d.height < 0.1 {
                         // Push children in reverse order so the first child is processed first.
@@ -356,7 +364,9 @@ impl LayerTreeBuilder {
                         tree.layers[frame_layer_id].child_layer_ids.push(new_id);
 
                         // Collect this box's paint commands into the new layer as BACKGROUND.
-                        Self::collect_paint_commands(frame_layout, &mut tree.layers[new_id], frame_clip, true);
+                        if !Self::is_visibility_hidden(frame_layout) {
+                            Self::collect_paint_commands(frame_layout, &mut tree.layers[new_id], frame_clip, true);
+                        }
 
                         // If overflow:hidden, emit PushClip before children and schedule PopClip after.
                         if overflow_hidden && !frame_layout.children.is_empty() {
@@ -377,7 +387,9 @@ impl LayerTreeBuilder {
                         }
                     } else {
                         // No trigger — paint into the current ancestor layer as CONTENT.
-                        Self::collect_paint_commands(frame_layout, &mut tree.layers[frame_layer_id], frame_clip, false);
+                        if !Self::is_visibility_hidden(frame_layout) {
+                            Self::collect_paint_commands(frame_layout, &mut tree.layers[frame_layer_id], frame_clip, false);
+                        }
 
                         // If overflow:hidden, emit PushClip before children and schedule PopClip after.
                         if overflow_hidden && !frame_layout.children.is_empty() {
@@ -402,11 +414,86 @@ impl LayerTreeBuilder {
     }
 
     /// Returns `true` if this box has `overflow: hidden` set.
+    ///
+    /// `overflow-x` / `overflow-y` count too: a box that clips on either axis is
+    /// clipped here, since this engine has no separate per-axis clip.
     fn has_overflow_hidden(layout: &LayoutBox) -> bool {
-        match layout.style_node.specified_values.get(&crate::css::intern("overflow")) {
-            Some(Value::Keyword(k)) => **k == *"hidden",
-            _ => false,
+        let sv = &layout.style_node.specified_values;
+        for prop in ["overflow", "overflow-x", "overflow-y"] {
+            if let Some(Value::Keyword(k)) = sv.get(&crate::css::intern(prop)) {
+                if matches!(&**k, "hidden" | "clip" | "scroll" | "auto") {
+                    return true;
+                }
+            }
         }
+        false
+    }
+
+    /// Returns `true` if `clip-path: inset(...)` leaves no area.
+    ///
+    /// `clip-path: inset(50%)` is the modern replacement for the `clip: rect(0,
+    /// 0, 0, 0)` visually-hidden idiom, so the degenerate case is worth
+    /// recognising even though general clip-path shapes are not supported.
+    fn is_clip_path_empty(layout: &LayoutBox) -> bool {
+        let Some(Value::Keyword(k)) = layout.style_node.specified_values.get(&crate::css::intern("clip-path")) else {
+            return false;
+        };
+        let text = k.to_lowercase();
+        let Some(args) = text.strip_prefix("inset(").and_then(|r| r.strip_suffix(')')) else {
+            return false;
+        };
+        let percents: Vec<f32> = args
+            .split_whitespace()
+            .take_while(|p| *p != "round")
+            .filter_map(|p| p.strip_suffix('%')?.parse::<f32>().ok())
+            .collect();
+        // inset() takes 1-4 values in the usual top/right/bottom/left order.
+        let (top, right, bottom, left) = match percents.as_slice() {
+            [all] => (*all, *all, *all, *all),
+            [tb, lr] => (*tb, *lr, *tb, *lr),
+            [t, lr, b] => (*t, *lr, *b, *lr),
+            [t, r, b, l] => (*t, *r, *b, *l),
+            _ => return false,
+        };
+        top + bottom >= 100.0 || left + right >= 100.0
+    }
+
+    /// Returns `true` if `visibility: hidden` hides this box's own painting.
+    ///
+    /// The box keeps its layout position and its children are still visited,
+    /// because `visibility` is inherited and a descendant can set it back to
+    /// `visible`.
+    fn is_visibility_hidden(layout: &LayoutBox) -> bool {
+        matches!(
+            layout.style_node.specified_values.get(&crate::css::intern("visibility")),
+            Some(Value::Keyword(k)) if matches!(&**k, "hidden" | "collapse")
+        )
+    }
+
+    /// Returns `true` if `clip` reduces this box to an empty region.
+    ///
+    /// Only the degenerate case is handled, because that is the one that carries
+    /// meaning on real pages: `clip: rect(0, 0, 0, 0)` is the visually-hidden
+    /// idiom. A non-empty `clip` rect is rare and is left unclipped rather than
+    /// guessed at.
+    fn is_clipped_away(layout: &LayoutBox) -> bool {
+        if Self::is_clip_path_empty(layout) {
+            return true;
+        }
+        let Some(Value::Keyword(k)) = layout.style_node.specified_values.get(&crate::css::intern("clip")) else {
+            return false;
+        };
+        let text = k.to_lowercase();
+        let Some(args) = text.strip_prefix("rect(").and_then(|r| r.strip_suffix(')')) else {
+            return false;
+        };
+        let nums: Vec<f32> = args
+            .split(|c| c == ',' || c == ' ')
+            .filter(|p| !p.is_empty())
+            .filter_map(|p| p.trim_end_matches("px").parse::<f32>().ok())
+            .collect();
+        // rect(top, right, bottom, left): empty when the edges cross or meet.
+        matches!(nums.as_slice(), [top, right, bottom, left] if right - left <= 0.0 || bottom - top <= 0.0)
     }
 
     /// Inspect a `LayoutBox`'s CSS properties and return the list of
@@ -593,16 +680,20 @@ impl LayerTreeBuilder {
                 },
                 _ => 0,
             };
-            commands.push(PaintCommand::Text {
-                rect: d,
-                text: contents.borrow().to_string(),
-                font_size,
-                color,
-                clip,
-                bold,
-                italic,
-                text_decoration,
-            });
+            // `font-size: 0` is a hiding idiom (and the way inline-block gaps are
+            // collapsed); there is no glyph to draw at zero pixels.
+            if font_size >= 0.5 {
+                commands.push(PaintCommand::Text {
+                    rect: d,
+                    text: contents.borrow().to_string(),
+                    font_size,
+                    color,
+                    clip,
+                    bold,
+                    italic,
+                    text_decoration,
+                });
+            }
         }
 
         // List item marker (• / ◦ / ▪ / "1." etc.)
