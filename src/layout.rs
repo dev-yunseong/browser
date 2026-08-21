@@ -303,6 +303,24 @@ fn measure_text_width(text: &str, font_size: f32, wrap_width: f32) -> f32 {
 
 /// Read a raw `px` value from `specified_values` for a single property.
 /// Returns 0.0 for anything that isn't an explicit pixel length.
+/// Read `aspect-ratio` as width-over-height, accepting both `16 / 9` and `1.777`.
+fn read_aspect_ratio(sn: &StyledNode) -> Option<f32> {
+    let value = sn.specified_values.get(&crate::css::intern("aspect-ratio"))?;
+    let ratio = match value {
+        Value::Number(n) => *n,
+        Value::Keyword(k) => {
+            let (w, h) = k.split_once('/')?;
+            let (w, h) = (w.trim().parse::<f32>().ok()?, h.trim().parse::<f32>().ok()?);
+            if h == 0.0 {
+                return None;
+            }
+            w / h
+        }
+        _ => return None,
+    };
+    (ratio > 0.0 && ratio.is_finite()).then_some(ratio)
+}
+
 fn read_px_direct(sn: &StyledNode, prop: &str) -> f32 {
     match sn.specified_values.get(&crate::css::intern(prop)) {
         Some(Value::Length(v, Unit::Px)) => *v,
@@ -863,6 +881,10 @@ impl<'a> LayoutBox<'a> {
             Some(Value::Length(v, Unit::Percent)) => container_width * (v / 100.0),
             Some(Value::Length(v, Unit::Vw)) => vw * (v / 100.0),
             Some(Value::Length(v, Unit::Vh)) => vh * (v / 100.0),
+            Some(v @ Value::Math(_)) => {
+                resolve_math_px(v, container_width, vw, vh, node_font_size(self.style_node))
+                    .unwrap_or(container_width)
+            }
             // CSS Intrinsic & Extrinsic Sizing Level 3
             Some(Value::Keyword(k)) if **k == *"min-content" => {
                 intrinsic_cache.min_content_width(self.style_node, vw, vh)
@@ -1020,9 +1042,14 @@ impl<'a> LayoutBox<'a> {
             if self.dimensions.width <= 0.0 {
                 self.dimensions.width = 150.0_f32.min(container_width);
             }
-            // Use CSS height if specified; otherwise derive a 2:3 placeholder from width.
+            // Use CSS height if specified; otherwise derive it from the image's
+            // aspect ratio. `aspect-ratio` is injected from the decoded bytes once
+            // the image has been fetched, so on the re-render after loading an
+            // `<img width=…>` takes its real proportions instead of a placeholder.
             let final_h = if height > 0.0 {
                 height
+            } else if let Some(ratio) = read_aspect_ratio(self.style_node) {
+                self.dimensions.width / ratio
             } else {
                 self.dimensions.width * 0.667
             };
@@ -2738,6 +2765,7 @@ fn resolve_offset(
         Some(Value::Length(v, Unit::Percent)) => Some(container_size * (v / 100.0)),
         Some(Value::Length(v, Unit::Vw)) => Some(vw * (v / 100.0)),
         Some(Value::Length(v, Unit::Vh)) => Some(vh * (v / 100.0)),
+        Some(v @ Value::Math(_)) => resolve_math_px(v, container_size, vw, vh, node_font_size(sn)),
         // Unitless 0 is a valid <length> in CSS (the only unitless length allowed).
         Some(Value::Number(v)) if *v == 0.0 => Some(0.0),
         Some(Value::Keyword(k)) if **k == *"auto" => None,
@@ -2813,6 +2841,28 @@ fn get_line_break_clear(sn: &StyledNode) -> Option<ClearValue> {
     None
 }
 
+/// Resolve a `calc()`/`clamp()` value that still holds a percentage.
+///
+/// Expressions without percentages are already folded to pixels during style
+/// computation; only the ones needing a containing-block basis reach here.
+fn resolve_math_px(value: &Value, cb: f32, vw: f32, vh: f32, font_size: f32) -> Option<f32> {
+    let Value::Math(expr) = value else { return None };
+    expr.resolve(&crate::css::MathContext {
+        viewport_width: vw,
+        viewport_height: vh,
+        font_size,
+        percent_basis: Some(cb),
+    })
+}
+
+/// The computed `font-size` of a node in pixels, for `em`-relative math.
+fn node_font_size(sn: &StyledNode) -> f32 {
+    match sn.specified_values.get(&crate::css::intern("font-size")) {
+        Some(Value::Length(v, Unit::Px)) => *v,
+        _ => 16.0,
+    }
+}
+
 fn get_prop(sn: &StyledNode, p1: &str, p2: &str, cw: f32, vw: f32, vh: f32) -> f32 {
     match sn
         .specified_values
@@ -2823,6 +2873,7 @@ fn get_prop(sn: &StyledNode, p1: &str, p2: &str, cw: f32, vw: f32, vh: f32) -> f
         Some(Value::Length(v, Unit::Percent)) => cw * (v / 100.0),
         Some(Value::Length(v, Unit::Vw)) => vw * (v / 100.0),
         Some(Value::Length(v, Unit::Vh)) => vh * (v / 100.0),
+        Some(v @ Value::Math(_)) => resolve_math_px(v, cw, vw, vh, node_font_size(sn)).unwrap_or(0.0),
         _ => 0.0,
     }
 }

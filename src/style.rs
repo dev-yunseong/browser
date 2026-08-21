@@ -566,6 +566,61 @@ pub fn build_style_tree(
     tree
 }
 
+/// Fold `calc()` / `clamp()` / `min()` / `max()` values in a computed style tree
+/// down to pixels.
+///
+/// This runs after style computation, where `em` is already resolved and the
+/// viewport is known, but before layout. Expressions containing a percentage are
+/// left in place: their basis is the containing block, which only layout knows,
+/// so they are resolved there instead of being guessed at here.
+pub fn resolve_math_values(node: &mut StyledNode, viewport_width: f32, viewport_height: f32) {
+    // Computed maps are shared and deduplicated between nodes, so an already
+    // resolved map is reused rather than rebuilt for every node that points at it.
+    let mut resolved: HashMap<usize, PropertyMap> = HashMap::new();
+    let mut stack: Vec<*mut StyledNode> = vec![node as *mut StyledNode];
+
+    // SAFETY: each pointer comes from a live &mut and is visited exactly once,
+    // so no two mutable references to the same node exist at the same time.
+    while let Some(ptr) = stack.pop() {
+        let node = unsafe { &mut *ptr };
+        let key = Arc::as_ptr(&node.specified_values.0) as usize;
+
+        if let Some(cached) = resolved.get(&key) {
+            node.specified_values = cached.clone();
+        } else if node.specified_values.values().any(|v| matches!(v, Value::Math(_))) {
+            let font_size = match node.specified_values.get(&intern("font-size")) {
+                Some(Value::Length(v, crate::css::Unit::Px)) => *v,
+                _ => 16.0,
+            };
+            let ctx = crate::css::MathContext {
+                viewport_width,
+                viewport_height,
+                font_size,
+                percent_basis: None,
+            };
+            let mut map = (*node.specified_values.0).clone();
+            for value in map.values_mut() {
+                let Value::Math(expr) = value else { continue };
+                // A percentage needs the containing block, which only layout
+                // knows; those expressions stay put and are resolved there.
+                if expr.needs_percent_basis() {
+                    continue;
+                }
+                if let Some(px) = expr.resolve(&ctx) {
+                    *value = Value::Length(px, crate::css::Unit::Px);
+                }
+            }
+            let new_map = PropertyMap(Arc::new(map));
+            resolved.insert(key, new_map.clone());
+            node.specified_values = new_map;
+        }
+
+        for child in node.children.iter_mut() {
+            stack.push(child as *mut StyledNode);
+        }
+    }
+}
+
 /// Returns the CSS initial value for a given property name, or `None` if not defined here.
 /// Only properties that can be set to `initial` keyword need an entry.
 fn initial_value(prop: &str) -> Option<Value> {
@@ -981,45 +1036,151 @@ fn parse_legacy_length_attr(value: &str) -> Option<Value> {
 
 // ── Pseudo-element injection ──────────────────────────────────────────────────
 
-/// Check whether a CSS selector (ignoring its `pseudo_element` field) matches a
-/// styled element node.  This is a simplified match: it only checks the
-/// rightmost part of the selector (tag / id / class) and does not walk ancestor
-/// combinators.  This is sufficient for the most common pseudo-element patterns
-/// (`p::before`, `.clearfix::after`, `div.foo::before`, etc.).
-///
-/// Returns `true` when the selector base matches `node`.
-fn selector_base_matches_element(sel: &crate::css::Selector, node: &StyledNode) -> bool {
-    use crate::css::Selector;
-    let (tag, id, classes) = match &node.node.data {
-        NodeData::Element { ref name, ref attrs, .. } => {
-            let t = name.local.to_string();
-            let mut id: Option<String> = None;
-            let mut classes: Vec<String> = Vec::new();
-            for attr in attrs.borrow().iter() {
-                let k = attr.name.local.to_string();
-                let v = attr.value.to_string();
-                if k == "id" { id = Some(v.clone()); }
-                if k == "class" {
-                    classes = v.split_whitespace().map(|s| s.to_string()).collect();
-                }
-            }
-            (t, id, classes)
-        }
-        _ => return false, // Only elements can have pseudo-elements
+/// Tag, id and classes of a DOM handle, or `None` if it is not an element.
+fn element_info(handle: &Handle) -> Option<(String, Option<String>, Vec<String>)> {
+    let NodeData::Element { ref name, ref attrs, .. } = handle.data else {
+        return None;
     };
+    let mut id = None;
+    let mut classes = Vec::new();
+    for attr in attrs.borrow().iter() {
+        match attr.name.local.as_ref() {
+            "id" => id = Some(attr.value.to_string()),
+            "class" => classes = attr.value.split_whitespace().map(str::to_string).collect(),
+            _ => {}
+        }
+    }
+    Some((name.local.to_string(), id, classes))
+}
 
-    if let Some(ref s_tag) = sel.tag {
-        if *s_tag != tag { return false; }
+fn parent_element(handle: &Handle) -> Option<Handle> {
+    let weak = handle.parent.take();
+    let parent = weak.as_ref().and_then(|w| w.upgrade());
+    handle.parent.set(weak);
+    parent.filter(|p| matches!(p.data, NodeData::Element { .. }))
+}
+
+/// Element siblings of `handle` in document order, and its index among them.
+fn element_sibling_position(handle: &Handle) -> Option<(usize, usize)> {
+    let parent = parent_element(handle)?;
+    let children = parent.children.borrow();
+    let elements: Vec<&Handle> = children
+        .iter()
+        .filter(|c| matches!(c.data, NodeData::Element { .. }))
+        .collect();
+    let index = elements.iter().position(|c| std::rc::Rc::ptr_eq(c, handle))?;
+    Some((index, elements.len()))
+}
+
+/// Match one compound selector (no combinators) against a DOM element.
+fn compound_matches_element(sel: &Selector, handle: &Handle) -> bool {
+    let Some((tag, id, classes)) = element_info(handle) else {
+        return false;
+    };
+    if sel.tag.as_ref().is_some_and(|t| *t != tag) {
+        return false;
     }
-    if let Some(ref s_id) = sel.id {
-        if id.as_deref() != Some(s_id) { return false; }
+    if sel.id.as_ref().is_some_and(|i| id.as_deref() != Some(i)) {
+        return false;
     }
-    for s_class in &sel.class {
-        if !classes.contains(s_class) { return false; }
+    if sel.class.iter().any(|c| !classes.contains(c)) {
+        return false;
+    }
+    for attr_sel in &sel.attributes {
+        let NodeData::Element { ref attrs, .. } = handle.data else {
+            return false;
+        };
+        let matched = attrs.borrow().iter().any(|a| {
+            a.name.local.as_ref() == attr_sel.name
+                && match &attr_sel.value {
+                    crate::css::AttributeMatch::Exists => true,
+                    crate::css::AttributeMatch::Equals(v) => a.value.as_ref() == v,
+                }
+        });
+        if !matched {
+            return false;
+        }
+    }
+    for pseudo in &sel.pseudo_classes {
+        let ok = match pseudo {
+            PseudoClass::Not(inner) => !inner.iter().any(|s| selector_matches_element(s, handle)),
+            PseudoClass::Is(inner) => inner.iter().any(|s| selector_matches_element(s, handle)),
+            PseudoClass::Root => tag == "html",
+            PseudoClass::FirstChild => element_sibling_position(handle).is_some_and(|(i, _)| i == 0),
+            PseudoClass::LastChild => element_sibling_position(handle).is_some_and(|(i, n)| i + 1 == n),
+            PseudoClass::OnlyChild => element_sibling_position(handle).is_some_and(|(_, n)| n == 1),
+            PseudoClass::NthChild(a, b) => element_sibling_position(handle).is_some_and(|(i, _)| {
+                let offset = i as i32 + 1 - b;
+                if *a == 0 { offset == 0 } else { offset % a == 0 && offset / a >= 0 }
+            }),
+            // Interactive and unimplemented states do not apply to a freshly
+            // rendered page, so their rules must not be injected.
+            _ => false,
+        };
+        if !ok {
+            return false;
+        }
     }
     // Require at least one constraint to avoid matching everything with `*::before`.
-    let has_constraint = sel.tag.is_some() || sel.id.is_some() || !sel.class.is_empty();
-    has_constraint
+    sel.tag.is_some()
+        || sel.id.is_some()
+        || !sel.class.is_empty()
+        || !sel.attributes.is_empty()
+        || !sel.pseudo_classes.is_empty()
+}
+
+/// Check whether a CSS selector (ignoring its `pseudo_element` field) matches a
+/// DOM element, ancestor combinators included.
+///
+/// Walking the combinators matters as much here as it does for ordinary rules:
+/// matching only the rightmost compound turns `.markdown-body sup>a::before {
+/// content: "[" }` into a rule that brackets every link on the page.
+fn selector_matches_element(sel: &Selector, handle: &Handle) -> bool {
+    if !compound_matches_element(sel, handle) {
+        return false;
+    }
+    let Some(ancestor_sel) = sel.ancestor.as_ref() else {
+        return true;
+    };
+    match sel.combinator.as_ref().unwrap_or(&Combinator::Descendant) {
+        Combinator::Descendant => {
+            let mut current = parent_element(handle);
+            while let Some(node) = current {
+                if selector_matches_element(ancestor_sel, &node) {
+                    return true;
+                }
+                current = parent_element(&node);
+            }
+            false
+        }
+        Combinator::Child => parent_element(handle)
+            .is_some_and(|p| selector_matches_element(ancestor_sel, &p)),
+        Combinator::NextSibling | Combinator::SubsequentSibling => {
+            let Some(parent) = parent_element(handle) else {
+                return false;
+            };
+            let children = parent.children.borrow();
+            let elements: Vec<&Handle> = children
+                .iter()
+                .filter(|c| matches!(c.data, NodeData::Element { .. }))
+                .collect();
+            let Some(index) = elements.iter().position(|c| std::rc::Rc::ptr_eq(c, handle)) else {
+                return false;
+            };
+            match sel.combinator.as_ref().unwrap_or(&Combinator::Descendant) {
+                Combinator::NextSibling => index
+                    .checked_sub(1)
+                    .is_some_and(|i| selector_matches_element(ancestor_sel, elements[i])),
+                _ => elements[..index]
+                    .iter()
+                    .any(|c| selector_matches_element(ancestor_sel, c)),
+            }
+        }
+    }
+}
+
+fn selector_base_matches_element(sel: &Selector, node: &StyledNode) -> bool {
+    selector_matches_element(sel, &node.node)
 }
 
 /// Build a synthetic `StyledNode` that acts as a pseudo-element.

@@ -90,6 +90,92 @@ pub enum Value {
     RawCustomProp(Arc<str>),
     /// CSS gradient: `linear-gradient(...)` or `radial-gradient(...)`.
     Gradient(GradientValue),
+    /// An unevaluated `calc()` / `clamp()` / `min()` / `max()` expression.
+    ///
+    /// These cannot be folded at parse time because their operands may be
+    /// viewport- or container-relative, so the tree is kept and resolved once
+    /// those sizes are known.
+    Math(MathExpr),
+}
+
+/// A parsed CSS math expression.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MathExpr {
+    /// A leaf length or plain number.
+    Value(f32, Option<Unit>),
+    Add(Box<MathExpr>, Box<MathExpr>),
+    Sub(Box<MathExpr>, Box<MathExpr>),
+    Mul(Box<MathExpr>, Box<MathExpr>),
+    Div(Box<MathExpr>, Box<MathExpr>),
+    Min(Vec<MathExpr>),
+    Max(Vec<MathExpr>),
+    /// `clamp(min, preferred, max)`.
+    Clamp(Box<MathExpr>, Box<MathExpr>, Box<MathExpr>),
+}
+
+/// The lengths a math expression may be resolved against.
+#[derive(Debug, Clone, Copy)]
+pub struct MathContext {
+    pub viewport_width: f32,
+    pub viewport_height: f32,
+    pub font_size: f32,
+    /// Basis for percentages, or `None` when it is not yet known — an expression
+    /// containing a percentage then stays unresolved rather than guessing.
+    pub percent_basis: Option<f32>,
+}
+
+impl MathExpr {
+    /// Evaluate to pixels, or `None` if an operand cannot be resolved yet.
+    pub fn resolve(&self, ctx: &MathContext) -> Option<f32> {
+        match self {
+            MathExpr::Value(n, unit) => match unit {
+                None | Some(Unit::Px) => Some(*n),
+                Some(Unit::Em) => Some(n * ctx.font_size),
+                Some(Unit::Vw) => Some(ctx.viewport_width * (n / 100.0)),
+                Some(Unit::Vh) => Some(ctx.viewport_height * (n / 100.0)),
+                Some(Unit::Percent) => ctx.percent_basis.map(|b| b * (n / 100.0)),
+                Some(Unit::Fr) => None,
+            },
+            MathExpr::Add(a, b) => Some(a.resolve(ctx)? + b.resolve(ctx)?),
+            MathExpr::Sub(a, b) => Some(a.resolve(ctx)? - b.resolve(ctx)?),
+            MathExpr::Mul(a, b) => Some(a.resolve(ctx)? * b.resolve(ctx)?),
+            MathExpr::Div(a, b) => {
+                let divisor = b.resolve(ctx)?;
+                if divisor == 0.0 { None } else { Some(a.resolve(ctx)? / divisor) }
+            }
+            MathExpr::Min(args) => args
+                .iter()
+                .map(|a| a.resolve(ctx))
+                .collect::<Option<Vec<f32>>>()?
+                .into_iter()
+                .reduce(f32::min),
+            MathExpr::Max(args) => args
+                .iter()
+                .map(|a| a.resolve(ctx))
+                .collect::<Option<Vec<f32>>>()?
+                .into_iter()
+                .reduce(f32::max),
+            MathExpr::Clamp(lo, val, hi) => {
+                let (lo, val, hi) = (lo.resolve(ctx)?, val.resolve(ctx)?, hi.resolve(ctx)?);
+                // Per spec clamp() is max(lo, min(val, hi)), so a lo above hi wins.
+                Some(val.min(hi).max(lo))
+            }
+        }
+    }
+
+    /// `true` if any leaf is a percentage, i.e. resolution needs a basis.
+    pub fn needs_percent_basis(&self) -> bool {
+        match self {
+            MathExpr::Value(_, unit) => matches!(unit, Some(Unit::Percent)),
+            MathExpr::Add(a, b) | MathExpr::Sub(a, b) | MathExpr::Mul(a, b) | MathExpr::Div(a, b) => {
+                a.needs_percent_basis() || b.needs_percent_basis()
+            }
+            MathExpr::Min(args) | MathExpr::Max(args) => args.iter().any(Self::needs_percent_basis),
+            MathExpr::Clamp(a, b, c) => {
+                a.needs_percent_basis() || b.needs_percent_basis() || c.needs_percent_basis()
+            }
+        }
+    }
 }
 
 impl Eq for Value {}
@@ -114,6 +200,9 @@ impl Hash for Value {
             }
             Value::RawCustomProp(s) => s.hash(state),
             Value::Gradient(g) => g.hash(state),
+            // The tree is hashed by its debug form: math values are rare and this
+            // avoids a hand-written Hash for every operator.
+            Value::Math(expr) => format!("{expr:?}").hash(state),
         }
     }
 }
@@ -1379,6 +1468,156 @@ fn auto_distribute_stops(mut stops: Vec<CssColorStop>) -> Vec<CssColorStop> {
     stops
 }
 
+/// Parse a CSS math function (`calc()`, `clamp()`, `min()`, `max()`) into an
+/// expression tree, or `None` if it is not one or cannot be understood.
+pub fn parse_math_function(val: &str) -> Option<MathExpr> {
+    let trimmed = val.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    for name in ["calc(", "clamp(", "min(", "max("] {
+        if !lower.starts_with(name) {
+            continue;
+        }
+        let inner = trimmed.get(name.len()..)?.strip_suffix(')')?;
+        return match name {
+            "calc(" => parse_math_sum(inner),
+            "clamp(" => {
+                let args = split_math_args(inner);
+                let [lo, val, hi] = args.as_slice() else { return None };
+                Some(MathExpr::Clamp(
+                    Box::new(parse_math_sum(lo)?),
+                    Box::new(parse_math_sum(val)?),
+                    Box::new(parse_math_sum(hi)?),
+                ))
+            }
+            _ => {
+                let args: Option<Vec<MathExpr>> =
+                    split_math_args(inner).iter().map(|a| parse_math_sum(a)).collect();
+                let args = args?;
+                if args.is_empty() {
+                    return None;
+                }
+                Some(if name == "min(" { MathExpr::Min(args) } else { MathExpr::Max(args) })
+            }
+        };
+    }
+    None
+}
+
+/// Split comma-separated arguments of a math function, ignoring commas nested
+/// inside another function call.
+fn split_math_args(inner: &str) -> Vec<&str> {
+    let mut args = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, b) in inner.bytes().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                args.push(inner[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    args.push(inner[start..].trim());
+    args.into_iter().filter(|a| !a.is_empty()).collect()
+}
+
+/// `<sum> := <product> (('+' | '-') <product>)*`
+///
+/// Scanned right to left so the left-associative tree comes out with the
+/// rightmost operator at the root. `+` and `-` require surrounding whitespace in
+/// CSS, which is what keeps them apart from a sign on a number.
+fn parse_math_sum(expr: &str) -> Option<MathExpr> {
+    let expr = expr.trim();
+    if let Some((lhs, op, rhs)) = split_top_level_operator(expr, &[b'+', b'-'], true) {
+        let (l, r) = (parse_math_sum(lhs)?, parse_math_product(rhs)?);
+        return Some(if op == b'+' {
+            MathExpr::Add(Box::new(l), Box::new(r))
+        } else {
+            MathExpr::Sub(Box::new(l), Box::new(r))
+        });
+    }
+    parse_math_product(expr)
+}
+
+/// `<product> := <term> (('*' | '/') <term>)*`
+fn parse_math_product(expr: &str) -> Option<MathExpr> {
+    let expr = expr.trim();
+    if let Some((lhs, op, rhs)) = split_top_level_operator(expr, &[b'*', b'/'], false) {
+        let (l, r) = (parse_math_product(lhs)?, parse_math_term(rhs)?);
+        return Some(if op == b'*' {
+            MathExpr::Mul(Box::new(l), Box::new(r))
+        } else {
+            MathExpr::Div(Box::new(l), Box::new(r))
+        });
+    }
+    parse_math_term(expr)
+}
+
+/// Find the last top-level occurrence of one of `ops` and split there.
+///
+/// `require_space` marks the additive operators, which CSS requires to be
+/// surrounded by whitespace precisely so `10px -5px` cannot be read as a
+/// subtraction and `calc(1px + -2px)` stays unambiguous.
+fn split_top_level_operator<'a>(
+    expr: &'a str,
+    ops: &[u8],
+    require_space: bool,
+) -> Option<(&'a str, u8, &'a str)> {
+    let bytes = expr.as_bytes();
+    let mut depth = 0usize;
+    for i in (0..bytes.len()).rev() {
+        match bytes[i] {
+            b')' => depth += 1,
+            b'(' => depth = depth.saturating_sub(1),
+            b if depth == 0 && ops.contains(&b) => {
+                if require_space {
+                    let spaced = i > 0
+                        && bytes[i - 1].is_ascii_whitespace()
+                        && bytes.get(i + 1).is_some_and(|c| c.is_ascii_whitespace());
+                    if !spaced {
+                        continue;
+                    }
+                } else if i == 0 {
+                    continue;
+                }
+                return Some((&expr[..i], b, &expr[i + 1..]));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `<term> := <number><unit> | '(' <sum> ')' | <math-function>`
+fn parse_math_term(expr: &str) -> Option<MathExpr> {
+    let expr = expr.trim();
+    if let Some(inner) = expr.strip_prefix('(').and_then(|e| e.strip_suffix(')')) {
+        return parse_math_sum(inner);
+    }
+    if let Some(nested) = parse_math_function(expr) {
+        return Some(nested);
+    }
+    let lower = expr.to_ascii_lowercase();
+    for (suffix, unit) in [
+        ("px", Some(Unit::Px)),
+        ("rem", Some(Unit::Em)),
+        ("em", Some(Unit::Em)),
+        ("vw", Some(Unit::Vw)),
+        ("vh", Some(Unit::Vh)),
+        ("vmin", Some(Unit::Vw)),
+        ("vmax", Some(Unit::Vw)),
+        ("%", Some(Unit::Percent)),
+    ] {
+        if let Some(num) = lower.strip_suffix(suffix) {
+            return num.trim().parse::<f32>().ok().map(|n| MathExpr::Value(n, unit));
+        }
+    }
+    lower.parse::<f32>().ok().map(|n| MathExpr::Value(n, None))
+}
+
 pub fn parse_value(val: &str) -> Value {
     let val = val.trim();
     // Strip !important
@@ -1415,6 +1654,12 @@ pub fn parse_value(val: &str) -> Value {
             let fallback = fallback_str.map(|fb| Box::new(parse_value(fb)));
             return Value::CssVar { name: intern(name_str), fallback };
         }
+    }
+
+    // calc() / clamp() / min() / max(): kept as an expression until the viewport
+    // and container sizes needed to evaluate them are known.
+    if let Some(expr) = parse_math_function(val) {
+        return Value::Math(expr);
     }
 
     // gradient: linear-gradient(...) or radial-gradient(...)

@@ -688,7 +688,7 @@ pub fn process_html_with_cache(
     };
 
     let start = Instant::now();
-    let style_tree = style::build_style_tree(
+    let mut style_tree = style::build_style_tree(
         &dom_tree.document,
         &stylesheet,
         None,
@@ -697,11 +697,13 @@ pub fn process_html_with_cache(
         focused_id,
         csp_policy.as_ref(),
     );
+    style::resolve_math_values(&mut style_tree, width, VIEWPORT_HEIGHT);
+    inject_image_aspect_ratios(&mut style_tree, image_cache);
     let style_elapsed = start.elapsed();
 
     let start = Instant::now();
     let (layout_tree_opt, _, final_y) =
-        layout::build_layout_tree(&style_tree, 0.0, 0.0, 0.0, width, width, 768.0);
+        layout::build_layout_tree(&style_tree, 0.0, 0.0, 0.0, width, width, VIEWPORT_HEIGHT);
     let layout_tree = layout_tree_opt.ok_or("Failed to build layout tree")?;
     let layout_elapsed = start.elapsed();
 
@@ -712,7 +714,12 @@ pub fn process_html_with_cache(
     let mut pixmap = tiny_skia::Pixmap::new(w_u32, height)
         .ok_or_else(|| format!("Failed to create pixmap with size {}x{}", w_u32, height))?;
 
-    pixmap.fill(tiny_skia::Color::WHITE);
+    // The canvas takes its colour from <html>, or from <body> when <html> has
+    // none. CSS propagates the body background to the canvas so it covers the
+    // whole page rather than just the body box, and a page whose palette is a
+    // near-white grey looks obviously wrong against a hard white canvas.
+    let canvas = canvas_background(&style_tree).unwrap_or(tiny_skia::Color::WHITE);
+    pixmap.fill(canvas);
 
     let mut links: Vec<(layout::Rect, String)> = Vec::new();
     let mut form_controls = Vec::new();
@@ -1102,6 +1109,11 @@ impl BrowserEngine {
 
     fn cache_missing_images(&mut self, image_urls: &[String]) -> bool {
         self.cache_missing_images_with(image_urls, |url| {
+            // A `data:` URI carries its own bytes; going to the network for one
+            // fails, which is why inline images rendered as empty boxes.
+            if let Some(bytes) = decode_data_uri(url) {
+                return Ok(bytes);
+            }
             let response = reqwest::blocking::get(url).map_err(|e| e.to_string())?;
             let bytes = response.bytes().map_err(|e| e.to_string())?;
             Ok(bytes.to_vec())
@@ -1625,6 +1637,109 @@ fn hit_test(x: f32, y: f32, r: &layout::Rect) -> bool {
 }
 
 // ── Engine actor ──────────────────────────────────────────────────────────────
+
+
+/// Decode a `data:` URI into its bytes, or `None` if this is not one.
+///
+/// Only the base64 form is decoded; percent-encoded data URIs are left to the
+/// normal fetch path, which resolves them the same way a URL would.
+fn decode_data_uri(url: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    let rest = url.strip_prefix("data:").or_else(|| url.strip_prefix("DATA:"))?;
+    let (meta, payload) = rest.split_once(',')?;
+    if !meta.to_ascii_lowercase().ends_with("base64") {
+        return None;
+    }
+    // Inline images are often wrapped across lines in HTML source.
+    let cleaned: String = payload.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    base64::engine::general_purpose::STANDARD.decode(cleaned).ok()
+}
+
+/// Give every `<img>` whose bytes are already cached an `aspect-ratio` matching
+/// the decoded image.
+///
+/// Layout has no access to the image cache, so without this an image sized by
+/// width alone has to guess its height. Expressing the intrinsic proportions as
+/// a normal CSS property keeps that guess out of the layout code and makes the
+/// second render — the one after the images finish loading — correct.
+fn inject_image_aspect_ratios(
+    node: &mut style::StyledNode,
+    image_cache: &HashMap<String, Vec<u8>>,
+) {
+    if image_cache.is_empty() {
+        return;
+    }
+    let mut stack: Vec<*mut style::StyledNode> = vec![node as *mut style::StyledNode];
+    // SAFETY: each pointer comes from a live &mut and is visited exactly once.
+    while let Some(ptr) = stack.pop() {
+        let node = unsafe { &mut *ptr };
+        if let Some(ratio) = decoded_aspect_ratio(node, image_cache) {
+            let key = css::intern("aspect-ratio");
+            if !node.specified_values.contains_key(&key) {
+                let mut map = (*node.specified_values.0).clone();
+                map.insert(key, css::Value::Number(ratio));
+                node.specified_values = style::PropertyMap(std::sync::Arc::new(map));
+            }
+        }
+        for child in node.children.iter_mut() {
+            stack.push(child as *mut style::StyledNode);
+        }
+    }
+}
+
+/// Width-over-height of the cached bytes behind an `<img>`, if it is one.
+fn decoded_aspect_ratio(
+    node: &style::StyledNode,
+    image_cache: &HashMap<String, Vec<u8>>,
+) -> Option<f32> {
+    let markup5ever_rcdom::NodeData::Element { ref name, ref attrs, .. } = node.node.data else {
+        return None;
+    };
+    if name.local.as_ref() != "img" {
+        return None;
+    }
+    let src = attrs
+        .borrow()
+        .iter()
+        .find(|a| a.name.local.as_ref() == "src")
+        .map(|a| a.value.to_string())?;
+    let bytes = image_cache.get(&src)?;
+    let (w, h) = image::load_from_memory(bytes)
+        .ok()
+        .map(|img| (img.width() as f32, img.height() as f32))?;
+    (h > 0.0).then(|| w / h)
+}
+
+/// The background colour the page canvas should be painted with.
+///
+/// Per CSS backgrounds, the root element's background is propagated to the
+/// canvas, and when the root has none the body's is used instead.
+fn canvas_background(style_tree: &style::StyledNode) -> Option<tiny_skia::Color> {
+    fn find<'a>(node: &'a style::StyledNode, tag: &str) -> Option<&'a style::StyledNode> {
+        if let markup5ever_rcdom::NodeData::Element { ref name, .. } = node.node.data {
+            if name.local.as_ref() == tag {
+                return Some(node);
+            }
+        }
+        node.children.iter().find_map(|c| find(c, tag))
+    }
+    fn background(node: &style::StyledNode) -> Option<tiny_skia::Color> {
+        let key = css::intern("background-color");
+        let Some(css::Value::Color(c)) = node.specified_values.get(&key) else {
+            return None;
+        };
+        (c.a > 0).then(|| tiny_skia::Color::from_rgba8(c.r, c.g, c.b, c.a))
+    }
+    find(style_tree, "html")
+        .and_then(background)
+        .or_else(|| find(style_tree, "body").and_then(background))
+}
+
+/// Viewport height assumed when resolving `vh` units and viewport-relative math.
+///
+/// Rendering is a full-page raster with no scrolling, so there is no real
+/// viewport height to read; this is the height the layout is measured against.
+const VIEWPORT_HEIGHT: f32 = 768.0;
 
 use std::sync::mpsc;
 
