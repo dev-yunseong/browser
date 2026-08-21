@@ -1,0 +1,14 @@
+{
+  "name": "browser-parity-tools",
+  "private": true,
+  "type": "module",
+  "description": "Chromium reference capture and pixel-diff tooling for visual parity work.",
+  "scripts": {
+    "capture": "node capture.mjs"
+  },
+  "dependencies": {
+    "pixelmatch": "^7.1.0",
+    "playwright": "^1.49.0",
+    "pngjs": "^7.0.0"
+  }
+}
