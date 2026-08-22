@@ -12,6 +12,11 @@
   .chained { color: var(--a, var(--b, #f0f)); }
   .fallback { color: var(--nope, #0a0); }
   section { padding: 6px 12px; }
+  /* Arithmetic on a custom property — how spacing scales are derived. */
+  :root { --gutter: 48px; --half: calc(var(--gutter) / 2); }
+  .calcpad { padding-left: calc(var(--gutter) * .5); background: #eef; }
+  .calcnested { margin-left: var(--half); background: #efe; }
+  .calcclamp { width: clamp(120px, calc(var(--gutter) * 6), 400px); background: #fee; }
 </style>
 </head>
 <body>
@@ -22,6 +27,9 @@
     </div>
     <section><p class="chained">CHAINED fallback should be magenta</p></section>
     <section><p class="fallback">FALLBACK should be green</p></section>
+    <section><p class="calcpad">calc(var * .5) padding should be 24px</p></section>
+    <section><p class="calcnested">nested calc var margin should be 24px</p></section>
+    <section><p class="calcclamp">clamp with calc(var) should be 288px wide</p></section>
   </div>
 </body>
 </html>

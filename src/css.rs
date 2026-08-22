@@ -111,6 +111,13 @@ pub enum MathExpr {
     Max(Vec<MathExpr>),
     /// `clamp(min, preferred, max)`.
     Clamp(Box<MathExpr>, Box<MathExpr>, Box<MathExpr>),
+    /// An unresolved `var(--name, fallback)` operand.
+    ///
+    /// Design systems keep their spacing scale in custom properties and then do
+    /// arithmetic on it — `calc(var(--gutter) * .5)` is the single most common
+    /// shape. The reference has to survive parsing so it can be substituted once
+    /// the custom properties for that element are known.
+    Var(Arc<str>, Option<Box<MathExpr>>),
 }
 
 /// The lengths a math expression may be resolved against.
@@ -163,6 +170,8 @@ impl MathExpr {
                 // Per spec clamp() is max(lo, min(val, hi)), so a lo above hi wins.
                 Some(val.min(hi).max(lo))
             }
+            // An unsubstituted variable has no value; the expression stays put.
+            MathExpr::Var(_, fallback) => fallback.as_ref().and_then(|f| f.resolve(ctx)),
         }
     }
 
@@ -177,8 +186,61 @@ impl MathExpr {
             MathExpr::Clamp(a, b, c) => {
                 a.needs_percent_basis() || b.needs_percent_basis() || c.needs_percent_basis()
             }
+            MathExpr::Var(_, fallback) => fallback.as_ref().is_some_and(|f| f.needs_percent_basis()),
         }
     }
+
+    /// Replace `var()` operands using the element's custom properties.
+    ///
+    /// `lookup` returns the raw text of a custom property, which is parsed as a
+    /// math operand so a variable holding `calc(...)` composes too. A name that
+    /// does not resolve keeps its fallback, or stays a `Var` and leaves the whole
+    /// expression unresolved — which is the same outcome the property would have
+    /// had if the variable were missing.
+    pub fn substitute_vars(&self, lookup: &dyn Fn(&str) -> Option<String>) -> MathExpr {
+        let sub = |e: &MathExpr| Box::new(e.substitute_vars(lookup));
+        match self {
+            MathExpr::Value(n, unit) => MathExpr::Value(*n, unit.clone()),
+            MathExpr::Add(a, b) => MathExpr::Add(sub(a), sub(b)),
+            MathExpr::Sub(a, b) => MathExpr::Sub(sub(a), sub(b)),
+            MathExpr::Mul(a, b) => MathExpr::Mul(sub(a), sub(b)),
+            MathExpr::Div(a, b) => MathExpr::Div(sub(a), sub(b)),
+            MathExpr::Min(args) => MathExpr::Min(args.iter().map(|a| a.substitute_vars(lookup)).collect()),
+            MathExpr::Max(args) => MathExpr::Max(args.iter().map(|a| a.substitute_vars(lookup)).collect()),
+            MathExpr::Clamp(a, b, c) => MathExpr::Clamp(sub(a), sub(b), sub(c)),
+            MathExpr::Var(name, fallback) => {
+                if let Some(text) = lookup(name) {
+                    if let Some(expr) = parse_math_operand(&text) {
+                        return expr.substitute_vars(lookup);
+                    }
+                }
+                match fallback {
+                    Some(f) => f.substitute_vars(lookup),
+                    None => MathExpr::Var(name.clone(), None),
+                }
+            }
+        }
+    }
+
+    /// `true` if any operand is still an unresolved variable.
+    pub fn has_unresolved_var(&self) -> bool {
+        match self {
+            MathExpr::Value(..) => false,
+            MathExpr::Add(a, b) | MathExpr::Sub(a, b) | MathExpr::Mul(a, b) | MathExpr::Div(a, b) => {
+                a.has_unresolved_var() || b.has_unresolved_var()
+            }
+            MathExpr::Min(args) | MathExpr::Max(args) => args.iter().any(Self::has_unresolved_var),
+            MathExpr::Clamp(a, b, c) => {
+                a.has_unresolved_var() || b.has_unresolved_var() || c.has_unresolved_var()
+            }
+            MathExpr::Var(..) => true,
+        }
+    }
+}
+
+/// Parse a single math operand: a length, a nested math function, or a `var()`.
+pub fn parse_math_operand(text: &str) -> Option<MathExpr> {
+    parse_math_sum(text.trim())
 }
 
 impl Eq for Value {}
@@ -1789,6 +1851,12 @@ fn parse_math_term(expr: &str) -> Option<MathExpr> {
     }
     if let Some(nested) = parse_math_function(expr) {
         return Some(nested);
+    }
+    if let Some(inner) = expr.strip_prefix("var(").and_then(|e| e.strip_suffix(')')) {
+        let mut args = split_math_args(inner);
+        let name = args.remove(0).trim();
+        let fallback = args.first().and_then(|f| parse_math_sum(f)).map(Box::new);
+        return Some(MathExpr::Var(intern(name), fallback));
     }
     let lower = expr.to_ascii_lowercase();
     for (suffix, unit) in [

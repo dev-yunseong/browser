@@ -933,6 +933,22 @@ fn build_final_tree(
                                 }
                             })
                         }
+                        // A math expression may name custom properties —
+                        // `calc(var(--gutter) * .5)` is how design systems derive
+                        // one spacing step from another — so substitute them while
+                        // this element's properties are in hand. Folding to pixels
+                        // happens later, once the viewport is known.
+                        Value::Math(expr) => {
+                            let substituted = expr.substitute_vars(&|name| {
+                                match custom_props.get(&intern(name)) {
+                                    Some(Value::RawCustomProp(raw)) => Some(raw.to_string()),
+                                    Some(Value::Length(v, crate::css::Unit::Px)) => Some(format!("{v}px")),
+                                    Some(Value::Number(v)) => Some(v.to_string()),
+                                    _ => None,
+                                }
+                            });
+                            Some(Value::Math(substituted))
+                        }
                         // `em` resolves against this element's own font size; `rem`
                         // against the root's, which is what keeps a design system's
                         // spacing scale from compounding inside nested text.
