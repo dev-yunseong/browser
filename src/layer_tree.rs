@@ -724,6 +724,51 @@ impl LayerTreeBuilder {
             }
         }
 
+        // Outline: drawn just outside the border box, and taking no space in
+        // layout — which is what separates it from a border.
+        {
+            let width = match sv.get(&crate::css::intern("outline-width")) {
+                Some(Value::Length(v, _)) => *v,
+                Some(Value::Number(v)) => *v,
+                _ => 0.0,
+            };
+            let style_is_none = matches!(
+                sv.get(&crate::css::intern("outline-style")),
+                Some(Value::Keyword(k)) if matches!(&**k, "none" | "hidden")
+            );
+            if width > 0.0 && !style_is_none {
+                let color = match sv.get(&crate::css::intern("outline-color")) {
+                    Some(Value::Color(c)) => c.clone(),
+                    _ => match sv.get(&crate::css::intern("color")) {
+                        Some(Value::Color(c)) => c.clone(),
+                        _ => Color { r: 0, g: 0, b: 0, a: 255 },
+                    },
+                };
+                let offset = match sv.get(&crate::css::intern("outline-offset")) {
+                    Some(Value::Length(v, _)) => *v,
+                    _ => 0.0,
+                };
+                let o = offset + width;
+                let outer = crate::layout::Rect {
+                    x: (d.x - o).round(),
+                    y: (d.y - o).round(),
+                    width: (d.width + o * 2.0).round(),
+                    height: (d.height + o * 2.0).round(),
+                };
+                let w = width.round().max(1.0);
+                for rect in [
+                    crate::layout::Rect { x: outer.x, y: outer.y, width: outer.width, height: w },
+                    crate::layout::Rect { x: outer.x, y: outer.y + outer.height - w, width: outer.width, height: w },
+                    crate::layout::Rect { x: outer.x, y: outer.y, width: w, height: outer.height },
+                    crate::layout::Rect { x: outer.x + outer.width - w, y: outer.y, width: w, height: outer.height },
+                ] {
+                    if rect.width > 0.0 && rect.height > 0.0 {
+                        commands.push(PaintCommand::Rect(rect, color.clone(), 0.0));
+                    }
+                }
+            }
+        }
+
         // Image
         if layout.display == DisplayType::Image {
             if let Some(ref url) = layout.image_url {

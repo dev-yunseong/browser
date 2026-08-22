@@ -555,6 +555,22 @@ pub fn parse_css(source: &str) -> Stylesheet {
                         }
                     }
                 }
+                // `outline` mirrors `border`'s syntax but draws outside the box and
+                // takes no space. Focus rings and many design systems' selected
+                // states are drawn with it.
+                "outline" => {
+                    let mut temp_map = HashMap::new();
+                    parse_border_shorthand(&val_raw, &mut temp_map);
+                    for (part, target) in [
+                        ("border-width", "outline-width"),
+                        ("border-style", "outline-style"),
+                        ("border-color", "outline-color"),
+                    ] {
+                        if let Some(v) = temp_map.get(part) {
+                            declarations.push(Declaration { name: intern(target), value: v.clone(), important });
+                        }
+                    }
+                }
                 // Single-edge shorthand: `border-bottom: 1px solid #ccc`. Hairline
                 // rules on one edge are how most page furniture is drawn, so an
                 // unexpanded value here loses a large share of a site's structure.
