@@ -1799,6 +1799,10 @@ pub enum PseudoClass {
     Not(Vec<Selector>),
     /// `:is()` / `:where()` / legacy `:matches()` — matches when any inner does.
     Is(Vec<Selector>),
+    /// `:has(...)` — a relative selector list. Each entry carries the combinator
+    /// it was written with: `:has(> .a)` is `Child`, `:has(+ .a)` is
+    /// `NextSibling`, and a bare `:has(.a)` is `Descendant`.
+    Has(Vec<(Combinator, Selector)>),
     FirstChild,
     LastChild,
     OnlyChild,
@@ -1859,6 +1863,13 @@ impl Selector {
             match pc {
                 PseudoClass::Not(inner) | PseudoClass::Is(inner) => {
                     if let Some((ia, ib, ic)) = inner.iter().map(|s| s.specificity()).max() {
+                        a += ia;
+                        b += ib;
+                        c += ic;
+                    }
+                }
+                PseudoClass::Has(inner) => {
+                    if let Some((ia, ib, ic)) = inner.iter().map(|(_, s)| s.specificity()).max() {
                         a += ia;
                         b += ib;
                         c += ic;
@@ -1985,6 +1996,23 @@ fn parse_pseudo_class(token: &str) -> PseudoClass {
         "root" => PseudoClass::Root,
         "not" => PseudoClass::Not(inner()),
         "is" | "where" | "matches" | "any" | "-webkit-any" => PseudoClass::Is(inner()),
+        "has" => PseudoClass::Has(
+            split_selector_list(arg)
+                .into_iter()
+                .map(|part| {
+                    // A relative selector may open with the combinator that ties
+                    // it to the anchor: `:has(> .a)`, `:has(+ .a)`, `:has(~ .a)`.
+                    // Written bare, it is a descendant.
+                    let (combinator, rest) = match part.as_bytes().first() {
+                        Some(b'>') => (Combinator::Child, &part[1..]),
+                        Some(b'+') => (Combinator::NextSibling, &part[1..]),
+                        Some(b'~') => (Combinator::SubsequentSibling, &part[1..]),
+                        _ => (Combinator::Descendant, part),
+                    };
+                    (combinator, parse_selector(rest.trim()))
+                })
+                .collect(),
+        ),
         "first-child" => PseudoClass::FirstChild,
         "last-child" => PseudoClass::LastChild,
         "only-child" => PseudoClass::OnlyChild,

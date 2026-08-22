@@ -261,6 +261,9 @@ fn matches_pseudo_class(
         PseudoClass::Is(inner) => inner
             .iter()
             .any(|sel| matches_selector_arena(sel, idx, arena, hovered_id, focused_id)),
+        PseudoClass::Has(inner) => inner.iter().any(|(combinator, sel)| {
+            has_relative_match(combinator, sel, idx, arena, hovered_id, focused_id)
+        }),
         PseudoClass::FirstChild => element_siblings(idx, arena).1 == 0,
         PseudoClass::LastChild => {
             let (siblings, pos) = element_siblings(idx, arena);
@@ -296,6 +299,99 @@ fn matches_pseudo_class(
         PseudoClass::Checked => has_attr(node, "checked") || has_attr(node, "selected"),
         PseudoClass::Empty => arena[idx].children_idx.is_empty(),
         PseudoClass::Unsupported => false,
+    }
+}
+
+/// The element side of `:has(...)`: does anything in `anchor`'s relative scope
+/// match `sel`?
+///
+/// The scope is what the combinator names — the whole subtree for a descendant,
+/// the element children for `>`, the next element sibling for `+`, every later
+/// one for `~`. The inner selector is then matched against each candidate the
+/// ordinary way, so `:has(.a .b)` reads its own ancestor chain against the
+/// document rather than against the anchor's subtree; that is a superset of the
+/// scoped rule and only differs for a selector whose ancestor part sits above
+/// the anchor.
+fn has_relative_match(
+    combinator: &Combinator,
+    sel: &Selector,
+    anchor: usize,
+    arena: &[NodeDataSend],
+    hovered_id: Option<&str>,
+    focused_id: Option<&str>,
+) -> bool {
+    let mut hit = |c: usize| matches_selector_arena(sel, c, arena, hovered_id, focused_id);
+    match combinator {
+        Combinator::Descendant => {
+            let mut stack: Vec<usize> = arena[anchor].children_idx.clone();
+            while let Some(c) = stack.pop() {
+                if arena[c].is_element && hit(c) {
+                    return true;
+                }
+                stack.extend(arena[c].children_idx.iter().copied());
+            }
+            false
+        }
+        Combinator::Child => arena[anchor]
+            .children_idx
+            .iter()
+            .any(|&c| arena[c].is_element && hit(c)),
+        Combinator::NextSibling | Combinator::SubsequentSibling => {
+            let (siblings, pos) = element_siblings(anchor, arena);
+            let later = &siblings[(pos + 1).min(siblings.len())..];
+            if matches!(combinator, Combinator::NextSibling) {
+                later.first().is_some_and(|&c| hit(c))
+            } else {
+                later.iter().any(|&c| hit(c))
+            }
+        }
+    }
+}
+
+/// `:has(...)` over the DOM handles, for the pass that decides which generated
+/// boxes a page asks for. See `has_relative_match` for the scoping rule.
+fn has_relative_match_handle(combinator: &Combinator, sel: &Selector, anchor: &Handle) -> bool {
+    let is_element = |h: &Handle| matches!(h.data, NodeData::Element { .. });
+    match combinator {
+        Combinator::Descendant => {
+            let mut stack: Vec<Handle> = anchor.children.borrow().iter().cloned().collect();
+            while let Some(c) = stack.pop() {
+                if is_element(&c) && selector_matches_element(sel, &c) {
+                    return true;
+                }
+                stack.extend(c.children.borrow().iter().cloned());
+            }
+            false
+        }
+        Combinator::Child => anchor
+            .children
+            .borrow()
+            .iter()
+            .any(|c| is_element(c) && selector_matches_element(sel, c)),
+        Combinator::NextSibling | Combinator::SubsequentSibling => {
+            let Some(parent) = anchor.parent.take().and_then(|w| {
+                let up = w.upgrade();
+                anchor.parent.set(Some(w));
+                up
+            }) else {
+                return false;
+            };
+            let children = parent.children.borrow();
+            let siblings: Vec<&Handle> = children.iter().filter(|c| is_element(c)).collect();
+            let anchor_ptr = std::rc::Rc::as_ptr(anchor);
+            let Some(pos) = siblings
+                .iter()
+                .position(|c| std::rc::Rc::as_ptr(c) == anchor_ptr)
+            else {
+                return false;
+            };
+            let later = &siblings[(pos + 1).min(siblings.len())..];
+            if matches!(combinator, Combinator::NextSibling) {
+                later.first().is_some_and(|c| selector_matches_element(sel, c))
+            } else {
+                later.iter().any(|c| selector_matches_element(sel, c))
+            }
+        }
     }
 }
 
@@ -1410,6 +1506,9 @@ fn compound_matches_element(sel: &Selector, handle: &Handle) -> bool {
         let ok = match pseudo {
             PseudoClass::Not(inner) => !inner.iter().any(|s| selector_matches_element(s, handle)),
             PseudoClass::Is(inner) => inner.iter().any(|s| selector_matches_element(s, handle)),
+            PseudoClass::Has(inner) => inner
+                .iter()
+                .any(|(combinator, s)| has_relative_match_handle(combinator, s, handle)),
             PseudoClass::Root => tag == "html",
             PseudoClass::FirstChild => element_sibling_position(handle).is_some_and(|(i, _)| i == 0),
             PseudoClass::LastChild => element_sibling_position(handle).is_some_and(|(i, n)| i + 1 == n),
@@ -2338,6 +2437,80 @@ mod tests {
                 "{source:?} should unescape to {want:?}"
             );
         }
+    }
+
+    /// `:has()` is how a modern design system reacts to what an element
+    /// *contains*. github's hero pads itself only when it holds a UI panel —
+    /// `.lp-SectionHero-visual:has(.…--copilotUI) { padding: 48px 96px }` —
+    /// and with the pseudo-class unsupported the section came out 31px short.
+    #[test]
+    fn test_has_matches_on_what_an_element_contains() {
+        fn height_of<'a>(n: &'a StyledNode, id: &str) -> Option<f32> {
+            fn find<'a>(n: &'a StyledNode, id: &str) -> Option<&'a StyledNode> {
+                if let markup5ever_rcdom::NodeData::Element { ref attrs, .. } = n.node.data {
+                    if attrs.borrow().iter().any(|a| a.name.local.as_ref() == "id" && a.value.as_ref() == id) {
+                        return Some(n);
+                    }
+                }
+                n.children.iter().find_map(|c| find(c, id))
+            }
+            find(n, id).and_then(|s| get_length_px(s, "height"))
+        }
+
+        let css = ".box:has(.flag) { height: 40px }";
+        let tree = make_tree(
+            r#"<div id="a" class="box"><span><i class="flag"></i></span></div>
+               <div id="b" class="box"><span><i class="other"></i></span></div>"#,
+            css,
+        );
+        assert_eq!(height_of(&tree, "a"), Some(40.0), ":has() must match a deep descendant");
+        assert_eq!(height_of(&tree, "b"), None, ":has() must not match without one");
+    }
+
+    /// A relative selector carries the combinator it was written with.
+    #[test]
+    fn test_has_honours_its_leading_combinator() {
+        fn matched(html: &str, css: &str, id: &str) -> bool {
+            fn find<'a>(n: &'a StyledNode, id: &str) -> Option<&'a StyledNode> {
+                if let markup5ever_rcdom::NodeData::Element { ref attrs, .. } = n.node.data {
+                    if attrs.borrow().iter().any(|a| a.name.local.as_ref() == "id" && a.value.as_ref() == id) {
+                        return Some(n);
+                    }
+                }
+                n.children.iter().find_map(|c| find(c, id))
+            }
+            let tree = make_tree(html, css);
+            find(&tree, id).and_then(|s| get_length_px(s, "height")) == Some(40.0)
+        }
+
+        // `> .flag` is a child, not any descendant.
+        let child_html = r#"<div id="a" class="box"><i class="flag"></i></div>
+                            <div id="b" class="box"><span><i class="flag"></i></span></div>"#;
+        assert!(matched(child_html, ".box:has(> .flag) { height: 40px }", "a"));
+        assert!(!matched(child_html, ".box:has(> .flag) { height: 40px }", "b"));
+
+        // `+ .flag` is the *next* element sibling; `~ .flag` is any later one.
+        let sib_html = r#"<div id="a" class="box"></div><i class="flag"></i>
+                          <div id="b" class="box"></div><em></em><i class="flag"></i>"#;
+        assert!(matched(sib_html, ".box:has(+ .flag) { height: 40px }", "a"));
+        assert!(!matched(sib_html, ".box:has(+ .flag) { height: 40px }", "b"));
+        assert!(matched(sib_html, ".box:has(~ .flag) { height: 40px }", "b"));
+    }
+
+    /// `:has()` takes a selector *list*, and contributes the specificity of its
+    /// most specific argument — the same rule `:is()` follows.
+    #[test]
+    fn test_has_parses_a_list_and_carries_its_specificity() {
+        use crate::css::{parse_selector, Combinator, PseudoClass};
+        let sel = parse_selector(".card:has(> .a, .b .c)");
+        let [PseudoClass::Has(ref inner)] = sel.pseudo_classes[..] else {
+            panic!("expected one :has(), got {:?}", sel.pseudo_classes);
+        };
+        assert_eq!(inner.len(), 2);
+        assert!(matches!(inner[0].0, Combinator::Child));
+        assert!(matches!(inner[1].0, Combinator::Descendant));
+        // `.card` plus the two classes of `.b .c`, the most specific argument.
+        assert_eq!(sel.specificity(), (0, 3, 0));
     }
 
     /// The character before `=` picks the attribute match. Reading every form

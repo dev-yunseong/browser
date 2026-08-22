@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>:has() probe</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #fff; color: #111; font: 14px/1.5 sans-serif; }
+  section { border-top: 2px solid #08f; }
+  .box { background: #eef; padding: 4px; margin-bottom: 8px; }
+  .flag { display: inline-block; width: 12px; height: 12px; background: #f60; }
+
+  /* The shape github's hero is built on: a wrapper pads itself only when it
+     holds a particular panel, so the whole section is 96px taller when it does.
+     With `:has()` unsupported the padding never lands and the section is short
+     by exactly that much. */
+  .visual:has(.panel--ui) { padding: 48px 96px; align-items: center; display: flex; background: #ffe; }
+  .panel { width: 100%; background: #cfc; padding: 8px; }
+
+  /* A relative selector keeps the combinator it was written with. */
+  .c:has(> .flag) { background: #cff; }
+  .n:has(+ .flag) { background: #fcf; }
+  .s:has(~ .flag) { outline: 2px solid #093; }
+
+  /* A list: any argument matching is enough. */
+  .list:has(.missing, .flag) { border-left: 6px solid #909; }
+
+  /* `:has()` next to an ordinary constraint, and inside `:not()`'s company. */
+  .card { border: 1px solid #999; padding: 6px; margin-bottom: 8px; }
+  .card:has(img) { background: #ffd; }
+  .card:not(:has(img)) { background: #ddf; }
+</style>
+</head>
+<body>
+  <section>
+    <h2>contains, at any depth</h2>
+    <div class="box"><span><i class="flag"></i></span> deep descendant matches</div>
+    <div class="box"><span><i class="other"></i></span> nothing to match</div>
+  </section>
+
+  <section>
+    <h2>the hero shape</h2>
+    <div class="visual"><div class="panel panel--ui">padded because the panel is here</div></div>
+    <div class="visual"><div class="panel">no padding: the panel is a plain one</div></div>
+  </section>
+
+  <section>
+    <h2>relative combinators</h2>
+    <div class="box c"><i class="flag"></i> child</div>
+    <div class="box c"><span><i class="flag"></i></span> grandchild, no match</div>
+    <div class="box n">next sibling follows</div><i class="flag"></i>
+    <div class="box n">a paragraph comes first</div><p>between</p><i class="flag"></i>
+    <div class="box s">a later sibling exists</div><p>between</p><i class="flag"></i>
+  </section>
+
+  <section>
+    <h2>lists and combinations</h2>
+    <div class="box list"><i class="flag"></i> one argument of two matches</div>
+    <div class="card"><img src="dot.svg" width="16" height="16" alt=""> holds an image</div>
+    <div class="card">holds no image</div>
+  </section>
+</body>
+</html>

@@ -132,6 +132,7 @@ Ordered by how much of a page each one destroyed.
 | Every `<img>` wrapped by a freshly created, detached one | `HTMLImageElement`'s constructor was the legacy `new Image(w, h)`, which *makes* an element rather than adopting the one the node factory hands it. Script reading an image on the page saw no `src`, no `class` and no parent, and each traversal leaked another stray `<img>` into the document. |
 | `getBoundingClientRect` reporting the content box | It read `dimensions` straight, which holds the content box on an axis a stated value settled. A control at `height: 40px` under `border-box` sizing answered 22 — its height shorn of the padding and border the property includes. |
 | A generated box answering for a real element | `::before` and `::after` are synthesised elements with no parent, so all of them key to the empty document path, and whichever went in last answered for every element whose own key could not be built. |
+| `:has()` unsupported | The pseudo-class a modern design system reacts to its own contents with. github's hero pads itself only when it holds a UI panel — `.lp-SectionHero-visual:has(.…--copilotUI) { padding: 48px 96px }` — and without it the section came out 31px short, which is most of the page's whole height deficit. |
 | Flow advancing past the content box | A box that states a height and carries padding handed the next block a cursor its own padding too high, and every section below it climbed by that much. |
 
 
@@ -143,7 +144,7 @@ pixels:
 
 | fixture | layout | fold | page | height (chromium -> engine) |
 |---|---|---|---|---|
-| github.com | 1.66% | 3.33% | 3.27% | 10570 -> 10537 |
+| github.com | 1.71% | 3.32% | 2.37% | 10570 -> 10569 |
 | yunseong.dev | 1.46% | 3.22% | 3.90% | 4976 -> 4947 |
 | naver.com | 1.32% | 2.88% | 2.55% | 18658 -> 16384 |
 
