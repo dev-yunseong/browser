@@ -2049,17 +2049,36 @@ impl<'a> LayoutBox<'a> {
             // its absence is what says the image has nothing of its own to be
             // sized by. github's pillar screenshots are all remote, and reading
             // them as a fixed box left each of its security columns 38px short.
-            let broken = read_aspect_ratio(self.style_node).is_none() && height <= 0.0;
+            // `aspect-ratio` is injected from the decoded bytes, so its absence
+            // is what says the image has nothing of its own to be sized by.
+            let has_natural_size = read_aspect_ratio(self.style_node).is_some();
+            let broken = !has_natural_size && height <= 0.0;
             let alt = self.alt_text.as_deref().unwrap_or("").trim().to_string();
             // An image that says nothing about itself and has nothing to say in
-            // its place takes no room at all, which is what `alt=""` asks for
-            // and what a browser gives a source it could not fetch.
-            if broken && alt.is_empty() && auto_width {
-                self.dimensions.width = 0.0;
-                self.dimensions.height = 0.0;
+            // its place is not rendered at all where it is an ordinary inline
+            // `<img>`: the whole element collapses, and a stated height does not
+            // hold its row open. That is what `alt=""` asks for and what a
+            // browser gives a source it could not fetch.
+            //
+            // A page that gave the image a display of its own still gets a box,
+            // and the stated height holds: github's customer logos are
+            // `inline-block` SVGs 42px tall, and collapsing those took 62px out
+            // of the page. Its width is what an empty box shrinks to — nothing —
+            // unless it is block-level, where it fills its line like any block.
+            let plain_inline = !matches!(
+                self.style_node.specified_values.get(&crate::css::intern("display")),
+                Some(Value::Keyword(k)) if &**k != "inline"
+            );
+            if !has_natural_size && alt.is_empty() && auto_width {
+                self.dimensions.width = if plain_inline || !is_block {
+                    0.0
+                } else {
+                    container_width
+                };
+                self.dimensions.height = if plain_inline { 0.0 } else { height.max(0.0) };
                 self.content_box_width = false;
-                let final_x = self.dimensions.x + self.margin.right;
-                let final_y = self.dimensions.y + self.margin.bottom;
+                let final_x = self.dimensions.x + self.dimensions.width + self.margin.right;
+                let final_y = self.dimensions.y + self.dimensions.height + self.margin.bottom;
                 return (Some(self), final_x, final_y);
             }
             let alt_fallback = broken && !alt.is_empty();
@@ -7279,6 +7298,75 @@ mod tests {
             img.dimensions.height > 0.0,
             "image with only width specified must have non-zero height, got {}",
             img.dimensions.height
+        );
+    }
+
+    /// A source that never arrived and an empty `alt` is not rendered at all,
+    /// and a stated height does not hold the row open on its own: with the width
+    /// auto the box has no area and the whole element collapses. github's
+    /// customer logos are SVGs written exactly that way, and the 100px
+    /// placeholder drew a hairline frame across a band the reference leaves
+    /// blank.
+    #[test]
+    fn test_a_broken_image_with_only_a_stated_height_collapses_entirely() {
+        let html = r#"<img id="a" src="x.png" alt="" style="height: 42px">"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let img = find_element_by_id(&layout, "a").expect("img");
+        assert_eq!(outer_width(img), 0.0, "nothing to show is no width");
+        assert_eq!(outer_height(img), 0.0, "and a height on its own is no box");
+    }
+
+    /// Only an ordinary inline `<img>` collapses. A page that gave the image a
+    /// display of its own still gets a box, and the stated height holds — its
+    /// width is what an empty box shrinks to. github's customer logos are
+    /// `inline-block` SVGs 42px tall, and collapsing those took 62px out of the
+    /// page.
+    #[test]
+    fn test_a_broken_inline_block_image_keeps_its_stated_height() {
+        let html = r#"<img id="a" src="x.png" alt="" style="display: inline-block; height: 42px">"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let img = find_element_by_id(&layout, "a").expect("img");
+        assert_eq!(outer_width(img), 0.0, "an empty box shrinks to nothing wide");
+        assert!(
+            (outer_height(img) - 42.0).abs() < 0.5,
+            "but the stated height holds, got {}",
+            outer_height(img)
+        );
+    }
+
+    /// A block-level one fills its line the way any block does.
+    #[test]
+    fn test_a_broken_block_image_fills_its_line() {
+        let html = r#"<div style="width: 300px"><img id="a" src="x.png" alt="" style="display: block; height: 42px"></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let img = find_element_by_id(&layout, "a").expect("img");
+        assert!(
+            (outer_width(img) - 300.0).abs() < 0.5,
+            "a block fills its line, got {}",
+            outer_width(img)
+        );
+        assert!(
+            (outer_height(img) - 42.0).abs() < 0.5,
+            "and keeps its stated height, got {}",
+            outer_height(img)
+        );
+    }
+
+    /// A width the page stated is used as stated: only `auto` collapses.
+    #[test]
+    fn test_a_broken_image_keeps_a_width_the_page_stated() {
+        let html = r#"<img id="a" src="x.png" alt="" style="width: 100px; height: 42px">"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let img = find_element_by_id(&layout, "a").expect("img");
+        assert!(
+            (outer_width(img) - 100.0).abs() < 0.5,
+            "a stated width is kept, got {}",
+            outer_width(img)
+        );
+        assert!(
+            (outer_height(img) - 42.0).abs() < 0.5,
+            "as is the stated height, got {}",
+            outer_height(img)
         );
     }
 

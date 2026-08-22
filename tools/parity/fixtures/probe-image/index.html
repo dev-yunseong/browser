@@ -22,5 +22,17 @@
     <div style="width:375px;border:1px solid #333"><img style="display:block;max-width:100%" alt="short alt" src="/nope.png"></div></section>
   <section><b>broken image, inline, no alt</b>
     <div style="width:375px;border:1px solid #333">before <img alt="" src="/nope.png"> after</div></section>
+  <section><b>a source that never arrived, with an empty alt</b>
+    <!-- Nothing to show and nothing to say in its place: the element is not
+         rendered at all, and a stated height does not hold the row open on its
+         own. Only a box the page sized on both axes survives, drawn as an
+         empty frame. -->
+    <div>inline, stated height:<img src="/never-arrives.svg" alt="" style="height: 42px"></div>
+    <div>inline, stated width and height:<img src="/never-arrives.svg" alt="" style="width: 100px; height: 42px"></div>
+    <div>inline, nothing stated at all:<img src="/never-arrives.svg" alt=""></div>
+    <div>inline-block, stated height:<img src="/never-arrives.svg" alt="" style="display: inline-block; height: 42px"></div>
+    <div>inline-block, nothing stated:<img src="/never-arrives.svg" alt="" style="display: inline-block"></div>
+    <div>block, stated height:<img src="/never-arrives.svg" alt="" style="display: block; height: 42px"></div>
+  </section>
 </body>
 </html>

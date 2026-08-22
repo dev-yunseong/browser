@@ -122,6 +122,10 @@ pub enum PaintCommand {
         /// The line height the alt text wraps on, so paint lays it out the way
         /// layout sized the box for it.
         alt_line_height: f32,
+        /// Whether a source that never arrived leaves a frame behind. A browser
+        /// draws one only for a box the page sized on *both* axes; one whose
+        /// width came from the layout is left blank.
+        framed: bool,
     },
     /// An inline `<svg>` subtree, as markup, to be rasterised into `rect`.
     ///
@@ -735,6 +739,21 @@ impl LayerTreeBuilder {
     ///
     /// `overflow-x` / `overflow-y` count too: a box that clips on either axis is
     /// clipped here, since this engine has no separate per-axis clip.
+    /// Whether the page sized this box on both axes.
+    ///
+    /// A browser frames an image it could not fetch only when it did — a box
+    /// whose width came from the layout is left blank however tall it was told
+    /// to be.
+    fn states_both_axes(layout: &LayoutBox) -> bool {
+        let sv = &layout.style_node.specified_values;
+        ["width", "height"].iter().all(|prop| {
+            matches!(
+                sv.get(&crate::css::intern(prop)),
+                Some(Value::Length(v, _)) if *v > 0.0
+            )
+        })
+    }
+
     fn has_overflow_hidden(layout: &LayoutBox) -> bool {
         let sv = &layout.style_node.specified_values;
         for prop in ["overflow", "overflow-x", "overflow-y"] {
@@ -1283,6 +1302,7 @@ impl LayerTreeBuilder {
                     alt_color,
                     alt_font_size,
                     alt_line_height: crate::layout::resolved_line_height_px(layout.style_node),
+                    framed: Self::states_both_axes(layout),
                 });
             }
         }

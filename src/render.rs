@@ -483,7 +483,7 @@ fn execute_commands_on_tile(
                     }
                 }
             }
-            PaintCommand::Image { rect: r, url, object_fit, alt, alt_color, alt_font_size, alt_line_height } => {
+            PaintCommand::Image { rect: r, url, object_fit, alt, alt_color, alt_font_size, alt_line_height, framed } => {
                 let resolved_url = if image_cache.contains_key(url) {
                     None
                 } else {
@@ -547,7 +547,7 @@ fn execute_commands_on_tile(
                 } else { false };
 
                 if !drawn {
-                    draw_broken_image(pixmap, *r, alt, alt_color, *alt_font_size, *alt_line_height, transform);
+                    draw_broken_image(pixmap, *r, alt, alt_color, *alt_font_size, *alt_line_height, transform, *framed);
                 }
             }
             PaintCommand::Text { rect, text, font_size, line_height, leading_space, color, clip, style, letter_spacing, text_decoration, preserve_newlines, text_align } => {
@@ -864,11 +864,18 @@ fn draw_broken_image(
     font_size: f32,
     line_height: f32,
     transform: Transform,
+    // Whether the page sized this box on both axes. A browser frames an image
+    // it could not fetch only when it did.
+    framed: bool,
 ) {
     if alt.trim().is_empty() {
-        // Nothing to say about the image, so a browser leaves the space empty
-        // rather than drawing a frame around it. A hairline in the text colour
-        // marks it out for the case where the box was reserved by a stated size.
+        // Nothing to say about the image. A browser marks out the space it was
+        // told to reserve with a hairline, and leaves a box it sized itself
+        // blank — a block-level one that filled its line came out framed right
+        // across the page.
+        if !framed {
+            return;
+        }
         let mut border_paint = Paint::default();
         border_paint.set_color_rgba8(color.r, color.g, color.b, 90);
         let mut stroke = Stroke::default();
@@ -1822,6 +1829,7 @@ mod tests {
             16.0,
             19.2,
             Transform::identity(),
+            true,
         );
         // The middle of the box is untouched; only its edge is drawn on.
         let mid = ((20 * 60) + 30) * 4;
@@ -1834,6 +1842,28 @@ mod tests {
         assert!(
             pixmap.data()[edge] < 255,
             "but the outline is drawn along the top edge"
+        );
+    }
+
+    /// A browser frames an image it could not fetch only for a box the page
+    /// sized on both axes. A block-level one whose width came from the layout is
+    /// left blank — framing it drew a hairline right across the page.
+    #[test]
+    fn test_a_box_the_page_did_not_size_is_left_unframed() {
+        let mut pixmap = white_pixmap(60, 40);
+        draw_broken_image(
+            &mut pixmap,
+            LayoutRect { x: 0.0, y: 0.0, width: 60.0, height: 40.0 },
+            "",
+            &Color { r: 0, g: 0, b: 0, a: 255 },
+            16.0,
+            19.2,
+            Transform::identity(),
+            false,
+        );
+        assert!(
+            pixmap.data().chunks_exact(4).all(|px| px[..3] == [255, 255, 255]),
+            "nothing at all is drawn for an unframed empty-alt image"
         );
     }
 
@@ -1850,6 +1880,7 @@ mod tests {
             16.0,
             19.2,
             Transform::identity(),
+            true,
         );
         let reddish = pixmap
             .data()
@@ -2436,6 +2467,7 @@ mod tests {
             alt_color: Color { r: 0, g: 0, b: 0, a: 255 },
             alt_font_size: 16.0,
             alt_line_height: 19.2,
+            framed: false,
         }];
         let base_url = Url::parse("https://example.com/path").unwrap();
         let mut image_cache = HashMap::new();
