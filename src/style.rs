@@ -1468,6 +1468,53 @@ mod tests {
         build_style_tree(&dom.document, &stylesheet, None, &js_overrides, None, None, None)
     }
 
+    /// A design system's tokens are mixed-case — `--borderColor-default`, not
+    /// `--bordercolor-default`. Custom property names are case-sensitive, so
+    /// lowercasing them at parse time made every `var()` naming one look up a
+    /// property nothing had defined, and the whole palette resolved to nothing.
+    #[test]
+    fn test_custom_property_names_are_case_sensitive() {
+        let html = r#"<html data-color-mode="dark" data-dark-theme="dark"><body><div id="x">hi</div></body></html>"#;
+        let css = r#"
+          [data-color-mode="dark"][data-dark-theme="dark"] {
+            --borderColor-default: #3d444d;
+            --borderWidth-thin: 1px;
+          }
+          #x { border-right: var(--borderWidth-thin) solid var(--borderColor-default); }
+        "#;
+        let tree = make_tree(html, css);
+        let x = find_node(&tree, "div").expect("div");
+
+        assert_eq!(get_length_px(x, "border-right-width"), Some(1.0));
+        assert_eq!(get_keyword(x, "border-right-style").as_deref(), Some("solid"));
+        assert_eq!(
+            get_color(x, "border-right-color"),
+            Some(Color { r: 0x3d, g: 0x44, b: 0x4d, a: 255 })
+        );
+    }
+
+    /// A `var()` written first in a border shorthand is the width, not the
+    /// colour. Reading it as the colour left the width to default to `medium`,
+    /// which drew a 3px rule in the element's text colour where the page asked
+    /// for a hairline in a muted one.
+    #[test]
+    fn test_border_shorthand_leading_var_is_the_width() {
+        let html = r#"<html><body><div id="x">hi</div></body></html>"#;
+        let css = r#"
+          :root { --w: 2px; }
+          #x { border-top: var(--w) solid #fff9; }
+        "#;
+        let tree = make_tree(html, css);
+        let x = find_node(&tree, "div").expect("div");
+
+        assert_eq!(get_length_px(x, "border-top-width"), Some(2.0));
+        assert_eq!(
+            get_color(x, "border-top-color"),
+            Some(Color { r: 255, g: 255, b: 255, a: 0x99 }),
+            "#fff9 is a four-digit hex — a white at 60% alpha"
+        );
+    }
+
     /// Walk the StyledNode tree depth-first to find the first node whose tag matches.
     fn find_node<'a>(root: &'a StyledNode, tag: &str) -> Option<&'a StyledNode> {
         if let markup5ever_rcdom::NodeData::Element { ref name, .. } = root.node.data {

@@ -525,7 +525,17 @@ pub fn parse_css(source: &str) -> Stylesheet {
             if decl.is_empty() { continue; }
             
             let mut kv = decl.splitn(2, ':');
-            let key = intern(&kv.next().unwrap_or("").trim().to_lowercase());
+            let raw_key = kv.next().unwrap_or("").trim();
+            // Property names are case-insensitive, but custom property names are
+            // not: `--borderColor-default` and `--bordercolor-default` are two
+            // different properties. Lowercasing them here meant every `var()`
+            // naming a mixed-case token looked up a name nothing had defined, so
+            // a design system's whole palette resolved to nothing.
+            let key = if raw_key.starts_with("--") {
+                intern(raw_key)
+            } else {
+                intern(&raw_key.to_lowercase())
+            };
             let mut val_raw = kv.next().unwrap_or("").trim().to_string();
             if key.is_empty() || val_raw.is_empty() { continue; }
 
@@ -1501,15 +1511,93 @@ pub fn parse_border_shorthand_pub(val: &str, declarations: &mut HashMap<String, 
     parse_border_shorthand(val, declarations);
 }
 
+/// The line styles `border-style` accepts. A width paired with anything not on
+/// this list is not a border at all, so the list has to be complete: an
+/// unrecognised style used to fall through to the colour branch and take the
+/// declaration's colour slot with it.
+const BORDER_STYLES: [&str; 10] = [
+    "none", "hidden", "solid", "dashed", "dotted", "double", "groove", "ridge", "inset", "outset",
+];
+
+/// The named widths, in the pixel values browsers use for them.
+fn named_border_width(word: &str) -> Option<f32> {
+    match word {
+        "thin" => Some(1.0),
+        "medium" => Some(3.0),
+        "thick" => Some(5.0),
+        _ => None,
+    }
+}
+
 fn parse_border_shorthand(val: &str, declarations: &mut HashMap<String, Value>) {
-    let parts: Vec<&str> = val.split_whitespace().collect();
-    for part in parts {
-        if part.ends_with("px") || part.chars().all(|c| c.is_numeric()) {
+    // Split on parens, not whitespace: a component is routinely written as
+    // `var(--borderColor-default, #d1d9e0)` or `rgb(0 0 0 / 20%)`, and cutting
+    // those at their inner spaces leaves fragments none of the branches below
+    // can make sense of.
+    let parts = split_respecting_parens(val);
+    // Anything that resolves later — `var()`, `calc()` — cannot be classified
+    // here, because whether `var(--x)` is this border's width or its colour
+    // depends on what `--x` holds. They are set aside and placed by position
+    // afterwards.
+    let mut deferred: Vec<(usize, &str)> = Vec::new();
+    let mut saw_width = false;
+    let mut saw_color = false;
+
+    for (idx, part) in parts.iter().enumerate() {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let lower = part.to_ascii_lowercase();
+
+        if BORDER_STYLES.contains(&lower.as_str()) {
+            declarations.insert("border-style".to_string(), Value::Keyword(intern(&lower)));
+            continue;
+        }
+        if let Some(px) = named_border_width(&lower) {
+            declarations.insert("border-width".to_string(), Value::Length(px, Unit::Px));
+            saw_width = true;
+            continue;
+        }
+        // Any length unit, not just `px`: design systems state hairlines in
+        // `rem` so they scale with the root size, and a dropped width left the
+        // border missing entirely.
+        if let Some(len) = parse_length(part) {
+            declarations.insert("border-width".to_string(), len);
+            saw_width = true;
+            continue;
+        }
+        if part.parse::<f32>().is_ok() {
             declarations.insert("border-width".to_string(), parse_value(part));
-        } else if let Some(color) = parse_color(part) {
+            saw_width = true;
+            continue;
+        }
+        if let Some(color) = parse_color(part) {
             declarations.insert("border-color".to_string(), Value::Color(color));
-        } else if matches!(part, "solid" | "dashed" | "dotted" | "none") {
-            declarations.insert("border-style".to_string(), Value::Keyword(intern(part)));
+            saw_color = true;
+            continue;
+        }
+        if part.contains('(') {
+            deferred.push((idx, part));
+            continue;
+        }
+    }
+
+    // Place what could not be classified. The grammar allows any order, but the
+    // width is written first in practice, so a leading unresolved value is the
+    // width and any later one is the colour. Guessing the other way is what put
+    // `border-top: var(--borderWidth-thin) solid #fff9` in the colour slot and
+    // then defaulted the width to `medium`, drawing a 3px white rule where the
+    // page asked for a 1px translucent one.
+    for (idx, part) in deferred {
+        let value = parse_value(part);
+        let is_leading = idx == 0;
+        if is_leading && !saw_width {
+            declarations.insert("border-width".to_string(), value);
+            saw_width = true;
+        } else if !saw_color {
+            declarations.insert("border-color".to_string(), value);
+            saw_color = true;
         }
     }
 }
@@ -2022,6 +2110,16 @@ pub fn parse_color(s: &str) -> Option<Color> {
                 let g = u8::from_str_radix(&hex[1..2].repeat(2), 16).ok()?;
                 let b = u8::from_str_radix(&hex[2..3].repeat(2), 16).ok()?;
                 Some(Color { r, g, b, a: 255 })
+            }
+            // `#rgba` — the shorthand for a translucent colour. Without it a
+            // value like `#fff9` parsed as nothing at all, and the property fell
+            // back to its initial value instead of the tint the page asked for.
+            4 => {
+                let r = u8::from_str_radix(&hex[0..1].repeat(2), 16).ok()?;
+                let g = u8::from_str_radix(&hex[1..2].repeat(2), 16).ok()?;
+                let b = u8::from_str_radix(&hex[2..3].repeat(2), 16).ok()?;
+                let a = u8::from_str_radix(&hex[3..4].repeat(2), 16).ok()?;
+                Some(Color { r, g, b, a })
             }
             6 => {
                 let r = u8::from_str_radix(&hex[0..2], 16).ok()?;

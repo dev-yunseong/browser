@@ -675,9 +675,15 @@ impl LayerTreeBuilder {
         // carry a rule on one side only, or a different colour per side, and a
         // single stroke can express neither.
         {
+            // An unset border colour is `currentColor`, not a grey of this
+            // renderer's choosing — the rounded path below was drawing a light
+            // grey ring where the page asked for one in its own text colour.
             let uniform_color = || match sv.get(&crate::css::intern("border-color")) {
                 Some(Value::Color(c)) => c.clone(),
-                _ => Color { r: 180, g: 180, b: 180, a: 255 },
+                _ => match sv.get(&crate::css::intern("color")) {
+                    Some(Value::Color(c)) => c.clone(),
+                    _ => Color { r: 0, g: 0, b: 0, a: 255 },
+                },
             };
             let side_color = |side: &str| match sv.get(&crate::css::intern(&format!("border-{side}-color"))) {
                 Some(Value::Color(c)) => c.clone(),
