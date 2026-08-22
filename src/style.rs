@@ -2196,6 +2196,29 @@ mod tests {
         }
     }
 
+    /// Only whitespace *outside* brackets and parentheses separates a
+    /// selector's compounds. Splitting on every space tore `:not(.a + .a)` into
+    /// three parts, so github's
+    /// `.LogoSuite--default:not(.LogoSuite + .LogoSuite) .logobar` matched
+    /// nothing and its logo strip lost its 32px of top padding.
+    #[test]
+    fn test_a_pseudo_class_argument_is_one_compound() {
+        use crate::css::{parse_selector, Combinator, PseudoClass};
+        let sel = parse_selector(".a:not(.b + .b) .inner");
+        assert_eq!(sel.class, vec!["inner".to_string()]);
+        assert!(matches!(sel.combinator, Some(Combinator::Descendant)));
+        let ancestor = sel.ancestor.as_ref().expect("the `.a:not(…)` compound");
+        assert_eq!(ancestor.class, vec!["a".to_string()]);
+        let [PseudoClass::Not(ref inner)] = ancestor.pseudo_classes[..] else {
+            panic!("expected one :not(), got {:?}", ancestor.pseudo_classes);
+        };
+        assert_eq!(inner.len(), 1);
+        assert!(
+            matches!(inner[0].combinator, Some(Combinator::NextSibling)),
+            "the argument keeps its own combinator"
+        );
+    }
+
     /// An empty operand matches nothing, per the selectors spec — and keeps
     /// `[class^=""]` from styling every element on the page.
     #[test]

@@ -1941,10 +1941,43 @@ fn space_out_combinators(s: &str) -> String {
     out
 }
 
+/// Split a selector into its compounds and combinators.
+///
+/// Only whitespace outside brackets, parentheses and quotes separates them:
+/// `:not(.a + .b)` is one compound, and splitting on every space tore it into
+/// three, so the rule it belonged to matched nothing.
+fn split_selector_parts(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut start: Option<usize> = None;
+    for (i, c) in s.char_indices() {
+        match c {
+            _ if quote == Some(c) => quote = None,
+            '"' | '\'' if quote.is_none() => quote = Some(c),
+            _ if quote.is_some() => {}
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 && c.is_whitespace() => {
+                if let Some(st) = start.take() {
+                    parts.push(&s[st..i]);
+                }
+                continue;
+            }
+            _ => {}
+        }
+        start.get_or_insert(i);
+    }
+    if let Some(st) = start {
+        parts.push(&s[st..]);
+    }
+    parts
+}
+
 pub fn parse_selector(s: &str) -> Selector {
     // Pre-process string to ensure spaces around combinators for easy splitting
     let s = space_out_combinators(s);
-    let parts: Vec<&str> = s.split_whitespace().collect();
+    let parts: Vec<&str> = split_selector_parts(&s);
     if parts.is_empty() { return Selector::new(); }
 
     let mut root: Option<Selector> = None;
