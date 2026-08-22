@@ -432,10 +432,19 @@ fn apply_attribute_styles_arena(node: &NodeDataSend, map: &mut HashMap<Arc<str>,
         // short of the browser's.
         "svg" => {
             let mut ratio = None;
+            let mut attr_width = None;
+            let mut attr_height = None;
             for (k, v) in &node.attrs {
                 match k.as_str() {
                     "width" | "height" => {
                         if let Some(len) = parse_legacy_length_attr(v) {
+                            if let Value::Length(px, crate::css::Unit::Px) = len {
+                                if k == "width" {
+                                    attr_width = Some(px);
+                                } else {
+                                    attr_height = Some(px);
+                                }
+                            }
                             map.entry(intern(k)).or_insert(len);
                         }
                     }
@@ -452,6 +461,18 @@ fn apply_attribute_styles_arena(node: &NodeDataSend, map: &mut HashMap<Arc<str>,
                         }
                     }
                     _ => {}
+                }
+            }
+            // Without a `viewBox` the width and height attributes are the
+            // intrinsic size, and their ratio is what `height: auto` follows.
+            // github's CTA ships `<svg width="2280" height="1200">` as a
+            // spacer, and reading no ratio from it made the block 100px too
+            // tall — and every section below it that much too low.
+            if ratio.is_none() {
+                if let (Some(w), Some(h)) = (attr_width, attr_height) {
+                    if w > 0.0 && h > 0.0 {
+                        ratio = Some(w / h);
+                    }
                 }
             }
             if let Some(r) = ratio {

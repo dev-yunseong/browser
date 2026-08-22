@@ -582,6 +582,17 @@ fn horiz_padding_border(sn: &StyledNode) -> f32 {
     read_px_direct(sn, "padding-left") + read_px_direct(sn, "padding-right") + side("left") + side("right")
 }
 
+/// The single margin two adjoining margins collapse to.
+///
+/// CSS 2.2 §8.3.1: the largest positive plus the most negative, so a negative
+/// margin still pulls the box back even when the margin it meets is zero.
+/// Taking the plain maximum threw negative margins away entirely, and a page
+/// that overlaps two sections on purpose — `margin-top: -10%` under a spacer —
+/// got a gap where the overlap should be.
+fn collapse_margins(a: f32, b: f32) -> f32 {
+    a.max(b).max(0.0) + a.min(b).min(0.0)
+}
+
 /// Whether a child contributes to its parent's intrinsic (min- or max-content)
 /// width.
 ///
@@ -3045,16 +3056,17 @@ impl<'a> LayoutBox<'a> {
                             // the parent moves down and the space ends up
                             // outside it. Dropping it instead pulled the top of
                             // every page up by its first paragraph's margin.
-                            let extra = (cb.margin.top - self.margin.top).max(0.0);
-                            if extra > 0.0 {
-                                self.margin.top += extra;
-                                self.dimensions.y += extra;
-                                cursor_y += extra;
+                            let collapsed_own = collapse_margins(self.margin.top, cb.margin.top);
+                            let shift = collapsed_own - self.margin.top;
+                            if shift != 0.0 {
+                                self.margin.top = collapsed_own;
+                                self.dimensions.y += shift;
+                                cursor_y += shift;
                             }
                             0.0
                         } else {
                             // Case 1: standard adjacent-sibling collapse.
-                            prev_margin_bottom.max(cb.margin.top)
+                            collapse_margins(prev_margin_bottom, cb.margin.top)
                         };
                         first_block_placed = true;
                         // `cb` was built at current_y = 0, so cb.dimensions.y == cb.margin.top.
@@ -3179,7 +3191,7 @@ impl<'a> LayoutBox<'a> {
         if !parent_open_bottom || height > 0.0 {
             cursor_y += prev_margin_bottom;
         } else if first_block_placed {
-            self.margin.bottom = self.margin.bottom.max(prev_margin_bottom);
+            self.margin.bottom = collapse_margins(self.margin.bottom, prev_margin_bottom);
         }
         // Clearfix: ensure the container is tall enough to cover all floated children.
         cursor_y = cursor_y.max(float_ctx.bottom());
@@ -4965,6 +4977,55 @@ mod tests {
         let next = find_element_by_id(&layout, "next").expect("next");
         assert_eq!(outer.margin.bottom, 0.0);
         assert_eq!(next.dimensions.y, 100.0, "got {}", next.dimensions.y);
+    }
+
+    /// A negative margin pulls a box back over its predecessor. Collapsing two
+    /// margins by taking the larger threw the negative one away, so a page that
+    /// overlaps two sections on purpose got a gap where the overlap should be.
+    #[test]
+    fn test_a_negative_margin_pulls_the_box_back() {
+        let html = r#"<div id="w" style="width:400px">
+            <div id="a" style="height:40px"></div>
+            <div id="b" style="height:40px;margin-top:-10%"></div>
+            <div id="c" style="height:40px;margin-top:-20px"></div>
+            <div id="d" style="height:40px;margin-top:10%"></div>
+          </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let y = |id: &str| find_element_by_id(&layout, id).expect(id).dimensions.y;
+        // A percentage margin is a fraction of the containing block's *width*.
+        assert_eq!(y("b"), 0.0, "-10% of 400 pulls it right back over `a`");
+        assert_eq!(y("c"), 20.0, "and -20px pulls it 20 back over `b`");
+        assert_eq!(y("d"), 100.0, "a positive percentage still pushes it down");
+        assert_eq!(
+            find_element_by_id(&layout, "w").expect("w").dimensions.height,
+            140.0
+        );
+    }
+
+    /// Two margins that meet collapse to the largest positive plus the most
+    /// negative, so one of each cancel rather than the positive simply winning.
+    #[test]
+    fn test_a_positive_and_a_negative_margin_cancel() {
+        assert_eq!(collapse_margins(20.0, -10.0), 10.0);
+        assert_eq!(collapse_margins(0.0, -40.0), -40.0);
+        assert_eq!(collapse_margins(-10.0, -30.0), -30.0);
+        assert_eq!(collapse_margins(20.0, 30.0), 30.0);
+    }
+
+    /// An `<svg>` with no `viewBox` takes its intrinsic ratio from its width
+    /// and height attributes, which is what `height: auto` follows. github
+    /// ships `<svg width="2280" height="1200">` as a spacer, and reading no
+    /// ratio from it made the block 100px too tall.
+    #[test]
+    fn test_svg_without_a_viewbox_takes_its_ratio_from_its_attributes() {
+        let html = r#"<div style="width:800px"><svg id="s" width="2280" height="1200" style="width:100%;height:auto"></svg></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let svg = find_element_by_id(&layout, "s").expect("svg");
+        assert!(
+            (svg.dimensions.height - 421.05).abs() < 1.0,
+            "800 wide at 2280:1200 is 421 tall, got {}",
+            svg.dimensions.height
+        );
     }
 
     // ── Flex intrinsic sizing ─────────────────────────────────────────────────

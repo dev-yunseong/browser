@@ -30,6 +30,18 @@
   .bb, .bb * { box-sizing: border-box; }
   .bb { max-width: 720px; margin: 0 auto; padding-left: 12px; background: #ccf; }
   .bb > div { background: #006; }
+  /* A page that overlaps two sections on purpose pulls one back with a
+     negative margin — a percentage of the containing block's *width*, on
+     either axis. */
+  .neg { width: 400px; background: #eef; margin-top: 20px; }
+  .neg > div { height: 40px; }
+  .n1 { background: #9f9; }
+  .n2 { background: #f99; margin-top: -10%; }
+  .n3 { background: #99f; margin-top: -20px; }
+  .n4 { background: #ff9; margin-top: 10%; }
+  /* An <svg> with no viewBox takes its ratio from its width/height attributes. */
+  .svgratio { width: 400px; background: #dfd; }
+  .svgratio svg { width: 100%; height: auto; display: block; background: #8c8; }
 </style>
 </head>
 <body>
@@ -44,5 +56,9 @@
   <div class="rule"></div><div class="maxw"><div>centred container, child at 52px</div></div>
   <div class="rule"></div><div class="bb"><div>border-box container, child at 52px</div></div>
   <div class="rule"></div>
+  <div class="neg">
+    <div class="n1"></div><div class="n2"></div><div class="n3"></div><div class="n4"></div>
+  </div>
+  <div class="svgratio"><svg width="800" height="200" aria-hidden="true"></svg></div>
 </body>
 </html>
