@@ -105,8 +105,11 @@ impl IntrinsicSizeCache {
                     }
 
                     let pad_border = horiz_padding_border(node);
-                    let non_skip: Vec<&StyledNode> =
-                        node.children.iter().filter(|c| !should_skip(c)).collect();
+                    let non_skip: Vec<&StyledNode> = node
+                        .children
+                        .iter()
+                        .filter(|c| contributes_to_intrinsic_size(c))
+                        .collect();
                     let num_children = non_skip.len();
 
                     work.push(Frame::Post {
@@ -129,7 +132,7 @@ impl IntrinsicSizeCache {
                     let non_skip_children: Vec<&StyledNode> = node_ref
                         .children
                         .iter()
-                        .filter(|c| !should_skip(c))
+                        .filter(|c| contributes_to_intrinsic_size(c))
                         .collect();
                     let start = val_stack.len().saturating_sub(num_children);
                     let child_vals: Vec<f32> = val_stack.drain(start..).collect();
@@ -292,8 +295,11 @@ impl IntrinsicSizeCache {
                     }
 
                     let pad_border = horiz_padding_border(node);
-                    let non_skip: Vec<&StyledNode> =
-                        node.children.iter().filter(|c| !should_skip(c)).collect();
+                    let non_skip: Vec<&StyledNode> = node
+                        .children
+                        .iter()
+                        .filter(|c| contributes_to_intrinsic_size(c))
+                        .collect();
                     let num_children = non_skip.len();
 
                     work.push(Frame::Post {
@@ -326,7 +332,7 @@ impl IntrinsicSizeCache {
                         let non_skip_children: Vec<&StyledNode> = node_ref
                             .children
                             .iter()
-                            .filter(|c| !should_skip(c))
+                            .filter(|c| contributes_to_intrinsic_size(c))
                             .collect();
                         let items: Vec<f32> = child_vals
                             .iter()
@@ -559,6 +565,22 @@ fn horiz_padding_border(sn: &StyledNode) -> f32 {
         if w > 0.0 { w } else { read_px_direct(sn, "border-width") }
     };
     read_px_direct(sn, "padding-left") + read_px_direct(sn, "padding-right") + side("left") + side("right")
+}
+
+/// Whether a child contributes to its parent's intrinsic (min- or max-content)
+/// width.
+///
+/// An absolutely or fixedly positioned box is out of flow: it is sized against
+/// its containing block, not against its parent's content, and it adds nothing
+/// to what its parent has to be wide enough to hold. Counting github's floating
+/// "Enter your email" label — `position: absolute` over the field it labels —
+/// made the field 105px wider than the field itself.
+fn contributes_to_intrinsic_size(child: &StyledNode) -> bool {
+    !should_skip(child)
+        && !matches!(
+            get_position_type(child),
+            PositionType::Absolute | PositionType::Fixed
+        )
 }
 
 /// Whether a child of a flex or grid container is not an item of it.
@@ -4482,6 +4504,44 @@ mod tests {
         );
     }
 
+    /// An out-of-flow child is sized against its containing block, not against
+    /// its parent's content, so it adds nothing to the parent's intrinsic
+    /// width. github floats its "Enter your email" label over the field with
+    /// `position: absolute`; counting it made the field 105px wider than the
+    /// field.
+    #[test]
+    fn test_absolutely_positioned_child_adds_no_intrinsic_width() {
+        let html = r#"<div id="col" style="display:flex;flex-direction:column;align-items:center">
+            <div id="row" style="display:flex;position:relative">
+              <label style="position:absolute;top:0;left:0;width:200px;height:20px"></label>
+              <span style="display:block;width:120px;height:30px"></span>
+            </div></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let row = find_element_by_id(&layout, "row").expect("row");
+        assert_eq!(
+            row.dimensions.width, 120.0,
+            "only the in-flow span sizes the row, got {}",
+            row.dimensions.width
+        );
+    }
+
+    /// The same in ordinary block flow.
+    #[test]
+    fn test_absolutely_positioned_child_adds_no_intrinsic_width_in_flow() {
+        let html = r#"<div id="col" style="display:flex;flex-direction:column;align-items:center">
+            <div id="blk" style="position:relative">
+              <i style="position:absolute;display:block;width:300px;height:20px"></i>
+              <i style="display:block;width:90px;height:30px"></i>
+            </div></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let blk = find_element_by_id(&layout, "blk").expect("blk");
+        assert_eq!(
+            blk.dimensions.width, 90.0,
+            "the absolute child does not widen the block, got {}",
+            blk.dimensions.width
+        );
+    }
+
     // ── `box-sizing: border-box` ──────────────────────────────────────────────
 
     /// Under `border-box` a stated width is the *outer* width, so an intrinsic
@@ -4835,16 +4895,14 @@ mod tests {
         );
     }
 
+    /// An inline-block whose only child is out of flow has no content to size
+    /// itself from, so it is zero wide and the text after it starts at the
+    /// container's edge — what every browser does. The absolutely positioned
+    /// child still lays out and paints; it just sizes against its containing
+    /// block rather than against this box.
     #[test]
-    fn test_inline_zero_width_falls_back_to_intrinsic_for_positioned_children() {
-        let html = r#"
-            <div style="width: 160px;">
-                <a id="login-link" style="display: inline-block;">
-                    <span style="position: absolute;">로그인</span>
-                </a>
-                <span id="after">after</span>
-            </div>
-        "#;
+    fn test_inline_box_with_only_positioned_children_is_zero_wide() {
+        let html = r#"<div style="width: 160px;"><a id="login-link" style="display: inline-block;"><span style="position: absolute;">로그인</span></a><span id="after">after</span></div>"#;
         let dom = dom::parse_html(html);
         let stylesheet = css::parse_css("");
         let style_tree = style::build_style_tree(
@@ -4862,15 +4920,20 @@ mod tests {
         let link = find_element_by_id(&layout, "login-link").expect("login-link not found");
         let after = find_element_by_id(&layout, "after").expect("after not found");
 
-        assert!(
-            link.dimensions.width > 20.0,
-            "inline box with positioned descendants should get intrinsic fallback width, got {}",
+        assert_eq!(
+            link.dimensions.width, 0.0,
+            "an out-of-flow child contributes no width to its parent, got {}",
             link.dimensions.width
         );
         assert!(
             after.dimensions.x >= link.dimensions.x + link.dimensions.width - 1.0,
-            "following inline content should flow after fallback-width element: link.right={}, after.x={}",
+            "following inline content still flows after it: link.right={}, after.x={}",
             link.dimensions.x + link.dimensions.width,
+            after.dimensions.x
+        );
+        assert_eq!(
+            after.dimensions.x, 0.0,
+            "and the text after it starts at the container edge, got {}",
             after.dimensions.x
         );
     }

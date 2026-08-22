@@ -17,6 +17,9 @@
   .control { display: flex; }
   .control-container { display: flex; align-items: center; gap: 4px; border: 1px solid #333; padding: 3px; background: #fff; }
   .field-wrap { width: 100%; display: flex; position: relative; background: #cff; }
+  /* A label floated over the field it names. It is out of flow, so it must not
+     widen the field it sits on. */
+  .field-label { position: absolute; top: 12px; left: 18px; font-size: 16px; color: #444; }
   .field-wrap span { width: inherit; }
   .field-wrap input { width: 260px; padding: 18px 12px 0 18px; font-size: 24px; border: 0; background: transparent; }
   .submit { flex-shrink: 0; height: 48px; padding: 6px 20px; border: 1px solid #060; background: #0a0; color: #fff; font-size: 16px; }
@@ -37,7 +40,8 @@
         <section class="control">
           <div class="control-container">
             <div class="field-wrap">
-              <span><input type="email" placeholder="you@domain.com"></span>
+              <label class="field-label" for="probe-email">Enter your email</label>
+              <span><input id="probe-email" type="email" placeholder="you@domain.com"></span>
             </div>
             <button class="submit" type="submit">Sign up for GitHub</button>
           </div>
