@@ -50,6 +50,10 @@ Ordered by how much of a page each one destroyed.
 | `ch` / `ex` unsupported | `max-width: 46ch` was dropped and prose ran the full width of its container. |
 | Auto-offset out-of-flow boxes pinned to their containing block | A hero positioned below a header jumped to the top of the page. |
 | Reserved inter-element space not drawn | Paint trimmed the run layout had reserved space for, so text after an inline element ran into it. |
+| `margin: 0 auto` centred the content width | A padded container sat half its padding off to one side and took its whole subtree with it. |
+| `min-height` / `max-height` applied only in block layout | A navbar sized by `min-height` collapsed to its content and everything below it moved up. |
+| Hairlines drawn at fractional offsets | A 1px `#161718` rule spread across two rows and came out `#656667`. On a design built from hairlines that is most of its visible structure. |
+| `display: flex` parsed as a length | Introduced while adding `ch`/`ex`: the parser matched a unit suffix without checking that a number preceded it, and `flex` ends in `ex`. Caught by the probes the same day. |
 
 ## What still limits parity
 
