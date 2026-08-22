@@ -2741,7 +2741,7 @@ impl<'a> LayoutBox<'a> {
             _ => 16.0,
         };
         let fonts = crate::font::fonts();
-        let line_height = font_size * 1.4;
+        let line_height = resolved_line_height_px(self.style_node);
         let space_w = fonts.advance(' ', font_size);
         let white_space = self
             .style_node
@@ -2947,12 +2947,20 @@ fn resolved_font_size_px(sn: &StyledNode) -> f32 {
     }
 }
 
-fn resolved_line_height_px(sn: &StyledNode) -> f32 {
+/// The line box height for a node, honouring `line-height`.
+///
+/// A unitless `line-height` is a multiplier of the element's own font size; a
+/// length is used as-is; a percentage resolves against the font size. `normal`
+/// comes from the font's vertical metrics, not a fixed multiplier — a guessed
+/// factor makes every block on a page the wrong height, and the error compounds
+/// down a long document.
+pub fn resolved_line_height_px(sn: &StyledNode) -> f32 {
     let font_size = resolved_font_size_px(sn);
     match sn.specified_values.get(&crate::css::intern("line-height")) {
         Some(Value::Length(v, Unit::Px)) => (*v).max(0.0),
+        Some(Value::Length(v, Unit::Percent)) => (font_size * (*v / 100.0)).max(0.0),
         Some(Value::Number(v)) => (font_size * *v).max(0.0),
-        _ => font_size * 1.4,
+        _ => crate::font::fonts().normal_line_height(font_size),
     }
 }
 

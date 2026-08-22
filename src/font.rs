@@ -67,6 +67,17 @@ impl FontSet {
         text.chars().map(|c| self.advance(c, font_size)).sum()
     }
 
+    /// The height of one line when `line-height: normal`.
+    ///
+    /// Taken from the primary face's own vertical metrics rather than a fixed
+    /// multiplier, so line boxes match what a browser using the same face
+    /// computes.
+    pub fn normal_line_height(&self, font_size: f32) -> f32 {
+        let units = self.primary.units_per_em().unwrap_or(1000.0);
+        let height = self.primary.height_unscaled() + self.primary.line_gap_unscaled();
+        height * (font_size / units)
+    }
+
     /// Scale to use with `ab_glyph` for a given face at `font_size`.
     ///
     /// The faces have different units-per-em, so a shared `PxScale` would draw

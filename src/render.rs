@@ -397,14 +397,14 @@ fn execute_commands_on_tile(
                     draw_broken_image(pixmap, *r, alt, transform);
                 }
             }
-            PaintCommand::Text { rect, text, font_size, color, clip, bold, italic, text_decoration } => {
+            PaintCommand::Text { rect, text, font_size, line_height, color, clip, bold, italic, text_decoration } => {
                 let mut adjusted_rect = *rect;
                 adjusted_rect.x += tx;
                 adjusted_rect.y += ty;
                 let mut adjusted_clip = *clip;
                 adjusted_clip.x += tx;
                 adjusted_clip.y += ty;
-                render_text_raw(text.clone(), adjusted_rect, *font_size, color, adjusted_clip, pixmap, *bold, *italic, *text_decoration);
+                render_text_raw(text.clone(), adjusted_rect, *font_size, *line_height, color, adjusted_clip, pixmap, *bold, *italic, *text_decoration);
             }
             PaintCommand::Shadow(r, s) => {
                 let blur = *s.blur;
@@ -610,7 +610,7 @@ fn draw_broken_image(pixmap: &mut Pixmap, r: LayoutRect, alt: &str, transform: T
             height: (r.height - 8.0).max(0.0),
         };
         let text_color = Color { r: 100, g: 100, b: 100, a: 255 };
-        render_text_raw(display_text, text_rect, 12.0, &text_color, text_rect, pixmap, false, false, 0);
+        render_text_raw(display_text, text_rect, 12.0, 14.0, &text_color, text_rect, pixmap, false, false, 0);
     }
 }
 
@@ -655,6 +655,7 @@ fn render_text_raw(
     text: String,
     rect: LayoutRect,
     font_size: f32,
+    line_height: f32,
     color: &Color,
     clip: LayoutRect,
     pixmap: &mut Pixmap,
@@ -696,7 +697,7 @@ fn render_text_raw(
             // End the current decoration line segment before wrapping.
             decoration_lines.push((line_start_x, line_end_x, current_y));
             current_x = rect.x;
-            current_y += font_size * 1.4;
+            current_y += line_height;
             line_start_x = current_x;
             line_end_x = current_x;
         }
