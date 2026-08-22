@@ -2734,6 +2734,10 @@ impl<'a> LayoutBox<'a> {
             .get(&crate::css::intern("font-size"))
         {
             Some(Value::Length(v, Unit::Px)) => v.max(1.0),
+            // Zero is the only unitless font-size CSS accepts, and it means the
+            // text takes no space. Any other bare number is a value this parser
+            // failed to attach a unit to, and must not be read as pixels.
+            Some(Value::Number(v)) if *v == 0.0 => 0.0,
             _ => 16.0,
         };
         let fonts = crate::font::fonts();

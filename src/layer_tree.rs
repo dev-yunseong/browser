@@ -379,6 +379,14 @@ impl LayerTreeBuilder {
                         continue;
                     }
 
+                    let overflow_hidden = Self::has_overflow_hidden(frame_layout);
+
+                    // A zero-sized box still has its children visited, even when it
+                    // clips. Dropping the subtree would be right if the box were
+                    // genuinely zero-sized, but a box this engine sized wrongly is
+                    // far more common than the `width: 0; height: 0; overflow:
+                    // hidden` idiom, and losing a whole subtree to a sizing bug is
+                    // much worse than painting something a browser would clip.
                     // Skip zero-sized boxes but still visit children.
                     if d.width < 0.1 || d.height < 0.1 {
                         // Push children in reverse order so the first child is processed first.
@@ -388,8 +396,6 @@ impl LayerTreeBuilder {
                         continue;
                     }
 
-                    // Check if this box clips its overflow.
-                    let overflow_hidden = Self::has_overflow_hidden(frame_layout);
                     let border_radius = match frame_layout.style_node.specified_values.get(&crate::css::intern("border-radius")) {
                         Some(Value::Length(v, _)) => *v,
                         _ => 0.0,
@@ -484,6 +490,19 @@ impl LayerTreeBuilder {
             return false;
         };
         let text = k.to_lowercase();
+
+        // `clip-path: rect(top right bottom left)` — the modern spelling of the
+        // visually-hidden idiom, and the one large sites have moved to.
+        if let Some(args) = text.strip_prefix("rect(").and_then(|r| r.strip_suffix(')')) {
+            let edges: Vec<f32> = args
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|p| !p.is_empty())
+                .take(4)
+                .filter_map(|p| p.trim_end_matches("px").parse::<f32>().ok())
+                .collect();
+            return matches!(edges.as_slice(), [top, right, bottom, left] if right - left <= 0.0 || bottom - top <= 0.0);
+        }
+
         let Some(args) = text.strip_prefix("inset(").and_then(|r| r.strip_suffix(')')) else {
             return false;
         };
@@ -738,6 +757,9 @@ impl LayerTreeBuilder {
         if let NodeData::Text { ref contents } = layout.style_node.node.data {
             let font_size = match sv.get(&crate::css::intern("font-size")) {
                 Some(Value::Length(v, _)) => *v,
+                // Zero is the only unitless font-size CSS accepts; any other bare
+                // number is an unparsed value, not a pixel size.
+                Some(Value::Number(v)) if *v == 0.0 => 0.0,
                 _ => 16.0,
             };
             let color = match sv.get(&crate::css::intern("color")) {

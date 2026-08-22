@@ -32,6 +32,8 @@ const VIEWPORT_HEIGHT = 1200;
 const SERVE_PORT = 8099;
 const DAEMON_PORT = 7071;
 const CHROME = '/opt/pw-browsers/chromium';
+const SETTLE_ATTEMPTS = 8;
+const SETTLE_INTERVAL_MS = 1500;
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -111,17 +113,37 @@ async function renderChromium(browser, url) {
   return PNG.sync.read(buf);
 }
 
-/** This engine's raster for the same URL, via the daemon control API. */
+/**
+ * This engine's raster for the same URL, via the daemon control API.
+ *
+ * Images are fetched after the first layout and trigger a re-render, so a
+ * screenshot taken straight after navigating can catch the page mid-load and
+ * makes the comparison non-reproducible. Shots are repeated until two in a row
+ * agree, which is the settled page a reader would see.
+ */
 async function renderEngine(url) {
+  const shoot = async () => {
+    const res = await fetch(`http://127.0.0.1:${DAEMON_PORT}/screenshot`);
+    if (!res.ok) throw new Error(`screenshot failed: ${res.status}`);
+    return Buffer.from(await res.arrayBuffer());
+  };
+
   const nav = await fetch(`http://127.0.0.1:${DAEMON_PORT}/navigate`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ url }),
   });
   if (!nav.ok) throw new Error(`navigate failed: ${nav.status}`);
-  const shot = await fetch(`http://127.0.0.1:${DAEMON_PORT}/screenshot`);
-  if (!shot.ok) throw new Error(`screenshot failed: ${shot.status}`);
-  return PNG.sync.read(Buffer.from(await shot.arrayBuffer()));
+
+  let previous = await shoot();
+  for (let attempt = 0; attempt < SETTLE_ATTEMPTS; attempt += 1) {
+    await sleep(SETTLE_INTERVAL_MS);
+    const current = await shoot();
+    if (current.equals(previous)) return PNG.sync.read(current);
+    previous = current;
+  }
+  console.warn(`  ${url}: engine output still changing after ${SETTLE_ATTEMPTS} shots`);
+  return PNG.sync.read(previous);
 }
 
 /**

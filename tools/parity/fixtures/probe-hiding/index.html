@@ -19,6 +19,7 @@
   /* 10 */ .h-fontsize { font-size: 0; }
   /* 11 */ .h-zero { width: 0; height: 0; overflow: hidden; }
   /* 12 */ .h-off { position: absolute; left: -9999px; top: -9999px; }
+  /* 13 */ .h-cliprect { width: 1px; height: 1px; clip-path: rect(0px 0px 0px 0px); position: absolute; overflow: hidden; border: 0; padding: 0; }
 </style>
 </head>
 <body>
@@ -34,6 +35,7 @@
   <div class="case"><span class="label">10 font-size:0</span> <span class="h-fontsize">FAIL-fontsize</span></div>
   <div class="case"><span class="label">11 width/height 0</span> <span class="h-zero">FAIL-zero</span></div>
   <div class="case"><span class="label">12 offscreen</span> <span class="h-off">FAIL-offscreen</span></div>
+  <div class="case"><span class="label">13 clip-path rect</span> <span class="h-cliprect">FAIL-cliprect</span></div>
   <div class="case"><span class="label">end</span></div>
 </body>
 </html>
