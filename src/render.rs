@@ -352,6 +352,17 @@ fn build_clip_mask(
     let mut m = Mask::new(pw, ph)?;
 
     let local_rect = LayoutRect { x: rect.x + tx, y: rect.y + ty, width: rect.width, height: rect.height };
+
+    // A clip rect empty along either axis clips its whole subtree away. The path
+    // builder rejects a degenerate rect, and reading that rejection as "no mask"
+    // would paint the subtree *unclipped* — the exact opposite of what the style
+    // asked for. `grid-template-rows: 0fr` over an `overflow: hidden` panel is
+    // this case, and it is how every animatable disclosure widget stays shut.
+    // A freshly allocated mask is all zeroes, which is precisely the empty clip.
+    if local_rect.width <= 0.0 || local_rect.height <= 0.0 {
+        return Some(m);
+    }
+
     let path = if radius.is_rounded() {
         create_elliptical_rect_path(local_rect, radius)
     } else {
@@ -2077,6 +2088,74 @@ mod tests {
         execute_commands_on_tile(&cmds, &mut pixmap, tile_rect, &HashMap::new(), &base_url);
 
         assert_ne!(pixmap.data(), before.as_slice(), "zero-blur shadow must modify the pixmap");
+    }
+
+    /// A clip rect that is empty along one axis clips its subtree away. The path
+    /// builder rejects a degenerate rect, and treating that as "no mask" would
+    /// paint the subtree unclipped — the opposite of what was asked for.
+    #[test]
+    fn test_degenerate_clip_rect_paints_nothing() {
+        use crate::layer_tree::{CornerRadii, PaintCommand};
+        use url::Url;
+
+        let mut pixmap = Pixmap::new(50, 50).unwrap();
+        let before = pixmap.data().to_vec();
+
+        let cmds = vec![
+            PaintCommand::PushClip {
+                rect: LayoutRect { x: 0.0, y: 0.0, width: 50.0, height: 0.0 },
+                radius: CornerRadii::NONE,
+            },
+            PaintCommand::Rect(
+                LayoutRect { x: 0.0, y: 0.0, width: 50.0, height: 50.0 },
+                Color { r: 255, g: 0, b: 0, a: 255 },
+                CornerRadii::NONE,
+                0.0,
+            ),
+            PaintCommand::PopClip,
+        ];
+
+        let tile_rect = LayoutRect { x: 0.0, y: 0.0, width: 50.0, height: 50.0 };
+        let base_url = Url::parse("https://example.com/").unwrap();
+        execute_commands_on_tile(&cmds, &mut pixmap, tile_rect, &HashMap::new(), &base_url);
+
+        assert_eq!(
+            pixmap.data(), before.as_slice(),
+            "a zero-height clip must suppress the fill, not let it through",
+        );
+    }
+
+    /// The same fill with a real clip still lands, so the test above is measuring
+    /// the empty clip and not a broken command list.
+    #[test]
+    fn test_non_degenerate_clip_rect_still_paints() {
+        use crate::layer_tree::{CornerRadii, PaintCommand};
+        use url::Url;
+
+        let mut pixmap = Pixmap::new(50, 50).unwrap();
+        let before = pixmap.data().to_vec();
+
+        let cmds = vec![
+            PaintCommand::PushClip {
+                rect: LayoutRect { x: 0.0, y: 0.0, width: 50.0, height: 20.0 },
+                radius: CornerRadii::NONE,
+            },
+            PaintCommand::Rect(
+                LayoutRect { x: 0.0, y: 0.0, width: 50.0, height: 50.0 },
+                Color { r: 255, g: 0, b: 0, a: 255 },
+                CornerRadii::NONE,
+                0.0,
+            ),
+            PaintCommand::PopClip,
+        ];
+
+        let tile_rect = LayoutRect { x: 0.0, y: 0.0, width: 50.0, height: 50.0 };
+        let base_url = Url::parse("https://example.com/").unwrap();
+        execute_commands_on_tile(&cmds, &mut pixmap, tile_rect, &HashMap::new(), &base_url);
+
+        assert_ne!(pixmap.data(), before.as_slice(), "a 20px-tall clip must let the fill through");
+        let below = pixmap.data()[(30 * 50 + 10) * 4 + 3];
+        assert_eq!(below, 0, "nothing may paint below the clip, got alpha {}", below);
     }
 
     /// A blurred shadow (blur > 0) must modify the pixmap and produce a

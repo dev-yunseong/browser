@@ -57,7 +57,11 @@ fn test_table_cell_shrink_wrap() {
 }
 
 #[test]
-fn test_image_default_size() {
+fn test_image_without_dimensions_or_alt_collapses() {
+    // An `<img>` with no width/height, no alt and nothing decoded has no
+    // intrinsic size to lay out, and Chromium collapses it to 0x0 rather than
+    // reserving a placeholder box. Reserving one shifts everything after the
+    // image down by a line the reference never has.
     let html = r#"<img id="target" src="foo.png">"#;
     let dom = dom::parse_html(html);
     let stylesheet = css::parse_css("");
@@ -68,9 +72,26 @@ fn test_image_default_size() {
     let (layout_opt, _, _) = build_layout_tree(target_node, 0.0, 0.0, 0.0, 500.0, 1000.0, 1000.0);
     let layout = layout_opt.unwrap();
 
-    println!("Image width: {}", layout.dimensions.width);
-    // Default image width in compute_max_content_width is 100.0
-    assert_eq!(layout.dimensions.width, 100.0);
+    assert_eq!(layout.dimensions.width, 0.0);
+    assert_eq!(layout.dimensions.height, 0.0);
+}
+
+#[test]
+fn test_image_with_stated_dimensions_keeps_them() {
+    // A stated width/height is the placeholder box: the reference reserves
+    // exactly that space while the image is still undecoded.
+    let html = r#"<img id="target" src="foo.png" width="120" height="80">"#;
+    let dom = dom::parse_html(html);
+    let stylesheet = css::parse_css("");
+    let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None, None, None);
+
+    let target_node = find_node_by_id(&style_tree, "target").unwrap();
+
+    let (layout_opt, _, _) = build_layout_tree(target_node, 0.0, 0.0, 0.0, 500.0, 1000.0, 1000.0);
+    let layout = layout_opt.unwrap();
+
+    assert_eq!(layout.dimensions.width, 120.0);
+    assert_eq!(layout.dimensions.height, 80.0);
 }
 
 fn find_node_by_id<'a>(sn: &'a style::StyledNode, id: &str) -> Option<&'a style::StyledNode> {

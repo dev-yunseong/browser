@@ -416,16 +416,6 @@ impl LayerTreeBuilder {
                 Frame::Process { layout: frame_layout, layer_id: frame_layer_id, clip: frame_clip } => {
                     let d = frame_layout.dimensions;
 
-                    // Per CSS spec, the default `overflow: visible` means content (in particular
-                    // text) must NOT be clipped to its ancestors' content boxes. Only boxes with
-                    // `overflow: hidden|clip|auto|scroll` establish a clipping region — and those
-                    // are handled via PushClip/PopClip + the mask stack in render.rs.
-                    //
-                    // Therefore, `next_clip` is propagated unchanged to descendants; it represents
-                    // a conservative paint-order hint (current layer's drawable region) rather than
-                    // a mandatory per-glyph clip.
-                    let next_clip = frame_clip;
-
                     // A subtree clipped to nothing paints nothing. The
                     // `clip: rect(0, 0, 0, 0)` + `position: absolute` pair is how
                     // screen-reader-only text is kept out of the visual page, and
@@ -436,6 +426,22 @@ impl LayerTreeBuilder {
 
                     let overflow_hidden = Self::has_overflow_hidden(frame_layout);
 
+                    // Per CSS spec, the default `overflow: visible` means content (in
+                    // particular text) must NOT be clipped to its ancestors' content
+                    // boxes, so `next_clip` is passed down untouched through every
+                    // ordinary box. Only `overflow: hidden|clip|auto|scroll`
+                    // establishes a clipping region, and there the region narrows for
+                    // the whole subtree. Backgrounds and borders honour that through
+                    // the PushClip/PopClip mask stack in render.rs, but a text run
+                    // carries its own clip rect and never consults that stack — so
+                    // without narrowing it here, a clipped panel's text paints right
+                    // over whatever follows it.
+                    let next_clip = if overflow_hidden {
+                        Self::intersect_rects(frame_clip, d)
+                    } else {
+                        frame_clip
+                    };
+
                     // A zero-sized box still has its children visited, even when it
                     // clips. Dropping the subtree would be right if the box were
                     // genuinely zero-sized, but a box this engine sized wrongly is
@@ -444,6 +450,27 @@ impl LayerTreeBuilder {
                     // much worse than painting something a browser would clip.
                     // Skip zero-sized boxes but still visit children.
                     if d.width < 0.1 || d.height < 0.1 {
+                        // A box that is zero along one axis and real along the
+                        // other meant it: `grid-template-rows: 0fr` with an
+                        // `overflow: hidden` child is how every modern
+                        // disclosure holds its panel shut, and leaving that
+                        // panel unclipped paints its whole text over whatever
+                        // follows. A box that measured zero on *both* axes is
+                        // the sizing bug the rule above guards against, and
+                        // still paints.
+                        let deliberate = d.width >= 0.1 || d.height >= 0.1;
+                        if overflow_hidden && deliberate && !frame_layout.children.is_empty() {
+                            let push_cmd = PaintCommand::PushClip {
+                                rect: d,
+                                radius: CornerRadii::NONE,
+                            };
+                            tree.layers[frame_layer_id].content_commands.push(push_cmd.clone());
+                            for tile in &mut tree.layers[frame_layer_id].tiles {
+                                tile.content_commands.push(push_cmd.clone());
+                                tile.dirty = true;
+                            }
+                            stack.push(Frame::PopClip { layer_id: frame_layer_id, is_background: false });
+                        }
                         // Push children in reverse order so the first child is processed first.
                         for child in frame_layout.children.iter().rev() {
                             stack.push(Frame::Process { layout: child, layer_id: frame_layer_id, clip: next_clip });
@@ -519,6 +546,24 @@ impl LayerTreeBuilder {
                     }
                 }
             }
+        }
+    }
+
+    /// The overlap of two rects, or an empty rect at `a`'s origin when they miss.
+    ///
+    /// Used to narrow the text clip region at every clipping box, so a run
+    /// inherits the intersection of every clip above it rather than only the
+    /// nearest one.
+    fn intersect_rects(a: LayoutRect, b: LayoutRect) -> LayoutRect {
+        let x0 = a.x.max(b.x);
+        let y0 = a.y.max(b.y);
+        let x1 = (a.x + a.width).min(b.x + b.width);
+        let y1 = (a.y + a.height).min(b.y + b.height);
+        LayoutRect {
+            x: x0,
+            y: y0,
+            width: (x1 - x0).max(0.0),
+            height: (y1 - y0).max(0.0),
         }
     }
 
@@ -1550,6 +1595,95 @@ mod tests {
             .flat_map(|l| l.content_commands.iter().chain(l.background_commands.iter()))
             .any(|cmd| matches!(cmd, PaintCommand::PushClip { radius, .. } if radius.is_rounded()));
         assert!(has_rounded_push, "overflow:hidden + border-radius must emit PushClip with radius > 0");
+    }
+
+    /// Text inside an `overflow: hidden` box carries its own clip rect and never
+    /// consults the mask stack, so the clip has to reach it through `next_clip`.
+    #[test]
+    fn test_overflow_hidden_narrows_the_text_clip() {
+        let tree = build_tree_from_html(
+            r#"<div style="width:200px;height:40px;overflow:hidden;">
+                <div style="height:400px;">a very tall run of text</div>
+            </div>"#,
+            "",
+        );
+        let clips: Vec<LayoutRect> = tree.layers.iter()
+            .flat_map(|l| l.content_commands.iter().chain(l.background_commands.iter()))
+            .filter_map(|cmd| match cmd {
+                PaintCommand::Text { clip, .. } => Some(*clip),
+                _ => None,
+            })
+            .collect();
+        assert!(!clips.is_empty(), "expected a text run inside the clipping box");
+        for clip in clips {
+            assert!(
+                clip.height <= 40.0 + 0.01,
+                "text clip must be narrowed to the clipping box, got height {}",
+                clip.height,
+            );
+        }
+    }
+
+    /// The animatable disclosure: `grid-template-rows: 0fr` collapses the row to
+    /// nothing and the `overflow: hidden` child holds the panel shut. The panel's
+    /// text must be clipped away entirely, not painted over what follows.
+    #[test]
+    fn test_zero_height_overflow_hidden_clips_its_panel_away() {
+        let tree = build_tree_from_html(
+            r#"<div style="display:grid;grid-template-rows:0fr;">
+                <div style="overflow:hidden;">
+                    <div>panel text that must not paint</div>
+                </div>
+            </div>"#,
+            "",
+        );
+        let cmds: Vec<&PaintCommand> = tree.layers.iter()
+            .flat_map(|l| l.content_commands.iter().chain(l.background_commands.iter()))
+            .collect();
+
+        for cmd in &cmds {
+            if let PaintCommand::Text { clip, .. } = cmd {
+                assert!(
+                    clip.height < 0.01,
+                    "a panel held at 0fr must clip its text away, got clip height {}",
+                    clip.height,
+                );
+            }
+        }
+
+        let push_count = cmds.iter().filter(|c| matches!(c, PaintCommand::PushClip { .. })).count();
+        let pop_count = cmds.iter().filter(|c| matches!(c, PaintCommand::PopClip)).count();
+        assert!(push_count >= 1, "a zero-height clipping box must still push its clip");
+        assert_eq!(push_count, pop_count, "PushClip and PopClip must be balanced");
+    }
+
+    /// Nested clipping boxes intersect: the inner run sees the overlap of both,
+    /// not just the nearest one.
+    #[test]
+    fn test_nested_clips_intersect() {
+        let tree = build_tree_from_html(
+            r#"<div style="width:300px;height:30px;overflow:hidden;">
+                <div style="width:300px;height:200px;overflow:hidden;">
+                    <div>text under two clips</div>
+                </div>
+            </div>"#,
+            "",
+        );
+        let clips: Vec<LayoutRect> = tree.layers.iter()
+            .flat_map(|l| l.content_commands.iter().chain(l.background_commands.iter()))
+            .filter_map(|cmd| match cmd {
+                PaintCommand::Text { clip, .. } => Some(*clip),
+                _ => None,
+            })
+            .collect();
+        assert!(!clips.is_empty(), "expected a text run inside the nested clips");
+        for clip in clips {
+            assert!(
+                clip.height <= 30.0 + 0.01,
+                "the outer 30px clip must survive the inner 200px one, got {}",
+                clip.height,
+            );
+        }
     }
 
     /// A positioned element (position:relative) without explicit z-index must establish a layer.

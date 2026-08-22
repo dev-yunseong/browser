@@ -127,6 +127,8 @@ Ordered by how much of a page each one destroyed.
 | `min-height` and `max-height` compared in the wrong box | The bound is a border box under `border-box` sizing while a measured height already is one, so insetting the bound and leaving the height alone compared a bound shorn of its padding against a height that still carried it. |
 | An absolutely positioned child resolved against the content box | Its containing block is the ancestor's *padding* box (CSS 2.2 §10.1), so an `inset: 0` overlay came out short by the padding it exists to cover. |
 | `background: var(--x)` never reaching paint | The shorthand holds the reference and the colour slot holds the reset the shorthand emits; substitution happens long after the shorthand was split, and the result was never put where paint looks for it. |
+| `overflow: hidden` never reaching the text inside it | A text run carries its own clip rect and never consults the mask stack the clip is pushed onto, so a clipped panel's prose painted straight over whatever followed it. A disclosure held shut at `grid-template-rows: 0fr` spilled its whole panel across the heading below. |
+| An empty clip rect read as no clip at all | `Rect::from_xywh` rejects a rect that is zero along an axis, and the rejection was handled as a failed allocation — fall back to painting unclipped. That is the exact inverse of an empty clip, which paints nothing. |
 | Flow advancing past the content box | A box that states a height and carries padding handed the next block a cursor its own padding too high, and every section below it climbed by that much. |
 
 
@@ -138,7 +140,7 @@ pixels:
 
 | fixture | layout | fold | page | height (chromium -> engine) |
 |---|---|---|---|---|
-| github.com | 1.66% | 3.33% | 3.34% | 10570 -> 10537 |
+| github.com | 1.66% | 3.33% | 3.27% | 10570 -> 10537 |
 | yunseong.dev | 1.46% | 3.22% | 3.90% | 4976 -> 4947 |
 | naver.com | 1.32% | 2.88% | 2.55% | 18658 -> 16384 |
 
