@@ -663,6 +663,35 @@ pub fn parse_css(source: &str) -> Stylesheet {
                         }
                     }
                 }
+                // `background` is a shorthand whose colour component must land in
+                // `background-color`. Leaving it only under `background` lets a UA
+                // default `background-color` win over an author's `background`,
+                // which is how buttons kept their grey chrome instead of taking
+                // the colour the page asked for.
+                "background" => {
+                    declarations.push(Declaration { name: key.clone(), value: parse_value(&val_raw), important });
+                    for part in split_respecting_parens(&val_raw) {
+                        if part.eq_ignore_ascii_case("transparent") || part.eq_ignore_ascii_case("none") {
+                            declarations.push(Declaration {
+                                name: intern("background-color"),
+                                value: Value::Color(Color { r: 0, g: 0, b: 0, a: 0 }),
+                                important,
+                            });
+                        } else if let Some(color) = parse_color(&part) {
+                            declarations.push(Declaration {
+                                name: intern("background-color"),
+                                value: Value::Color(color),
+                                important,
+                            });
+                        } else if let Some(gradient) = parse_gradient(&part) {
+                            declarations.push(Declaration {
+                                name: intern("background-image"),
+                                value: Value::Gradient(gradient),
+                                important,
+                            });
+                        }
+                    }
+                }
                 // gap shorthand: "gap: <row-gap> [<col-gap>]"
                 "gap" => {
                     let parts: Vec<&str> = val_raw.split_whitespace().collect();

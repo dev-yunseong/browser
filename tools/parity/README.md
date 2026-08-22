@@ -44,3 +44,27 @@ a regression points at a mechanism rather than at "github.com looks wrong":
 | `smoke` | block/inline flow, flex row, borders, radii |
 | `probe-hiding` | every idiom real sites use to hide content |
 | `probe-sizing` | grid track sizing, flex basis, percentage widths |
+
+## Known limitation: two box models in one engine
+
+`LayoutBox::dimensions` is read as a **border box** in some places and a
+**content box** in others, and the two readings are both load-bearing:
+
+- Painting draws backgrounds and borders straight over `dimensions`, and the
+  flex algorithm distributes free space into it — both of which only look right
+  if it is the border box.
+- `border_box_width()` adds padding and border *on top of* `dimensions`, and the
+  child content width is taken as `dimensions` unchanged — both of which only
+  hold if it is the content box.
+
+The visible cost is a shrink-to-fit control coming out narrower than its own
+label: `fit-content` already counts the padding, the border-box adjustment takes
+it off again, and the label is clipped (`probe-controls`). Nested padding also
+fails to reduce the width passed to children.
+
+Fixing it means picking one meaning and migrating every reader — the width
+computation, `border_box_width`/`margin_box_width`, the flex and grid track
+code, and the rect collectors — in one change, with
+`test_button_coordinate_collection` and `test_border_box_min_size_includes_padding`
+updated to the chosen model. It is not a local edit; a half-migration renders
+worse than either model alone.
