@@ -786,28 +786,7 @@ pub fn parse_css(source: &str) -> Stylesheet {
                 // which is how buttons kept their grey chrome instead of taking
                 // the colour the page asked for.
                 "background" => {
-                    declarations.push(Declaration { name: key.clone(), value: parse_value(&val_raw), important });
-                    for part in split_respecting_parens(&val_raw) {
-                        if part.eq_ignore_ascii_case("transparent") || part.eq_ignore_ascii_case("none") {
-                            declarations.push(Declaration {
-                                name: intern("background-color"),
-                                value: Value::Color(Color { r: 0, g: 0, b: 0, a: 0 }),
-                                important,
-                            });
-                        } else if let Some(color) = parse_color(&part) {
-                            declarations.push(Declaration {
-                                name: intern("background-color"),
-                                value: Value::Color(color),
-                                important,
-                            });
-                        } else if let Some(gradient) = parse_gradient(&part) {
-                            declarations.push(Declaration {
-                                name: intern("background-image"),
-                                value: Value::Gradient(gradient),
-                                important,
-                            });
-                        }
-                    }
+                    expand_background_shorthand(&val_raw, important, &mut declarations);
                 }
                 // gap shorthand: "gap: <row-gap> [<col-gap>]"
                 "gap" => {
@@ -1443,6 +1422,59 @@ fn physical_pair_for(key: &str) -> Option<(&'static str, &'static str)> {
         "border-block-color" => ("border-top-color", "border-bottom-color"),
         _ => return None,
     })
+}
+
+/// Expand the `background` shorthand.
+///
+/// A shorthand resets every longhand it covers, so a `background` that names
+/// only a position still clears the colour. Chromium serialises
+/// `background: none` back as `background: 0px 0px`, and github's accordion
+/// buttons ship exactly that to turn off the UA's grey button fill -- which
+/// stayed on, as a light bar behind every heading in the page's accordions.
+pub fn expand_background_shorthand(
+    val_raw: &str,
+    important: bool,
+    declarations: &mut Vec<Declaration>,
+) {
+    declarations.push(Declaration {
+        name: intern("background"),
+        value: parse_value(val_raw),
+        important,
+    });
+    // `inherit` and friends take the whole shorthand from elsewhere; there is
+    // nothing to reset.
+    let global = matches!(
+        val_raw.trim().to_lowercase().as_str(),
+        "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+    );
+    if !global {
+        declarations.push(Declaration {
+            name: intern("background-color"),
+            value: Value::Color(Color { r: 0, g: 0, b: 0, a: 0 }),
+            important,
+        });
+    }
+    for part in split_respecting_parens(val_raw) {
+        if part.eq_ignore_ascii_case("transparent") || part.eq_ignore_ascii_case("none") {
+            declarations.push(Declaration {
+                name: intern("background-color"),
+                value: Value::Color(Color { r: 0, g: 0, b: 0, a: 0 }),
+                important,
+            });
+        } else if let Some(color) = parse_color(&part) {
+            declarations.push(Declaration {
+                name: intern("background-color"),
+                value: Value::Color(color),
+                important,
+            });
+        } else if let Some(gradient) = parse_gradient(&part) {
+            declarations.push(Declaration {
+                name: intern("background-image"),
+                value: Value::Gradient(gradient),
+                important,
+            });
+        }
+    }
 }
 
 /// Expand a top/right/bottom/left shorthand such as `padding` or `margin`.
@@ -2842,6 +2874,59 @@ mod tests {
             }
             other => panic!("expected linear gradient, got {:?}", other),
         }
+    }
+
+    // ── The `background` shorthand ────────────────────────────────────────────
+
+    /// A shorthand resets every longhand it covers. Chromium serialises
+    /// `background: none` back as `background: 0px 0px`, and github's accordion
+    /// buttons ship exactly that to turn off the UA's grey button fill.
+    #[test]
+    fn test_background_shorthand_clears_the_colour() {
+        let d = decls_of("button { background: 0px 0px }");
+        assert!(
+            d.contains(&"background-color=Color(Color { r: 0, g: 0, b: 0, a: 0 })".to_string()),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn test_background_shorthand_keeps_a_stated_colour() {
+        let d = decls_of("p { background: #ff0000 }");
+        assert!(
+            d.contains(&"background-color=Color(Color { r: 255, g: 0, b: 0, a: 255 })".to_string()),
+            "{d:?}"
+        );
+        // The reset is emitted first, so the stated colour has to come after it
+        // and win the cascade within the rule.
+        let colours: Vec<&String> = d
+            .iter()
+            .filter(|s| s.starts_with("background-color="))
+            .collect();
+        assert_eq!(colours.len(), 2, "{d:?}");
+        assert!(colours[1].contains("r: 255, g: 0"), "{d:?}");
+    }
+
+    /// A gradient in the shorthand still clears the colour under it.
+    #[test]
+    fn test_background_shorthand_gradient_clears_the_colour() {
+        let d = decls_of("p { background: linear-gradient(#000, #fff) }");
+        assert!(d.iter().any(|s| s.starts_with("background-image=Gradient")), "{d:?}");
+        assert!(
+            d.contains(&"background-color=Color(Color { r: 0, g: 0, b: 0, a: 0 })".to_string()),
+            "{d:?}"
+        );
+    }
+
+    /// `inherit` takes the whole shorthand from the parent; there is nothing to
+    /// reset to transparent.
+    #[test]
+    fn test_background_inherit_does_not_reset() {
+        let d = decls_of("p { background: inherit }");
+        assert!(
+            !d.iter().any(|s| s.starts_with("background-color=")),
+            "{d:?}"
+        );
     }
 
     // ── Logical properties ────────────────────────────────────────────────────

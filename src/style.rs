@@ -1181,15 +1181,25 @@ fn apply_default_styles(tag: &str, map: &mut HashMap<Arc<str>, Value>) {
             map.entry(intern("width")).or_insert(Value::Length(120.0, crate::css::Unit::Px));
             map.entry(intern("font-size")).or_insert(Value::Length(13.3333, crate::css::Unit::Px));
         }
+        // The reference renderer's own defaults, measured rather than guessed:
+        // `padding: 1px 6px`, a 2px `outset` bevel, `#efefef`, 13.3333px and a
+        // centred label. A button styled by the page overrides all of it, but an
+        // unstyled one has to be the size the browser makes it or the row it
+        // sits in is the wrong height and its label wraps where it should not.
         "button" => {
             map.entry(intern("line-height")).or_insert(Value::Keyword(intern("normal")));
             map.entry(intern("font-size")).or_insert(Value::Length(13.3333, crate::css::Unit::Px));
+            // Chromium computes 2px here, but it draws an `outset` bevel from
+            // two greys rather than a flat edge; a 1px edge measures closer to
+            // that than a 2px one does.
             map.entry(intern("border-width")).or_insert(Value::Length(1.0, crate::css::Unit::Px));
-            map.entry(intern("border-color")).or_insert(Value::Color(crate::css::Color { r: 180, g: 180, b: 180, a: 255 }));
-            map.entry(intern("background-color")).or_insert(Value::Color(crate::css::Color { r: 240, g: 240, b: 240, a: 255 }));
-            map.entry(intern("padding")).or_insert(Value::Length(4.0, crate::css::Unit::Px));
-            // Width is content-driven (shrink-wrap in layout); enforce a minimum height.
-            map.entry(intern("min-height")).or_insert(Value::Length(24.0, crate::css::Unit::Px));
+            map.entry(intern("border-color")).or_insert(Value::Color(crate::css::Color { r: 190, g: 190, b: 190, a: 255 }));
+            map.entry(intern("background-color")).or_insert(Value::Color(crate::css::Color { r: 239, g: 239, b: 239, a: 255 }));
+            map.entry(intern("padding-top")).or_insert(Value::Length(1.0, crate::css::Unit::Px));
+            map.entry(intern("padding-bottom")).or_insert(Value::Length(1.0, crate::css::Unit::Px));
+            map.entry(intern("padding-left")).or_insert(Value::Length(6.0, crate::css::Unit::Px));
+            map.entry(intern("padding-right")).or_insert(Value::Length(6.0, crate::css::Unit::Px));
+            map.entry(intern("text-align")).or_insert(Value::Keyword(intern("center")));
         }
         // <center> is a legacy presentational element — UA default maps it to a block
         // with text-align: center, matching browsers' built-in stylesheet.
@@ -2119,6 +2129,11 @@ pub fn parse_inline_style_into_vec(style_str: &str, list: &mut Vec<crate::css::D
         let val = if important { val_raw.trim_end_matches("!important").trim() } else { val_raw };
 
         match &*key {
+            // The same reset a stylesheet's `background` performs: a `style`
+            // attribute's shorthand clears the colour too.
+            "background" => {
+                crate::css::expand_background_shorthand(val, important, list);
+            }
             "border" => {
                 let mut temp_map = HashMap::new();
                 crate::css::parse_border_shorthand_pub(val, &mut temp_map);
