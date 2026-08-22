@@ -1040,27 +1040,36 @@ fn build_final_tree(
     results.pop().expect("build_final_tree: results stack should have exactly one element")
 }
 
-fn apply_default_styles(tag: &str, map: &mut HashMap<Arc<str>, Value>) {
+/// Font size and block margins of a heading, in `em`, per the HTML spec's
+/// suggested rendering (§15.3.6). They are `em` rather than pixels on purpose:
+/// a heading inside a container with its own font size scales with it, and a
+/// page that sets `html { font-size }` expects the whole scale to follow.
+fn heading_metrics(tag: &str) -> Option<(f32, f32)> {
     match tag {
-        "h1" => {
-            map.entry(intern("font-size")).or_insert(Value::Length(32.0, crate::css::Unit::Px));
-            map.entry(intern("font-weight")).or_insert(Value::Keyword(intern("bold")));
-            map.entry(intern("margin-top")).or_insert(Value::Length(21.0, crate::css::Unit::Px));
-            map.entry(intern("margin-bottom")).or_insert(Value::Length(21.0, crate::css::Unit::Px));
-        }
-        "h2" => {
-            map.entry(intern("font-size")).or_insert(Value::Length(24.0, crate::css::Unit::Px));
-            map.entry(intern("font-weight")).or_insert(Value::Keyword(intern("bold")));
-            map.entry(intern("margin-top")).or_insert(Value::Length(14.0, crate::css::Unit::Px));
-            map.entry(intern("margin-bottom")).or_insert(Value::Length(14.0, crate::css::Unit::Px));
-        }
-        "h3" => {
-            map.entry(intern("font-size")).or_insert(Value::Length(18.0, crate::css::Unit::Px));
-            map.entry(intern("font-weight")).or_insert(Value::Keyword(intern("bold")));
-        }
-        "h4" | "h5" | "h6" => {
-            map.entry(intern("font-weight")).or_insert(Value::Keyword(intern("bold")));
-        }
+        "h1" => Some((2.0, 0.67)),
+        "h2" => Some((1.5, 0.83)),
+        "h3" => Some((1.17, 1.0)),
+        "h4" => Some((1.0, 1.33)),
+        "h5" => Some((0.83, 1.67)),
+        "h6" => Some((0.67, 2.33)),
+        _ => None,
+    }
+}
+
+fn apply_default_styles(tag: &str, map: &mut HashMap<Arc<str>, Value>) {
+    // Block margins in the UA sheet are all `em`, so they track the element's
+    // own font size. Stating them in pixels — as this did — pinned a paragraph's
+    // rhythm to a 16px body no matter what the page actually set, and the error
+    // compounded down a page built from stacked prose blocks.
+    if let Some((size_em, margin_em)) = heading_metrics(tag) {
+        map.entry(intern("font-size")).or_insert(Value::Length(size_em, crate::css::Unit::Em));
+        map.entry(intern("font-weight")).or_insert(Value::Keyword(intern("bold")));
+        // The margin is `em` of the heading's *own* size, which the size above
+        // has just set, so it resolves against the scaled value.
+        map.entry(intern("margin-top")).or_insert(Value::Length(margin_em, crate::css::Unit::Em));
+        map.entry(intern("margin-bottom")).or_insert(Value::Length(margin_em, crate::css::Unit::Em));
+    }
+    match tag {
         "a" => {
             map.entry(intern("color")).or_insert(Value::Color(parse_color("#0000ee").unwrap()));
             map.entry(intern("text-decoration")).or_insert(Value::Keyword(intern("underline")));
@@ -1074,6 +1083,10 @@ fn apply_default_styles(tag: &str, map: &mut HashMap<Arc<str>, Value>) {
         "code" | "pre" | "kbd" | "samp" => {
             map.entry(intern("font-family")).or_insert(Value::Keyword(intern("monospace")));
             map.entry(intern("background-color")).or_insert(Value::Color(crate::css::Color { r: 240, g: 240, b: 240, a: 255 }));
+            if tag == "pre" {
+                map.entry(intern("margin-top")).or_insert(Value::Length(1.0, crate::css::Unit::Em));
+                map.entry(intern("margin-bottom")).or_insert(Value::Length(1.0, crate::css::Unit::Em));
+            }
         }
         "input" => {
             map.entry(intern("border-width")).or_insert(Value::Length(1.0, crate::css::Unit::Px));
@@ -1116,17 +1129,25 @@ fn apply_default_styles(tag: &str, map: &mut HashMap<Arc<str>, Value>) {
             map.entry(intern("display")).or_insert(Value::Keyword(intern("block")));
             map.entry(intern("text-align")).or_insert(Value::Keyword(intern("center")));
         }
-        "ul" => {
+        "ul" | "ol" => {
+            map.entry(intern("margin-top")).or_insert(Value::Length(1.0, crate::css::Unit::Em));
+            map.entry(intern("margin-bottom")).or_insert(Value::Length(1.0, crate::css::Unit::Em));
             map.entry(intern("padding-left")).or_insert(Value::Length(40.0, crate::css::Unit::Px));
-            map.entry(intern("list-style-type")).or_insert(Value::Keyword(intern("disc")));
+            map.entry(intern("list-style-type")).or_insert(Value::Keyword(intern(
+                if tag == "ul" { "disc" } else { "decimal" },
+            )));
         }
-        "ol" => {
-            map.entry(intern("padding-left")).or_insert(Value::Length(40.0, crate::css::Unit::Px));
-            map.entry(intern("list-style-type")).or_insert(Value::Keyword(intern("decimal")));
+        "p" | "dl" => {
+            map.entry(intern("margin-top")).or_insert(Value::Length(1.0, crate::css::Unit::Em));
+            map.entry(intern("margin-bottom")).or_insert(Value::Length(1.0, crate::css::Unit::Em));
         }
-        "p" => {
-            map.entry(intern("margin-top")).or_insert(Value::Length(8.0, crate::css::Unit::Px));
-            map.entry(intern("margin-bottom")).or_insert(Value::Length(8.0, crate::css::Unit::Px));
+        // `margin: 1em 40px` — the side margins are what makes a blockquote read
+        // as a quote at all, so they are as load-bearing as the block ones.
+        "blockquote" | "figure" => {
+            map.entry(intern("margin-top")).or_insert(Value::Length(1.0, crate::css::Unit::Em));
+            map.entry(intern("margin-bottom")).or_insert(Value::Length(1.0, crate::css::Unit::Em));
+            map.entry(intern("margin-left")).or_insert(Value::Length(40.0, crate::css::Unit::Px));
+            map.entry(intern("margin-right")).or_insert(Value::Length(40.0, crate::css::Unit::Px));
         }
         _ => {}
     }

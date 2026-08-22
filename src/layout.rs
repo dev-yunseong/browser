@@ -5720,6 +5720,46 @@ mod tests {
         );
     }
 
+    /// A paragraph's UA margin is `1em`, so it tracks the page's font size.
+    /// Pinning it to 16px made a page that sets a larger body size come out
+    /// short, and the error compounded down a column of prose.
+    #[test]
+    fn test_paragraph_ua_margin_scales_with_font_size() {
+        let html = r#"<div style="font-size:20px"><p id="a">one</p><p id="b">two</p></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let a = find_element_by_id(&layout, "a").expect("p a");
+        let b = find_element_by_id(&layout, "b").expect("p b");
+
+        // Adjacent margins collapse, so the gap between the boxes is one 20px margin.
+        let gap = b.dimensions.y - (a.dimensions.y + a.dimensions.height);
+        assert!(
+            (gap - 20.0).abs() < 2.0,
+            "1em margin at 20px font should leave a 20px gap, got {}",
+            gap
+        );
+    }
+
+    /// `h1` is `2em` of its parent, not a fixed 32px.
+    #[test]
+    fn test_heading_ua_font_size_is_relative_to_parent() {
+        let html = r#"<div style="font-size:10px"><h1 id="h">Title</h1></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let h = find_element_by_id(&layout, "h").expect("h1");
+        // 2em of 10px = 20px text; its 0.67em margins resolve against that.
+        assert!(
+            (h.dimensions.height - 20.0).abs() < 6.0,
+            "h1 in a 10px context should be about one 20px line tall, got {}",
+            h.dimensions.height
+        );
+        assert!(
+            (h.margin.top - 13.4).abs() < 2.0,
+            "h1 margin should be 0.67em of its own 20px size, got {}",
+            h.margin.top
+        );
+    }
+
     /// `justify-content: center` must center flex children horizontally within
     /// the flex container.
     #[test]
