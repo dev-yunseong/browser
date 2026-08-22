@@ -1530,18 +1530,15 @@ impl<'a> LayoutBox<'a> {
         };
 
         if let NodeData::Text { ref contents } = self.style_node.node.data {
-            let available_width = if container_width.is_finite() {
-                let consumed = (initial_x - container_start_x).max(0.0);
-                (container_width - consumed).max(0.0)
-            } else {
-                container_width
-            };
+            // The full line-box width, not what is left of it: only the *first*
+            // line of this run starts where the run does, and `layout_text`
+            // works that out for itself.
             return self.layout_text(
                 contents.borrow().to_string(),
                 container_start_x,
                 initial_x,
                 current_y,
-                available_width,
+                container_width,
             );
         }
 
@@ -2908,14 +2905,23 @@ impl<'a> LayoutBox<'a> {
                     } else {
                         0.0
                     };
-                    let mut lx = container_x + left_indent + align_offset;
+                    let line_left = container_x + left_indent + align_offset;
+                    let mut lx = line_left;
                     for mut m in cur_line.members.drain(..) {
-                        let dx = lx - (m.dimensions.x - m.margin.left);
+                        // A text run's box spans the whole line box — its second
+                        // and later lines start at the line's own left edge —
+                        // and it carries what came before it on the first line
+                        // as an indent. So it is placed at the line's edge
+                        // rather than after its predecessor, and its right edge
+                        // is where the next thing on the line goes.
+                        let is_text = matches!(m.style_node.node.data, NodeData::Text { .. });
+                        let place_at = if is_text { line_left } else { lx };
+                        let dx = place_at - (m.dimensions.x - m.margin.left);
                         let dy = cursor_y - (m.dimensions.y - m.margin.top);
                         offset_layout_box(&mut m, dx, dy);
                         max_child_x =
                             max_child_x.max(m.dimensions.x + outer_width(&m) + m.margin.right);
-                        lx += outer_width(&m) + m.margin.left + m.margin.right;
+                        lx = place_at + outer_width(&m) + m.margin.left + m.margin.right;
                         result.push(m);
                     }
                     cursor_y += cur_line.height;
@@ -3122,7 +3128,18 @@ impl<'a> LayoutBox<'a> {
                         // actually placed.  Empty/whitespace-only text nodes return None and
                         // must NOT interrupt adjacent-block margin collapsing.
                         prev_margin_bottom = 0.0;
-                        let item_w = outer_width(&cb) + cb.margin.left + cb.margin.right;
+                        // A text run's box spans the whole line box, so the
+                        // part of it the line already holds — the indent its
+                        // first line starts at — is not new width.
+                        let already_on_line = if matches!(entry.node.node.data, NodeData::Text { .. })
+                        {
+                            cur_line.width
+                        } else {
+                            0.0
+                        };
+                        let item_w = (outer_width(&cb) + cb.margin.left + cb.margin.right
+                            - already_on_line)
+                            .max(0.0);
                         let keep_table_cells_on_row =
                             self.display == DisplayType::TableRow && cb.display == DisplayType::TableCell;
                         if !keep_table_cells_on_row
@@ -3441,12 +3458,17 @@ impl<'a> LayoutBox<'a> {
             // Whitespace-only node: emit a single-space-wide invisible box so
             // the next inline sibling is separated from the previous one.
             if !at_line_start && text.contains(|c: char| c.is_whitespace()) {
-                let w = space_w.min(container_width.max(0.0));
-                self.dimensions.x = current_x + self.margin.left;
+                // Sized and placed like any other run: the box spans the line
+                // box, with what came before it on the line carried as the
+                // first line's indent.
+                let indent = (current_x - container_start_x).max(0.0);
+                let w = space_w.min((container_width - indent).max(0.0));
+                self.text_leading = indent;
+                self.dimensions.x = container_start_x + self.margin.left;
                 self.dimensions.y = current_y + self.margin.top;
-                self.dimensions.width = w;
+                self.dimensions.width = indent + w;
                 self.dimensions.height = line_height;
-                let final_x = self.dimensions.x + w + self.margin.right;
+                let final_x = self.dimensions.x + self.dimensions.width + self.margin.right;
                 let final_y = self.dimensions.y + line_height + self.margin.bottom;
                 return (Some(self), final_x, final_y);
             }
@@ -3460,8 +3482,18 @@ impl<'a> LayoutBox<'a> {
             !at_line_start && text.starts_with(|c: char| c.is_whitespace());
         let has_trailing_space = text.ends_with(|c: char| c.is_whitespace());
 
+        // Only the *first* line of a run starts where the run does: what an
+        // inline sibling to its left already used is unavailable on that line
+        // and available on every line after it. Measuring the whole run against
+        // the leftover width wrapped a heading with a bold lead-in a line early
+        // — and every line of every paragraph with an inline element in it.
+        let first_line_indent = (current_x - container_start_x).max(0.0)
+            + if has_leading_space { space_w } else { 0.0 };
+
         let mut lines_count = 1;
-        let mut line_w: f32 = 0.0;
+        // The indent is part of the first line's width; a break resets it,
+        // since the next line starts at the container's own edge.
+        let mut line_w: f32 = first_line_indent;
         let mut max_w: f32 = 0.0;
         // A line may only break *between* two words. The leading inter-element
         // space counts toward the width but is not something to break after:
@@ -3469,11 +3501,6 @@ impl<'a> LayoutBox<'a> {
         // line, so a tag whose text exactly filled its box came out split in
         // two where the browser keeps it whole.
         let mut word_on_line = false;
-
-        // Leading inter-element space (counts toward width but is invisible).
-        if has_leading_space {
-            line_w += space_w;
-        }
 
         let segments: Vec<&str> = if preserve_newlines {
             trimmed.split('\n').collect()
@@ -3548,12 +3575,12 @@ impl<'a> LayoutBox<'a> {
 
         max_w = max_w.max(line_w);
 
-        // The collapsed inter-element space is reserved inside this box's width,
-        // but it sits *before* the glyphs. Paint trims the run before drawing, so
-        // it needs to be told how far in to start — otherwise the text after an
-        // inline element is drawn a space too far left and runs into it.
-        self.text_leading = if has_leading_space { space_w } else { 0.0 };
-        self.dimensions.x = current_x + self.margin.left;
+        // The box spans the whole line box, because that is where its second
+        // and later lines live; the first line starts `text_leading` in, which
+        // is what an inline sibling to the left of it took plus any collapsed
+        // space between the two. Paint reads it the same way.
+        self.text_leading = first_line_indent;
+        self.dimensions.x = container_start_x + self.margin.left;
         self.dimensions.y = current_y + self.margin.top;
         self.dimensions.width = if no_wrap {
             max_w
@@ -4745,6 +4772,36 @@ mod tests {
         );
     }
 
+    /// Only a run's *first* line starts where the run does. What an inline
+    /// sibling to its left already used is unavailable on that line and
+    /// available on every line after it; measuring the whole run against the
+    /// leftover width wrapped it a line early — in a heading with a bold
+    /// lead-in, and in every paragraph with an inline element in it.
+    #[test]
+    fn test_only_the_first_line_of_a_run_is_indented() {
+        let html = r#"<div id="d" style="width:351px;font-size:20px;line-height:28px">
+            <span><span>Plan with clarity.</span> Organize everything from high-level roadmaps to everyday tasks.</span>
+          </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let d = find_element_by_id(&layout, "d").expect("d");
+        assert_eq!(
+            d.dimensions.height, 84.0,
+            "three lines of 28, not four: got {}",
+            d.dimensions.height
+        );
+    }
+
+    /// The run's box spans the line box, and the indent it carries is what
+    /// paint starts its first line at.
+    #[test]
+    fn test_a_run_after_an_inline_spans_the_line_box() {
+        let html = r#"<div id="d" style="width:400px"><span id="p" style="display:inline-block;width:120px">p</span>tail</div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let tail = find_text_box_containing(&layout, "tail").expect("tail");
+        assert_eq!(tail.dimensions.x, 0.0, "the box starts at the line's edge");
+        assert_eq!(tail.text_leading, 120.0, "and its first line 120 in");
+    }
+
     /// A shrink-to-fit box is sized to its own content, so that content must
     /// not then wrap inside it. The two widths are summed in different orders
     /// and land a few ULPs apart, which an exact `>` turned into a wrapped
@@ -5304,18 +5361,25 @@ mod tests {
         let layout = layout_opt.expect("layout");
         let text = find_text_box_containing(&layout, "This sentence").expect("text node not found");
 
+        // The run's box is the line box it lives in: its first line starts
+        // after the prefix, but every line after that starts at the container's
+        // own edge and has the full width to fill.
         assert!(
-            text.dimensions.x >= 280.0,
-            "inline text should start after the prefix, got x={}",
-            text.dimensions.x
+            (text.text_leading - 280.0).abs() < 6.0,
+            "the first line starts after the prefix and the space between them, \
+             got an indent of {}",
+            text.text_leading
         );
-        assert!(
-            text.dimensions.width <= 520.0,
-            "inline text width should be limited by the remaining line width, got {}",
-            text.dimensions.width
+        assert_eq!(
+            text.dimensions.x, 0.0,
+            "and the box itself spans the line box, got x={}",
+            text.dimensions.x
         );
         assert!(text.dimensions.height > 24.0,
             "inline text should wrap onto multiple lines when the prefix consumes horizontal space, got height={}",
+            text.dimensions.height);
+        assert!(text.dimensions.height < 60.0,
+            "but only two of them: the second line has all 800px, got height={}",
             text.dimensions.height);
     }
 
