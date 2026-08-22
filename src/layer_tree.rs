@@ -72,6 +72,32 @@ impl CornerRadii {
 }
 
 
+/// How the lines of a run sit inside the box the run was measured into.
+///
+/// `text-align` places *every* line by its own width, so paint needs it: the
+/// box carries only where the widest line goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextAlign {
+    /// The lines start at the box's own edge — `left`, `start`, and the default.
+    Start,
+    Center,
+    /// `right` and `end`.
+    End,
+}
+
+impl TextAlign {
+    /// The alignment a `text-align` keyword asks for. `justify` is not stretched
+    /// here, so it reads as the start edge, which is where its last line sits.
+    pub fn from_keyword(k: &str) -> Self {
+        match k {
+            "center" => TextAlign::Center,
+            "right" | "end" => TextAlign::End,
+            _ => TextAlign::Start,
+        }
+    }
+}
+
+
 /// A single atomic drawing operation. Moved from render.rs so that layer_tree.rs
 /// owns the data pipeline (layout → layer tree → paint commands) while render.rs
 /// owns the pixel execution (paint commands → Pixmap).
@@ -124,6 +150,9 @@ pub enum PaintCommand {
         /// and friends make them. Layout counted its lines that way, so paint
         /// has to draw them that way.
         preserve_newlines: bool,
+        /// Where each of the run's lines sits inside the box. Layout places the
+        /// box by its widest line; the rest are settled against that here.
+        text_align: TextAlign,
     },
     /// Outer box-shadow
     Shadow(LayoutRect, BoxShadow),
@@ -1302,6 +1331,12 @@ impl LayerTreeBuilder {
                     preserve_newlines: crate::layout::preserves_newlines(
                         crate::layout::resolved_white_space(layout.style_node),
                     ),
+                    // `text-align` inherits, so the run carries the alignment of
+                    // whatever block it ended up in.
+                    text_align: match sv.get(&crate::css::intern("text-align")) {
+                        Some(Value::Keyword(k)) => TextAlign::from_keyword(k),
+                        _ => TextAlign::Start,
+                    },
                 });
             }
         }
@@ -1339,6 +1374,10 @@ impl LayerTreeBuilder {
                     letter_spacing: 0.0,
                     text_decoration: 0,
                     preserve_newlines: false,
+                    // A marker, a control's label, its value and its
+                    // placeholder are each one line in a box this places, so
+                    // there is nothing to settle them against.
+                    text_align: TextAlign::Start,
                 });
             }
         }
@@ -1381,6 +1420,10 @@ impl LayerTreeBuilder {
                     letter_spacing: 0.0,
                     text_decoration: 0,
                     preserve_newlines: false,
+                    // A marker, a control's label, its value and its
+                    // placeholder are each one line in a box this places, so
+                    // there is nothing to settle them against.
+                    text_align: TextAlign::Start,
                 });
             }
         }
@@ -1419,6 +1462,7 @@ impl LayerTreeBuilder {
                 letter_spacing: crate::layout::resolved_letter_spacing_px(layout.style_node),
                 text_decoration: 0,
                 preserve_newlines: false,
+                text_align: TextAlign::Start,
             });
         }
 
@@ -1485,6 +1529,10 @@ impl LayerTreeBuilder {
                     letter_spacing: crate::layout::resolved_letter_spacing_px(layout.style_node),
                     text_decoration: 0,
                     preserve_newlines: false,
+                    // A marker, a control's label, its value and its
+                    // placeholder are each one line in a box this places, so
+                    // there is nothing to settle them against.
+                    text_align: TextAlign::Start,
                 });
             }
         }

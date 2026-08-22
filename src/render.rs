@@ -550,14 +550,14 @@ fn execute_commands_on_tile(
                     draw_broken_image(pixmap, *r, alt, alt_color, *alt_font_size, *alt_line_height, transform);
                 }
             }
-            PaintCommand::Text { rect, text, font_size, line_height, leading_space, color, clip, style, letter_spacing, text_decoration, preserve_newlines } => {
+            PaintCommand::Text { rect, text, font_size, line_height, leading_space, color, clip, style, letter_spacing, text_decoration, preserve_newlines, text_align } => {
                 let mut adjusted_rect = *rect;
                 adjusted_rect.x += tx;
                 adjusted_rect.y += ty;
                 let mut adjusted_clip = *clip;
                 adjusted_clip.x += tx;
                 adjusted_clip.y += ty;
-                render_text_raw(text.clone(), adjusted_rect, *font_size, *line_height, color, adjusted_clip, pixmap, *style, *letter_spacing, *text_decoration, *preserve_newlines, *leading_space);
+                render_text_raw(text.clone(), adjusted_rect, *font_size, *line_height, color, adjusted_clip, pixmap, *style, *letter_spacing, *text_decoration, *preserve_newlines, *leading_space, *text_align);
             }
             PaintCommand::Svg { rect, source, current_color } => {
                 let mut r = *rect;
@@ -912,6 +912,9 @@ fn draw_broken_image(
         0,
         false,
         inset,
+        // A broken image's `alt` runs from the box's left edge, as a browser
+        // draws it.
+        crate::layer_tree::TextAlign::Start,
     );
 }
 
@@ -990,6 +993,9 @@ fn render_text_raw(
     // How far into the box the *first* line starts: what an inline sibling to
     // its left already used. Later lines start at the box's own edge.
     first_line_indent: f32,
+    // Where each line sits inside the box, which layout placed by the widest
+    // of them.
+    text_align: crate::layer_tree::TextAlign,
 ) {
     let italic = style.italic;
     let trimmed = text.trim();
@@ -1002,8 +1008,6 @@ fn render_text_raw(
     // font came out that much too high: at `line-height: 40px` on a 16px face,
     // ten pixels of it.
     let baseline_offset = line_height - fonts.below_baseline(font_size, style, line_height);
-    let mut current_y = rect.y + baseline_offset;
-    let mut current_x = rect.x + first_line_indent;
     let space_w = fonts.advance(' ', font_size, style) + letter_spacing;
 
     // Shear coefficient for italic synthesis: shifts pixels ~12° (tan 12° ≈ 0.213)
@@ -1012,8 +1016,6 @@ fn render_text_raw(
     // We track line segments so we can draw decorations per line.
     // Each entry: (line_start_x, line_end_x, baseline_y)
     let mut decoration_lines: Vec<(f32, f32, f32)> = Vec::new();
-    let mut line_start_x = current_x;
-    let mut line_end_x = current_x;
 
     // font_size_half_px: rounds to nearest 0.5 px so that glyphs at the same
     // logical size share a cache entry regardless of tiny float differences.
@@ -1024,149 +1026,203 @@ fn render_text_raw(
     } else {
         vec![trimmed]
     };
-    for (segment_index, segment) in segments.into_iter().enumerate() {
-    if segment_index > 0 {
-        decoration_lines.push((line_start_x, line_end_x, current_y));
-        current_x = rect.x;
-        current_y += line_height;
-        line_start_x = current_x;
-        line_end_x = current_x;
+
+    /// One word, resolved to the glyphs that draw it: each carries the kerning
+    /// that precedes it and the advance that follows.
+    struct Word {
+        glyphs: Vec<(crate::font::FaceId, ab_glyph::GlyphId, f32, f32, bool)>,
+        width: f32,
     }
-    for word in segment.split_whitespace() {
-        let mut word_w = 0.0;
-        let mut glyphs = Vec::new();
-        // Kerning is applied here exactly as `FontSet::measure` applies it, so
-        // paint puts the glyphs where the widths that decided the line breaks
-        // said they would be.
-        let mut prev_glyph: Option<(crate::font::FaceId, ab_glyph::GlyphId)> = None;
-        for c in word.chars() {
-            let (face, gid) = fonts.glyph(c, style);
-            // A real bold face is bundled, so only the CJK fallback — which has
-            // no bold companion — still needs the strokes thickened by hand.
-            let synthetic_bold = style.bold && face == crate::font::FaceId::Fallback;
-            let kern = fonts.kern(prev_glyph, (face, gid), font_size);
-            let adv = fonts.advance(c, font_size, style) + letter_spacing;
-            glyphs.push((face, gid, kern, adv, synthetic_bold));
-            word_w += kern + adv;
-            prev_glyph = Some((face, gid));
+    /// One line of the run.
+    struct Line {
+        words: Vec<Word>,
+        /// Where the line starts before any alignment: the box's own edge, plus
+        /// what an inline sibling to the left already took on the first line.
+        left: f32,
+        /// The line's ink width, without the space that follows its last word.
+        width: f32,
+    }
+
+    // The whole run is broken into lines before any glyph goes down: a line
+    // cannot be placed until its own width is known, and `text-align` places
+    // every line by its own width — not only the first. Drawing as the words
+    // arrived started each line at the box's left edge, so a centred paragraph
+    // had its first line centred by the box and every later one left-aligned
+    // against that line.
+    let mut lines: Vec<Line> = Vec::new();
+    let mut line = Line { words: Vec::new(), left: rect.x + first_line_indent, width: 0.0 };
+    let mut cursor = line.left;
+    for (segment_index, segment) in segments.into_iter().enumerate() {
+        if segment_index > 0 {
+            let finished = std::mem::replace(
+                &mut line,
+                Line { words: Vec::new(), left: rect.x, width: 0.0 },
+            );
+            lines.push(finished);
+            cursor = line.left;
         }
-        if current_x + word_w > rect.x + rect.width + 1.0 && current_x > rect.x {
-            // End the current decoration line segment before wrapping.
-            decoration_lines.push((line_start_x, line_end_x, current_y));
-            current_x = rect.x;
-            current_y += line_height;
-            line_start_x = current_x;
-            line_end_x = current_x;
+        for word in segment.split_whitespace() {
+            let mut width = 0.0;
+            let mut glyphs = Vec::new();
+            // Kerning is applied here exactly as `FontSet::measure` applies it,
+            // so paint puts the glyphs where the widths that decided the line
+            // breaks said they would be.
+            let mut prev_glyph: Option<(crate::font::FaceId, ab_glyph::GlyphId)> = None;
+            for c in word.chars() {
+                let (face, gid) = fonts.glyph(c, style);
+                // A real bold face is bundled, so only the CJK fallback — which
+                // has no bold companion — still needs the strokes thickened by
+                // hand.
+                let synthetic_bold = style.bold && face == crate::font::FaceId::Fallback;
+                let kern = fonts.kern(prev_glyph, (face, gid), font_size);
+                let adv = fonts.advance(c, font_size, style) + letter_spacing;
+                glyphs.push((face, gid, kern, adv, synthetic_bold));
+                width += kern + adv;
+                prev_glyph = Some((face, gid));
+            }
+            if cursor + width > rect.x + rect.width + 1.0 && cursor > rect.x {
+                let finished = std::mem::replace(
+                    &mut line,
+                    Line { words: Vec::new(), left: rect.x, width: 0.0 },
+                );
+                lines.push(finished);
+                cursor = line.left;
+            }
+            line.width = cursor + width - line.left;
+            line.words.push(Word { glyphs, width });
+            cursor += width + space_w;
         }
-        for (face, gid, kern, adv, synthetic_bold) in glyphs {
-            current_x += kern;
-            // Quarter-pixel phases are what browsers use; finer buys nothing
-            // visible and multiplies the cache.
-            const PHASES: f32 = 4.0;
-            let x_phase = ((current_x - current_x.floor()) * PHASES).round() as u8 % PHASES as u8;
-            let key = GlyphKey {
-                face,
-                glyph_id: gid.0,
-                font_size_half_px,
-                bold: synthetic_bold,
-                italic: false, // Italic shear is applied at paint time; do not vary cache by italic
-                x_phase,
+    }
+    lines.push(line);
+    lines.retain(|l| !l.words.is_empty());
+
+    // The lines are aligned within the widest of them, which is the width
+    // layout gave the box and already placed where the alignment asks for.
+    // Working from that extent rather than from the container leaves a run that
+    // fits on one line exactly where it was, and settles the rest of a wrapped
+    // run against it.
+    let widest = lines
+        .iter()
+        .map(|l| (l.left - rect.x) + l.width)
+        .fold(0.0_f32, f32::max);
+
+    let mut current_y = rect.y + baseline_offset;
+    for line in &lines {
+        use crate::layer_tree::TextAlign;
+        let slack = (widest - ((line.left - rect.x) + line.width)).max(0.0);
+        let mut current_x = line.left
+            + match text_align {
+                TextAlign::Center => slack / 2.0,
+                TextAlign::End => slack,
+                TextAlign::Start => 0.0,
             };
+        let line_start_x = current_x;
+        for (word_index, word) in line.words.iter().enumerate() {
+            if word_index > 0 {
+                current_x += space_w;
+            }
+            for &(face, gid, kern, adv, synthetic_bold) in &word.glyphs {
+                current_x += kern;
+                // Quarter-pixel phases are what browsers use; finer buys nothing
+                // visible and multiplies the cache.
+                const PHASES: f32 = 4.0;
+                let x_phase = ((current_x - current_x.floor()) * PHASES).round() as u8 % PHASES as u8;
+                let key = GlyphKey {
+                    face,
+                    glyph_id: gid.0,
+                    font_size_half_px,
+                    bold: synthetic_bold,
+                    italic: false, // Italic shear is applied at paint time; do not vary cache by italic
+                    x_phase,
+                };
 
-            // ── Cache lookup ──────────────────────────────────────────────────
-            //
-            // Try to find a pre-rasterized entry.  On a miss, rasterize the glyph
-            // and store it.  We use a temporary placement of (0.0, 0.0) so that
-            // the resulting pixels (gx, gy, coverage) are purely relative to the
-            // glyph's own bounding-box origin and can be replayed at any position.
-            let cached: GlyphPixels = {
-                // Fast path: check cache without holding the lock across the
-                // potentially-expensive rasterization.
-                let cached_opt = GLYPH_CACHE.lock()
-                    .ok()
-                    .and_then(|c| c.get(&key).cloned());
+                // ── Cache lookup ──────────────────────────────────────────────────
+                //
+                // Try to find a pre-rasterized entry.  On a miss, rasterize the glyph
+                // and store it.  We use a temporary placement of (0.0, 0.0) so that
+                // the resulting pixels (gx, gy, coverage) are purely relative to the
+                // glyph's own bounding-box origin and can be replayed at any position.
+                let cached: GlyphPixels = {
+                    // Fast path: check cache without holding the lock across the
+                    // potentially-expensive rasterization.
+                    let cached_opt = GLYPH_CACHE.lock()
+                        .ok()
+                        .and_then(|c| c.get(&key).cloned());
 
-                if let Some(entry) = cached_opt {
-                    entry
-                } else {
-                    // Cache miss — rasterize using a canonical origin (0, 0) so
-                    // that bx_delta/by_delta are position-independent.
-                    let canonical = gid.with_scale_and_position(
-                        fonts.scale(face, font_size),
-                        point(x_phase as f32 / PHASES, 0.0),
-                    );
-                    let entry = if let Some(outline) = fonts.face(face).outline_glyph(canonical) {
-                        let bounds = outline.px_bounds();
-                        let bx_delta = bounds.min.x.floor() as i32;
-                        let by_delta = bounds.min.y.floor() as i32;
+                    if let Some(entry) = cached_opt {
+                        entry
+                    } else {
+                        // Cache miss — rasterize using a canonical origin (0, 0) so
+                        // that bx_delta/by_delta are position-independent.
+                        let canonical = gid.with_scale_and_position(
+                            fonts.scale(face, font_size),
+                            point(x_phase as f32 / PHASES, 0.0),
+                        );
+                        let entry = if let Some(outline) = fonts.face(face).outline_glyph(canonical) {
+                            let bounds = outline.px_bounds();
+                            let bx_delta = bounds.min.x.floor() as i32;
+                            let by_delta = bounds.min.y.floor() as i32;
 
-                        // Bold: expand each sample to up to 4 pixel offsets.
-                        let bold_offsets: &[(i32, i32)] = if synthetic_bold {
-                            &[(0, 0), (1, 0), (-1, 0), (0, 1)]
+                            // Bold: expand each sample to up to 4 pixel offsets.
+                            let bold_offsets: &[(i32, i32)] = if synthetic_bold {
+                                &[(0, 0), (1, 0), (-1, 0), (0, 1)]
+                            } else {
+                                &[(0, 0)]
+                            };
+
+                            let mut pixels: Vec<(i32, i32, f32)> = Vec::new();
+                            outline.draw(|gx, gy, coverage| {
+                                for &(dx, dy) in bold_offsets {
+                                    pixels.push((gx as i32 + dx, gy as i32 + dy, coverage));
+                                }
+                            });
+
+                            GlyphPixels { bx_delta, by_delta, pixels }
                         } else {
-                            &[(0, 0)]
+                            // No outline (e.g. space character) — empty entry.
+                            GlyphPixels { bx_delta: 0, by_delta: 0, pixels: Vec::new() }
                         };
 
-                        let mut pixels: Vec<(i32, i32, f32)> = Vec::new();
-                        outline.draw(|gx, gy, coverage| {
-                            for &(dx, dy) in bold_offsets {
-                                pixels.push((gx as i32 + dx, gy as i32 + dy, coverage));
-                            }
-                        });
-
-                        GlyphPixels { bx_delta, by_delta, pixels }
-                    } else {
-                        // No outline (e.g. space character) — empty entry.
-                        GlyphPixels { bx_delta: 0, by_delta: 0, pixels: Vec::new() }
-                    };
-
-                    // Store in cache (best-effort; ignore poisoned mutex).
-                    if let Ok(mut cache) = GLYPH_CACHE.lock() {
-                        cache.insert(key, entry.clone());
+                        // Store in cache (best-effort; ignore poisoned mutex).
+                        if let Ok(mut cache) = GLYPH_CACHE.lock() {
+                            cache.insert(key, entry.clone());
+                        }
+                        entry
                     }
-                    entry
-                }
-            };
+                };
 
-            // ── Replay cached pixels ──────────────────────────────────────────
-            let place_x = current_x.floor() as i32;
-            let place_y = current_y.floor() as i32;
-            let bx = place_x + cached.bx_delta;
-            let by = place_y + cached.by_delta;
+                // ── Replay cached pixels ──────────────────────────────────────────
+                let place_x = current_x.floor() as i32;
+                let place_y = current_y.floor() as i32;
+                let bx = place_x + cached.bx_delta;
+                let by = place_y + cached.by_delta;
 
-            for &(gx_off, gy_off, coverage) in &cached.pixels {
-                let mut px = bx + gx_off;
-                let py = by + gy_off;
-                let pyf = py as f32;
+                for &(gx_off, gy_off, coverage) in &cached.pixels {
+                    let mut px = bx + gx_off;
+                    let py = by + gy_off;
+                    let pyf = py as f32;
 
-                // Italic shear: shift x based on distance from baseline.
-                // `current_y - pyf` ≈ `-(by_delta + gy_off)` since
-                // `current_y - place_y` is < 1.0 (fractional part only).
-                if italic {
-                    let shear_px = (ITALIC_SHEAR * (current_y - pyf)) as i32;
-                    px += shear_px;
-                }
+                    // Italic shear: shift x based on distance from baseline.
+                    // `current_y - pyf` ≈ `-(by_delta + gy_off)` since
+                    // `current_y - place_y` is < 1.0 (fractional part only).
+                    if italic {
+                        let shear_px = (ITALIC_SHEAR * (current_y - pyf)) as i32;
+                        px += shear_px;
+                    }
 
-                let pxf = px as f32;
-                if pxf >= clip.x && pxf < (clip.x + clip.width) &&
-                   pyf >= clip.y && pyf < (clip.y + clip.height) {
-                    if px >= 0 && py >= 0 && px < pixmap.width() as i32 && py < pixmap.height() as i32 {
-                        blend_glyph_pixel(pixmap, px as u32, py as u32, coverage, color);
+                    let pxf = px as f32;
+                    if pxf >= clip.x && pxf < (clip.x + clip.width) &&
+                       pyf >= clip.y && pyf < (clip.y + clip.height) {
+                        if px >= 0 && py >= 0 && px < pixmap.width() as i32 && py < pixmap.height() as i32 {
+                            blend_glyph_pixel(pixmap, px as u32, py as u32, coverage, color);
+                        }
                     }
                 }
+                current_x += adv;
             }
-
-            current_x += adv;
-            line_end_x = current_x;
         }
-        current_x += space_w;
-        line_end_x = current_x;
-    }
-    }
-
-    // Close the last line segment.
-    if line_end_x > line_start_x {
-        decoration_lines.push((line_start_x, line_end_x - space_w, current_y));
+        decoration_lines.push((line_start_x, current_x, current_y));
+        current_y += line_height;
     }
 
     // Draw text decorations.
@@ -1624,11 +1680,11 @@ mod tests {
         let at = |x: f32| LayoutRect { x, y: 2.0, width: 78.0, height: 26.0 };
         render_text_raw(
             "iiii".to_string(), at(4.0), 16.0, 19.2, &color, at(0.0), &mut whole,
-            crate::font::FontStyle::regular(), 0.0, 0, false, 0.0,
+            crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start,
         );
         render_text_raw(
             "iiii".to_string(), at(4.5), 16.0, 19.2, &color, at(0.0), &mut half,
-            crate::font::FontStyle::regular(), 0.0, 0, false, 0.0,
+            crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start,
         );
         assert_ne!(
             whole.data(), half.data(),
@@ -1859,6 +1915,112 @@ mod tests {
         LayoutRect { x: 0.0, y: 0.0, width: w, height: h }
     }
 
+    /// The horizontal span of the ink on one band of rows, if any.
+    fn ink_span(p: &Pixmap, y0: u32, y1: u32) -> Option<(u32, u32)> {
+        let (mut lo, mut hi) = (u32::MAX, 0u32);
+        for y in y0..y1.min(p.height()) {
+            for x in 0..p.width() {
+                let i = ((y * p.width() + x) * 4) as usize;
+                // White ground, black ink: anything darker is a glyph.
+                if p.data()[i] < 200 {
+                    lo = lo.min(x);
+                    hi = hi.max(x);
+                }
+            }
+        }
+        if lo == u32::MAX { None } else { Some((lo, hi)) }
+    }
+
+    /// A run wide enough to wrap, drawn into a 200x60 pixmap with 20px lines.
+    fn wrapped_run(align: crate::layer_tree::TextAlign) -> Pixmap {
+        let mut pixmap = white_pixmap(200, 60);
+        render_text_raw(
+            "wwwwww wwwwww ii".to_string(),
+            LayoutRect { x: 0.0, y: 0.0, width: 120.0, height: 40.0 },
+            16.0,
+            20.0,
+            &black(),
+            full_rect(200.0, 60.0),
+            &mut pixmap,
+            crate::font::FontStyle::regular(),
+            0.0,
+            0,
+            false,
+            0.0,
+            align,
+        );
+        pixmap
+    }
+
+    /// `text-align` places *every* line of a run by its own width. Drawing the
+    /// words as they arrived started each line at the box's left edge, so a
+    /// centred paragraph had its first line centred by the box and every later
+    /// one hanging off that line's left edge.
+    #[test]
+    fn test_every_line_of_a_centred_run_is_centred() {
+        let p = wrapped_run(crate::layer_tree::TextAlign::Center);
+        let first = ink_span(&p, 0, 20).expect("the first line must draw");
+        let second = ink_span(&p, 20, 40).expect("the run must wrap onto a second line");
+        let mid = |(lo, hi): (u32, u32)| (lo + hi) as i64;
+        assert!(
+            (mid(first) - mid(second)).abs() <= 2,
+            "both lines must share a centre: {first:?} vs {second:?}"
+        );
+    }
+
+    #[test]
+    fn test_every_line_of_a_right_aligned_run_ends_at_the_same_edge() {
+        let p = wrapped_run(crate::layer_tree::TextAlign::End);
+        let (_, first_end) = ink_span(&p, 0, 20).expect("the first line must draw");
+        let (_, second_end) = ink_span(&p, 20, 40).expect("the run must wrap onto a second line");
+        assert!(
+            (first_end as i64 - second_end as i64).abs() <= 2,
+            "both lines must end at the same edge: {first_end} vs {second_end}"
+        );
+    }
+
+    /// The default is unchanged: every line starts at the box's own edge.
+    #[test]
+    fn test_every_line_of_an_unaligned_run_starts_at_the_box_edge() {
+        let p = wrapped_run(crate::layer_tree::TextAlign::Start);
+        let (first_start, _) = ink_span(&p, 0, 20).expect("the first line must draw");
+        let (second_start, _) = ink_span(&p, 20, 40).expect("the run must wrap onto a second line");
+        assert!(
+            (first_start as i64 - second_start as i64).abs() <= 2,
+            "both lines must start at the same edge: {first_start} vs {second_start}"
+        );
+    }
+
+    /// A run that fits on one line is placed by layout, and paint must leave it
+    /// exactly where layout put it whatever the alignment says.
+    #[test]
+    fn test_a_single_line_run_does_not_move_when_it_is_centred() {
+        let draw = |align| {
+            let mut pixmap = white_pixmap(200, 30);
+            render_text_raw(
+                "hello".to_string(),
+                LayoutRect { x: 10.0, y: 0.0, width: 180.0, height: 20.0 },
+                16.0,
+                20.0,
+                &black(),
+                full_rect(200.0, 30.0),
+                &mut pixmap,
+                crate::font::FontStyle::regular(),
+                0.0,
+                0,
+                false,
+                0.0,
+                align,
+            );
+            ink_span(&pixmap, 0, 30).expect("the run must draw")
+        };
+        assert_eq!(
+            draw(crate::layer_tree::TextAlign::Start),
+            draw(crate::layer_tree::TextAlign::Center),
+            "layout already placed the box; a single line must not shift inside it"
+        );
+    }
+
     // ── Glyph cache population ────────────────────────────────────────────────
 
     /// Rendering text twice must produce identical pixel output (cache replay
@@ -1872,12 +2034,12 @@ mod tests {
         let color = black();
 
         let mut pixmap1 = white_pixmap(200, 40);
-        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut pixmap1, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0);
+        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut pixmap1, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
 
         clear_glyph_cache();
 
         let mut pixmap2 = white_pixmap(200, 40);
-        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut pixmap2, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0);
+        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut pixmap2, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
 
         assert_eq!(pixmap1.data(), pixmap2.data(),
             "cache and uncached renders must produce identical pixels");
@@ -1891,7 +2053,7 @@ mod tests {
 
         let rect = full_rect(200.0, 40.0);
         let mut pixmap = white_pixmap(200, 40);
-        render_text_raw("Abc".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0);
+        render_text_raw("Abc".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
 
         let cache_size = GLYPH_CACHE.lock().unwrap().len();
         assert!(cache_size > 0, "glyph cache should be non-empty after rendering text; got {} entries", cache_size);
@@ -1904,7 +2066,7 @@ mod tests {
         // Populate.
         let rect = full_rect(200.0, 40.0);
         let mut pixmap = white_pixmap(200, 40);
-        render_text_raw("Test".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0);
+        render_text_raw("Test".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
 
         clear_glyph_cache();
 
@@ -1921,11 +2083,11 @@ mod tests {
         let color = black();
 
         let mut p1 = white_pixmap(200, 40);
-        render_text_raw("Bold".to_string(), rect, 16.0, 19.2, &color, rect, &mut p1, crate::font::FontStyle { bold: true, ..crate::font::FontStyle::regular() }, 0.0, 0, false, 0.0);
+        render_text_raw("Bold".to_string(), rect, 16.0, 19.2, &color, rect, &mut p1, crate::font::FontStyle { bold: true, ..crate::font::FontStyle::regular() }, 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
 
         clear_glyph_cache();
         let mut p2 = white_pixmap(200, 40);
-        render_text_raw("Bold".to_string(), rect, 16.0, 19.2, &color, rect, &mut p2, crate::font::FontStyle { bold: true, ..crate::font::FontStyle::regular() }, 0.0, 0, false, 0.0);
+        render_text_raw("Bold".to_string(), rect, 16.0, 19.2, &color, rect, &mut p2, crate::font::FontStyle { bold: true, ..crate::font::FontStyle::regular() }, 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
 
         assert_eq!(p1.data(), p2.data(), "bold renders must be identical across cache miss and cache hit");
     }
@@ -1939,11 +2101,11 @@ mod tests {
         let color = black();
 
         let mut p1 = white_pixmap(200, 40);
-        render_text_raw("Italic".to_string(), rect, 16.0, 19.2, &color, rect, &mut p1, crate::font::FontStyle { italic: true, ..crate::font::FontStyle::regular() }, 0.0, 0, false, 0.0);
+        render_text_raw("Italic".to_string(), rect, 16.0, 19.2, &color, rect, &mut p1, crate::font::FontStyle { italic: true, ..crate::font::FontStyle::regular() }, 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
 
         clear_glyph_cache();
         let mut p2 = white_pixmap(200, 40);
-        render_text_raw("Italic".to_string(), rect, 16.0, 19.2, &color, rect, &mut p2, crate::font::FontStyle { italic: true, ..crate::font::FontStyle::regular() }, 0.0, 0, false, 0.0);
+        render_text_raw("Italic".to_string(), rect, 16.0, 19.2, &color, rect, &mut p2, crate::font::FontStyle { italic: true, ..crate::font::FontStyle::regular() }, 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
 
         assert_eq!(p1.data(), p2.data(), "italic renders must be identical across cache miss and cache hit");
     }
@@ -1960,7 +2122,7 @@ mod tests {
         let mut pixmap = white_pixmap(200, 40);
         let white_before = pixmap.data().to_vec();
 
-        render_text_raw("Hello world".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0);
+        render_text_raw("Hello world".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
 
         assert_ne!(pixmap.data(), white_before.as_slice(), "text rendering must modify the pixmap");
     }
@@ -1975,7 +2137,7 @@ mod tests {
         for text in &["", "   ", "\t\n"] {
             let mut pixmap = white_pixmap(200, 40);
             let before = pixmap.data().to_vec();
-            render_text_raw(text.to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0);
+            render_text_raw(text.to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
             assert_eq!(pixmap.data(), before.as_slice(), "empty/whitespace text must not modify pixmap");
         }
     }
@@ -1990,10 +2152,10 @@ mod tests {
         let color = black();
 
         let mut plain = white_pixmap(200, 40);
-        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut plain, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0);
+        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut plain, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
 
         let mut underlined = white_pixmap(200, 40);
-        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut underlined, crate::font::FontStyle::regular(), 0.0, 0b001, false, 0.0);
+        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut underlined, crate::font::FontStyle::regular(), 0.0, 0b001, false, 0.0, crate::layer_tree::TextAlign::Start);
 
         assert_ne!(plain.data(), underlined.data(), "underlined text must differ from plain text");
     }
@@ -2007,9 +2169,9 @@ mod tests {
         let color = black();
 
         let mut p12 = white_pixmap(200, 60);
-        render_text_raw("A".to_string(), rect, 12.0, 14.4, &color, rect, &mut p12, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0);
+        render_text_raw("A".to_string(), rect, 12.0, 14.4, &color, rect, &mut p12, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
         let mut p24 = white_pixmap(200, 60);
-        render_text_raw("A".to_string(), rect, 24.0, 28.8, &color, rect, &mut p24, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0);
+        render_text_raw("A".to_string(), rect, 24.0, 28.8, &color, rect, &mut p24, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
 
         // Primary assertion: different font sizes must produce different pixel output,
         // which proves the cache treats them as independent entries.
@@ -2045,10 +2207,10 @@ mod tests {
         let rect = full_rect(200.0, 40.0);
 
         let mut p_black = white_pixmap(200, 40);
-        render_text_raw("Hi".to_string(), rect, 16.0, 19.2, &black(), rect, &mut p_black, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0);
+        render_text_raw("Hi".to_string(), rect, 16.0, 19.2, &black(), rect, &mut p_black, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
 
         let mut p_red = white_pixmap(200, 40);
-        render_text_raw("Hi".to_string(), rect, 16.0, 19.2, &red(), rect, &mut p_red, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0);
+        render_text_raw("Hi".to_string(), rect, 16.0, 19.2, &red(), rect, &mut p_red, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
 
         assert_ne!(p_black.data(), p_red.data(), "black and red text must produce different pixel output");
     }
@@ -2300,10 +2462,10 @@ mod tests {
         let color = black();
 
         let mut p_right = white_pixmap(200, 40);
-        render_text_raw("Hello world text".to_string(), rect, 16.0, 19.2, &color, clip_right, &mut p_right, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0);
+        render_text_raw("Hello world text".to_string(), rect, 16.0, 19.2, &color, clip_right, &mut p_right, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
 
         let mut p_full = white_pixmap(200, 40);
-        render_text_raw("Hello world text".to_string(), rect, 16.0, 19.2, &color, clip_full, &mut p_full, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0);
+        render_text_raw("Hello world text".to_string(), rect, 16.0, 19.2, &color, clip_full, &mut p_full, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
 
         // The two renders must differ (full render has pixels in x=0..99 too).
         assert_ne!(p_right.data(), p_full.data(),

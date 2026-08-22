@@ -154,6 +154,7 @@ Ordered by how much of a page each one destroyed.
 | A placeholder drawn 0.85em above the field's middle | It is text on a line box, and the line box a single-line field gives it is the field's own content box. Positioning it by a guess at the ascent — and in the regular face at zero letter-spacing rather than the field's own — drew every placeholder off its centre and in the wrong face. |
 | A field's `value` never painted | The raster drew the box, the border and the placeholder, and left an `<input value="...">` looking empty; only the GUI's editable overlay showed the text, so a headless screenshot lost it. A filled field must also suppress the placeholder it no longer shows. |
 | The page as tall as the flow rather than as its scrollable overflow | A page is as tall as the content it can be scrolled to — the union of every box's border box, carried through its ancestors' transforms and cut back by whatever they clip. Measuring only where the in-flow cursor stopped cut off everything out of flow below it, and cut a rotated box's swung-out corner off at its untransformed edge: `probe-transform` ended 59px short of Chromium's scroll height. A `filter: blur()` halo is ink overflow, not scrollable overflow, and is rightly not counted. |
+| Only a run's *first* line placed by `text-align` | Every line of a run is placed by its own width. Layout centres the box, which is as wide as the run's widest line, and paint then drew each line from the box's left edge — so a centred paragraph had its first line centred and every later one hanging off that line's left edge. github's customer-story headings are two centred lines each, and the second one sat left of where it belongs on all of them. Paint now breaks the whole run into lines before it draws, and settles each one against the widest. |
 
 
 ## Where it stands
@@ -164,8 +165,8 @@ pixels:
 
 | fixture | layout | fold | page | height (chromium -> engine) |
 |---|---|---|---|---|
-| github.com | 1.16% | 2.84% | 1.55% | 10570 -> 10553 |
-| yunseong.dev | 1.03% | 2.56% | 2.68% | 4976 -> 4976 |
+| github.com | 0.82% | 2.43% | 1.52% | 10570 -> 10553 |
+| yunseong.dev | 1.02% | 2.55% | 2.67% | 4976 -> 4976 |
 | naver.com | 1.21% | 3.10% | 2.68% | 18658 -> 16384 |
 
 github.com began this work at 9.14% layout, 13.84% fold and 780px too tall;
@@ -203,6 +204,9 @@ exercises the UA stylesheet.
   content sharp. The blur's falloff is also a three-pass box blur rather than a
   true Gaussian, which spreads a heavy blur's energy differently — github's
   hero glow reads about half as bright as Chromium's at the same distance.
+- **`text-align: justify` is not stretched.** The inter-word spaces keep their
+  natural width, so a justified paragraph reads as left-aligned; `probe-align`
+  records the difference.
 - **`justify-items` other than `stretch` is not modelled** — a grid item always
   fills its cell on the inline axis.
 - **Two box models coexist.** `dimensions` holds the content box on an axis a
