@@ -776,49 +776,7 @@ pub fn parse_css(source: &str) -> Stylesheet {
                 }
                 // flex shorthand: "flex: <grow> [<shrink> [<basis>]]" or keyword
                 "flex" => {
-                    let parts: Vec<&str> = val_raw.split_whitespace().collect();
-                    match parts.len() {
-                        0 => {}
-                        1 => {
-                            match parts[0] {
-                                "none"    => {
-                                    declarations.push(Declaration { name: intern("flex-grow"),   value: Value::Number(0.0), important });
-                                    declarations.push(Declaration { name: intern("flex-shrink"), value: Value::Number(0.0), important });
-                                    declarations.push(Declaration { name: intern("flex-basis"),  value: Value::Keyword(intern("auto")), important });
-                                }
-                                "auto"    => {
-                                    declarations.push(Declaration { name: intern("flex-grow"),   value: Value::Number(1.0), important });
-                                    declarations.push(Declaration { name: intern("flex-shrink"), value: Value::Number(1.0), important });
-                                    declarations.push(Declaration { name: intern("flex-basis"),  value: Value::Keyword(intern("auto")), important });
-                                }
-                                _ => {
-                                    // Single unitless number expands to `flex: <n> 1 0%`.
-                                    if let Ok(n) = parts[0].parse::<f32>() {
-                                        declarations.push(Declaration { name: intern("flex-grow"),   value: Value::Number(n),   important });
-                                        declarations.push(Declaration { name: intern("flex-shrink"), value: Value::Number(1.0), important });
-                                        declarations.push(Declaration { name: intern("flex-basis"),  value: Value::Length(0.0, Unit::Percent), important });
-                                    }
-                                }
-                            }
-                        }
-                        2 => {
-                            if let (Ok(g), Ok(s)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>()) {
-                                declarations.push(Declaration { name: intern("flex-grow"),   value: Value::Number(g), important });
-                                declarations.push(Declaration { name: intern("flex-shrink"), value: Value::Number(s), important });
-                            } else if let Ok(g) = parts[0].parse::<f32>() {
-                                declarations.push(Declaration { name: intern("flex-grow"),   value: Value::Number(g), important });
-                                declarations.push(Declaration { name: intern("flex-shrink"), value: Value::Number(1.0), important });
-                                declarations.push(Declaration { name: intern("flex-basis"),  value: parse_value(parts[1]), important });
-                            }
-                        }
-                        _ => {
-                            if let (Ok(g), Ok(s)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>()) {
-                                declarations.push(Declaration { name: intern("flex-grow"),   value: Value::Number(g), important });
-                                declarations.push(Declaration { name: intern("flex-shrink"), value: Value::Number(s), important });
-                                declarations.push(Declaration { name: intern("flex-basis"),  value: parse_value(parts[2]), important });
-                            }
-                        }
-                    }
+                    expand_flex_shorthand(&val_raw, important, &mut declarations);
                 }
                 // `background` is a shorthand whose colour component must land in
                 // `background-color`. Leaving it only under `background` lets a UA
@@ -1480,6 +1438,78 @@ fn physical_pair_for(key: &str) -> Option<(&'static str, &'static str)> {
         "border-block-color" => ("border-top-color", "border-bottom-color"),
         _ => return None,
     })
+}
+
+/// Expand the `flex` shorthand into its three longhands.
+///
+/// Shared by the stylesheet parser and the `style`-attribute parser so the two
+/// cannot drift: an inline `flex: unset` has to reset the same three properties
+/// a stylesheet's does.
+pub fn expand_flex_shorthand(val_raw: &str, important: bool, declarations: &mut Vec<Declaration>) {
+    let parts: Vec<&str> = val_raw.split_whitespace().collect();
+    match parts.len() {
+        0 => {}
+        1 => {
+            match parts[0] {
+                "none"    => {
+                    declarations.push(Declaration { name: intern("flex-grow"),   value: Value::Number(0.0), important });
+                    declarations.push(Declaration { name: intern("flex-shrink"), value: Value::Number(0.0), important });
+                    declarations.push(Declaration { name: intern("flex-basis"),  value: Value::Keyword(intern("auto")), important });
+                }
+                "auto"    => {
+                    declarations.push(Declaration { name: intern("flex-grow"),   value: Value::Number(1.0), important });
+                    declarations.push(Declaration { name: intern("flex-shrink"), value: Value::Number(1.0), important });
+                    declarations.push(Declaration { name: intern("flex-basis"),  value: Value::Keyword(intern("auto")), important });
+                }
+                // A CSS-wide keyword resets the whole shorthand,
+                // and `flex` is not inherited, so `unset` and
+                // `revert` both land on the initial `0 1 auto`.
+                // Dropping the declaration instead left the
+                // `flex: 1 1 0%` the author wrote `flex: unset`
+                // to undo still standing: github's hero split
+                // its row evenly where the page asks for 65/35.
+                "initial" | "unset" | "revert" | "revert-layer" => {
+                    declarations.push(Declaration { name: intern("flex-grow"),   value: Value::Number(0.0), important });
+                    declarations.push(Declaration { name: intern("flex-shrink"), value: Value::Number(1.0), important });
+                    declarations.push(Declaration { name: intern("flex-basis"),  value: Value::Keyword(intern("auto")), important });
+                }
+                "inherit" => {
+                    for longhand in ["flex-grow", "flex-shrink", "flex-basis"] {
+                        declarations.push(Declaration {
+                            name: intern(longhand),
+                            value: Value::Keyword(intern("inherit")),
+                            important,
+                        });
+                    }
+                }
+                _ => {
+                    // Single unitless number expands to `flex: <n> 1 0%`.
+                    if let Ok(n) = parts[0].parse::<f32>() {
+                        declarations.push(Declaration { name: intern("flex-grow"),   value: Value::Number(n),   important });
+                        declarations.push(Declaration { name: intern("flex-shrink"), value: Value::Number(1.0), important });
+                        declarations.push(Declaration { name: intern("flex-basis"),  value: Value::Length(0.0, Unit::Percent), important });
+                    }
+                }
+            }
+        }
+        2 => {
+            if let (Ok(g), Ok(s)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>()) {
+                declarations.push(Declaration { name: intern("flex-grow"),   value: Value::Number(g), important });
+                declarations.push(Declaration { name: intern("flex-shrink"), value: Value::Number(s), important });
+            } else if let Ok(g) = parts[0].parse::<f32>() {
+                declarations.push(Declaration { name: intern("flex-grow"),   value: Value::Number(g), important });
+                declarations.push(Declaration { name: intern("flex-shrink"), value: Value::Number(1.0), important });
+                declarations.push(Declaration { name: intern("flex-basis"),  value: parse_value(parts[1]), important });
+            }
+        }
+        _ => {
+            if let (Ok(g), Ok(s)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>()) {
+                declarations.push(Declaration { name: intern("flex-grow"),   value: Value::Number(g), important });
+                declarations.push(Declaration { name: intern("flex-shrink"), value: Value::Number(s), important });
+                declarations.push(Declaration { name: intern("flex-basis"),  value: parse_value(parts[2]), important });
+            }
+        }
+    }
 }
 
 /// Expand the `background` shorthand.

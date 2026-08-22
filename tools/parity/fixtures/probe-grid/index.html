@@ -22,6 +22,14 @@
   .pic { display: grid; grid-template-columns: 132px minmax(0, 1fr); gap: 24px; align-items: center; background: #ffe; }
   .pic img { width: 100%; height: auto; display: block; }
   .pic p { margin: 0; background: #cff; }
+
+  /* The animatable disclosure: a one-row grid held at `0fr` while closed and
+     swapped to `1fr` when open, with the panel clipped by `overflow: hidden`.
+     A closed panel takes no height at all. */
+  .disc { display: grid; grid-template-rows: 0fr; background: #fee; }
+  .disc.open { grid-template-rows: 1fr; }
+  .disc > div { overflow: hidden; }
+  .panel { background: #dfd; padding: 8px; }
 </style>
 </head>
 <body>
@@ -31,6 +39,8 @@
   <div class="g s"><div class="short"></div><div class="tall"></div></div>
   <div class="g c selfend"><div class="short"></div><div class="tall"></div></div>
   <div class="g c selfstretch"><div class="short"></div><div class="tall"></div></div>
+  <div><strong>closed</strong><div class="disc"><div><div class="panel">This panel is closed: the row it sits in is <code>0fr</code>, so it takes no height and its text is clipped away entirely.</div></div></div><strong>after closed</strong></div>
+  <div><strong>open</strong><div class="disc open"><div><div class="panel">This panel is open: the row is <code>1fr</code>, so it is as tall as the text inside it.</div></div></div><strong>after open</strong></div>
   <div class="pic">
     <img src="portrait.svg" width="132" height="169" alt="portrait">
     <p>A column of text tall enough that the picture beside it would be stretched to match, were the grid not told to centre its items instead. It keeps the height its own proportions give it.</p>

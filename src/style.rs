@@ -2266,54 +2266,7 @@ pub fn parse_inline_style_into_vec(style_str: &str, list: &mut Vec<crate::css::D
                 list.push(crate::css::Declaration { name: intern("left"),   value: parse_value(left),   important });
             }
             "flex" => {
-                let parts: Vec<&str> = val.split_whitespace().collect();
-                match parts.len() {
-                    0 => {}
-                    1 => match parts[0] {
-                        "none" => {
-                            list.push(crate::css::Declaration { name: intern("flex-grow"), value: crate::css::Value::Number(0.0), important });
-                            list.push(crate::css::Declaration { name: intern("flex-shrink"), value: crate::css::Value::Number(0.0), important });
-                            list.push(crate::css::Declaration { name: intern("flex-basis"), value: crate::css::Value::Keyword(intern("auto")), important });
-                        }
-                        "auto" => {
-                            list.push(crate::css::Declaration { name: intern("flex-grow"), value: crate::css::Value::Number(1.0), important });
-                            list.push(crate::css::Declaration { name: intern("flex-shrink"), value: crate::css::Value::Number(1.0), important });
-                            list.push(crate::css::Declaration { name: intern("flex-basis"), value: crate::css::Value::Keyword(intern("auto")), important });
-                        }
-                        _ => {
-                            if let Ok(n) = parts[0].parse::<f32>() {
-                                list.push(crate::css::Declaration { name: intern("flex-grow"), value: crate::css::Value::Number(n), important });
-                                list.push(crate::css::Declaration { name: intern("flex-shrink"), value: crate::css::Value::Number(1.0), important });
-                                list.push(crate::css::Declaration { name: intern("flex-basis"), value: crate::css::Value::Length(0.0, crate::css::Unit::Percent), important });
-                            }
-                        }
-                    },
-                    2 => {
-                        if let (Ok(g), Ok(s)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>()) {
-                            list.push(crate::css::Declaration { name: intern("flex-grow"), value: crate::css::Value::Number(g), important });
-                            list.push(crate::css::Declaration { name: intern("flex-shrink"), value: crate::css::Value::Number(s), important });
-                        } else if let Ok(g) = parts[0].parse::<f32>() {
-                            list.push(crate::css::Declaration { name: intern("flex-grow"), value: crate::css::Value::Number(g), important });
-                            list.push(crate::css::Declaration { name: intern("flex-shrink"), value: crate::css::Value::Number(1.0), important });
-                            list.push(crate::css::Declaration {
-                                name: intern("flex-basis"),
-                                value: crate::css::parse_value(parts[1]),
-                                important,
-                            });
-                        }
-                    }
-                    _ => {
-                        if let (Ok(g), Ok(s)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>()) {
-                            list.push(crate::css::Declaration { name: intern("flex-grow"), value: crate::css::Value::Number(g), important });
-                            list.push(crate::css::Declaration { name: intern("flex-shrink"), value: crate::css::Value::Number(s), important });
-                            list.push(crate::css::Declaration {
-                                name: intern("flex-basis"),
-                                value: crate::css::parse_value(parts[2]),
-                                important,
-                            });
-                        }
-                    }
-                }
+                crate::css::expand_flex_shorthand(val, important, list);
             }
             "gap" => {
                 let parts: Vec<&str> = val.split_whitespace().collect();

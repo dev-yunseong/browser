@@ -2676,6 +2676,12 @@ impl<'a> LayoutBox<'a> {
             let read_track_list = |prop: &str| -> Vec<crate::css::Value> {
                 match self.style_node.specified_values.get(&crate::css::intern(prop)) {
                     Some(Value::Keyword(k)) => crate::css::parse_track_list(k),
+                    // A one-track template is parsed as the length itself rather
+                    // than as a keyword to split, and a single track is exactly
+                    // what the animatable-disclosure pattern uses
+                    // (`grid-template-rows: 0fr`). Reading only keywords left
+                    // that template empty and the panel content-sized.
+                    Some(v @ Value::Length(..)) => vec![v.clone()],
                     _ => Vec::new(),
                 }
             };
@@ -2881,10 +2887,7 @@ impl<'a> LayoutBox<'a> {
                 if item.row >= row_heights.len() {
                     continue;
                 }
-                let item_h = item.cb.dimensions.height
-                    + item.cb.padding.top + item.cb.padding.bottom
-                    + item.cb.border.top + item.cb.border.bottom
-                    + item.cb.margin.top + item.cb.margin.bottom;
+                let item_h = outer_height(&item.cb) + item.cb.margin.top + item.cb.margin.bottom;
                 // A row-spanning item's height is shared across the rows it covers
                 // rather than forced onto the first of them.
                 let per_row = item_h / item.row_span as f32;
@@ -2894,15 +2897,29 @@ impl<'a> LayoutBox<'a> {
             }
 
             // Apply explicit row track heights if provided.
+            // A row whose track states its own size does not grow to its
+            // content: an item stretched into it takes the track's size exactly,
+            // and whatever does not fit is the `overflow` property's business.
+            let mut row_is_definite: Vec<bool> = vec![false; num_rows_needed];
             for (row_idx, row_h) in row_heights.iter_mut().enumerate() {
                 if let Some(track) = row_tracks.get(row_idx) {
-                    let explicit_h = match track {
-                        Value::Length(v, Unit::Px) => Some(*v),
-                        Value::Length(v, Unit::Percent) => Some(vh * (v / 100.0)),
-                        _ => None,
-                    };
-                    if let Some(eh) = explicit_h {
-                        *row_h = row_h.max(eh);
+                    match track {
+                        Value::Length(v, Unit::Px) => *row_h = row_h.max(*v),
+                        Value::Length(v, Unit::Percent) => *row_h = row_h.max(vh * (v / 100.0)),
+                        // A flexible row with a zero factor takes none of the
+                        // free space and contributes no content of its own, so
+                        // it is nothing tall. That is how a page holds a panel
+                        // closed while keeping it animatable —
+                        // `grid-template-rows: 0fr`, opened by swapping in
+                        // `1fr` — and reading the row as content-sized instead
+                        // left every collapsed accordion panel standing open.
+                        // github's automation and collaboration sections came
+                        // out ~300px tall each on that alone.
+                        Value::Length(v, Unit::Fr) if *v == 0.0 => {
+                            *row_h = 0.0;
+                            row_is_definite[row_idx] = true;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -2983,7 +3000,8 @@ impl<'a> LayoutBox<'a> {
                         - item.cb.padding.top - item.cb.padding.bottom
                         - item.cb.border.top - item.cb.border.bottom
                     ).max(0.0);
-                    if avail_cell_h > outer_height(&item.cb) {
+                    let definite_row = row_is_definite.get(item.row).copied().unwrap_or(false);
+                    if definite_row || avail_cell_h > outer_height(&item.cb) {
                         item.cb.dimensions.height = avail_cell_h;
                         item.cb.content_box_height = true;
                     }
@@ -8271,6 +8289,64 @@ mod tests {
             (r.dimensions.width - 240.0).abs() < 1.0,
             "120 tall at 2:1 is 240 wide, got {}",
             r.dimensions.width
+        );
+    }
+
+    /// A row track with a zero flex factor takes none of the free space and
+    /// contributes no content of its own, so it is nothing tall. That is how a
+    /// page holds a disclosure panel closed while keeping it animatable —
+    /// `grid-template-rows: 0fr`, opened by swapping in `1fr`.
+    #[test]
+    fn test_a_zero_fr_row_collapses_its_item() {
+        let html = r#"<div style="width:800px">
+            <div id="shut" style="display:grid;grid-template-rows:0fr"><div id="shutinner" style="overflow:hidden"><p style="margin:0">panel text</p></div></div>
+            <div id="open" style="display:grid;grid-template-rows:1fr"><div style="overflow:hidden"><p style="margin:0">panel text</p></div></div>
+            <div id="after">after</div>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let shut = find_element_by_id(&layout, "shut").expect("shut");
+        assert!(
+            outer_height(shut) < 0.5,
+            "a 0fr row is nothing tall, got {}",
+            outer_height(shut)
+        );
+        let inner = find_element_by_id(&layout, "shutinner").expect("shutinner");
+        assert!(
+            outer_height(inner) < 0.5,
+            "and the item stretched into it takes the row's size, got {}",
+            outer_height(inner)
+        );
+        let open = find_element_by_id(&layout, "open").expect("open");
+        assert!(
+            outer_height(open) > 10.0,
+            "a 1fr row is as tall as what is in it, got {}",
+            outer_height(open)
+        );
+    }
+
+    /// A CSS-wide keyword resets a whole shorthand. `flex` is not inherited, so
+    /// `flex: unset` means the initial `0 1 auto` — not "leave whatever an
+    /// earlier rule said", which is what dropping the declaration amounted to.
+    #[test]
+    fn test_flex_unset_returns_an_item_to_its_initial_flex() {
+        let html = r#"<div style="width:800px"><div style="display:flex">
+            <div id="grow" style="flex:1 1 0%"></div>
+            <div id="fixed" style="flex:1 1 0%;flex:unset;width:200px"></div>
+        </div></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let fixed = find_element_by_id(&layout, "fixed").expect("fixed");
+        assert!(
+            (outer_width(fixed) - 200.0).abs() < 1.0,
+            "`flex: unset` leaves the item at its own width, got {}",
+            outer_width(fixed)
+        );
+        let grow = find_element_by_id(&layout, "grow").expect("grow");
+        assert!(
+            (outer_width(grow) - 600.0).abs() < 1.0,
+            "and the growing item takes the rest, got {}",
+            outer_width(grow)
         );
     }
 
