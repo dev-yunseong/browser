@@ -8378,6 +8378,39 @@ mod tests {
         );
     }
 
+    /// `rem` resolves against the *root* element's font size wherever it
+    /// appears, `calc()` included. Layout knows the element's own font size but
+    /// not the root's, so the fold has to happen in the style pass — resolving
+    /// it against the element instead turned github's `calc(100% - 2 * 2rem)`
+    /// into 56px of inset where the page asks for 64, and its hero carousel came
+    /// out 8px wide of where it belongs.
+    #[test]
+    fn test_rem_in_calc_resolves_against_the_root_font_size() {
+        let css = r#"
+            html { font-size: 16px }
+            #mix { font-size: 14px; width: calc(2rem + 2em) }
+            #inset { font-size: 14px; --w: calc(100% - 2 * 2rem); max-width: var(--w) }
+        "#;
+        let html = r#"<div style="width:800px"><div id="mix"></div><div id="inset"></div></div>"#;
+        let (layout, _, _) = layout_from_html_css(html, css, 800.0, 600.0);
+
+        // 2rem against the root's 16px is 32; 2em against the element's 14px is 28.
+        let mix = find_element_by_id(&layout, "mix").expect("mix");
+        assert!(
+            (outer_width(mix) - 60.0).abs() < 0.5,
+            "2rem (32) + 2em (28) is 60, got {}",
+            outer_width(mix)
+        );
+        // And the same through a custom property, which is how a design system
+        // writes its gutters.
+        let inset = find_element_by_id(&layout, "inset").expect("inset");
+        assert!(
+            (outer_width(inset) - 736.0).abs() < 0.5,
+            "800 less two 2rem gutters is 736, got {}",
+            outer_width(inset)
+        );
+    }
+
     /// An atomic inline normally lends the line the baseline of the text inside
     /// it. A box that hides its own baseline — `contain: layout`, a scroll
     /// container, or one with nothing in it — rests its whole box on the

@@ -1061,6 +1061,12 @@ fn build_final_tree(
                                     // `--half: calc(var(--gutter) / 2)` — so the
                                     // substitution has to run on the result too,
                                     // or the expression is left unresolvable.
+                                    // Font-relative operands fold here for the
+                                    // same reason as below: only the style pass
+                                    // knows both this element's font size and
+                                    // the root's, and a `rem` inside a custom
+                                    // property's `calc()` is how a design system
+                                    // writes its gutters.
                                     Value::Math(expr) => Value::Math(expr.substitute_vars(&|name| {
                                         match custom_props.get(&intern(name)) {
                                             Some(Value::RawCustomProp(raw)) => Some(raw.to_string()),
@@ -1068,7 +1074,7 @@ fn build_final_tree(
                                             Some(Value::Number(v)) => Some(v.to_string()),
                                             _ => None,
                                         }
-                                    })),
+                                    }).fold_font_relative(own_fs, root_fs, own_font)),
                                     Value::Keyword(kw) if kw.as_ref().eq_ignore_ascii_case("currentcolor") => {
                                         own_color.clone().unwrap_or(v.clone())
                                     }
@@ -1079,8 +1085,11 @@ fn build_final_tree(
                         // A math expression may name custom properties —
                         // `calc(var(--gutter) * .5)` is how design systems derive
                         // one spacing step from another — so substitute them while
-                        // this element's properties are in hand. Folding to pixels
-                        // happens later, once the viewport is known.
+                        // this element's properties are in hand. The font-relative
+                        // operands are folded here too, for the same reason: this
+                        // is the only place that knows both this element's font
+                        // size and the root's. Percentages and viewport units wait
+                        // for layout, which is where the containing block is known.
                         Value::Math(expr) => {
                             let substituted = expr.substitute_vars(&|name| {
                                 match custom_props.get(&intern(name)) {
@@ -1090,7 +1099,9 @@ fn build_final_tree(
                                     _ => None,
                                 }
                             });
-                            Some(Value::Math(substituted))
+                            Some(Value::Math(substituted.fold_font_relative(
+                                own_fs, root_fs, own_font,
+                            )))
                         }
                         // `em` resolves against this element's own font size; `rem`
                         // against the root's, which is what keeps a design system's

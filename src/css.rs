@@ -264,6 +264,59 @@ impl MathExpr {
         }
     }
 
+    /// Fold every font-relative operand — `em`, `rem`, `ch`, `ex` — to pixels.
+    ///
+    /// These depend on the element's own font and on the root's, both of which
+    /// only the style pass knows: layout has the element's font size to hand but
+    /// not the root's, and resolving `rem` against the element instead turned
+    /// github's `calc(100% - 2 * 2rem)` into 56px of inset where the page asks
+    /// for 64. Percentages and viewport units are left alone; they belong to
+    /// layout, which is the first place the containing block is known.
+    pub fn fold_font_relative(
+        &self,
+        font_size: f32,
+        root_font_size: f32,
+        font_style: crate::font::FontStyle,
+    ) -> MathExpr {
+        let fold = |e: &MathExpr| Box::new(e.fold_font_relative(font_size, root_font_size, font_style));
+        match self {
+            MathExpr::Value(n, unit) => {
+                let px = match unit {
+                    Some(Unit::Em) => Some(n * font_size),
+                    Some(Unit::Rem) => Some(n * root_font_size),
+                    Some(Unit::Ch) => {
+                        Some(n * crate::font::fonts().zero_advance(font_size, font_style))
+                    }
+                    Some(Unit::Ex) => Some(n * crate::font::fonts().x_height(font_size, font_style)),
+                    _ => None,
+                };
+                match px {
+                    Some(v) => MathExpr::Value(v, Some(Unit::Px)),
+                    None => MathExpr::Value(*n, unit.clone()),
+                }
+            }
+            MathExpr::Add(a, b) => MathExpr::Add(fold(a), fold(b)),
+            MathExpr::Sub(a, b) => MathExpr::Sub(fold(a), fold(b)),
+            MathExpr::Mul(a, b) => MathExpr::Mul(fold(a), fold(b)),
+            MathExpr::Div(a, b) => MathExpr::Div(fold(a), fold(b)),
+            MathExpr::Min(args) => MathExpr::Min(
+                args.iter()
+                    .map(|a| a.fold_font_relative(font_size, root_font_size, font_style))
+                    .collect(),
+            ),
+            MathExpr::Max(args) => MathExpr::Max(
+                args.iter()
+                    .map(|a| a.fold_font_relative(font_size, root_font_size, font_style))
+                    .collect(),
+            ),
+            MathExpr::Clamp(a, b, c) => MathExpr::Clamp(fold(a), fold(b), fold(c)),
+            MathExpr::Var(name, fallback) => MathExpr::Var(
+                name.clone(),
+                fallback.as_ref().map(|f| fold(f)),
+            ),
+        }
+    }
+
     /// `true` if any operand is still an unresolved variable.
     pub fn has_unresolved_var(&self) -> bool {
         match self {

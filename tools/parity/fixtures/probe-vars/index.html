@@ -23,6 +23,13 @@
   .varpad { padding: var(--sp-5) var(--sp-8); background: #eff; }
   .vargap { display: flex; gap: var(--sp-2, 8px) var(--sp-5); background: #fef; }
   .vargap span { background: #dde; }
+  /* `rem` inside a `calc()` resolves against the *root* font size, not the
+     element's — which is how a page keeps a hero inset from the viewport edge
+     while its own text is smaller than the root's. */
+  html { font-size: 16px; }
+  .remcalc { font-size: 14px; --w: calc(100% - 2 * 2rem); max-width: var(--w);
+             margin: 0 auto; height: 32px; background: #a6f; }
+  .remmix { font-size: 14px; width: calc(2rem + 2em); height: 24px; background: #6cf; }
 </style>
 </head>
 <body>
@@ -40,5 +47,7 @@
     <section><div class="varpad">padding from vars: 20px top/bottom, 32px sides</div></section>
     <section><div class="vargap"><span>one</span><span>two</span><span>three</span></div></section>
   </div>
+  <div class="remcalc"></div>
+  <div class="remmix"></div>
 </body>
 </html>
