@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Spacing probe</title>
+<style>
+  :root { --sp-5: 1.25rem; --gutter: 48px; --half: calc(var(--gutter) / 2); }
+  body { margin: 0; font: 16px/1.4 sans-serif; }
+  p { margin: 0; }
+  .box { background: #dde; }
+  .m-plain { margin-top: 20px; }
+  .m-var { margin-top: var(--sp-5); }
+  .m-calc { margin-top: calc(var(--sp-5) * 2); }
+  .m-nested { margin-top: var(--half); }
+  .rule { border-top: 2px solid #000; }
+</style>
+</head>
+<body>
+  <div class="rule"></div><p class="box">anchor</p><p class="box m-plain">plain 20px</p>
+  <div class="rule"></div><p class="box">anchor</p><p class="box m-var">var 20px</p>
+  <div class="rule"></div><p class="box">anchor</p><p class="box m-calc">calc var 40px</p>
+  <div class="rule"></div><p class="box">anchor</p><p class="box m-nested">nested var 24px</p>
+  <div class="rule"></div>
+</body>
+</html>

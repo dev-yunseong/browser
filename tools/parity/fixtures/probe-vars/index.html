@@ -17,6 +17,12 @@
   .calcpad { padding-left: calc(var(--gutter) * .5); background: #eef; }
   .calcnested { margin-left: var(--half); background: #efe; }
   .calcclamp { width: clamp(120px, calc(var(--gutter) * 6), 400px); background: #fee; }
+  /* Spacing scales are kept in custom properties and read back as margins. */
+  :root { --sp-5: 1.25rem; --sp-8: 2rem; }
+  .varmargin { margin-top: var(--sp-5); background: #ffe; }
+  .varpad { padding: var(--sp-5) var(--sp-8); background: #eff; }
+  .vargap { display: flex; gap: var(--sp-2, 8px) var(--sp-5); background: #fef; }
+  .vargap span { background: #dde; }
 </style>
 </head>
 <body>
@@ -30,6 +36,9 @@
     <section><p class="calcpad">calc(var * .5) padding should be 24px</p></section>
     <section><p class="calcnested">nested calc var margin should be 24px</p></section>
     <section><p class="calcclamp">clamp with calc(var) should be 288px wide</p></section>
+    <section style="background:#f4f4f4"><p>anchor line</p><p class="varmargin">margin-top var should be 20px below</p></section>
+    <section><div class="varpad">padding from vars: 20px top/bottom, 32px sides</div></section>
+    <section><div class="vargap"><span>one</span><span>two</span><span>three</span></div></section>
   </div>
 </body>
 </html>

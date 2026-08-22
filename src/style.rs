@@ -938,6 +938,19 @@ fn build_final_tree(
                                     Value::Length(n, crate::css::Unit::Ex) => {
                                         Value::Length(n * crate::font::fonts().x_height(own_fs), crate::css::Unit::Px)
                                     }
+                                    // A custom property may itself hold a math
+                                    // expression naming further properties —
+                                    // `--half: calc(var(--gutter) / 2)` — so the
+                                    // substitution has to run on the result too,
+                                    // or the expression is left unresolvable.
+                                    Value::Math(expr) => Value::Math(expr.substitute_vars(&|name| {
+                                        match custom_props.get(&intern(name)) {
+                                            Some(Value::RawCustomProp(raw)) => Some(raw.to_string()),
+                                            Some(Value::Length(v, crate::css::Unit::Px)) => Some(format!("{v}px")),
+                                            Some(Value::Number(v)) => Some(v.to_string()),
+                                            _ => None,
+                                        }
+                                    })),
                                     Value::Keyword(kw) if kw.as_ref().eq_ignore_ascii_case("currentcolor") => {
                                         own_color.clone().unwrap_or(v.clone())
                                     }
