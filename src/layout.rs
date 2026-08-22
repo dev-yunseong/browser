@@ -99,7 +99,8 @@ impl IntrinsicSizeCache {
                     };
 
                     if let Some(width) = width {
-                        self.max_content.insert(key, width);
+                        let width = clamp_intrinsic_width(node, width);
+                    self.max_content.insert(key, width);
                         val_stack.push(width);
                         continue;
                     }
@@ -167,7 +168,8 @@ impl IntrinsicSizeCache {
                             0.0
                         };
                         let width = if is_row { sum + gaps } else { widest } + pad_border;
-                        self.max_content.insert(key, width);
+                        let width = clamp_intrinsic_width(node_ref, width);
+                    self.max_content.insert(key, width);
                         val_stack.push(width);
                         continue;
                     }
@@ -212,6 +214,7 @@ impl IntrinsicSizeCache {
                     } else {
                         fixed_width + pad_border
                     };
+                    let width = clamp_intrinsic_width(node_ref, width);
                     self.max_content.insert(key, width);
                     val_stack.push(width);
                 }
@@ -289,6 +292,7 @@ impl IntrinsicSizeCache {
                     };
 
                     if let Some(width) = width {
+                        let width = clamp_intrinsic_width(node, width);
                         self.min_content.insert(key, width);
                         val_stack.push(width);
                         continue;
@@ -349,6 +353,7 @@ impl IntrinsicSizeCache {
                     } else {
                         child_vals.into_iter().fold(0.0f32, f32::max) + pad_border
                     };
+                    let width = clamp_intrinsic_width(node_ref, width);
                     self.min_content.insert(key, width);
                     val_stack.push(width);
                 }
@@ -936,6 +941,37 @@ fn is_flex_item(child: &StyledNode) -> bool {
 
 /// Whether a stated width or height on this box already covers its padding and
 /// border.
+/// Clamp an intrinsic width by the box's own `min-width` and `max-width`.
+///
+/// What a box contributes to its parent's intrinsic size is its content bounded
+/// by its own constraints. Leaving `min-width` out is how github's hero toggle
+/// came out one button short of the row it holds: every button in it is
+/// `min-width: 110px` around a label narrower than that, so the row was measured
+/// from the labels and the last button was clipped away.
+///
+/// A percentage bound resolves against a containing block this measurement does
+/// not have, so only the absolute forms count.
+fn clamp_intrinsic_width(sn: &StyledNode, width: f32) -> f32 {
+    let bound = |prop: &str| match sn.specified_values.get(&crate::css::intern(prop)) {
+        // Under `content-box` the bound names the content width, and `width`
+        // here is the outer one.
+        Some(Value::Length(v, Unit::Px)) => Some(if is_border_box(sn) {
+            *v
+        } else {
+            *v + horiz_padding_border(sn)
+        }),
+        _ => None,
+    };
+    let mut w = width;
+    if let Some(max) = bound("max-width") {
+        w = w.min(max);
+    }
+    if let Some(min) = bound("min-width") {
+        w = w.max(min);
+    }
+    w
+}
+
 fn is_border_box(sn: &StyledNode) -> bool {
     matches!(
         sn.specified_values.get(&crate::css::intern("box-sizing")),
@@ -8711,6 +8747,38 @@ mod tests {
              with the item it sits in; got {}",
             cb.dimensions.x,
             overlay.dimensions.x
+        );
+    }
+
+    /// What a box contributes to its parent's intrinsic size is bounded by its
+    /// own `min-width` and `max-width`. Measuring the labels alone left
+    /// github's hero toggle 109px short of the five buttons it holds, and the
+    /// last one was clipped away by the container's `overflow: hidden`.
+    #[test]
+    fn test_intrinsic_width_is_bounded_by_the_box_s_own_constraints() {
+        let css = r#"
+            .row { display: inline-block; }
+            .pill { display: inline-block; min-width: 110px; box-sizing: border-box; }
+            .capped { display: inline-block; max-width: 40px; box-sizing: border-box; }
+        "#;
+        let html = r#"<div style="width:800px">
+            <div id="row" class="row"><span class="pill">Code</span><span class="pill">Plan</span></div>
+            <div id="cap" class="row"><span class="capped">a very long label indeed</span></div>
+        </div>"#;
+        let (layout, _, _) = layout_from_html_css(html, css, 800.0, 600.0);
+
+        let row = find_element_by_id(&layout, "row").expect("row");
+        assert!(
+            (row.dimensions.width - 220.0).abs() < 1.0,
+            "two 110px pills make a 220px row; got {}",
+            row.dimensions.width
+        );
+
+        let cap = find_element_by_id(&layout, "cap").expect("cap");
+        assert!(
+            cap.dimensions.width <= 41.0,
+            "`max-width` bounds the contribution too; got {}",
+            cap.dimensions.width
         );
     }
 

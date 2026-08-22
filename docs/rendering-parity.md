@@ -137,6 +137,7 @@ Ordered by how much of a page each one destroyed.
 | An absolute box under a static parent sized against a containing block with no height yet | The block belongs to an ancestor whose own height is not settled until its in-flow children are, and the descendant was placed before that. `height: 100%` came out zero. github's hero glow is a `::before` sized exactly that way, under a static wrapper inside a `position: relative` carousel. |
 | Every positioned box treated as a stacking context | `position: relative` with `z-index: auto` is not one, so a `z-index: -1` child of it belongs further up and paints *below* that box's own background. Painting it as an ordinary negative child put github's hero glow on top of the panel it sits behind. |
 | Only the last `::before` rule carrying `content` applied | A design system states the shape once and overrides a size or a colour in a later, equally specific rule that names no `content` of its own. Those overrides were thrown away outright. |
+| An intrinsic width measured without the box's own `min-width` | What a box contributes to its parent's intrinsic size is its content bounded by its own constraints. github's hero toggle is five buttons at `min-width: 110px` around shorter labels; measured from the labels the row came out 109px short, and its `overflow: hidden` clipped the last button away. |
 | Flow advancing past the content box | A box that states a height and carries padding handed the next block a cursor its own padding too high, and every section below it climbed by that much. |
 
 
@@ -148,7 +149,7 @@ pixels:
 
 | fixture | layout | fold | page | height (chromium -> engine) |
 |---|---|---|---|---|
-| github.com | 1.37% | 2.89% | 1.90% | 10570 -> 10569 |
+| github.com | 1.37% | 2.89% | 1.88% | 10570 -> 10569 |
 | yunseong.dev | 1.46% | 3.22% | 3.90% | 4976 -> 4947 |
 | naver.com | 1.32% | 2.88% | 2.55% | 18658 -> 16384 |
 
