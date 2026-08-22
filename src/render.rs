@@ -1064,8 +1064,19 @@ fn build_radial_gradient_shader<'a>(
     )
 }
 
+/// How much a glyph's partial coverage is darkened before it is blended.
+///
+/// The reference renderer runs glyph coverage through a contrast curve before
+/// compositing, which is why the same face at the same size carries visibly more
+/// ink there than a straight linear blend produces. Measured over the whole
+/// `probe-generics` fixture, its text carried about a quarter more ink than ours
+/// and a third more fully-dark pixels; this exponent closes that gap. It is an
+/// approximation of the reference's curve, not a derivation of it.
+const TEXT_COVERAGE_GAMMA: f32 = 1.0 / 1.45;
+
 fn blend_glyph_pixel(pixmap: &mut Pixmap, x: u32, y: u32, coverage: f32, color: &Color) {
     if coverage <= 0.0 { return; }
+    let coverage = coverage.clamp(0.0, 1.0).powf(TEXT_COVERAGE_GAMMA);
     let alpha = (coverage * (color.a as f32 / 255.0)).clamp(0.0, 1.0);
     if alpha <= 0.0 { return; }
     let index = (y * pixmap.width() + x) as usize;
