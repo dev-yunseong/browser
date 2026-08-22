@@ -1479,6 +1479,17 @@ impl<'a> LayoutBox<'a> {
             Some(Value::Length(v, Unit::Px)) => *v,
             Some(Value::Length(v, Unit::Vw)) => vw * (v / 100.0),
             Some(Value::Length(v, Unit::Vh)) => vh * (v / 100.0),
+            // A percentage height resolves against the containing block's, and
+            // only when that one is definite — otherwise CSS says `auto`, which
+            // is what a zero here means to the code below. A containing block
+            // still being laid out carries height 0, so the two cases fall out
+            // of the same test. Without this an overlay written as
+            // `position: absolute; height: 100%` came out nothing tall, and the
+            // gradient wash it exists to paint never appeared.
+            Some(Value::Length(v, Unit::Percent)) => containing_block
+                .map(|cb| cb.height * (v / 100.0))
+                .filter(|h| *h > 0.0)
+                .unwrap_or(0.0),
             // CSS Intrinsic & Extrinsic Sizing Level 3 — height axis
             // For block containers, min-content and max-content height are both
             // equivalent to the natural auto height (content-derived). Return 0.0
@@ -3273,13 +3284,23 @@ impl<'a> LayoutBox<'a> {
                     }
                 };
 
+                // A child that states its own width resolves it against the
+                // containing block, so that is what it has to be laid out
+                // against: handing it the already-resolved width instead made
+                // `width: 40%` mean 40% of 40%, and a wash pinned across half a
+                // section came out a fifth of it.
+                let container_for_child = if child_explicit_width.is_some() {
+                    cb_for_child.width
+                } else {
+                    child_layout_width
+                };
                 // Build the child in a temporary origin; we'll reposition it below.
                 let (pc_opt, _, _) = build_layout_tree_with_cb_cached(
                     pos_node,
                     0.0,
                     0.0,
                     0.0,
-                    child_layout_width.max(1.0),
+                    container_for_child.max(1.0),
                     vw,
                     vh,
                     Some(cb_for_child),
@@ -4575,6 +4596,47 @@ mod tests {
         (layout_opt.expect("layout tree"), fx, fy)
     }
 
+
+    /// A percentage height resolves against the containing block's, and only
+    /// when that one is definite. An overlay written as
+    /// `position: absolute; height: 100%` was otherwise nothing tall, and the
+    /// gradient wash it exists to paint never appeared.
+    #[test]
+    fn test_percentage_height_resolves_against_the_containing_block() {
+        let html = r#"<div id="cb" style="position:relative;width:400px;height:300px">
+            <div id="full" style="position:absolute;height:100%;width:50%"></div>
+            <div id="half" style="position:absolute;height:50%"></div>
+          </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        assert_eq!(find_element_by_id(&layout, "full").expect("full").dimensions.height, 300.0);
+        assert_eq!(find_element_by_id(&layout, "half").expect("half").dimensions.height, 150.0);
+    }
+
+    /// A containing block still being laid out has no definite height, so a
+    /// percentage against it is `auto` — the box takes its content's height.
+    #[test]
+    fn test_percentage_height_against_an_indefinite_block_is_auto() {
+        let html = r#"<div id="outer"><div id="inner" style="height:100%"><div style="height:20px"></div></div></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        assert_eq!(
+            find_element_by_id(&layout, "inner").expect("inner").dimensions.height,
+            20.0
+        );
+    }
+
+    /// A positioned child states its width against the containing block, so
+    /// that is what it has to be laid out against. Handing it the
+    /// already-resolved width made `width: 40%` mean 40% of 40%.
+    #[test]
+    fn test_percentage_width_on_a_positioned_child_is_not_applied_twice() {
+        let html = r#"<div id="cb" style="position:relative;width:800px;height:200px">
+            <div id="wash" style="position:absolute;left:5%;width:40%;height:40px"></div>
+          </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let wash = find_element_by_id(&layout, "wash").expect("wash");
+        assert_eq!(wash.dimensions.width, 320.0, "40% of 800");
+        assert_eq!(wash.dimensions.x, 40.0, "5% of 800");
+    }
 
     // ── Grid item alignment ───────────────────────────────────────────────────
 

@@ -20,15 +20,41 @@ pub enum ObjectFit {
 
 // ── Paint Commands ────────────────────────────────────────────────────────────
 
+/// A corner radius, horizontal and vertical.
+///
+/// CSS gives every corner both, and they only coincide when the radius is a
+/// length: `border-radius: 50%` on a wide box is a full ellipse, not a stadium.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct CornerRadii {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl CornerRadii {
+    pub const NONE: Self = CornerRadii { x: 0.0, y: 0.0 };
+
+    /// The same radius on both axes — what a length radius gives.
+    pub fn uniform(r: f32) -> Self {
+        CornerRadii { x: r, y: r }
+    }
+
+    pub fn is_rounded(self) -> bool {
+        self.x > 0.0 && self.y > 0.0
+    }
+}
+
+
 /// A single atomic drawing operation. Moved from render.rs so that layer_tree.rs
 /// owns the data pipeline (layout → layer tree → paint commands) while render.rs
 /// owns the pixel execution (paint commands → Pixmap).
 #[derive(Debug, Clone)]
 pub enum PaintCommand {
     /// Filled rectangle: (bounds, color, corner-radius)
-    Rect(LayoutRect, Color, f32),
+    /// A solid background fill: box, colour, corner radii (horizontal,
+    /// vertical), `filter: blur()` radius (0 for none).
+    Rect(LayoutRect, Color, CornerRadii, f32),
     /// Stroked rectangle border: (bounds, stroke-width, color, corner-radius)
-    Border(LayoutRect, f32, Color, f32),
+    Border(LayoutRect, f32, Color, CornerRadii),
     /// Image: layout rect, source URL, object-fit mode, alt text
     Image {
         rect: LayoutRect,
@@ -75,18 +101,22 @@ pub enum PaintCommand {
         rect: LayoutRect,
         direction: LinearDirection,
         stops: Vec<CssColorStop>,
-        radius: f32,
+        radius: CornerRadii,
+        /// `filter: blur()` radius in pixels, 0 for none.
+        blur: f32,
     },
     /// CSS `radial-gradient()` background fill.
     RadialGradient {
         rect: LayoutRect,
         stops: Vec<CssColorStop>,
-        radius: f32,
+        radius: CornerRadii,
+        /// `filter: blur()` radius in pixels, 0 for none.
+        blur: f32,
     },
     /// Push a clip region onto the clip stack.
     /// All subsequent commands are clipped to `rect` (optionally with rounded corners
     /// when `radius` > 0). Paired with `PopClip`.
-    PushClip { rect: LayoutRect, radius: f32 },
+    PushClip { rect: LayoutRect, radius: CornerRadii },
     /// Pop the most recently pushed clip region from the clip stack.
     PopClip,
 }
@@ -374,9 +404,17 @@ impl LayerTreeBuilder {
                         continue;
                     }
 
-                    let border_radius = match frame_layout.style_node.specified_values.get(&crate::css::intern("border-radius")) {
-                        Some(Value::Length(v, _)) => *v,
-                        _ => 0.0,
+                    let border_radius = match frame_layout
+                        .style_node
+                        .specified_values
+                        .get(&crate::css::intern("border-radius"))
+                    {
+                        Some(Value::Length(v, crate::css::Unit::Percent)) => CornerRadii {
+                            x: d.width * (v / 100.0),
+                            y: d.height * (v / 100.0),
+                        },
+                        Some(Value::Length(v, _)) => CornerRadii::uniform(*v),
+                        _ => CornerRadii::NONE,
                     };
 
                     let (triggers, matrix) = Self::detect_triggers(frame_layout);
@@ -615,9 +653,21 @@ impl LayerTreeBuilder {
         }
         let sv = &layout.style_node.specified_values;
 
+        // A percentage radius is a fraction of the box, not a pixel count:
+        // `border-radius: 50%` on a wide box is a pill, and reading the 50 as
+        // pixels drew a barely-rounded rectangle where the page wanted a soft
+        // blob. (CSS makes each corner an ellipse — a percentage of the width
+        // horizontally and of the height vertically; the painter takes one
+        // radius, so the smaller side decides.)
         let radius = match sv.get(&crate::css::intern("border-radius")) {
-            Some(Value::Length(v, _)) => *v,
-            _ => 0.0,
+            // A percentage is a fraction of the box on each axis separately,
+            // which is what makes `border-radius: 50%` an ellipse.
+            Some(Value::Length(v, crate::css::Unit::Percent)) => CornerRadii {
+                x: d.width * (v / 100.0),
+                y: d.height * (v / 100.0),
+            },
+            Some(Value::Length(v, _)) => CornerRadii::uniform(*v),
+            _ => CornerRadii::NONE,
         };
 
         let mut commands = Vec::new();
@@ -629,13 +679,24 @@ impl LayerTreeBuilder {
             }
         }
 
+        // `filter: blur()` is applied to this element's own background fill.
+        // The decorative washes a design system builds out of a gradient under
+        // a heavy blur are empty boxes, so blurring the fill is the whole
+        // effect; a filtered element with content of its own keeps that content
+        // sharp, which is noted rather than modelled.
+        let blur = match sv.get(&crate::css::intern("filter-blur")) {
+            Some(Value::Length(v, crate::css::Unit::Px)) => v.max(0.0),
+            Some(Value::Number(v)) => v.max(0.0),
+            _ => 0.0,
+        };
+
         // Background
         let bg = sv.get(&crate::css::intern("background-color"))
             .or_else(|| sv.get(&crate::css::intern("background")))
             .or_else(|| sv.get(&crate::css::intern("background-image")));
         match bg {
             Some(Value::Color(c)) if c.a > 0 => {
-                commands.push(PaintCommand::Rect(d, c.clone(), radius));
+                commands.push(PaintCommand::Rect(d, c.clone(), radius, blur));
             }
             Some(Value::Gradient(GradientValue::Linear { direction, stops })) => {
                 commands.push(PaintCommand::LinearGradient {
@@ -643,6 +704,7 @@ impl LayerTreeBuilder {
                     direction: direction.clone(),
                     stops: stops.clone(),
                     radius,
+                    blur,
                 });
             }
             Some(Value::Gradient(GradientValue::Radial { stops, .. })) => {
@@ -650,6 +712,7 @@ impl LayerTreeBuilder {
                     rect: d,
                     stops: stops.clone(),
                     radius,
+                    blur,
                 });
             }
             _ => {}
@@ -664,6 +727,7 @@ impl LayerTreeBuilder {
                         direction: direction.clone(),
                         stops: stops.clone(),
                         radius,
+                        blur,
                     });
                 }
                 Some(Value::Gradient(GradientValue::Radial { stops, .. })) => {
@@ -671,6 +735,7 @@ impl LayerTreeBuilder {
                         rect: d,
                         stops: stops.clone(),
                         radius,
+                        blur,
                     });
                 }
                 _ => {}
@@ -709,7 +774,7 @@ impl LayerTreeBuilder {
             let b = &layout.border;
             let uniform = b.top == b.right && b.right == b.bottom && b.bottom == b.left;
 
-            if uniform && b.top > 0.0 && radius > 0.0 {
+            if uniform && b.top > 0.0 && radius.is_rounded() {
                 commands.push(PaintCommand::Border(d, b.top, uniform_color(), radius));
             } else {
                 // Edges are drawn as filled rectangles that meet at the corners.
@@ -733,7 +798,7 @@ impl LayerTreeBuilder {
                 ];
                 for (width, rect, side) in edges {
                     if width > 0.0 && rect.width > 0.0 && rect.height > 0.0 {
-                        commands.push(PaintCommand::Rect(snap(rect), side_color(side), 0.0));
+                        commands.push(PaintCommand::Rect(snap(rect), side_color(side), CornerRadii::NONE, 0.0));
                     }
                 }
             }
@@ -778,7 +843,7 @@ impl LayerTreeBuilder {
                     crate::layout::Rect { x: outer.x + outer.width - w, y: outer.y, width: w, height: outer.height },
                 ] {
                     if rect.width > 0.0 && rect.height > 0.0 {
-                        commands.push(PaintCommand::Rect(rect, color.clone(), 0.0));
+                        commands.push(PaintCommand::Rect(rect, color.clone(), CornerRadii::NONE, 0.0));
                     }
                 }
             }
@@ -1368,7 +1433,7 @@ mod tests {
         );
         let has_rounded_push = tree.layers.iter()
             .flat_map(|l| l.content_commands.iter().chain(l.background_commands.iter()))
-            .any(|cmd| matches!(cmd, PaintCommand::PushClip { radius, .. } if *radius > 0.0));
+            .any(|cmd| matches!(cmd, PaintCommand::PushClip { radius, .. } if radius.is_rounded()));
         assert!(has_rounded_push, "overflow:hidden + border-radius must emit PushClip with radius > 0");
     }
 
@@ -1541,7 +1606,7 @@ mod tests {
         );
         let has_rounded = tree.layers.iter()
             .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
-            .any(|cmd| matches!(cmd, PaintCommand::Rect(_, _, r) if *r > 0.0));
+            .any(|cmd| matches!(cmd, PaintCommand::Rect(_, _, r, _) if r.is_rounded()));
         assert!(has_rounded, "input with border-radius:24px must emit Rect with radius > 0");
     }
 
@@ -1554,7 +1619,7 @@ mod tests {
         );
         let has_rounded = tree.layers.iter()
             .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
-            .any(|cmd| matches!(cmd, PaintCommand::Rect(_, _, r) if *r > 0.0));
+            .any(|cmd| matches!(cmd, PaintCommand::Rect(_, _, r, _) if r.is_rounded()));
         assert!(!has_rounded, "input with border-radius:0 must not emit Rect with radius > 0");
     }
 
@@ -1567,7 +1632,7 @@ mod tests {
         );
         let has_rounded = tree.layers.iter()
             .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
-            .any(|cmd| matches!(cmd, PaintCommand::Rect(_, _, r) if *r > 0.0));
+            .any(|cmd| matches!(cmd, PaintCommand::Rect(_, _, r, _) if r.is_rounded()));
         assert!(has_rounded, "button with border-radius:8px must emit Rect with radius > 0");
     }
 
@@ -1580,7 +1645,7 @@ mod tests {
         );
         let has_rounded = tree.layers.iter()
             .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
-            .any(|cmd| matches!(cmd, PaintCommand::Rect(_, _, r) if *r > 0.0));
+            .any(|cmd| matches!(cmd, PaintCommand::Rect(_, _, r, _) if r.is_rounded()));
         assert!(has_rounded, "input with stylesheet border-radius:24px must emit Rect with radius > 0");
     }
 
@@ -1593,7 +1658,7 @@ mod tests {
         );
         let has_rounded = tree.layers.iter()
             .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
-            .any(|cmd| matches!(cmd, PaintCommand::Rect(_, _, r) if *r > 0.0));
+            .any(|cmd| matches!(cmd, PaintCommand::Rect(_, _, r, _) if r.is_rounded()));
         assert!(has_rounded, "input matched by attr selector with border-radius:24px must emit Rect with radius > 0");
     }
 
@@ -1606,7 +1671,7 @@ mod tests {
         );
         let has_rounded = tree.layers.iter()
             .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
-            .any(|cmd| matches!(cmd, PaintCommand::Rect(_, _, r) if *r > 0.0));
+            .any(|cmd| matches!(cmd, PaintCommand::Rect(_, _, r, _) if r.is_rounded()));
         assert!(has_rounded, "input with border-radius:24px 24px 24px 24px must emit Rect with radius > 0");
     }
 

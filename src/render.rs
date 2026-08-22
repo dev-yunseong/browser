@@ -3,7 +3,7 @@ use tiny_skia::{Pixmap, Paint, Transform, Stroke, PathBuilder, PixmapPaint, Mask
 use ab_glyph::{Font, point};
 use crate::layout::{LayoutBox, Rect as LayoutRect};
 use crate::css::{Color, CssColorStop, LinearDirection};
-use crate::layer_tree::{LayerTree, LayerTreeBuilder, PaintCommand, ObjectFit};
+use crate::layer_tree::{CornerRadii, LayerTree, LayerTreeBuilder, PaintCommand, ObjectFit};
 use crate::matrix::Matrix4x4;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -211,7 +211,7 @@ fn composite_layer_to_surface(
 /// `overflow: hidden` containers accumulate correctly.
 fn build_clip_mask(
     rect: LayoutRect,
-    radius: f32,
+    radius: CornerRadii,
     tx: f32,
     ty: f32,
     pw: u32,
@@ -222,8 +222,8 @@ fn build_clip_mask(
     let mut m = Mask::new(pw, ph)?;
 
     let local_rect = LayoutRect { x: rect.x + tx, y: rect.y + ty, width: rect.width, height: rect.height };
-    let path = if radius > 0.0 {
-        create_rounded_rect_path(local_rect, radius)
+    let path = if radius.is_rounded() {
+        create_elliptical_rect_path(local_rect, radius.x, radius.y)
     } else {
         tiny_skia::Rect::from_xywh(local_rect.x, local_rect.y, local_rect.width, local_rect.height)
             .and_then(|tr| { let mut pb = PathBuilder::new(); pb.push_rect(tr); pb.finish() })
@@ -279,44 +279,27 @@ fn execute_commands_on_tile(
                 clip_stack.pop();
             }
 
-            PaintCommand::Rect(r, c, radius) => {
-                let mut paint = Paint::default();
-                paint.set_color_rgba8(c.r, c.g, c.b, c.a);
-                if *radius > 0.0 {
-                    if let Some(path) = create_rounded_rect_path(*r, *radius) {
-                        pixmap.fill_path(&path, &paint, FillRule::Winding, transform, active_mask!());
-                    }
-                } else if let Some(tr) = tiny_skia::Rect::from_xywh(r.x, r.y, r.width, r.height) {
-                    pixmap.fill_rect(tr, &paint, transform, active_mask!());
-                }
+            PaintCommand::Rect(r, c, radius, blur) => {
+                let shader = tiny_skia::Shader::SolidColor(
+                    tiny_skia::Color::from_rgba8(c.r, c.g, c.b, c.a),
+                );
+                fill_background_shape(
+                    pixmap, *r, *radius, *blur, shader, transform, active_mask!(),
+                );
             }
-            PaintCommand::LinearGradient { rect: r, direction, stops, radius } => {
+            PaintCommand::LinearGradient { rect: r, direction, stops, radius, blur } => {
                 if let Some(shader) = build_linear_gradient_shader(*r, direction, stops) {
-                    let mut paint = Paint::default();
-                    paint.shader = shader;
-                    paint.anti_alias = true;
-                    if *radius > 0.0 {
-                        if let Some(path) = create_rounded_rect_path(*r, *radius) {
-                            pixmap.fill_path(&path, &paint, FillRule::Winding, transform, active_mask!());
-                        }
-                    } else if let Some(tr) = tiny_skia::Rect::from_xywh(r.x, r.y, r.width, r.height) {
-                        pixmap.fill_rect(tr, &paint, transform, active_mask!());
-                    }
+                    fill_background_shape(
+                        pixmap, *r, *radius, *blur, shader, transform, active_mask!(),
+                    );
                 }
             }
 
-            PaintCommand::RadialGradient { rect: r, stops, radius } => {
+            PaintCommand::RadialGradient { rect: r, stops, radius, blur } => {
                 if let Some(shader) = build_radial_gradient_shader(*r, stops) {
-                    let mut paint = Paint::default();
-                    paint.shader = shader;
-                    paint.anti_alias = true;
-                    if *radius > 0.0 {
-                        if let Some(path) = create_rounded_rect_path(*r, *radius) {
-                            pixmap.fill_path(&path, &paint, FillRule::Winding, transform, active_mask!());
-                        }
-                    } else if let Some(tr) = tiny_skia::Rect::from_xywh(r.x, r.y, r.width, r.height) {
-                        pixmap.fill_rect(tr, &paint, transform, active_mask!());
-                    }
+                    fill_background_shape(
+                        pixmap, *r, *radius, *blur, shader, transform, active_mask!(),
+                    );
                 }
             }
 
@@ -325,8 +308,8 @@ fn execute_commands_on_tile(
                 paint.set_color_rgba8(c.r, c.g, c.b, c.a);
                 let mut stroke = Stroke::default();
                 stroke.width = *w;
-                if *radius > 0.0 {
-                    if let Some(path) = create_rounded_rect_path(*r, *radius) {
+                if radius.is_rounded() {
+                    if let Some(path) = create_elliptical_rect_path(*r, radius.x, radius.y) {
                         pixmap.stroke_path(&path, &paint, &stroke, transform, active_mask!());
                     }
                 } else if let Some(tr) = tiny_skia::Rect::from_xywh(r.x + w/2.0, r.y + w/2.0, (r.width - w).max(0.0), (r.height - w).max(0.0)) {
@@ -537,54 +520,170 @@ fn execute_commands_on_tile(
 /// The kernel width is `2 * radius + 1`.  Only the alpha channel is blurred;
 /// the RGB channels are left at their initial values (white in the shadow
 /// case) because we only use alpha as coverage when compositing.
-fn box_blur_alpha(pixmap: &mut Pixmap, radius: usize) {
-    if radius == 0 { return; }
+/// Box-blur the named channels of an RGBA buffer, three passes to approximate a
+/// Gaussian.
+///
+/// Samples outside the buffer are the nearest edge pixel, which is what keeps
+/// the blur from darkening its own edges. The window is centred on the pixel:
+/// seeding the accumulator with one window and then sliding it as if it were
+/// centred on another leaves the sum drifting, and the result was a pair of
+/// bright bands with a hole between them rather than a blur.
+fn box_blur_channels(data: &mut [u8], w: usize, h: usize, radius: usize, channels: &[usize]) {
+    if radius == 0 || w == 0 || h == 0 {
+        return;
+    }
+    let k = (2 * radius + 1) as u32;
+    let clamp = |i: isize, n: usize| i.clamp(0, n as isize - 1) as usize;
 
-    let w = pixmap.width() as usize;
-    let h = pixmap.height() as usize;
-    let data = pixmap.data_mut();
-    let k = 2 * radius + 1;
-
-    // Horizontal pass — blur each row independently.
-    for row in 0..h {
-        let base = row * w * 4;
-        // Accumulate the first window.
-        let mut acc = 0u32;
-        for x in 0..k.min(w) {
-            acc += data[base + x * 4 + 3] as u32;
+    let mut line = vec![0u8; w.max(h)];
+    for _pass in 0..3 {
+        // Horizontal.
+        for row in 0..h {
+            let base = row * w * 4;
+            for &ch in channels {
+                let at = |data: &[u8], x: usize| data[base + x * 4 + ch] as u32;
+                let mut acc: u32 = (-(radius as isize)..=(radius as isize))
+                    .map(|d| at(data, clamp(d, w)))
+                    .sum();
+                for x in 0..w {
+                    line[x] = (acc / k) as u8;
+                    let add = at(data, clamp(x as isize + radius as isize + 1, w));
+                    let sub = at(data, clamp(x as isize - radius as isize, w));
+                    acc = acc + add - sub;
+                }
+                for x in 0..w {
+                    data[base + x * 4 + ch] = line[x];
+                }
+            }
         }
-
-        let mut tmp = vec![0u8; w];
-        for x in 0..w {
-            tmp[x] = (acc / k as u32) as u8;
-            // Slide window: add leading edge, remove trailing edge.
-            let lead = x + radius + 1;
-            let trail = if x >= radius { x - radius } else { w }; // sentinel: skip
-            if lead < w { acc += data[base + lead * 4 + 3] as u32; }
-            if x >= radius { acc = acc.saturating_sub(data[base + trail * 4 + 3] as u32); }
-        }
-        for x in 0..w {
-            data[base + x * 4 + 3] = tmp[x];
+        // Vertical.
+        for col in 0..w {
+            for &ch in channels {
+                let at = |data: &[u8], y: usize| data[(y * w + col) * 4 + ch] as u32;
+                let mut acc: u32 = (-(radius as isize)..=(radius as isize))
+                    .map(|d| at(data, clamp(d, h)))
+                    .sum();
+                for y in 0..h {
+                    line[y] = (acc / k) as u8;
+                    let add = at(data, clamp(y as isize + radius as isize + 1, h));
+                    let sub = at(data, clamp(y as isize - radius as isize, h));
+                    acc = acc + add - sub;
+                }
+                for y in 0..h {
+                    data[(y * w + col) * 4 + ch] = line[y];
+                }
+            }
         }
     }
+}
 
-    // Vertical pass — blur each column independently.
-    for col in 0..w {
-        let mut acc = 0u32;
-        for y in 0..k.min(h) {
-            acc += data[(y * w + col) * 4 + 3] as u32;
-        }
+/// Box-blur every channel of `pixmap`.
+///
+/// The alpha-only blur next to this is enough for a shadow, which is one
+/// colour; a `filter: blur()` over a gradient has to carry the colour through
+/// the blur too.
+fn box_blur_rgba(pixmap: &mut Pixmap, radius: usize) {
+    let (w, h) = (pixmap.width() as usize, pixmap.height() as usize);
+    box_blur_channels(pixmap.data_mut(), w, h, radius, &[0, 1, 2, 3]);
+    // Blurring the channels independently can leave a colour brighter than its
+    // own alpha, which is not a valid premultiplied pixel.
+    for px in pixmap.data_mut().chunks_exact_mut(4) {
+        let a = px[3];
+        px[0] = px[0].min(a);
+        px[1] = px[1].min(a);
+        px[2] = px[2].min(a);
+    }
+}
 
-        let mut tmp = vec![0u8; h];
-        for y in 0..h {
-            tmp[y] = (acc / k as u32) as u8;
-            let lead = y + radius + 1;
-            if lead < h { acc += data[(lead * w + col) * 4 + 3] as u32; }
-            if y >= radius { acc = acc.saturating_sub(data[((y - radius) * w + col) * 4 + 3] as u32); }
+/// Box-blur only the alpha channel — enough for a shadow, which is one colour.
+fn box_blur_alpha(pixmap: &mut Pixmap, radius: usize) {
+    let (w, h) = (pixmap.width() as usize, pixmap.height() as usize);
+    box_blur_channels(pixmap.data_mut(), w, h, radius, &[3]);
+}
+
+/// Fill a background box with `shader`, optionally rounded and optionally under
+/// a `filter: blur()`.
+///
+/// A blurred fill is drawn into its own pixmap, padded by the blur radius so
+/// the falloff has somewhere to go, blurred in all four channels, and then
+/// composited. A page's decorative washes are gradients under a heavy blur;
+/// drawn sharp they read as hard-edged blobs rather than as light.
+#[allow(clippy::too_many_arguments)]
+fn fill_background_shape(
+    pixmap: &mut Pixmap,
+    rect: LayoutRect,
+    radius: CornerRadii,
+    blur: f32,
+    shader: tiny_skia::Shader<'_>,
+    transform: Transform,
+    mask: Option<&Mask>,
+) {
+    let mut paint = Paint::default();
+    paint.shader = shader;
+    paint.anti_alias = true;
+
+    let draw = |target: &mut Pixmap, r: LayoutRect, tf: Transform, mask: Option<&Mask>| {
+        if radius.is_rounded() {
+            if let Some(path) = create_elliptical_rect_path(r, radius.x, radius.y) {
+                target.fill_path(&path, &paint, FillRule::Winding, tf, mask);
+            }
+        } else if let Some(tr) = tiny_skia::Rect::from_xywh(r.x, r.y, r.width, r.height) {
+            target.fill_rect(tr, &paint, tf, mask);
         }
-        for y in 0..h {
-            data[(y * w + col) * 4 + 3] = tmp[y];
-        }
+    };
+
+    if blur <= 0.0 {
+        draw(pixmap, rect, transform, mask);
+        return;
+    }
+
+    // In `filter: blur(N)` the N is the Gaussian's standard deviation, not the
+    // 2-sigma "blur radius" a box-shadow states — reading it as the latter drew
+    // every wash half as wide and twice as bright as the page asked for. The
+    // visible falloff runs to about 3 sigma, and the shader is positioned in
+    // page space, so the scratch pixmap is the box plus that margin, kept in
+    // page space by translating rather than re-anchoring.
+    let pad = (blur * 3.0).ceil().max(1.0);
+    let w = (rect.width + pad * 2.0).ceil().max(1.0) as u32;
+    let h = (rect.height + pad * 2.0).ceil().max(1.0) as u32;
+    // A wash the size of a page section is common; anything larger than a
+    // viewport-and-a-half is drawn sharp rather than allocating for it.
+    const MAX_BLUR_PIXELS: u32 = 4096;
+    if w > MAX_BLUR_PIXELS || h > MAX_BLUR_PIXELS {
+        draw(pixmap, rect, transform, mask);
+        return;
+    }
+    let Some(mut scratch) = Pixmap::new(w, h) else {
+        draw(pixmap, rect, transform, mask);
+        return;
+    };
+    // Draw at the box's own coordinates, shifted so the padded scratch holds it.
+    let into_scratch = Transform::from_translate(pad - rect.x, pad - rect.y);
+    draw(&mut scratch, rect, into_scratch, None);
+
+    // Three box passes of width w have variance 3(w^2-1)/12, so w = 2*sigma
+    // matches a Gaussian of that standard deviation — a radius of sigma - 1/2.
+    box_blur_rgba(&mut scratch, (blur - 0.5).round().max(1.0) as usize);
+
+    let mut blit = Paint::default();
+    let dest = LayoutRect {
+        x: rect.x - pad,
+        y: rect.y - pad,
+        width: w as f32,
+        height: h as f32,
+    };
+    // The pattern is anchored at the scratch pixmap's own origin, so it has to
+    // be moved to where the padded box sits on the page.
+    blit.shader = tiny_skia::Pattern::new(
+        scratch.as_ref(),
+        tiny_skia::SpreadMode::Pad,
+        tiny_skia::FilterQuality::Nearest,
+        1.0,
+        Transform::from_translate(dest.x, dest.y),
+    );
+    blit.anti_alias = false;
+    if let Some(tr) = tiny_skia::Rect::from_xywh(dest.x, dest.y, dest.width, dest.height) {
+        pixmap.fill_rect(tr, &blit, transform, mask);
     }
 }
 
@@ -646,23 +745,35 @@ fn draw_broken_image(
     );
 }
 
-fn create_rounded_rect_path(r: LayoutRect, radius: f32) -> Option<tiny_skia::Path> {
+/// A rounded rectangle whose corners are quarter-*ellipses*.
+///
+/// CSS gives every corner a horizontal and a vertical radius, and they only
+/// coincide when the radius is a length. `border-radius: 50%` on a wide box is
+/// a full ellipse, not a stadium, which is how a page draws a soft blob or a
+/// pill; drawing it with one radius left straight edges along the long sides.
+fn create_elliptical_rect_path(r: LayoutRect, rx: f32, ry: f32) -> Option<tiny_skia::Path> {
     let mut pb = PathBuilder::new();
     let rect = tiny_skia::Rect::from_xywh(r.x, r.y, r.width, r.height)?;
-    let radius = radius
-        .max(0.0)
-        .min(rect.width().min(rect.height()) / 2.0);
-    pb.move_to(rect.left() + radius, rect.top());
-    pb.line_to(rect.right() - radius, rect.top());
-    pb.quad_to(rect.right(), rect.top(), rect.right(), rect.top() + radius);
-    pb.line_to(rect.right(), rect.bottom() - radius);
-    pb.quad_to(rect.right(), rect.bottom(), rect.right() - radius, rect.bottom());
-    pb.line_to(rect.left() + radius, rect.bottom());
-    pb.quad_to(rect.left(), rect.bottom(), rect.left(), rect.bottom() - radius);
-    pb.line_to(rect.left(), rect.top() + radius);
-    pb.quad_to(rect.left(), rect.top(), rect.left() + radius, rect.top());
+    let rx = rx.max(0.0).min(rect.width() / 2.0);
+    let ry = ry.max(0.0).min(rect.height() / 2.0);
+    pb.move_to(rect.left() + rx, rect.top());
+    pb.line_to(rect.right() - rx, rect.top());
+    pb.quad_to(rect.right(), rect.top(), rect.right(), rect.top() + ry);
+    pb.line_to(rect.right(), rect.bottom() - ry);
+    pb.quad_to(rect.right(), rect.bottom(), rect.right() - rx, rect.bottom());
+    pb.line_to(rect.left() + rx, rect.bottom());
+    pb.quad_to(rect.left(), rect.bottom(), rect.left(), rect.bottom() - ry);
+    pb.line_to(rect.left(), rect.top() + ry);
+    pb.quad_to(rect.left(), rect.top(), rect.left() + rx, rect.top());
     pb.close();
     pb.finish()
+}
+
+fn create_rounded_rect_path(r: LayoutRect, radius: f32) -> Option<tiny_skia::Path> {
+    // A length radius is clamped by the shorter side, so the corners stay
+    // circular rather than turning into ellipses on a long box.
+    let radius = radius.min(r.width.min(r.height) / 2.0);
+    create_elliptical_rect_path(r, radius, radius)
 }
 
 
@@ -1319,6 +1430,84 @@ mod tests {
             &Color { r: 0, g: 0, b: 0, a: 255 },
         );
         assert_eq!(pixmap.data(), &before[..], "nothing was drawn");
+    }
+
+
+    /// `border-radius: 50%` on a wide box is a full ellipse, not a stadium:
+    /// each corner takes a percentage of the width horizontally and of the
+    /// height vertically. Drawing it with one radius left straight edges along
+    /// the long sides.
+    #[test]
+    fn test_percentage_radius_makes_an_ellipse_not_a_stadium() {
+        let mut pixmap = white_pixmap(200, 60);
+        let rect = LayoutRect { x: 0.0, y: 0.0, width: 200.0, height: 60.0 };
+        let cmds = vec![PaintCommand::Rect(
+            rect,
+            Color { r: 0, g: 0, b: 0, a: 255 },
+            crate::layer_tree::CornerRadii { x: 100.0, y: 30.0 },
+            0.0,
+        )];
+        let base_url = Url::parse("https://example.com/").unwrap();
+        execute_commands_on_tile(&cmds, &mut pixmap, rect, &HashMap::new(), &base_url);
+        let at = |x: usize, y: usize| pixmap.data()[(y * 200 + x) * 4];
+        // The middle of the long edge touches the box, and a quarter of the way
+        // along it the ellipse has already curved inwards.
+        assert!(at(100, 1) < 60, "the ellipse meets the top edge at its middle");
+        assert!(
+            at(30, 1) > 200,
+            "and is well inside it a quarter of the way along, got {}",
+            at(30, 1)
+        );
+        // A stadium of the same box would still be solid there.
+    }
+
+    /// A `filter: blur()` over a gradient has to carry the colour through the
+    /// blur, not just the alpha: drawn sharp, a page's decorative wash reads as
+    /// a hard-edged blob rather than as light.
+    #[test]
+    fn test_blurred_background_softens_its_edge() {
+        let stops = vec![
+            CssColorStop { color: Color { r: 255, g: 0, b: 0, a: 255 }, position: Some(0.0) },
+            CssColorStop { color: Color { r: 255, g: 0, b: 0, a: 255 }, position: Some(1.0) },
+        ];
+        let rect = LayoutRect { x: 20.0, y: 20.0, width: 60.0, height: 60.0 };
+        let render = |blur: f32| {
+            let mut pixmap = white_pixmap(120, 120);
+            let cmds = vec![PaintCommand::RadialGradient {
+                rect,
+                stops: stops.clone(),
+                radius: CornerRadii::NONE,
+                blur,
+            }];
+            let base_url = Url::parse("https://example.com/").unwrap();
+            execute_commands_on_tile(
+                &cmds,
+                &mut pixmap,
+                LayoutRect { x: 0.0, y: 0.0, width: 120.0, height: 120.0 },
+                &HashMap::new(),
+                &base_url,
+            );
+            pixmap
+        };
+        let sharp = render(0.0);
+        let soft = render(12.0);
+        let at = |p: &Pixmap, x: usize, y: usize| {
+            let i = (y * 120 + x) * 4;
+            (p.data()[i], p.data()[i + 1], p.data()[i + 2])
+        };
+        // Outside the box: nothing without the filter, colour with it.
+        assert_eq!(at(&sharp, 10, 50), (255, 255, 255), "no spill without a filter");
+        assert!(
+            at(&soft, 10, 50).1 < 250,
+            "the blur spreads the fill past its own box, got {:?}",
+            at(&soft, 10, 50)
+        );
+        // And the colour, not just the alpha, comes through.
+        let (r, g, b) = at(&soft, 50, 50);
+        assert!(
+            r as i32 > g as i32 + 40 && r as i32 > b as i32 + 40,
+            "the fill stays red under the blur: {r},{g},{b}"
+        );
     }
 
     /// A browser leaves an unloadable image's box transparent: it outlines it

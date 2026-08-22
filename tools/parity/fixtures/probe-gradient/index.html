@@ -10,6 +10,15 @@
   .positioned { background: linear-gradient(to bottom, #000240, #ffffff 117%); }
   .mixed { background: linear-gradient(to right, #f00 0%, #0f0, #00f 100%); }
   .over-white { background-color: #fff; }
+  /* A design system's decorative washes are gradients under a heavy blur.
+     Drawn sharp they read as hard-edged blobs rather than as light. */
+  .washes { position: relative; height: 240px; background: #0b0b1e; overflow: hidden; }
+  .wash { position: absolute; border-radius: 50%; }
+  .w1 { filter: blur(40px); background: radial-gradient(circle at 0 100%, #e6b7fe 10%, #5049c2 20%, rgba(87,78,255,0) 60%); width: 40%; height: 60%; top: 10%; left: 5%; }
+  .w2 { filter: blur(60px); background: radial-gradient(#a7a2ff 30%, rgba(147,80,255,.5)); width: 40%; height: 50%; top: 20%; left: 52%; }
+  /* `border-radius: 50%` on a wide box is a pill, not a 50px corner. */
+  .pill { position: absolute; bottom: 8px; left: 5%; width: 40%; height: 40px; border-radius: 50%; background: linear-gradient(90deg, #fc9, #9cf); }
+  .sharp { position: absolute; bottom: 8px; left: 52%; width: 40%; height: 40px; border-radius: 50%; background: linear-gradient(90deg, #fc9, #9cf); filter: blur(6px); }
 </style>
 </head>
 <body>
@@ -18,5 +27,11 @@
   <div class="four"></div>
   <div class="positioned"></div>
   <div class="mixed"></div>
+  <div class="washes">
+    <div class="wash w1"></div>
+    <div class="wash w2"></div>
+    <div class="pill"></div>
+    <div class="sharp"></div>
+  </div>
 </body>
 </html>

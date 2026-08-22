@@ -816,6 +816,24 @@ pub fn parse_css(source: &str) -> Stylesheet {
                     };
                     declarations.push(Declaration { name: intern("list-style-type"), value: type_val, important });
                 }
+                // `filter: blur(Npx)` — the one filter function this paints.
+                //
+                // A design system's decorative washes are gradients under a
+                // heavy blur; drawn sharp they read as hard-edged blobs rather
+                // than light. Other filter functions are dropped rather than
+                // half-applied.
+                "filter" | "-webkit-filter" => {
+                    let v = val_raw.trim().to_lowercase();
+                    if let Some(rest) = v.strip_prefix("blur(") {
+                        if let Some(arg) = rest.strip_suffix(')') {
+                            declarations.push(Declaration {
+                                name: intern("filter-blur"),
+                                value: parse_value(arg.trim()),
+                                important,
+                            });
+                        }
+                    }
+                }
                 // inset shorthand: "inset: <top> [<right> [<bottom> [<left>]]]"
                 // Same quad syntax as margin/padding, maps to top/right/bottom/left.
                 "inset" => {
