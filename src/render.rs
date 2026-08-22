@@ -843,12 +843,63 @@ fn render_text_raw(
 }
 
 /// Convert a `CssColorStop` slice into `tiny_skia::GradientStop`s.
+/// Convert CSS colour stops to shader stops, filling in the positions CSS
+/// leaves implicit.
+///
+/// A stop with no position is not at 0: the first defaults to 0, the last to 1,
+/// and a run in between is spaced equally across the gap. Treating them all as 0
+/// collapses the gradient — `linear-gradient(navy, transparent)` became a flat
+/// slab of navy, which on a page that fades a hero into its background paints
+/// the whole section opaque.
+///
+/// Positions are also forced non-decreasing, as the spec requires: a stop
+/// earlier than the one before it is clamped up to it.
 fn css_stops_to_skia(stops: &[CssColorStop]) -> Vec<GradientStop> {
-    stops.iter().filter_map(|s| {
-        let pos = s.position.unwrap_or(0.0).clamp(0.0, 1.0);
-        let color = tiny_skia::Color::from_rgba8(s.color.r, s.color.g, s.color.b, s.color.a);
-        GradientStop::new(pos, color).into()
-    }).collect()
+    if stops.is_empty() {
+        return Vec::new();
+    }
+
+    let last = stops.len() - 1;
+    let mut positions: Vec<Option<f32>> = stops
+        .iter()
+        .map(|s| s.position.map(|p| p.clamp(0.0, 1.0)))
+        .collect();
+    positions[0].get_or_insert(0.0);
+    positions[last].get_or_insert(1.0);
+
+    // Space each run of unpositioned stops evenly between its known neighbours.
+    let mut i = 0;
+    while i < positions.len() {
+        if positions[i].is_some() {
+            i += 1;
+            continue;
+        }
+        let before = i - 1;
+        let mut after = i;
+        while positions[after].is_none() {
+            after += 1;
+        }
+        let (start, end) = (positions[before].unwrap_or(0.0), positions[after].unwrap_or(1.0));
+        let steps = (after - before) as f32;
+        for (n, slot) in positions[i..after].iter_mut().enumerate() {
+            *slot = Some(start + (end - start) * ((n + 1) as f32 / steps));
+        }
+        i = after + 1;
+    }
+
+    let mut previous = 0.0f32;
+    stops
+        .iter()
+        .zip(positions)
+        .map(|(s, pos)| {
+            let pos = pos.unwrap_or(previous).max(previous);
+            previous = pos;
+            GradientStop::new(
+                pos,
+                tiny_skia::Color::from_rgba8(s.color.r, s.color.g, s.color.b, s.color.a),
+            )
+        })
+        .collect()
 }
 
 /// Build a tiny-skia `Shader` for a CSS `linear-gradient()`.

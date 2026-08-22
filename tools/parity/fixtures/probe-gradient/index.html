@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Gradient probe</title>
+<style>
+  body { margin: 0; font: 14px/1.4 sans-serif; background: #fff; }
+  div { height: 80px; margin-bottom: 8px; }
+  .two { background: linear-gradient(rgb(0, 2, 64), rgba(0, 0, 0, 0)); }
+  .three { background: linear-gradient(#f00, #0f0, #00f); }
+  .four { background: linear-gradient(to right, #f00, #ff0, #0f0, #00f); }
+  .positioned { background: linear-gradient(to bottom, #000240, #ffffff 117%); }
+  .mixed { background: linear-gradient(to right, #f00 0%, #0f0, #00f 100%); }
+  .over-white { background-color: #fff; }
+</style>
+</head>
+<body>
+  <div class="over-white"><div class="two"></div></div>
+  <div class="three"></div>
+  <div class="four"></div>
+  <div class="positioned"></div>
+  <div class="mixed"></div>
+</body>
+</html>
