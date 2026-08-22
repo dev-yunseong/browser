@@ -488,6 +488,10 @@ pub struct Declaration {
 pub struct Rule {
     pub selectors: Vec<Selector>,
     pub declarations: Vec<Declaration>,
+    /// Where this rule's cascade layer sits, low to high. Layer order beats
+    /// specificity, so this is the cascade's first sort key; unlayered rules
+    /// take the highest rank because they outrank every layer.
+    pub layer_rank: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -627,9 +631,11 @@ pub fn parse_css(source: &str) -> Stylesheet {
     // For now, we still strip them to avoid breaking the simple parser, 
     // but we'll implement a proper @media parser soon.
     let mut font_faces = Vec::new();
-    let source = strip_at_rules(&source, &mut font_faces);
+    let segments = strip_at_rules(&source, &mut font_faces);
 
-    let blocks: Vec<&str> = source.split('}').collect();
+    for (layer_rank, segment) in &segments {
+    let layer_rank = *layer_rank;
+    let blocks: Vec<&str> = segment.split('}').collect();
     for block in blocks {
         if block.trim().is_empty() { continue; }
 
@@ -919,7 +925,8 @@ pub fn parse_css(source: &str) -> Stylesheet {
             }
         }
 
-        items.push(RuleOrAtRule::Rule(Rule { selectors, declarations }));
+        items.push(RuleOrAtRule::Rule(Rule { selectors, declarations, layer_rank }));
+    }
     }
 
     Stylesheet { items, font_faces }
@@ -1216,7 +1223,7 @@ fn media_range_matches(condition: &str) -> bool {
 /// `!important` reverses layer order in the real cascade. That is not modelled:
 /// important declarations are applied after the normal ones whatever layer they
 /// came from.
-fn strip_at_rules(source: &str, font_faces: &mut Vec<FontFace>) -> String {
+fn strip_at_rules(source: &str, font_faces: &mut Vec<FontFace>) -> Vec<(u32, String)> {
     let mut order: Vec<String> = Vec::new();
     let mut segments: Vec<(Option<String>, String)> = Vec::new();
     collect_at_rules(source, None, font_faces, &mut order, &mut segments);
@@ -1255,11 +1262,22 @@ fn strip_at_rules(source: &str, font_faces: &mut Vec<FontFace>) -> String {
     let mut positions: Vec<usize> = (0..segments.len()).collect();
     positions.sort_by_cached_key(|&i| (rank(&segments[i].0), i));
 
-    let mut result = String::with_capacity(source.len());
+    // Segments that share a layer share a rank: within one layer the cascade
+    // falls back to specificity, and only *between* layers does order decide.
+    // Handing every segment its own rank would let a later rule in the same
+    // layer beat a more specific earlier one.
+    let mut out: Vec<(u32, String)> = Vec::with_capacity(positions.len());
+    let mut current_rank: u32 = 0;
+    let mut previous: Option<Vec<usize>> = None;
     for i in positions {
-        result.push_str(&segments[i].1);
+        let this = rank(&segments[i].0);
+        if previous.as_ref().is_some_and(|p| *p != this) {
+            current_rank += 1;
+        }
+        previous = Some(this);
+        out.push((current_rank, std::mem::take(&mut segments[i].1)));
     }
-    result
+    out
 }
 
 /// Walk `source`, dropping at-rule wrappers and recording each run of ordinary

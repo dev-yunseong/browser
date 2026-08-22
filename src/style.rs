@@ -659,7 +659,9 @@ pub fn build_style_tree(
             }
         }
         let mut matched: Vec<((usize, usize, usize), usize)> = rule_best.into_iter().map(|(ridx, spec)| (spec, ridx)).collect();
-        matched.sort_by_key(|&(spec, _)| spec);
+        // Layer order comes first — see the note on the full sort below — and
+        // the rule index is the tie-break within a layer.
+        matched.sort_by_key(|&(spec, ridx)| (all_rules[ridx].layer_rank, spec, ridx));
         sig_cache.insert(sig, matched);
     }
 
@@ -706,8 +708,16 @@ pub fn build_style_tree(
             }
         }
 
-        // Sort by specificity, then by position in the stylesheet, so that later
-        // declarations overwrite earlier ones.
+        // Cascade layer first, then specificity, then position in the sheet.
+        //
+        // Layer order *beats* specificity: an unlayered rule wins over a rule in
+        // any layer however specific that one is. github states its component
+        // rules inside `@layer primer-brand` and overrides them with plain
+        // page-level classes, so ranking by specificity alone let
+        // `.Pillar__description:not(.Pillar--has-border …)` — four classes deep
+        // — keep its 24px margin over the unlayered
+        // `.lp-SectionTemplate-customer-description`'s 16px, and every pillar
+        // came out 8px too tall.
         //
         // The rule index is the tie-break the cascade actually specifies, and
         // without it equal-specificity rules were applied in whatever order they
@@ -715,7 +725,7 @@ pub fn build_style_tree(
         // not stable between runs, so the same page laid out differently from one
         // render to the next — and equal specificity is the common case in a
         // design system, where nearly every rule is a single class.
-        rule_matches.sort_by_key(|&(rule_idx, spec)| (spec, rule_idx));
+        rule_matches.sort_by_key(|&(rule_idx, spec)| (all_rules[rule_idx].layer_rank, spec, rule_idx));
 
         // Apply matched rules; defer important declarations.
         // Only allocate `important` if needed (most nodes have no !important rules).
@@ -2519,6 +2529,60 @@ mod tests {
                 || named.specified_values.get(&intern("background-color")).is_some(),
             "the first rule's background must survive the second rule's `content`",
         );
+    }
+
+    /// Cascade layer order beats specificity: an unlayered rule wins over one
+    /// in any layer, however specific that one is. github states its component
+    /// rules inside `@layer primer-brand` and overrides them with plain
+    /// page-level classes, so ranking by specificity alone kept a four-class
+    /// `:not()` selector's 24px margin over the unlayered rule's 16px and every
+    /// pillar came out 8px too tall.
+    #[test]
+    fn test_an_unlayered_rule_beats_a_more_specific_layered_one() {
+        let css = r#"
+            @layer components;
+            @layer components {
+              .desc:not(.bordered .desc:last-child) { margin-bottom: 24px }
+            }
+            .customer-desc { margin-bottom: 16px }
+        "#;
+        let tree = make_tree(r#"<div><p id="p" class="desc customer-desc">x</p><a>y</a></div>"#, css);
+        fn find_id<'a>(n: &'a StyledNode, id: &str) -> Option<&'a StyledNode> {
+            if let markup5ever_rcdom::NodeData::Element { ref attrs, .. } = n.node.data {
+                if attrs.borrow().iter().any(|a| a.name.local.as_ref() == "id" && a.value.as_ref() == id) {
+                    return Some(n);
+                }
+            }
+            n.children.iter().find_map(|c| find_id(c, id))
+        }
+        let p = find_id(&tree, "p").expect("the paragraph");
+        assert_eq!(
+            get_length_px(p, "margin-bottom"),
+            Some(16.0),
+            "the unlayered rule wins even though the layered one is far more specific",
+        );
+    }
+
+    /// Within one layer the cascade falls back to specificity as usual.
+    #[test]
+    fn test_specificity_still_decides_inside_one_layer() {
+        let css = r#"
+            @layer components {
+              .desc.narrow { margin-bottom: 24px }
+              .desc { margin-bottom: 4px }
+            }
+        "#;
+        let tree = make_tree(r#"<p id="p" class="desc narrow">x</p>"#, css);
+        fn find_id<'a>(n: &'a StyledNode, id: &str) -> Option<&'a StyledNode> {
+            if let markup5ever_rcdom::NodeData::Element { ref attrs, .. } = n.node.data {
+                if attrs.borrow().iter().any(|a| a.name.local.as_ref() == "id" && a.value.as_ref() == id) {
+                    return Some(n);
+                }
+            }
+            n.children.iter().find_map(|c| find_id(c, id))
+        }
+        let p = find_id(&tree, "p").expect("the paragraph");
+        assert_eq!(get_length_px(p, "margin-bottom"), Some(24.0));
     }
 
     /// `:has()` is how a modern design system reacts to what an element

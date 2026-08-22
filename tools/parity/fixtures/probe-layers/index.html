@@ -25,6 +25,14 @@
   .d { background: #88f; }
   @layer components { .d { background: #f88; } }
 
+  /* Layer order beats specificity outright: an unlayered rule wins over one in
+     a layer however specific that one is. github's component rules live in
+     `@layer primer-brand` and its page-level classes override them exactly so. */
+  @layer components { .j:not(.bordered .j:last-child) { background: #f88; } }
+  .j { background: #8f8; }
+  /* And within one layer specificity still decides. */
+  @layer components { .k { background: #f88; } .k.strong { background: #8f8; } }
+
   /* A media query inside a layer keeps the layer and is still evaluated. */
   @layer base {
     @media (max-width: 900px) { .e { background: #8f8; } }
@@ -54,5 +62,7 @@
   <p class="row g">base's own rules beat base.inner — green</p>
   <p class="row h">base.two beats base.one — green</p>
   <p class="row i">components.late beats base — green</p>
+  <div class="j">an unlayered rule beats a far more specific layered one</div>
+  <div class="k strong">inside one layer, specificity still decides</div>
 </body>
 </html>

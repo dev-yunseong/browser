@@ -142,6 +142,7 @@ Ordered by how much of a page each one destroyed.
 | `order` ignored by grid auto-placement | Flex honoured it; grid placed its items in plain document order. github alternates its feature sections by giving one column `order: 2` and the other `order: 1`, so every screenshot came out on the side the text belongs on, and the text on the picture's side. |
 | An `overflow: hidden` clip never reaching a descendant *layer* | A clip is expressed as PushClip/PopClip inside one layer's own command list, and a box that composites on its own — positioned, transformed or blended — never sees it. That only shows on a box whose paint spreads past its own bounds: github's hero glow is blurred by 42px, and its halo escaped the intro section and washed over the whole band below it. |
 | `filter` in a `style` attribute dropped | The inline-style parser had no case for it, so an inline blur never produced the longhand paint reads and the box came out sharp. |
+| Cascade layer order ranked below specificity | Layer order beats specificity outright: an unlayered rule wins over one in any layer however specific that one is. Re-ordering the source so unlayered rules came last only settled *ties*; github states its component rules inside `@layer primer-brand` and overrides them with plain page-level classes, so a four-class `:not()` selector kept its 24px margin over the unlayered rule's 16px and every pillar came out 8px too tall. |
 | Flow advancing past the content box | A box that states a height and carries padding handed the next block a cursor its own padding too high, and every section below it climbed by that much. |
 
 
@@ -153,7 +154,7 @@ pixels:
 
 | fixture | layout | fold | page | height (chromium -> engine) |
 |---|---|---|---|---|
-| github.com | 1.37% | 2.89% | 1.60% | 10570 -> 10569 |
+| github.com | 1.37% | 2.89% | 1.60% | 10570 -> 10553 |
 | yunseong.dev | 1.45% | 3.21% | 4.10% | 4976 -> 4915 |
 | naver.com | 1.32% | 2.88% | 2.53% | 18658 -> 16384 |
 
