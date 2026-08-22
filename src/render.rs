@@ -147,7 +147,10 @@ fn composite_layer_to_surface(
         return;
     }
 
-    let has_effect = layer.opacity < 1.0 || layer.transform != Matrix4x4::identity();
+    let has_effect = layer.opacity < 1.0
+        || layer.transform != Matrix4x4::identity()
+        || layer.mask.is_some()
+        || layer.blend_mode.is_some();
     // A `filter: blur()` spreads its fill well outside the box it belongs to,
     // so the surface this layer renders into has to have room for the falloff
     // or the wash is cut off at its own edge — which, once the layer is also
@@ -203,9 +206,15 @@ fn composite_layer_to_surface(
         }
     }
 
-    if let Some(pixmap) = effect_pixmap {
+    if let Some(mut pixmap) = effect_pixmap {
+        if let Some(ref mask) = layer.mask {
+            apply_gradient_mask(&mut pixmap, mask, layer.bounds, effect_rect);
+        }
         let mut paint = PixmapPaint::default();
         paint.opacity = layer.opacity;
+        if let Some(ref mode) = layer.blend_mode {
+            paint.blend_mode = css_blend_mode(mode);
+        }
 
         let local_x = layer.bounds.x - surface_rect.x;
         let local_y = layer.bounds.y - surface_rect.y;
@@ -217,6 +226,90 @@ fn composite_layer_to_surface(
             .pre_concat(Transform::from_translate(-pad, -pad));
 
         target.draw_pixmap(0, 0, pixmap.as_ref(), &paint, transform, None);
+    }
+}
+
+/// Map a CSS `mix-blend-mode` onto the compositing mode that draws it.
+///
+/// `plus-lighter` is the separable "add the two together" mode, which is what
+/// tiny-skia calls `Plus`. Anything this engine has no equivalent for composites
+/// normally rather than not at all, since a missing layer reads worse than one
+/// blended the ordinary way.
+fn css_blend_mode(name: &str) -> tiny_skia::BlendMode {
+    use tiny_skia::BlendMode as B;
+    match name {
+        "multiply" => B::Multiply,
+        "screen" => B::Screen,
+        "overlay" => B::Overlay,
+        "darken" => B::Darken,
+        "lighten" => B::Lighten,
+        "color-dodge" => B::ColorDodge,
+        "color-burn" => B::ColorBurn,
+        "hard-light" => B::HardLight,
+        "soft-light" => B::SoftLight,
+        "difference" => B::Difference,
+        "exclusion" => B::Exclusion,
+        "hue" => B::Hue,
+        "saturation" => B::Saturation,
+        "color" => B::Color,
+        "luminosity" => B::Luminosity,
+        "plus-lighter" => B::Plus,
+        _ => B::SourceOver,
+    }
+}
+
+/// Fade a finished layer by its `mask-image` gradient.
+///
+/// A mask multiplies what the layer drew by the mask's own alpha, so where the
+/// gradient is transparent the layer is too. The gradient is resolved over the
+/// layer's *box*, not over the padded surface the layer was drawn into, which is
+/// what keeps the fade where the page put it when a blur widened the surface.
+fn apply_gradient_mask(
+    pixmap: &mut Pixmap,
+    mask: &crate::css::GradientValue,
+    bounds: LayoutRect,
+    surface: LayoutRect,
+) {
+    let local = LayoutRect {
+        x: bounds.x - surface.x,
+        y: bounds.y - surface.y,
+        width: bounds.width,
+        height: bounds.height,
+    };
+    let shader = match mask {
+        crate::css::GradientValue::Linear { direction, stops } => {
+            build_linear_gradient_shader(local, direction, stops)
+        }
+        crate::css::GradientValue::Radial { stops, center, extent, .. } => {
+            build_radial_gradient_shader(local, stops, *center, *extent)
+        }
+    };
+    let Some(shader) = shader else { return };
+
+    // Draw the gradient into a scratch pixmap the same size, then multiply the
+    // layer's premultiplied pixels by its alpha.
+    let Some(mut alpha) = Pixmap::new(pixmap.width(), pixmap.height()) else {
+        return;
+    };
+    let mut paint = Paint::default();
+    paint.shader = shader;
+    paint.anti_alias = false;
+    let full = match tiny_skia::Rect::from_xywh(0.0, 0.0, pixmap.width() as f32, pixmap.height() as f32) {
+        Some(r) => r,
+        None => return,
+    };
+    alpha.fill_rect(full, &paint, Transform::identity(), None);
+
+    let mask_px = alpha.data();
+    let out = pixmap.data_mut();
+    for i in (0..out.len()).step_by(4) {
+        let a = mask_px[i + 3] as u32;
+        if a == 255 {
+            continue;
+        }
+        for c in 0..4 {
+            out[i + c] = ((out[i + c] as u32 * a + 127) / 255) as u8;
+        }
     }
 }
 
@@ -1115,6 +1208,15 @@ fn css_stops_to_skia(stops: &[CssColorStop]) -> Vec<GradientStop> {
         })
         .collect();
 
+    // CSS interpolates a gradient in *premultiplied* space, where a fully
+    // transparent stop contributes no colour at all — `#9a7cff` fading to
+    // `rgba(14,10,162,0)` stays purple the whole way. Interpolating the stated
+    // colours instead drags the run through the transparent stop's own hue, so
+    // a purple glow came out ringed in dark blue. Since the premultiplied
+    // colour of an alpha-0 stop is zero whatever its channels say, taking its
+    // neighbour's colour reproduces the premultiplied result exactly.
+    let resolved = carry_colour_into_transparent_stops(resolved);
+
     // tiny-skia only takes stops inside [0, 1], so a run that starts before 0
     // or ends past 1 is clipped to the box: the colour at the boundary is the
     // interpolation of the two stops that straddle it.
@@ -1124,6 +1226,34 @@ fn css_stops_to_skia(stops: &[CssColorStop]) -> Vec<GradientStop> {
             GradientStop::new(pos, tiny_skia::Color::from_rgba8(c.r, c.g, c.b, c.a))
         })
         .collect()
+}
+
+/// Give every fully transparent stop the colour of its nearest visible
+/// neighbour.
+///
+/// See the note at the call site: this is what makes an ordinary interpolation
+/// agree with the premultiplied one CSS specifies, for the one case that
+/// actually matters — a run fading out to nothing.
+fn carry_colour_into_transparent_stops(
+    mut stops: Vec<(f32, crate::css::Color)>,
+) -> Vec<(f32, crate::css::Color)> {
+    let visible: Vec<usize> = (0..stops.len()).filter(|&i| stops[i].1.a != 0).collect();
+    if visible.is_empty() {
+        return stops;
+    }
+    for i in 0..stops.len() {
+        if stops[i].1.a != 0 {
+            continue;
+        }
+        let nearest = visible
+            .iter()
+            .copied()
+            .min_by_key(|&v| v.abs_diff(i))
+            .expect("checked non-empty");
+        let c = stops[nearest].1.clone();
+        stops[i].1 = crate::css::Color { a: 0, ..c };
+    }
+    stops
 }
 
 /// Sample the colour of a gradient run at `t`, in sRGB.

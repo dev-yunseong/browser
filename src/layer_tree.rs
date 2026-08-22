@@ -150,6 +150,9 @@ pub enum CompositingTrigger {
     PositionSticky,
     /// `will-change` with a value other than `auto`
     WillChange(String),
+    /// `mask-image` — the layer's own pixels are faded by a gradient once it is
+    /// finished, which needs a surface of its own to fade.
+    Mask,
 }
 
 // ── Layer ─────────────────────────────────────────────────────────────────────
@@ -199,6 +202,13 @@ pub struct Layer {
     /// Retained for use by the future compositor (issue #33); not used during
     /// the flat z-index sorted rendering pass implemented in this issue.
     pub child_layer_ids: Vec<usize>,
+    /// `mask-image`, when it names a gradient — the shape a page reaches for to
+    /// fade a decorative wash in or out. Applied to the finished layer as an
+    /// alpha multiply over its own box.
+    pub mask: Option<crate::css::GradientValue>,
+    /// `mix-blend-mode`, as the name CSS gives it. `None` is the default
+    /// `normal`, which is ordinary source-over compositing.
+    pub blend_mode: Option<String>,
 }
 
 impl Layer {
@@ -243,6 +253,8 @@ impl Layer {
             background_commands: Vec::new(),
             content_commands: Vec::new(),
             child_layer_ids: Vec::new(),
+            mask: None,
+            blend_mode: None,
         }
     }
 }
@@ -427,7 +439,9 @@ impl LayerTreeBuilder {
                         // This box establishes a new compositing layer.
                         let new_id = tree.layers.len();
                         let opacity = frame_layout.get_opacity();
-                        let new_layer = Layer::new(new_id, frame_layout.z_index, opacity, d, triggers, matrix);
+                        let mut new_layer = Layer::new(new_id, frame_layout.z_index, opacity, d, triggers, matrix);
+                        new_layer.mask = Self::read_mask(frame_layout);
+                        new_layer.blend_mode = Self::read_blend_mode(frame_layout);
                         tree.add_layer(new_layer);
 
                         // Record parent → child relationship: access parent index first,
@@ -622,7 +636,45 @@ impl LayerTreeBuilder {
             }
         }
 
+        if Self::read_mask(layout).is_some() || Self::read_blend_mode(layout).is_some() {
+            triggers.push(CompositingTrigger::Mask);
+        }
+
         (triggers, matrix)
+    }
+
+    /// The gradient a box's `mask-image` names, if any.
+    ///
+    /// Only the gradient forms are read: an image mask needs the bytes decoded,
+    /// while a gradient is the shape pages actually use to fade a wash out at
+    /// its own edge — github's hero carousel hides the top of its background
+    /// gradients this way, and without the mask they ran the full height of the
+    /// section.
+    fn read_mask(layout: &LayoutBox) -> Option<crate::css::GradientValue> {
+        let sv = &layout.style_node.specified_values;
+        for prop in ["mask-image", "-webkit-mask-image"] {
+            if let Some(Value::Gradient(g)) = sv.get(&crate::css::intern(prop)) {
+                return Some(g.clone());
+            }
+        }
+        None
+    }
+
+    /// The `mix-blend-mode` a box asks for, other than the default `normal`.
+    ///
+    /// A decorative wash is very often set to add rather than cover —
+    /// `plus-lighter` over a dark section is how a page makes a glow read as
+    /// light rather than as paint — and compositing it normally leaves it about
+    /// half as bright as the page intends.
+    fn read_blend_mode(layout: &LayoutBox) -> Option<String> {
+        match layout
+            .style_node
+            .specified_values
+            .get(&crate::css::intern("mix-blend-mode"))
+        {
+            Some(Value::Keyword(k)) if **k != *"normal" => Some(k.to_string()),
+            _ => None,
+        }
     }
 
     fn compute_transform_matrix(ops: &[TransformOp], elem_width: f32, elem_height: f32) -> Matrix4x4 {

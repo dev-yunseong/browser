@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Mask probe</title>
+<style>
+  body { margin: 0; background: #fff; font: 14px/1.5 sans-serif; color: #111; }
+  .band { position: relative; height: 140px; margin-bottom: 8px; overflow: hidden;
+          background: repeating-linear-gradient(45deg, #eee 0 12px, #fff 12px 24px); }
+  .fill { position: absolute; inset: 0; background: linear-gradient(#27e, #5f8); }
+  /* A wash faded in from the top — how a page hides the hard edge of a
+     decorative gradient. */
+  .top-fade { mask-image: linear-gradient(rgba(255,255,255,0), rgb(255,255,255) 25%); }
+  .bottom-fade { -webkit-mask-image: linear-gradient(rgb(255,255,255) 60%, rgba(255,255,255,0)); }
+  .side-fade { mask-image: linear-gradient(90deg, rgba(255,255,255,0), #fff 30%, #fff 70%, rgba(255,255,255,0)); }
+  .spot { mask-image: radial-gradient(60% 80% at 50% 50%, #fff 40%, rgba(255,255,255,0) 100%); }
+  /* A mask on a box that also carries text, so the fade covers the whole layer
+     rather than only its background. */
+  .withtext { padding: 16px; color: #003; font-weight: 700; }
+  /* A decorative wash set to add rather than cover, which is how a page makes a
+     glow read as light over a dark section. */
+  .dark { background: #0d1117; }
+  .glow { position: absolute; top: 10%; left: 10%; width: 50%; height: 80%;
+          background: radial-gradient(70% 90% at 50% 50%, #9a7cff 30%, rgba(14,10,162,0) 100%); }
+  .plus { mix-blend-mode: plus-lighter; }
+  .screen { mix-blend-mode: screen; left: 45%; background: radial-gradient(70% 90% at 50% 50%, #5fed83 30%, rgba(14,10,162,0) 100%); mix-blend-mode: screen; }
+  .mult { mix-blend-mode: multiply; }
+</style>
+</head>
+<body>
+  <div class="band"><div class="fill top-fade"></div></div>
+  <div class="band"><div class="fill bottom-fade"></div></div>
+  <div class="band"><div class="fill side-fade"></div></div>
+  <div class="band"><div class="fill spot"></div></div>
+  <div class="band"><div class="fill top-fade withtext">Masked text fades with the layer it sits in, because the mask applies to everything the box draws.</div></div>
+  <div class="band"><div class="fill"></div></div>
+  <div class="band dark"><div class="glow"></div><div class="glow screen"></div></div>
+  <div class="band dark"><div class="glow plus"></div><div class="glow screen"></div></div>
+  <div class="band"><div class="fill"></div><div class="glow mult"></div></div>
+</body>
+</html>
