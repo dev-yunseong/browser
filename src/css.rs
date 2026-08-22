@@ -878,16 +878,7 @@ pub fn parse_css(source: &str) -> Stylesheet {
                 // than light. Other filter functions are dropped rather than
                 // half-applied.
                 "filter" | "-webkit-filter" => {
-                    let v = val_raw.trim().to_lowercase();
-                    if let Some(rest) = v.strip_prefix("blur(") {
-                        if let Some(arg) = rest.strip_suffix(')') {
-                            declarations.push(Declaration {
-                                name: intern("filter-blur"),
-                                value: parse_value(arg.trim()),
-                                important,
-                            });
-                        }
-                    }
+                    expand_filter(&val_raw, important, &mut declarations);
                 }
                 // inset shorthand: "inset: <top> [<right> [<bottom> [<left>]]]"
                 // Same quad syntax as margin/padding, maps to top/right/bottom/left.
@@ -1548,6 +1539,25 @@ fn physical_pair_for(key: &str) -> Option<(&'static str, &'static str)> {
 /// A corner whose two radii differ is kept as the pair, since no single `Value`
 /// can hold both; `layer_tree` splits it again when it resolves them against the
 /// box.
+/// Split `filter: blur(Npx)` out into the `filter-blur` longhand paint reads.
+///
+/// Shared with the `style` attribute parser: a `filter` written there was
+/// dropped outright, so an inline blur never reached paint.
+pub fn expand_filter(val_raw: &str, important: bool, declarations: &mut Vec<Declaration>) {
+    let v = val_raw.trim().to_lowercase();
+    let Some(rest) = v.strip_prefix("blur(") else {
+        return;
+    };
+    let Some(arg) = rest.strip_suffix(')') else {
+        return;
+    };
+    declarations.push(Declaration {
+        name: intern("filter-blur"),
+        value: parse_value(arg.trim()),
+        important,
+    });
+}
+
 pub fn expand_border_radius(val_raw: &str, important: bool, declarations: &mut Vec<Declaration>) {
     let (horiz_src, vert_src) = match val_raw.split_once('/') {
         Some((h, v)) => (h, v),

@@ -242,6 +242,16 @@ pub struct Layer {
     /// ordinary negative child instead put github's hero glow on top of the
     /// panel it is supposed to sit behind.
     pub is_stacking_context: bool,
+    /// The clip an `overflow: hidden` ancestor puts on this layer, in page
+    /// coordinates, when the layer paints outside its own bounds.
+    ///
+    /// A clip is otherwise expressed as PushClip/PopClip inside one layer's own
+    /// command list, which a descendant layer never sees. That only matters for
+    /// a layer whose paint reaches past its box — a `filter: blur()` halo —
+    /// since anything drawn inside the box is inside the clip anyway. github's
+    /// hero glow is blurred by 42px, and the halo escaped the intro section's
+    /// clip and washed over the whole band below it.
+    pub clip: Option<LayoutRect>,
     /// `mask-image`, when it names a gradient — the shape a page reaches for to
     /// fade a decorative wash in or out. Applied to the finished layer as an
     /// alpha multiply over its own box.
@@ -294,6 +304,7 @@ impl Layer {
             content_commands: Vec::new(),
             child_layer_ids: Vec::new(),
             is_stacking_context: true,
+            clip: None,
             mask: None,
             blend_mode: None,
         }
@@ -504,6 +515,17 @@ impl LayerTreeBuilder {
                         new_layer.mask = Self::read_mask(frame_layout);
                         new_layer.blend_mode = Self::read_blend_mode(frame_layout);
                         new_layer.is_stacking_context = Self::establishes_stacking_context(frame_layout);
+                        // A clipping ancestor narrows `frame_clip`; anything
+                        // still at the viewport is unclipped. Only a layer whose
+                        // paint spreads past its own box needs the mask.
+                        let root_clip = tree.layers[0].bounds;
+                        let clipped = frame_clip.x > root_clip.x + 0.5
+                            || frame_clip.y > root_clip.y + 0.5
+                            || frame_clip.x + frame_clip.width < root_clip.x + root_clip.width - 0.5
+                            || frame_clip.y + frame_clip.height
+                                < root_clip.y + root_clip.height - 0.5;
+                        new_layer.clip = (clipped && Self::spreads_past_its_box(frame_layout))
+                            .then_some(frame_clip);
                         tree.add_layer(new_layer);
 
                         // Record parent → child relationship: access parent index first,
@@ -674,6 +696,24 @@ impl LayerTreeBuilder {
         matches!(nums.as_slice(), [top, right, bottom, left] if right - left <= 0.0 || bottom - top <= 0.0)
     }
 
+    /// Whether this box's paint reaches outside its own border box, which is
+    /// what makes an ancestor's clip visible on it. Today that means a blur.
+    fn spreads_past_its_box(layout: &LayoutBox) -> bool {
+        matches!(
+            layout
+                .style_node
+                .specified_values
+                .get(&crate::css::intern("filter-blur")),
+            Some(Value::Length(v, crate::css::Unit::Px)) if *v > 0.0
+        ) || matches!(
+            layout
+                .style_node
+                .specified_values
+                .get(&crate::css::intern("filter-blur")),
+            Some(Value::Number(v)) if *v > 0.0
+        )
+    }
+
     /// Whether this box establishes a stacking context, as opposed to merely
     /// getting a layer so its paint order can be expressed.
     ///
@@ -697,6 +737,7 @@ impl LayerTreeBuilder {
         }
         if sv.contains_key(&crate::css::intern("transform"))
             || sv.contains_key(&crate::css::intern("filter"))
+            || sv.contains_key(&crate::css::intern("filter-blur"))
             || sv.contains_key(&crate::css::intern("mask-image"))
             || sv.contains_key(&crate::css::intern("will-change"))
             || sv.contains_key(&crate::css::intern("perspective"))
@@ -1743,6 +1784,47 @@ mod tests {
                 clip.height,
             );
         }
+    }
+
+    /// A blurred box paints well outside its own bounds, and an `overflow:
+    /// hidden` ancestor clips that halo. A box that composites on its own —
+    /// because it is positioned, transformed or blended — never sees the
+    /// PushClip in its ancestor's command list, so the clip has to travel with
+    /// the layer: github's hero glow is blurred by 42px, scaled and blended,
+    /// and its halo escaped the intro section and washed over the band below.
+    #[test]
+    fn test_a_blurred_layer_carries_its_ancestor_s_clip() {
+        let tree = build_tree_from_html(
+            r#"<div style="width:400px;height:200px;overflow:hidden">
+                 <div style="position:relative;width:400px;height:200px;filter:blur(40px);background-color:#9a7cff"></div>
+               </div>"#,
+            "",
+        );
+        let blurred = tree.layers.iter()
+            .find(|l| l.bounds.width == 400.0 && l.bounds.height == 200.0 && l.clip.is_some())
+            .expect("the blurred layer must carry the clip");
+        let clip = blurred.clip.expect("clip");
+        assert!(
+            clip.height <= 200.0 + 0.5,
+            "the clip is the ancestor's box, got height {}",
+            clip.height
+        );
+    }
+
+    /// A layer that paints only inside its own box needs no mask: whatever it
+    /// draws is inside the clip already, and building one per layer costs.
+    #[test]
+    fn test_an_unblurred_layer_carries_no_clip() {
+        let tree = build_tree_from_html(
+            r#"<div style="width:400px;height:200px;overflow:hidden">
+                 <div style="position:relative;width:400px;height:200px;opacity:0.5;background-color:#9a7cff"></div>
+               </div>"#,
+            "",
+        );
+        assert!(
+            tree.layers.iter().all(|l| l.clip.is_none()),
+            "only a layer whose paint spreads past its box needs the mask",
+        );
     }
 
     /// `position: relative` with `z-index: auto` gets a layer here so paint

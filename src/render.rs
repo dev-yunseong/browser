@@ -150,7 +150,10 @@ fn composite_layer_to_surface(
     let has_effect = layer.opacity < 1.0
         || layer.transform != Matrix4x4::identity()
         || layer.mask.is_some()
-        || layer.blend_mode.is_some();
+        || layer.blend_mode.is_some()
+        // An ancestor's clip reaches this layer only through the blit, so the
+        // layer needs a surface of its own to blit.
+        || layer.clip.is_some();
     // A `filter: blur()` spreads its fill well outside the box it belongs to,
     // so the surface this layer renders into has to have room for the falloff
     // or the wash is cut off at its own edge — which, once the layer is also
@@ -233,7 +236,18 @@ fn composite_layer_to_surface(
             .pre_concat(layer.transform.to_skia())
             .pre_concat(Transform::from_translate(-pad, -pad));
 
-        target.draw_pixmap(0, 0, pixmap.as_ref(), &paint, transform, None);
+        let clip_mask = layer.clip.and_then(|rect| {
+            build_clip_mask(
+                rect,
+                CornerRadii::NONE,
+                -surface_rect.x,
+                -surface_rect.y,
+                target.width(),
+                target.height(),
+                None,
+            )
+        });
+        target.draw_pixmap(0, 0, pixmap.as_ref(), &paint, transform, clip_mask.as_ref());
     }
 }
 

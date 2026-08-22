@@ -29,6 +29,11 @@
                    background: radial-gradient(120% 110% at 85% 55%, rgb(154, 124, 255) 35%, rgba(14, 10, 162, 0) 100%); }
   .half::before { width: 50%; height: 50%; }
 
+  .clipbox { position: relative; height: 120px; margin: 0 32px; overflow: hidden; background: #151a22; }
+  .clipbox .glow { position: absolute; inset: 20px 120px; filter: blur(24px); mix-blend-mode: plus-lighter;
+                   background: radial-gradient(circle at 50% 50%, rgb(154, 124, 255) 20%, rgba(14, 10, 162, 0) 100%); }
+  .spacer { margin: 0 32px; padding: 12px 0; }
+
   /* `position: relative` with `z-index: auto` is not a stacking context, so a
      `z-index: -1` child of it paints *below* its own background. With a stated
      z-index it is one, and the child paints above that background instead. */
@@ -49,6 +54,16 @@
     <h2>percentages against a grandparent containing block</h2>
     <div class="cb"><div class="mid"><div class="panel"></div></div></div>
     <div class="cb"><div class="mid"><div class="panel half"></div></div></div>
+  </section>
+
+  <section>
+    <h2>a blurred glow inside a clipping box</h2>
+    <!-- A blurred box paints well outside its own bounds, and an
+         `overflow: hidden` ancestor clips that halo. A box that composites on
+         its own never sees the clip in its ancestor's command list, so the clip
+         has to travel with the layer. -->
+    <div class="clipbox"><div class="glow"></div></div>
+    <div class="spacer">whatever follows must stay clear of the halo</div>
   </section>
 
   <section>

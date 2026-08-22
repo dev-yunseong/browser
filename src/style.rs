@@ -2790,6 +2790,9 @@ pub fn parse_inline_style_into_vec(style_str: &str, list: &mut Vec<crate::css::D
             "border-radius" => {
                 crate::css::expand_border_radius(val, important, list);
             }
+            "filter" | "-webkit-filter" => {
+                crate::css::expand_filter(val, important, list);
+            }
             "box-shadow" => {
                 if let Some(shadow) = crate::css::parse_box_shadow(val) {
                     list.push(crate::css::Declaration {

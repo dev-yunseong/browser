@@ -140,6 +140,8 @@ Ordered by how much of a page each one destroyed.
 | An intrinsic width measured without the box's own `min-width` | What a box contributes to its parent's intrinsic size is its content bounded by its own constraints. github's hero toggle is five buttons at `min-width: 110px` around shorter labels; measured from the labels the row came out 109px short, and its `overflow: hidden` clipped the last button away. |
 | Whitespace at the edge of a block's content measured as a space | CSS drops it, and the intrinsic measurement did not. A date written as two spans inside a `<p>` indented in the source carries a whitespace-only text node on each side; counting those made the box three spaces wider than the run it holds, and on yunseong.dev that was enough to push the heading beside it onto a second line. |
 | `order` ignored by grid auto-placement | Flex honoured it; grid placed its items in plain document order. github alternates its feature sections by giving one column `order: 2` and the other `order: 1`, so every screenshot came out on the side the text belongs on, and the text on the picture's side. |
+| An `overflow: hidden` clip never reaching a descendant *layer* | A clip is expressed as PushClip/PopClip inside one layer's own command list, and a box that composites on its own — positioned, transformed or blended — never sees it. That only shows on a box whose paint spreads past its own bounds: github's hero glow is blurred by 42px, and its halo escaped the intro section and washed over the whole band below it. |
+| `filter` in a `style` attribute dropped | The inline-style parser had no case for it, so an inline blur never produced the longhand paint reads and the box came out sharp. |
 | Flow advancing past the content box | A box that states a height and carries padding handed the next block a cursor its own padding too high, and every section below it climbed by that much. |
 
 
@@ -151,7 +153,7 @@ pixels:
 
 | fixture | layout | fold | page | height (chromium -> engine) |
 |---|---|---|---|---|
-| github.com | 1.37% | 2.89% | 1.86% | 10570 -> 10569 |
+| github.com | 1.37% | 2.89% | 1.60% | 10570 -> 10569 |
 | yunseong.dev | 1.45% | 3.21% | 4.10% | 4976 -> 4915 |
 | naver.com | 1.32% | 2.88% | 2.55% | 18658 -> 16384 |
 
