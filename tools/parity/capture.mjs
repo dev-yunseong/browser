@@ -12,8 +12,8 @@
  * The self-contained HTML is the important artefact: a screenshot alone cannot
  * be re-rendered, so without it a parity diff has nothing to diff against.
  *
- * Cross-origin stylesheets and images are fetched through Playwright's request
- * context rather than from inside the page. A site that serves its CSS from a
+ * Cross-origin stylesheets, images and web fonts are fetched through
+ * Playwright's request context rather than from inside the page. A site that serves its CSS from a
  * separate asset domain — which is most large sites — exposes neither
  * `cssRules` nor a CORS-allowed `fetch` to page scripts, so an in-page fetch
  * yields a snapshot with no CSS at all, and a diff against it silently compares
@@ -31,6 +31,10 @@ const VIEWPORT = { width: 800, height: 1200 };
 const SETTLE_MS = 6000;
 const NAV_TIMEOUT_MS = 60000;
 const MAX_INLINE_BYTES = 400 * 1024;
+// Fonts are the one asset worth a larger budget: a page measured with the wrong
+// face breaks its lines somewhere else, so every line below the first is in the
+// wrong place and the page comes out the wrong length.
+const MAX_INLINE_FONT_BYTES = 3 * 1024 * 1024;
 
 const TARGETS = [
   { name: 'github', url: 'https://github.com' },
@@ -135,6 +139,40 @@ async function capture(browser, target, outDir) {
       }
     }
 
+    // Inline the faces the page ships. A snapshot that still points at a CDN
+    // renders with whatever fallback the machine happens to have, which is a
+    // difference in the snapshot rather than in either renderer.
+    let fontsInlined = 0;
+    let fontBytes = 0;
+    const fontCache = new Map();
+    const inlineFonts = async (cssText) => {
+      const urls = [...cssText.matchAll(/url\((['"]?)([^'")]+)\1\)/g)]
+        .map((m) => m[2])
+        .filter((u) => /\.(woff2?|ttf|otf)(\?|#|$)/i.test(u) && !u.startsWith('data:'));
+      for (const url of new Set(urls)) {
+        if (fontCache.has(url)) continue;
+        const body = await fetchAsset(context.request, url);
+        if (!body || body.length > MAX_INLINE_FONT_BYTES) {
+          fontCache.set(url, null);
+          continue;
+        }
+        const type = /\.woff2/i.test(url) ? 'font/woff2'
+          : /\.woff/i.test(url) ? 'font/woff'
+          : /\.otf/i.test(url) ? 'font/otf'
+          : 'font/ttf';
+        fontCache.set(url, `data:${type};base64,${body.toString('base64')}`);
+        fontsInlined += 1;
+        fontBytes += body.length;
+      }
+      return cssText.replace(/url\((['"]?)([^'")]+)\1\)/g, (match, quote, ref) => {
+        const uri = fontCache.get(ref);
+        return uri ? `url(${quote}${uri}${quote})` : match;
+      });
+    };
+    for (let i = 0; i < css.length; i += 1) {
+      if (css[i].includes('@font-face')) css[i] = await inlineFonts(css[i]);
+    }
+
     const dataUris = await Promise.all(
       images.map(async (src) => {
         const url = new URL(src, baseHref).href;
@@ -165,7 +203,8 @@ async function capture(browser, target, outDir) {
     const cssBytes = css.reduce((n, c) => n + c.length, 0);
     console.log(
       `ok   ${target.name.padEnd(9)} ${(out.length / 1024).toFixed(0)} KB snapshot, ` +
-        `${(cssBytes / 1024).toFixed(0)} KB CSS (${fetched} sheet(s) fetched server-side)`,
+        `${(cssBytes / 1024).toFixed(0)} KB CSS (${fetched} sheet(s) fetched server-side), ` +
+        `${fontsInlined} font(s) inlined (${(fontBytes / 1024).toFixed(0)} KB)`,
     );
     if (cssBytes === 0) {
       console.error(`WARN ${target.name}: no CSS captured — the snapshot will render unstyled`);

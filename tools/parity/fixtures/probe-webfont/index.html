@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Web font probe</title>
+<style>
+  /* Three delivery formats, all of which real sites use. Each face is
+     visibly different from the bundled sans, so a face that fails to load
+     shows up as both the wrong shapes and the wrong measured width. */
+  @font-face {
+    font-family: "Probe Serif";
+    src: url("probe-serif.woff2") format("woff2");
+    font-weight: 400;
+    font-style: normal;
+  }
+  @font-face {
+    font-family: "Probe Sans";
+    src: url("probe-sans.ttf") format("truetype");
+  }
+  @font-face {
+    font-family: "Probe Bold";
+    src: url("probe-bold.woff") format("woff");
+    font-weight: 700;
+  }
+  body { margin: 0; font: 20px/1.4 sans-serif; background: #fff; }
+  p { margin: 0 0 8px; }
+  /* The box is sized by the text, so a wrong face shows as a wrong width. */
+  .fit { display: inline-block; background: #dfe; }
+  .serif { font-family: "Probe Serif", sans-serif; }
+  .sans  { font-family: "Probe Sans", sans-serif; }
+  .bold  { font-family: "Probe Bold", sans-serif; font-weight: 700; }
+  .stack { font-family: "Nothing Here", "Probe Serif", sans-serif; }
+  .missing { font-family: "Not Loaded At All", sans-serif; }
+  /* Wrapping is decided by advance widths, so a wrong face breaks the lines
+     somewhere else — the failure that makes a whole page the wrong length. */
+  .measure { width: 300px; background: #eef; }
+</style>
+</head>
+<body>
+  <p><span class="fit serif">Handgloves woff2</span></p>
+  <p><span class="fit sans">Handgloves truetype</span></p>
+  <p><span class="fit bold">Handgloves woff</span></p>
+  <p><span class="fit stack">First family missing, second loads</span></p>
+  <p><span class="fit missing">No face for this family</span></p>
+  <p class="measure serif">The quick brown fox jumps over the lazy dog while the line breaks land wherever this face says they do.</p>
+  <p class="measure sans">The quick brown fox jumps over the lazy dog while the line breaks land wherever this face says they do.</p>
+</body>
+</html>

@@ -12,7 +12,7 @@
 //! DejaVu has no glyphs for.
 
 use ab_glyph::{Font, FontRef, GlyphId, PxScale};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 const SANS: &[u8] = include_bytes!("../assets/fonts/DejaVuSans.ttf");
 const SANS_BOLD: &[u8] = include_bytes!("../assets/fonts/DejaVuSans-Bold.ttf");
@@ -31,6 +31,8 @@ pub enum FaceId {
     Mono,
     MonoBold,
     Fallback,
+    /// A face the page shipped through `@font-face`, by registration order.
+    Web(u32),
 }
 
 /// The parts of an element's font that change which face is used.
@@ -42,14 +44,18 @@ pub struct FontStyle {
     pub bold: bool,
     pub italic: bool,
     pub monospace: bool,
+    /// A registered web-font family, if the element's `font-family` names one.
+    /// `None` means the bundled faces.
+    pub web_family: Option<u16>,
 }
 
 impl FontStyle {
     pub const fn regular() -> Self {
-        FontStyle { bold: false, italic: false, monospace: false }
+        FontStyle { bold: false, italic: false, monospace: false, web_family: None }
     }
 
-    /// The face this style asks for, before any fallback for missing glyphs.
+    /// The bundled face this style asks for, before any fallback for missing
+    /// glyphs. Web faces are consulted first, in `FontSet::glyph`.
     pub fn face(self) -> FaceId {
         match (self.monospace, self.bold) {
             (true, true) => FaceId::MonoBold,
@@ -58,6 +64,101 @@ impl FontStyle {
             (false, false) => FaceId::Sans,
         }
     }
+}
+
+/// One face a page shipped through `@font-face`.
+struct WebFace {
+    family: u16,
+    bold: bool,
+    italic: bool,
+    font: FontRef<'static>,
+}
+
+/// Faces registered from `@font-face`, and the family names they answer to.
+///
+/// Both grow for the life of the process: a face is parsed from leaked bytes so
+/// it can be handed out as `&'static`, which is what lets layout and paint share
+/// one reference without threading a lifetime through every call.
+#[derive(Default)]
+struct WebFonts {
+    families: Vec<String>,
+    faces: Vec<&'static WebFace>,
+}
+
+fn web_fonts() -> &'static RwLock<WebFonts> {
+    static WEB: OnceLock<RwLock<WebFonts>> = OnceLock::new();
+    WEB.get_or_init(|| RwLock::new(WebFonts::default()))
+}
+
+/// Register a decoded face under `family`, returning its id.
+///
+/// `data` is leaked on purpose: a face outlives the page that loaded it, and
+/// pages routinely re-use the same font across navigations.
+pub fn register_web_face(family: &str, data: Vec<u8>, bold: bool, italic: bool) -> Option<FaceId> {
+    let leaked: &'static [u8] = Box::leak(data.into_boxed_slice());
+    let font = FontRef::try_from_slice(leaked).ok()?;
+    let family = family.trim().to_ascii_lowercase();
+
+    let mut reg = web_fonts().write().ok()?;
+    let family_idx = match reg.families.iter().position(|f| *f == family) {
+        Some(i) => i,
+        None => {
+            reg.families.push(family);
+            reg.families.len() - 1
+        }
+    };
+    let face: &'static WebFace = Box::leak(Box::new(WebFace {
+        family: u16::try_from(family_idx).ok()?,
+        bold,
+        italic,
+        font,
+    }));
+    reg.faces.push(face);
+    Some(FaceId::Web(u32::try_from(reg.faces.len() - 1).ok()?))
+}
+
+/// The id of a registered family, if any face has been loaded under that name.
+pub fn web_family_id(family: &str) -> Option<u16> {
+    let family = family.trim().to_ascii_lowercase();
+    let reg = web_fonts().read().ok()?;
+    reg.families
+        .iter()
+        .position(|f| *f == family)
+        .and_then(|i| u16::try_from(i).ok())
+}
+
+/// Whether any web face has been registered at all.
+///
+/// Callers use this to skip the family lookup entirely on the common page that
+/// ships no fonts of its own.
+pub fn has_web_faces() -> bool {
+    web_fonts().read().map(|r| !r.faces.is_empty()).unwrap_or(false)
+}
+
+fn web_face(id: u32) -> Option<&'static WebFace> {
+    web_fonts().read().ok()?.faces.get(id as usize).copied()
+}
+
+/// Every face registered under `family`, best match for `style` first.
+///
+/// A page that ships a subsetted family — one `@font-face` per unicode range,
+/// which is how a CJK face is delivered — registers many faces under one name,
+/// so the caller walks them until one has the glyph.
+fn faces_for(family: u16, bold: bool, italic: bool) -> Vec<(u32, &'static WebFace)> {
+    let Ok(reg) = web_fonts().read() else {
+        return Vec::new();
+    };
+    let mut matching: Vec<(u32, &'static WebFace)> = reg
+        .faces
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.family == family)
+        .map(|(i, f)| (i as u32, *f))
+        .collect();
+    // Exact weight/slant matches first; the rest stay as fallbacks rather than
+    // being dropped, because a page that ships only one weight still wants it.
+    matching.sort_by_key(|(_, f)| ((f.bold != bold) as u8, (f.italic != italic) as u8));
+    matching
 }
 
 pub struct FontSet {
@@ -76,14 +177,30 @@ impl FontSet {
             FaceId::Mono => &self.mono,
             FaceId::MonoBold => &self.mono_bold,
             FaceId::Fallback => &self.fallback,
+            // A registered face is parsed from leaked bytes, so the reference
+            // outlives this borrow; the bundled sans stands in if the id is
+            // stale, which can only happen across a registry reset.
+            FaceId::Web(idx) => match web_face(idx) {
+                Some(f) => &f.font,
+                None => &self.sans,
+            },
         }
     }
 
     /// The face that has a glyph for `c`, and that glyph's id.
     ///
-    /// `glyph_id` returns 0 (`.notdef`) for a character a face does not cover,
-    /// which is what drives the fallback.
+    /// A family the page shipped is tried first, then the bundled face the
+    /// style asks for, then the CJK fallback. `glyph_id` returns 0 (`.notdef`)
+    /// for a character a face does not cover, which is what drives each step.
     pub fn glyph(&self, c: char, style: FontStyle) -> (FaceId, GlyphId) {
+        if let Some(family) = style.web_family {
+            for (idx, face) in faces_for(family, style.bold, style.italic) {
+                let gid = face.font.glyph_id(c);
+                if gid.0 != 0 {
+                    return (FaceId::Web(idx), gid);
+                }
+            }
+        }
         let wanted = style.face();
         let primary = self.face(wanted).glyph_id(c);
         if primary.0 != 0 {
@@ -120,7 +237,14 @@ impl FontSet {
     /// multiplier, so line boxes match what a browser using the same face
     /// computes.
     pub fn normal_line_height(&self, font_size: f32, style: FontStyle) -> f32 {
-        let face = self.face(style.face());
+        // A page's own face sets its line height too: a face with taller
+        // metrics than the bundled one makes every line box taller, and the
+        // error compounds down the page.
+        let face_id = style
+            .web_family
+            .and_then(|f| faces_for(f, style.bold, style.italic).first().map(|(i, _)| FaceId::Web(*i)))
+            .unwrap_or_else(|| style.face());
+        let face = self.face(face_id);
         let units = face.units_per_em().unwrap_or(1000.0);
         let height = face.height_unscaled() + face.line_gap_unscaled();
         height * (font_size / units)

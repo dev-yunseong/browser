@@ -393,9 +393,26 @@ pub enum RuleOrAtRule {
     AtRule(AtRule),
 }
 
+/// One `@font-face` rule, reduced to what this engine can act on.
+///
+/// A page that ships its own face is measured with it or not at all: the
+/// bundled fallback has different advance widths, so every line breaks
+/// somewhere else and the page comes out a different length.
+#[derive(Debug, Clone)]
+pub struct FontFace {
+    /// Family name, lowercased and unquoted, as `font-family` will name it.
+    pub family: String,
+    /// `src` URLs in declared order. The first one that decodes is used.
+    pub sources: Vec<String>,
+    pub bold: bool,
+    pub italic: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Stylesheet {
     pub items: Vec<RuleOrAtRule>,
+    /// `@font-face` rules, in document order.
+    pub font_faces: Vec<FontFace>,
 }
 
 impl Stylesheet {
@@ -497,7 +514,8 @@ pub fn parse_css(source: &str) -> Stylesheet {
     // Simple @rule preservation (Issue #21)
     // For now, we still strip them to avoid breaking the simple parser, 
     // but we'll implement a proper @media parser soon.
-    let source = strip_at_rules(&source);
+    let mut font_faces = Vec::new();
+    let source = strip_at_rules(&source, &mut font_faces);
 
     let blocks: Vec<&str> = source.split('}').collect();
     for block in blocks {
@@ -855,7 +873,70 @@ pub fn parse_css(source: &str) -> Stylesheet {
         items.push(RuleOrAtRule::Rule(Rule { selectors, declarations }));
     }
 
-    Stylesheet { items }
+    Stylesheet { items, font_faces }
+}
+
+/// Read one `@font-face` body into the parts this engine can act on.
+///
+/// `src` is a comma-separated list of `url(...) format(...)` entries in
+/// preference order; the URLs are kept in that order and the first that
+/// decodes wins. `local(...)` entries name system faces this engine does not
+/// look up, so they are skipped rather than mistaken for a URL.
+fn parse_font_face(body: &str) -> Option<FontFace> {
+    let mut family = String::new();
+    let mut sources = Vec::new();
+    let mut bold = false;
+    let mut italic = false;
+
+    for decl in body.split(';') {
+        let mut kv = decl.splitn(2, ':');
+        let name = kv.next().unwrap_or("").trim().to_ascii_lowercase();
+        let value = kv.next().unwrap_or("").trim();
+        if value.is_empty() {
+            continue;
+        }
+        match name.as_str() {
+            "font-family" => {
+                family = value.trim_matches(|c| c == '"' || c == '\'').trim().to_ascii_lowercase();
+            }
+            "src" => {
+                for entry in split_top_level_commas(value) {
+                    let entry = entry.trim();
+                    if entry.starts_with("local(") {
+                        continue;
+                    }
+                    if let Some(start) = entry.find("url(") {
+                        let rest = &entry[start + 4..];
+                        if let Some(end) = rest.find(')') {
+                            let url = rest[..end].trim().trim_matches(|c| c == '"' || c == '\'');
+                            if !url.is_empty() {
+                                sources.push(url.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            "font-weight" => {
+                // A variable font states a range (`45 920`). Its default
+                // instance is the regular weight, and this engine cannot pick
+                // another, so only a single bold weight counts as bold.
+                let words: Vec<&str> = value.split_whitespace().collect();
+                bold = match words.as_slice() {
+                    [one] => *one == "bold" || one.parse::<f32>().is_ok_and(|w| w >= 600.0),
+                    _ => false,
+                };
+            }
+            "font-style" => {
+                italic = value.starts_with("italic") || value.starts_with("oblique");
+            }
+            _ => {}
+        }
+    }
+
+    if family.is_empty() || sources.is_empty() {
+        return None;
+    }
+    Some(FontFace { family, sources, bold, italic })
 }
 
 /// Viewport width used for `@media` query evaluation.
@@ -1071,7 +1152,7 @@ fn media_range_matches(condition: &str) -> bool {
 /// Bodies are processed recursively so an `@media` nested inside an `@layer`
 /// (or vice versa) is still evaluated rather than left as raw text for the
 /// block splitter to trip over.
-fn strip_at_rules(source: &str) -> String {
+fn strip_at_rules(source: &str, font_faces: &mut Vec<FontFace>) -> String {
     let chars: Vec<char> = source.chars().collect();
     let mut result = String::with_capacity(source.len());
     let mut i = 0;
@@ -1117,6 +1198,15 @@ fn strip_at_rules(source: &str) -> String {
         let body_end = if depth == 0 { i - 1 } else { i };
         let body: String = chars[body_start..body_end].iter().collect();
 
+        // `@font-face` is the one dropped at-rule whose contents matter: it is
+        // how a page ships the face its layout was designed around.
+        if keyword == "font-face" {
+            if let Some(face) = parse_font_face(&body) {
+                font_faces.push(face);
+            }
+            continue;
+        }
+
         let keep = match keyword.as_str() {
             "media" => evaluate_media_query(&preamble),
             // Layers only affect cascade order, which this engine does not model;
@@ -1126,12 +1216,12 @@ fn strip_at_rules(source: &str) -> String {
             // guards with `@supports`, so the positive form is applied and only
             // the `not` fallback is skipped.
             "supports" => !preamble.trim_start().to_lowercase().starts_with("not "),
-            // `@font-face`, `@keyframes`, `@property` and `@container` declare
-            // things this engine cannot act on.
+            // `@keyframes`, `@property` and `@container` declare things this
+            // engine cannot act on.
             _ => false,
         };
         if keep {
-            result.push_str(&strip_at_rules(&body));
+            result.push_str(&strip_at_rules(&body, font_faces));
         }
     }
     result
@@ -2244,6 +2334,45 @@ fn named_color(s: &str) -> Option<Color> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `@font-face` is the one at-rule whose contents matter to layout: it is
+    /// how a page ships the face its line breaks were designed around.
+    #[test]
+    fn test_font_face_is_captured_with_its_sources_in_order() {
+        let ss = parse_css(
+            r#"@font-face {
+                 font-family: "Probe Serif";
+                 src: local("Nothing"), url("a.woff2") format("woff2"), url(b.ttf) format("truetype");
+                 font-weight: 700;
+                 font-style: italic;
+               }
+               body { color: red; }"#,
+        );
+        assert_eq!(ss.font_faces.len(), 1);
+        let face = &ss.font_faces[0];
+        assert_eq!(face.family, "probe serif", "family is matched case-insensitively");
+        assert_eq!(
+            face.sources,
+            vec!["a.woff2".to_string(), "b.ttf".to_string()],
+            "local() names a system face this engine cannot look up, so it is skipped"
+        );
+        assert!(face.bold);
+        assert!(face.italic);
+        // The rest of the sheet still parses.
+        assert_eq!(ss.all_rules().len(), 1);
+    }
+
+    /// A variable font states a weight range. Its default instance is the
+    /// regular weight and this engine cannot pick another, so a range must not
+    /// be read as "this face is bold".
+    #[test]
+    fn test_font_face_weight_range_is_not_bold() {
+        let ss = parse_css(
+            r#"@font-face { font-family: Pretendard; src: url(p.woff2); font-weight: 45 920; }"#,
+        );
+        assert_eq!(ss.font_faces.len(), 1);
+        assert!(!ss.font_faces[0].bold);
+    }
 
     /// `:has(p, div, pre)` carries commas of its own. Splitting the selector
     /// list on every comma turned one narrow selector into several wide ones —

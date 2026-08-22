@@ -3127,7 +3127,27 @@ pub fn resolved_font_style(sn: &StyledNode) -> crate::font::FontStyle {
         Some(Value::RawCustomProp(s)) => family_is_monospace(s.as_ref()),
         _ => false,
     };
-    crate::font::FontStyle { bold, italic, monospace }
+    crate::font::FontStyle { bold, italic, monospace, web_family: web_family_for(sv) }
+}
+
+/// The registered web-font family an element's `font-family` stack selects.
+///
+/// The stack is walked in order, exactly as font matching does: the first name
+/// the page actually loaded a face for wins, and a stack whose custom faces all
+/// failed to load falls through to the bundled ones.
+fn web_family_for(sv: &crate::style::PropertyMap) -> Option<u16> {
+    if !crate::font::has_web_faces() {
+        return None;
+    }
+    let stack = match sv.get(&crate::css::intern("font-family")) {
+        Some(Value::Keyword(k)) => k.to_string(),
+        Some(Value::RawCustomProp(s)) => s.to_string(),
+        _ => return None,
+    };
+    stack
+        .split(',')
+        .map(|f| f.trim().trim_matches(|c| c == '"' || c == '\''))
+        .find_map(crate::font::web_family_id)
 }
 
 /// Whether a `font-family` stack asks for a fixed-pitch face.
@@ -5859,7 +5879,7 @@ mod tests {
         let bold = fonts.measure(
             "Yunseong",
             16.0,
-            crate::font::FontStyle { bold: true, italic: false, monospace: false },
+            crate::font::FontStyle { bold: true, italic: false, monospace: false, web_family: None },
             0.0,
         );
         assert!(

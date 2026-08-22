@@ -687,6 +687,11 @@ pub fn process_html_with_cache(
         s
     };
 
+    // Load the faces the page ships before anything measures text: layout
+    // decides line breaks from advance widths, so a face that arrives after the
+    // fact would leave every line broken in the wrong place.
+    load_web_fonts(&stylesheet, base_url);
+
     let start = Instant::now();
     let mut style_tree = style::build_style_tree(
         &dom_tree.document,
@@ -1643,6 +1648,76 @@ fn hit_test(x: f32, y: f32, r: &layout::Rect) -> bool {
 ///
 /// Only the base64 form is decoded; percent-encoded data URIs are left to the
 /// normal fetch path, which resolves them the same way a URL would.
+/// Fetch and register every `@font-face` the page declares.
+///
+/// Each family's sources are tried in declared order and the first that decodes
+/// wins, which is how a page lists `woff2` before its `ttf` fallback. Faces
+/// already loaded in this process are skipped, so a second navigation to the
+/// same site costs nothing.
+fn load_web_fonts(stylesheet: &css::Stylesheet, base_url: &Url) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static LOADED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let loaded = LOADED.get_or_init(|| Mutex::new(HashSet::new()));
+
+    let faces: Vec<&css::FontFace> = stylesheet
+        .font_faces
+        .iter()
+        .filter(|face| {
+            let key = format!("{}|{}|{}|{}", face.family, face.bold, face.italic, face.sources.join(","));
+            loaded
+                .lock()
+                .map(|mut l: std::sync::MutexGuard<'_, HashSet<String>>| l.insert(key))
+                .unwrap_or(false)
+        })
+        .collect();
+    if faces.is_empty() {
+        return;
+    }
+
+    let fetched: Vec<(&css::FontFace, Option<Vec<u8>>)> = faces
+        .into_par_iter()
+        .map(|face| {
+            for src in &face.sources {
+                let bytes = if src.starts_with("data:") || src.starts_with("DATA:") {
+                    decode_data_uri(src)
+                } else {
+                    base_url
+                        .join(src)
+                        .ok()
+                        .and_then(|url| reqwest::blocking::get(url.as_str()).ok())
+                        .and_then(|resp| resp.bytes().ok())
+                        .map(|b| b.to_vec())
+                };
+                if let Some(decoded) = bytes.and_then(|b| decode_font(&b)) {
+                    return (face, Some(decoded));
+                }
+            }
+            (face, None)
+        })
+        .collect();
+
+    for (face, bytes) in fetched {
+        if let Some(bytes) = bytes {
+            crate::font::register_web_face(&face.family, bytes, face.bold, face.italic);
+        }
+    }
+}
+
+/// Turn downloaded font bytes into something `ab_glyph` can parse.
+///
+/// WOFF and WOFF2 are containers around an SFNT, and every site that ships a
+/// face ships it compressed, so an engine that only reads bare TTF/OTF loads no
+/// web fonts at all.
+fn decode_font(bytes: &[u8]) -> Option<Vec<u8>> {
+    match bytes.get(..4)? {
+        b"wOF2" => wuff::decompress_woff2(bytes).ok(),
+        b"wOFF" => wuff::decompress_woff1(bytes).ok(),
+        // Bare SFNT: `\0\1\0\0` (TrueType), `OTTO` (CFF), `true`/`ttcf`.
+        _ => Some(bytes.to_vec()),
+    }
+}
+
 fn decode_data_uri(url: &str) -> Option<Vec<u8>> {
     use base64::Engine as _;
     let rest = url.strip_prefix("data:").or_else(|| url.strip_prefix("DATA:"))?;
