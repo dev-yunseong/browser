@@ -2937,7 +2937,16 @@ impl<'a> LayoutBox<'a> {
 
         let content_height =
             (cursor_y - self.dimensions.y + self.padding.bottom + self.border.bottom).max(0.0);
-        let final_h = if height > 0.0 { height } else { content_height };
+        let mut final_h = if height > 0.0 { height } else { content_height };
+        // A form control with no in-flow children still holds one line: its
+        // value or its placeholder sits on it, and a browser sizes the control
+        // from that line rather than collapsing it to its padding.
+        if self.display == DisplayType::Input && self.children.is_empty() && height <= 0.0 {
+            let line = resolved_line_height_px(self.style_node);
+            final_h = final_h.max(
+                line + self.padding.top + self.padding.bottom + self.border.top + self.border.bottom,
+            );
+        }
         self.dimensions.height =
             clamp_height(self.style_node, box_sizing, &self.padding, &self.border, final_h);
 
@@ -6555,6 +6564,40 @@ mod tests {
             (auto.paint_rect().width - 800.0).abs() < 1.0,
             "an auto width already covers the padding, got {}",
             auto.paint_rect().width
+        );
+    }
+
+    /// A form control's height is content-driven: one line of the control's own
+    /// font plus its padding and border. Pinning it to a fixed 24px made a
+    /// padded field several pixels taller than the browser draws it, and the
+    /// field is the tallest thing in its row.
+    #[test]
+    fn test_input_height_comes_from_its_line_and_padding() {
+        let html = r#"<div style="width:800px"><input id="f" style="padding:10px 12px;border:1px solid #000"></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let f = find_element_by_id(&layout, "f").expect("input");
+        let line = resolved_line_height_px(f.style_node);
+        let expected = line + 20.0 + 2.0;
+        assert!(
+            (f.dimensions.height - expected).abs() < 1.5,
+            "one line plus 20px padding and 2px border = {expected}, got {}",
+            f.dimensions.height
+        );
+    }
+
+    /// A control does not inherit the page's font size either, so a page that
+    /// sets a large body size does not blow its fields up with it.
+    #[test]
+    fn test_input_keeps_its_own_font_size() {
+        let html = r#"<div style="font-size:40px"><input id="f" style="padding:0;border:0"></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let f = find_element_by_id(&layout, "f").expect("input");
+        assert!(
+            f.dimensions.height < 25.0,
+            "the field keeps its own ~13px font, got height {}",
+            f.dimensions.height
         );
     }
 

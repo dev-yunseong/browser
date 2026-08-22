@@ -1100,8 +1100,11 @@ fn apply_default_styles(tag: &str, map: &mut HashMap<Arc<str>, Value>) {
             map.entry(intern("padding")).or_insert(Value::Length(4.0, crate::css::Unit::Px));
             // UA defaults: HTML spec §14.3 — <input> default size = 20 chars ≈ 160 px at 13 px font.
             map.entry(intern("width")).or_insert(Value::Length(160.0, crate::css::Unit::Px));
-            // Real browsers render single-line inputs at ~21 px; use 24 for legibility.
-            map.entry(intern("height")).or_insert(Value::Length(24.0, crate::css::Unit::Px));
+            // The height is content-driven, as it is in a browser: one line of
+            // the control's own font plus its padding and border. Pinning it to
+            // a fixed 24px made a padded field several pixels taller than the
+            // browser draws it, and the field is the tallest thing in its row.
+            map.entry(intern("font-size")).or_insert(Value::Length(13.3333, crate::css::Unit::Px));
         }
         "textarea" => {
             map.entry(intern("line-height")).or_insert(Value::Keyword(intern("normal")));
@@ -1120,10 +1123,11 @@ fn apply_default_styles(tag: &str, map: &mut HashMap<Arc<str>, Value>) {
             map.entry(intern("background-color")).or_insert(Value::Color(crate::css::Color { r: 255, g: 255, b: 255, a: 255 }));
             map.entry(intern("padding")).or_insert(Value::Length(4.0, crate::css::Unit::Px));
             map.entry(intern("width")).or_insert(Value::Length(120.0, crate::css::Unit::Px));
-            map.entry(intern("height")).or_insert(Value::Length(24.0, crate::css::Unit::Px));
+            map.entry(intern("font-size")).or_insert(Value::Length(13.3333, crate::css::Unit::Px));
         }
         "button" => {
             map.entry(intern("line-height")).or_insert(Value::Keyword(intern("normal")));
+            map.entry(intern("font-size")).or_insert(Value::Length(13.3333, crate::css::Unit::Px));
             map.entry(intern("border-width")).or_insert(Value::Length(1.0, crate::css::Unit::Px));
             map.entry(intern("border-color")).or_insert(Value::Color(crate::css::Color { r: 180, g: 180, b: 180, a: 255 }));
             map.entry(intern("background-color")).or_insert(Value::Color(crate::css::Color { r: 240, g: 240, b: 240, a: 255 }));
