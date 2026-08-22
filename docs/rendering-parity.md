@@ -105,6 +105,30 @@ Ordered by how much of a page each one destroyed.
 | A form control identified by its `display` | Primer sets `display: flex` on its text inputs; reading the display instead of the element collapsed github's email field to its own top padding. |
 | A `var()` in a border shorthand placed by position alone | `border: solid var(--borderWidth-thin) transparent` has its only open slot at the *end*, and the width was dropped, leaving the button with no border at all. |
 | The `background` shorthand did not reset the colour | Chromium serialises `background: none` back as `background: 0px 0px`, and github's accordions ship exactly that to turn off the UA's grey button fill — which stayed on, as a light bar behind every heading. |
+| `::before` and `::after` modelled as text runs | Layout sized a generated box by its text, so `content: ""` came out nothing at all and a stated `width`, `height`, `background` or `position` was never read. That is most of what generated content does: the disc behind github's play button, the stripe down a card, the wash behind a hero. |
+| A selector's verdict cached across elements that share a signature | Only ancestor combinators and attribute constraints opted out of the cache; pseudo-classes did not. The first `.row:first-child` verdict was handed to every `.row` on the page — yunseong.dev's project list gave each of its five entries the first one's zero top padding and came out 128px short. |
+| Attribute-selector operators read as plain equality | `[class^="…"]`, `[class$=…]`, `[class*=…]`, `[class~=…]` and `[class|=…]` all left the operator stuck on the attribute's *name*, so none of them matched anything. github styles its whole link component through `[class^="Primer_Brand__Link-module__Link___"]`. |
+| A pseudo-class argument split on its own spaces | `:not(.a + .a)` was torn into three parts by the pass that spaces out combinators, so the rule matched nothing. github's logo strip lost its 32px of top padding to it. |
+| `aspect-ratio` applied to the content box under `border-box` | The ratio sizes whichever box `box-sizing` names. github's hero frame — a `1000 / 1196` box inside 8px of padding and a 1px border — came out 21px short in each of four sections. |
+| A ratio-settled height not treated as definite | `height: 100%` inside a ratio-sized frame resolved to `auto`, so the media that fills such a frame never painted. |
+| The ratio not re-applied after flexing | Growing or shrinking an item along the main axis moves the other axis with it; re-laying the item out reads its own stated width back, which is the one flexing just overruled. |
+| `grid-template-rows: 0fr` read as content-sized | A zero flex factor takes none of the free space and contributes no content, which is how every modern accordion holds a panel closed. Reading the track as content-sized left every collapsed panel standing open — ~300px per section on github. |
+| `flex: unset` dropped | The shorthand knew only `none`, `auto` and numbers, so the `flex: 1 1 0%` an author wrote `flex: unset` to undo stayed in force and github's security hero split its row evenly instead of 65/35. |
+| `rem` inside `calc()` resolved against the element | Layout has the element's font size but not the root's and passed the former for both, so `calc(100% - 2 * 2rem)` came out 56px of inset where the page asks for 64. |
+| A nested cascade layer ranked by its qualified name | `base.inner` sorts at `base`'s place among the top-level layers, not after every layer mentioned before it — so a rule in `base.inner` beat one in `components`, backwards. |
+| `mask-image` unsupported | How a page hides the hard edge of a background it lays over a section. github's hero carousel drew its two backing gradients at full strength from the top of the section instead of fading them in. |
+| `mix-blend-mode` unsupported | A glow set to `plus-lighter` over a dark section reads as light, not as paint; composited normally it comes out about half as bright as the page intends. |
+| Gradients interpolated in unpremultiplied space | CSS interpolates premultiplied, where a fully transparent stop contributes no colour: `#9a7cff` fading to `rgba(14,10,162,0)` stays purple the whole way. Interpolating the stated colours ringed every glow in dark blue. |
+| A radial gradient's radii, stated outright, read as a colour stop | `radial-gradient(141.53% 114.68% at 87.46% 55.27%, …)` names no extent keyword, and falling back to a farthest-corner circle is a very different wash. |
+| Out-of-flow children appended rather than kept in tree order | Paint order among positioned boxes is document order. github's hero carousel painted its video under the two gradients that sit behind it in the markup. |
+| An escaping absolute box carried along with its flex item | A flex or grid item is laid out at the origin and offset into place afterwards; a descendant already placed in page coordinates moved twice. github's carousel put its video 52px right of where the page has it. |
+| A broken image sized as a fixed placeholder | An image whose bytes never arrived *is* its alt text, laid out in the element's own box. Every screenshot on github's security pillars is remote, and reading them as a fixed box left each of those columns 38px short. |
+| `border-radius` reduced to one value for the whole box | `border-radius: 24px 24px 0 0` rounds the top of a panel and leaves it flush at the bottom; the `/` syntax that gives each corner separate horizontal and vertical radii was thrown away outright. |
+| `min-height` and `max-height` compared in the wrong box | The bound is a border box under `border-box` sizing while a measured height already is one, so insetting the bound and leaving the height alone compared a bound shorn of its padding against a height that still carried it. |
+| An absolutely positioned child resolved against the content box | Its containing block is the ancestor's *padding* box (CSS 2.2 §10.1), so an `inset: 0` overlay came out short by the padding it exists to cover. |
+| `background: var(--x)` never reaching paint | The shorthand holds the reference and the colour slot holds the reset the shorthand emits; substitution happens long after the shorthand was split, and the result was never put where paint looks for it. |
+| Flow advancing past the content box | A box that states a height and carries padding handed the next block a cursor its own padding too high, and every section below it climbed by that much. |
+
 
 ## Where it stands
 
@@ -114,13 +138,17 @@ pixels:
 
 | fixture | layout | fold | page | height (chromium -> engine) |
 |---|---|---|---|---|
-| github.com | 2.56% | 3.37% | 12.51% | 10570 -> 10654 |
-| yunseong.dev | 1.51% | 3.34% | 3.99% | 4976 -> 5012 |
-| naver.com | 1.32% | 2.89% | 2.56% | 18658 -> 16384 |
+| github.com | 1.66% | 3.33% | 3.34% | 10570 -> 10537 |
+| yunseong.dev | 1.46% | 3.22% | 3.90% | 4976 -> 4947 |
+| naver.com | 1.32% | 2.88% | 2.55% | 18658 -> 16384 |
 
-Sixteen of the twenty probe fixtures sit at or below 1%, and `probe-grid` is
-pixel-identical over the fold. github.com began this run at 9.14% / 13.84% and
-780px too tall; yunseong.dev at 4.24% and 256px too short.
+github.com began this work at 9.14% layout, 13.84% fold and 780px too tall;
+yunseong.dev at 4.24% and 256px too short. Section by section github now
+matches Chromium to within a pixel or two on four of its six sections.
+
+Every probe fixture sits at or below 1.7% on the layout metric, and
+`probe-grid`, `probe-transform` and `probe-aspect` are pixel-identical over the
+fold.
 
 naver.com's number means little: its snapshot was captured without CSS (see
 below), so both renderers are drawing an unstyled page and the comparison only
@@ -128,23 +156,37 @@ exercises the UA stylesheet.
 
 ## What still limits parity
 
+- **Glyph rasterisation.** Most of what is left on a text-heavy fixture is not
+  layout: converting both renders to greyscale removes only a twentieth of the
+  difference, so it is glyph shape and hinting rather than the reference's
+  subpixel antialiasing. The engine draws about 12% less ink than Chromium over
+  `probe-generics`, with the text-coverage curve already compensating for most
+  of the gap.
 - **Canvas, video and script-driven content do not render.** github.com's
-  landing page is largely a WebGL canvas and a video, so a large share of its
-  remaining difference is content this engine does not draw at all rather than
-  draws wrongly.
+  landing page is largely a WebGL canvas and a video, so a share of its
+  remaining difference is content this engine does not draw at all.
 - **`filter: blur()` applies to an element's own background, not to its
   subtree.** The decorative washes it exists for are empty boxes, so that is
   the whole effect there; a filtered element with content of its own keeps that
-  content sharp.
+  content sharp. The blur's falloff is also a three-pass box blur rather than a
+  true Gaussian, which spreads a heavy blur's energy differently — github's
+  hero glow reads about half as bright as Chromium's at the same distance.
 - **`justify-items` other than `stretch` is not modelled** — a grid item always
   fills its cell on the inline axis.
-- **`transform` is not applied to painted boxes**, so a wash the page rotates
-  or offsets sits square and where it was written.
-- **Two box models coexist** — see `tools/parity/README.md` for the two failed
+- **Two box models coexist.** `dimensions` holds the content box on an axis a
+  stated value settled and the border box on one that was measured;
+  `LayoutBox` now records which, and everything outside layout goes through
+  `outer_width`/`outer_height`. See `tools/parity/README.md` for the two failed
   migrations and what each one hit.
+- **A deeper absolute descendant still resolves against the content box.** The
+  padding-box rule is applied where a positioned ancestor places its own
+  children; one further down still inherits the content box.
 - **Inline runs do not fragment across lines.** A run's box spans the line box
   and its first line is indented, which is enough for line *breaking* to match;
   a wrapped run still cannot have a different height or background per line.
+- **Transformed overflow does not extend the page.** A rotated or scaled box
+  that reaches past the document's own bottom does not lengthen it, so
+  `probe-transform` ends 59px short of Chromium's scroll height.
 - **A snapshot can only be as good as its capture.** `capture.mjs` now inlines
   fonts as well as stylesheets and images, but a snapshot taken before that
   still points at a CDN, and a page rendered against a fallback face is a
