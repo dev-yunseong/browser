@@ -68,12 +68,20 @@ Ordered by how much of a page each one destroyed.
 | Gradient stops clamped to the box | `#fff 117%` means the gradient never reaches white inside the box; clamping made it reach white at the bottom edge, so a hero faded a whole shade too early. |
 | UA block margins stated in pixels | `p`, `ul`, `h1`-`h6` take `em` margins in the spec's sheet, so they track the page's font size. Fixed pixels pinned a page's rhythm to a 16px body, and `h3`-`h6` had no margins at all. |
 | Grid `auto` tracks sized from free space | `auto` and `fr` drew from the same pool, so on `auto 1fr` the auto track swallowed the row and the column beside it came out empty. |
+| `inline-flex` unrecognised | A button built as `display: inline-flex` — which is how a design system builds every button — fell through to its tag's default and became an ordinary inline box, drawn the full width of its bar. |
+| Shrink-to-fit boxes narrowed by their own padding | Max-content already counts padding in; taking it off again under `border-box` made a button exactly its own padding too narrow, so its label ran past the end of its background. |
+| A padded inline child's box counted twice | Line boxes added padding and border on top of `dimensions`, which for an auto-sized box already covers them. A section holding a padded button came out 20px too tall, once per section down the page. |
+| Form controls inherited the page's `line-height` | The UA sheet gives them a font of their own, which is why a button inside `body { line-height: 1.4 }` is not 1.4 lines tall. |
+| Void elements serialised with an end tag | `</br>` is parsed as *another* `<br>`, and the serialised DOM is what the second render parses — so every page gained a blank line per line break each time it was re-rendered. |
 
 ## Where it stands
 
-Ten of the thirteen probe fixtures are now under 1% of a 16px block-mean diff,
-and two of them are pixel-identical over the first fold. The three that are not
-are listed below with what holds them back.
+Thirteen of the fifteen probe fixtures sit at or near 1% of a 16px block-mean
+diff, and `probe-gradient` is pixel-identical over the first fold. The two that
+are not — `probe-controls` at 2.0% and `probe-inline` at 1.5% — are held back by
+the box model and by inline fragmentation, both below. Of the three sites,
+yunseong.dev is at 4.2% and github.com at 14.5%; naver.com cannot be measured
+until its snapshot is re-captured with CSS in it.
 
 ## What still limits parity
 
