@@ -2988,6 +2988,7 @@ fn resolve_math_px(value: &Value, cb: f32, vw: f32, vh: f32, font_size: f32) -> 
         viewport_width: vw,
         viewport_height: vh,
         font_size,
+        root_font_size: font_size,
         percent_basis: Some(cb),
     })
 }

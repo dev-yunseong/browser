@@ -119,6 +119,8 @@ pub struct MathContext {
     pub viewport_width: f32,
     pub viewport_height: f32,
     pub font_size: f32,
+    /// The root element's font size, which `rem` resolves against.
+    pub root_font_size: f32,
     /// Basis for percentages, or `None` when it is not yet known — an expression
     /// containing a percentage then stays unresolved rather than guessing.
     pub percent_basis: Option<f32>,
@@ -131,6 +133,7 @@ impl MathExpr {
             MathExpr::Value(n, unit) => match unit {
                 None | Some(Unit::Px) => Some(*n),
                 Some(Unit::Em) => Some(n * ctx.font_size),
+                Some(Unit::Rem) => Some(n * ctx.root_font_size),
                 Some(Unit::Vw) => Some(ctx.viewport_width * (n / 100.0)),
                 Some(Unit::Vh) => Some(ctx.viewport_height * (n / 100.0)),
                 Some(Unit::Percent) => ctx.percent_basis.map(|b| b * (n / 100.0)),
@@ -287,6 +290,8 @@ pub enum Unit {
     Vw,
     Vh,
     Em,
+    /// Relative to the root element's font size, not the parent's.
+    Rem,
     Percent,
     /// CSS Grid fractional unit (flexible tracks).
     Fr,
@@ -1759,7 +1764,7 @@ fn parse_math_term(expr: &str) -> Option<MathExpr> {
     let lower = expr.to_ascii_lowercase();
     for (suffix, unit) in [
         ("px", Some(Unit::Px)),
-        ("rem", Some(Unit::Em)),
+        ("rem", Some(Unit::Rem)),
         ("em", Some(Unit::Em)),
         ("vw", Some(Unit::Vw)),
         ("vh", Some(Unit::Vh)),
@@ -1845,8 +1850,9 @@ pub fn parse_value(val: &str) -> Value {
         Value::Length(val.trim_end_matches("vw").parse().unwrap_or(0.0), Unit::Vw)
     } else if val.ends_with("vh") {
         Value::Length(val.trim_end_matches("vh").parse().unwrap_or(0.0), Unit::Vh)
-    } else if val.ends_with("em") || val.ends_with("rem") {
-        let num = val.trim_end_matches("rem").trim_end_matches("em");
+    } else if let Some(num) = val.strip_suffix("rem") {
+        Value::Length(num.parse().unwrap_or(1.0), Unit::Rem)
+    } else if let Some(num) = val.strip_suffix("em") {
         Value::Length(num.parse().unwrap_or(1.0), Unit::Em)
     } else if val.ends_with('%') {
         Value::Length(val.trim_end_matches('%').parse().unwrap_or(0.0), Unit::Percent)
@@ -2655,9 +2661,10 @@ fn parse_track_token(token: &str) -> Value {
     } else if t.ends_with('%') {
         let n = t.trim_end_matches('%').parse::<f32>().unwrap_or(0.0);
         Value::Length(n, Unit::Percent)
-    } else if t.ends_with("em") || t.ends_with("rem") {
-        let n = t.trim_end_matches("rem").trim_end_matches("em").parse::<f32>().unwrap_or(1.0);
-        Value::Length(n, Unit::Em)
+    } else if let Some(n) = t.strip_suffix("rem") {
+        Value::Length(n.parse::<f32>().unwrap_or(1.0), Unit::Rem)
+    } else if let Some(n) = t.strip_suffix("em") {
+        Value::Length(n.parse::<f32>().unwrap_or(1.0), Unit::Em)
     } else {
         // fallback: try as keyword
         Value::Keyword(intern(token.trim()))

@@ -585,6 +585,19 @@ pub fn build_style_tree(
     tree
 }
 
+/// The computed `font-size` of the `<html>` element, if the tree has one.
+fn find_root_font_size(node: &StyledNode) -> Option<f32> {
+    if let NodeData::Element { ref name, .. } = node.node.data {
+        if name.local.as_ref() == "html" {
+            return match node.specified_values.get(&intern("font-size")) {
+                Some(Value::Length(v, crate::css::Unit::Px)) => Some(*v),
+                _ => None,
+            };
+        }
+    }
+    node.children.iter().find_map(find_root_font_size)
+}
+
 /// Fold `calc()` / `clamp()` / `min()` / `max()` values in a computed style tree
 /// down to pixels.
 ///
@@ -595,6 +608,10 @@ pub fn build_style_tree(
 pub fn resolve_math_values(node: &mut StyledNode, viewport_width: f32, viewport_height: f32) {
     // Computed maps are shared and deduplicated between nodes, so an already
     // resolved map is reused rather than rebuilt for every node that points at it.
+    // `rem` inside a math function resolves against the root element, not the
+    // element the expression sits on.
+    let root_font_size = find_root_font_size(node).unwrap_or(16.0);
+
     let mut resolved: HashMap<usize, PropertyMap> = HashMap::new();
     let mut stack: Vec<*mut StyledNode> = vec![node as *mut StyledNode];
 
@@ -615,6 +632,7 @@ pub fn resolve_math_values(node: &mut StyledNode, viewport_width: f32, viewport_
                 viewport_width,
                 viewport_height,
                 font_size,
+                root_font_size,
                 percent_basis: None,
             };
             let mut map = (*node.specified_values.0).clone();
@@ -740,6 +758,9 @@ fn build_final_tree(
         parent_pm: initial_parent_style.cloned(),
     }];
     let mut results: Vec<StyledNode> = Vec::new();
+    // `rem` resolves against the root element's font size. The traversal is
+    // depth-first from the root, so this is set before any descendant reads it.
+    let mut root_fs: f32 = 16.0;
 
     while let Some(frame) = work.pop() {
         match frame {
@@ -747,6 +768,11 @@ fn build_final_tree(
                 // Read the current sequential index BEFORE incrementing.
                 let current_idx = *arena_idx;
                 *arena_idx += 1;
+
+                let is_root_element = matches!(
+                    handle.data,
+                    NodeData::Element { ref name, .. } if name.local.as_ref() == "html"
+                );
 
                 // Compute specified_values: apply inheritance, defaults, em/% resolution.
                 let mut specified_values = std::mem::take(&mut raw_styles[current_idx]);
@@ -815,18 +841,28 @@ fn build_final_tree(
                     .and_then(|p| p.get(&fs_key))
                     .and_then(|v| if let Value::Length(pv, crate::css::Unit::Px) = v { Some(*pv) } else { None })
                     .unwrap_or(16.0);
-                if let Some(val) = specified_values.get(&fs_key) {
-                    let resolved_fs = match val {
+                // A font size may be written in any of these units, and may arrive
+                // through a custom property — design systems keep their type scale
+                // in one. Resolving a var() only when it already held pixels left
+                // every `font-size: var(--scale-step)` unresolved, so headings
+                // silently inherited body size.
+                fn font_size_px(value: &Value, parent_fs: f32, root_fs: f32) -> Option<f32> {
+                    match value {
                         Value::Length(v, crate::css::Unit::Px) => Some(*v),
                         Value::Length(v, crate::css::Unit::Percent) => Some(parent_fs * (v / 100.0)),
                         Value::Length(v, crate::css::Unit::Em) => Some(parent_fs * v),
+                        Value::Length(v, crate::css::Unit::Rem) => Some(root_fs * v),
                         Value::Keyword(kw) if kw.as_ref() == "inherit" => Some(parent_fs),
                         Value::Keyword(kw) if kw.as_ref() == "initial" => Some(16.0),
-                        Value::CssVar { .. } => {
-                            resolve_var(val, &custom_props, 0)
-                                .and_then(|resolved| if let Value::Length(pv, crate::css::Unit::Px) = resolved { Some(pv) } else { None })
-                        }
                         _ => None,
+                    }
+                }
+                if let Some(val) = specified_values.get(&fs_key) {
+                    let resolved_fs = match val {
+                        Value::CssVar { .. } => resolve_var(val, &custom_props, 0)
+                            .as_ref()
+                            .and_then(|resolved| font_size_px(resolved, parent_fs, root_fs)),
+                        other => font_size_px(other, parent_fs, root_fs),
                     };
                     if let Some(fs) = resolved_fs {
                         specified_values.insert(fs_key.clone(), Value::Length(fs, crate::css::Unit::Px));
@@ -835,6 +871,11 @@ fn build_final_tree(
                 let own_fs = specified_values.get(&fs_key)
                     .and_then(|v| if let Value::Length(pv, crate::css::Unit::Px) = v { Some(*pv) } else { None })
                     .unwrap_or(parent_fs);
+                // The root element is visited before anything that can reference
+                // it, so its font size is known by the time a `rem` needs it.
+                if is_root_element {
+                    root_fs = own_fs;
+                }
 
                 // --- Step 4: Resolve inherit / initial / var() / em (non-font-size) / currentColor ---
                 let color_key = intern("color");
@@ -884,6 +925,7 @@ fn build_final_tree(
                                 // After resolving var(), also resolve em/currentColor on the result.
                                 match &v {
                                     Value::Length(n, crate::css::Unit::Em) => Value::Length(n * own_fs, crate::css::Unit::Px),
+                                    Value::Length(n, crate::css::Unit::Rem) => Value::Length(n * root_fs, crate::css::Unit::Px),
                                     Value::Keyword(kw) if kw.as_ref().eq_ignore_ascii_case("currentcolor") => {
                                         own_color.clone().unwrap_or(v.clone())
                                     }
@@ -891,9 +933,14 @@ fn build_final_tree(
                                 }
                             })
                         }
-                        // Em resolution for non-font-size properties (resolves against own font-size).
+                        // `em` resolves against this element's own font size; `rem`
+                        // against the root's, which is what keeps a design system's
+                        // spacing scale from compounding inside nested text.
                         Value::Length(n, crate::css::Unit::Em) => {
                             Some(Value::Length(n * own_fs, crate::css::Unit::Px))
+                        }
+                        Value::Length(n, crate::css::Unit::Rem) => {
+                            Some(Value::Length(n * root_fs, crate::css::Unit::Px))
                         }
                         _ => None,
                     };
