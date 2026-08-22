@@ -613,7 +613,8 @@ pub fn parse_css(source: &str) -> Stylesheet {
                 // uniform radius for all corners — sufficient for the rounded-input / button
                 // use-case (Google search bar, etc.).  The "/" elliptical syntax is not supported.
                 "border-radius" => {
-                    let first = val_raw.split_whitespace().next().unwrap_or("0");
+                    let parts = split_respecting_parens(&val_raw);
+                    let first = parts.first().map(String::as_str).unwrap_or("0");
                     // Strip the "/" elliptical part if present (e.g. "8px / 4px")
                     let first = first.split('/').next().unwrap_or("0").trim();
                     let value = parse_value(first);
@@ -1106,13 +1107,20 @@ fn strip_at_rules(source: &str) -> String {
     result
 }
 
+/// Expand a top/right/bottom/left shorthand such as `padding` or `margin`.
+///
+/// Values are split on top-level whitespace only: splitting on plain whitespace
+/// shreds a function argument list, so `padding: clamp(2rem, 5vw, 4.5rem) 0`
+/// came out as five junk parts and the declaration was dropped entirely. A
+/// fluid spacing scale is written exactly that way, so the padding that
+/// separates a page's sections simply vanished.
 pub fn parse_quad_shorthand(prefix: &str, val: &str, declarations: &mut HashMap<String, Value>) {
-    let parts: Vec<&str> = val.split_whitespace().collect();
+    let parts = split_respecting_parens(val);
     let (top, right, bottom, left) = match parts.len() {
-        1 => (parts[0], parts[0], parts[0], parts[0]),
-        2 => (parts[0], parts[1], parts[0], parts[1]),
-        3 => (parts[0], parts[1], parts[2], parts[1]),
-        4 => (parts[0], parts[1], parts[2], parts[3]),
+        1 => (&parts[0], &parts[0], &parts[0], &parts[0]),
+        2 => (&parts[0], &parts[1], &parts[0], &parts[1]),
+        3 => (&parts[0], &parts[1], &parts[2], &parts[1]),
+        4 => (&parts[0], &parts[1], &parts[2], &parts[3]),
         _ => return,
     };
     declarations.insert(format!("{}-top", prefix), parse_value(top));
