@@ -559,6 +559,23 @@ fn automatic_minimum_main_size(
     intrinsic_cache.min_content_width(sn, vw, vh)
 }
 
+impl<'a> LayoutBox<'a> {
+    /// The rect paint, clipping and hit testing use: always the border box.
+    ///
+    /// `dimensions` is the border box already when the width or height was auto
+    /// and the content box when it was stated, so the padding is added back only
+    /// in the second case. Drawing `dimensions` unconditionally made a box with
+    /// a declared width and padding paint its padding short.
+    pub fn paint_rect(&self) -> Rect {
+        Rect {
+            x: self.dimensions.x,
+            y: self.dimensions.y,
+            width: outer_width(self),
+            height: outer_height(self),
+        }
+    }
+}
+
 fn border_box_width(cb: &LayoutBox<'_>) -> f32 {
     cb.dimensions.width + cb.padding.left + cb.padding.right + cb.border.left + cb.border.right
 }
@@ -6512,6 +6529,32 @@ mod tests {
             (a.dimensions.x - 8.0).abs() < 1.0,
             "and it starts inside the padding, got x={}",
             a.dimensions.x
+        );
+    }
+
+    /// A background and a border cover the *border* box. `dimensions` is that
+    /// box already when the width was auto, and the content box when it was
+    /// stated, so a box with a declared width and padding used to paint its
+    /// padding short.
+    #[test]
+    fn test_paint_rect_is_always_the_border_box() {
+        let html = r#"<div style="width:800px">
+            <div id="stated" style="width:100px;padding:10px">x</div>
+            <div id="auto" style="padding:10px">y</div>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let stated = find_element_by_id(&layout, "stated").expect("stated");
+        assert!(
+            (stated.paint_rect().width - 120.0).abs() < 1.0,
+            "100px of content plus 20px of padding, got {}",
+            stated.paint_rect().width
+        );
+        let auto = find_element_by_id(&layout, "auto").expect("auto");
+        assert!(
+            (auto.paint_rect().width - 800.0).abs() < 1.0,
+            "an auto width already covers the padding, got {}",
+            auto.paint_rect().width
         );
     }
 

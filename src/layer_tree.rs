@@ -604,7 +604,8 @@ impl LayerTreeBuilder {
     ///
     /// Covers: box-shadow, background, border, images, and text.
     fn collect_paint_commands(layout: &LayoutBox, layer: &mut Layer, clip: LayoutRect, is_root_of_layer: bool) {
-        let d = layout.dimensions;
+        // The border box, which is what a background and a border cover.
+        let d = layout.paint_rect();
         let sv = &layout.style_node.specified_values;
 
         let radius = match sv.get(&crate::css::intern("border-radius")) {

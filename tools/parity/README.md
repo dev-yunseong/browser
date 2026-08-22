@@ -57,29 +57,23 @@ a regression points at a mechanism rather than at "github.com looks wrong":
 | `probe-generics` | which face `sans-serif`, `serif` and `monospace` resolve to |
 | `probe-webfont` | `@font-face` in woff2, woff and truetype, and family fallback |
 
-## Known limitation: two box models in one engine
+## The box model, and where it now stands
 
-`LayoutBox::dimensions` is read as a **border box** in some places and a
-**content box** in others, and the two readings are both load-bearing:
+`LayoutBox::dimensions` used to be read as a **border box** in some places and a
+**content box** in others, with no rule saying which. It now has one:
 
-- Painting draws backgrounds and borders straight over `dimensions`, and the
-  flex algorithm distributes free space into it — both of which only look right
-  if it is the border box.
-- `border_box_width()` adds padding and border *on top of* `dimensions`, and the
-  child content width is taken as `dimensions` unchanged — both of which only
-  hold if it is the content box.
+> An **auto** width or height leaves `dimensions` as the **border box**; a
+> **stated** one leaves it as the **content box**.
 
-The visible cost left is a box with a *stated* width and padding painting its
-padding short. Nested padding also fails to reduce the width passed to children,
-so text can wrap later than it should.
+That holds because both ways of arriving at an auto size — shrink-to-fit from
+max-content, and a block filling `container_width - margins` — already count
+padding and border in, while `border-box` sizing takes them back off a stated
+one. Everything that reads `dimensions` follows the rule through one of three
+helpers: `outer_width`/`outer_height` for the size a line box or flex line has
+to reserve, `LayoutBox::paint_rect` for what a background and border cover, and
+the `inner_width` computation for the width children are laid out against.
 
-Fixing it means picking one meaning and migrating every reader — the width
-computation, `border_box_width`/`margin_box_width`, the flex and grid track
-code, the flex re-layout pass that re-runs an item at its flexed main size, and
-the rect collectors — in one change, with `test_button_coordinate_collection`
-and `test_border_box_min_size_includes_padding` updated to the chosen model.
-
-This has been attempted twice, and both attempts are worth knowing about.
+Getting there took three attempts, and the first two are worth knowing about.
 
 The first migrated the width computation and painting together and left the flex
 paths alone. Every test still passed and nearly every fixture got worse: flex
@@ -88,44 +82,17 @@ width back in as a containing-block width, and the padding is then taken off a
 second time. The tests do not cover that interaction; only the pixel diff caught
 it.
 
-The second attempt was narrower and did land, so the rule is now at least
-statable:
+The second stopped taking padding off a *shrink-to-fit* width under
+`border-box`, on the grounds that max-content already counts it. That fixes the
+clipped button and immediately breaks `min-width`: the bounds were compared in
+the content-box space the rest of the function assumed, so a `min-width: 85px`
+box came out 24px too wide and a floated header cluster overflowed the viewport.
 
-> An **auto** width leaves `dimensions.width` as the **border box**; a **stated**
-> width leaves it as the **content box**.
+The third worked because the bounds were mapped into whichever space `width` is
+held in, and because each reader was moved as it was found — with a probe
+fixture measuring the result each time.
 
-That holds because both ways of arriving at an auto width — shrink-to-fit from
-max-content, and a block filling `container_width - margins` — already count
-padding and border in, while `border-box` sizing takes them back off a stated
-one. Before, an auto width under `border-box` had its padding taken off as well,
-so a shrink-to-fit button came out exactly its own padding too narrow and its
-label was drawn past the end of its background (`probe-controls`). `min-width`
-and `max-width` are now mapped into whichever space `width` is being held in,
-which is what the first version of this change got wrong: comparing a
-content-box bound against a border-box width made a `min-width: 85px` box 24px
-too wide and overflowed a floated header cluster.
-
-The child content width now follows the same rule: a padded block lays its
-children out against `width` less its padding when the width is auto, and
-against `width` unchanged when it was stated. Before, a padded block handed its
-children its own outer width and their text ran past its padding.
-
-Paint reads `dimensions` as the border box, so what remains is the *stated*-width
-case: a box with a declared width and padding paints its padding short. Fixing
-that needs paint and the flex re-layout pass moved together — the first attempt
-showed that changing one at a time renders worse than either model alone.
-
-A flex item is the one other path that has been migrated, and only because its
-conversion could be done in one place: through the flex algorithm `dimensions`
+What is left is the flex algorithm's own convention: through it `dimensions`
 holds the content box, which is what flex-basis and grow operate on, and it is
-converted to the border box once, after the algorithm finishes.
-
-## Known limitation: inline runs do not fragment across lines
-
-A text run is one box with one rect. When a run starts mid-line and wraps, the
-continuation is drawn from that same rect's left edge rather than from the start
-of the line box, so the second line of a paragraph containing inline elements is
-indented by however far into the line the run began (`probe-inline`).
-
-Fixing it means fragmenting an inline box into one rect per line it occupies,
-which the line-building code does not currently model.
+converted once at the end. That conversion is the one place where the two
+meanings still meet.
