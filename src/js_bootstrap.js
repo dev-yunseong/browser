@@ -3996,13 +3996,14 @@ window.XMLHttpRequest = XMLHttpRequest;
 window.DOMTokenList = DOMTokenList;
 
 // -- Image constructor (HTMLImageElement) ------------------------------------
+// The wrapper the node factory hands every `<img>` in the document. It takes
+// the same `(nativeId, tag, string_id)` every other element wrapper takes: the
+// legacy `new Image(w, h)` constructor is `Image` below, and having this class
+// create an element instead meant every `<img>` on the page was wrapped by a
+// fresh detached one — no attributes, no parent, and no layout box of its own.
 class HTMLImageElement extends Element {
-    constructor(width, height) {
-        // Create a real img element in the DOM
-        var nativeId = __aura_create_element('img');
-        super(nativeId, 'img', '');
-        if (width !== undefined) __aura_set_attribute(nativeId, 'width', String(width));
-        if (height !== undefined) __aura_set_attribute(nativeId, 'height', String(height));
+    constructor(id, tag, string_id) {
+        super(id, tag || 'img', string_id);
         this.onload = null;
         this.onerror = null;
     }
@@ -4021,9 +4022,17 @@ class HTMLImageElement extends Element {
     get naturalWidth() { return 0; }
     get naturalHeight() { return 0; }
 }
-// Alias Image to HTMLImageElement (browsers expose Image constructor)
-var Image = HTMLImageElement;
-window.Image = HTMLImageElement;
+// `new Image(w, h)` is the legacy constructor: it makes a *new* `<img>`, which
+// is why it cannot be `HTMLImageElement` itself.
+class Image extends HTMLImageElement {
+    constructor(width, height) {
+        var nativeId = __aura_create_element('img');
+        super(nativeId, 'img', '');
+        if (width !== undefined) __aura_set_attribute(nativeId, 'width', String(width));
+        if (height !== undefined) __aura_set_attribute(nativeId, 'height', String(height));
+    }
+}
+window.Image = Image;
 window.HTMLImageElement = HTMLImageElement;
 
 // -- Other HTML element constructors -----------------------------------------
@@ -4323,12 +4332,6 @@ class HTMLSelectElement extends HTMLElement {
 window.HTMLSelectElement = HTMLSelectElement;
 
 class HTMLOptionElement extends HTMLElement {
-    constructor(text, value, defaultSelected, selected) {
-        var nativeId = __aura_create_element('option');
-        super(nativeId, 'option', '');
-        if (text !== undefined) this.textContent = String(text);
-        if (value !== undefined) __aura_set_attribute(nativeId, 'value', String(value));
-    }
     get value() { return __aura_get_attribute(this._id, 'value') || ''; }
     set value(v) { __aura_set_attribute(this._id, 'value', String(v)); }
     get text() { return this.textContent; }
@@ -4338,8 +4341,18 @@ class HTMLOptionElement extends HTMLElement {
     get defaultSelected() { return false; }
 }
 window.HTMLOptionElement = HTMLOptionElement;
-var Option = HTMLOptionElement;
-window.Option = HTMLOptionElement;
+
+// `new Option(text, value)` makes a new `<option>`, the same way `new Image()`
+// makes a new `<img>`; the class above stays a wrapper for the ones on the page.
+class Option extends HTMLOptionElement {
+    constructor(text, value, defaultSelected, selected) {
+        var nativeId = __aura_create_element('option');
+        super(nativeId, 'option', '');
+        if (text !== undefined) this.textContent = String(text);
+        if (value !== undefined) __aura_set_attribute(nativeId, 'value', String(value));
+    }
+}
+window.Option = Option;
 
 class HTMLTextAreaElement extends HTMLElement {
     get value() { return __aura_get_text_content(this._id); }

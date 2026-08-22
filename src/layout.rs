@@ -972,7 +972,7 @@ fn has_stated(cb: &LayoutBox<'_>, prop: &str) -> bool {
 /// counts them for the common auto-width box whose `dimensions` already covers
 /// them — a padded button then reserved its padding twice and the line came out
 /// that much too wide.
-fn outer_width(cb: &LayoutBox<'_>) -> f32 {
+pub(crate) fn outer_width(cb: &LayoutBox<'_>) -> f32 {
     if cb.content_box_width {
         border_box_width(cb)
     } else {
@@ -981,7 +981,7 @@ fn outer_width(cb: &LayoutBox<'_>) -> f32 {
 }
 
 /// This box's border-box height. See `outer_width`.
-fn outer_height(cb: &LayoutBox<'_>) -> f32 {
+pub(crate) fn outer_height(cb: &LayoutBox<'_>) -> f32 {
     if cb.content_box_height {
         border_box_height(cb)
     } else {

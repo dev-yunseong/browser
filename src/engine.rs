@@ -874,17 +874,36 @@ fn collect_layout_metrics(
 ) {
     let mut stack = vec![layout_tree];
     while let Some(layout) = stack.pop() {
-        if matches!(
-            layout.style_node.node.data,
-            markup5ever_rcdom::NodeData::Element { .. }
-        ) {
+        // A generated box (`::before` / `::after`) is a synthesised element with
+        // no parent, so every one of them keys to the empty path — and the last
+        // one inserted then answered `getBoundingClientRect` for every element
+        // whose own key could not be built. Scripts only ever address real nodes,
+        // so parentless boxes are left out of the map entirely.
+        let has_parent = {
+            let weak = layout.style_node.node.parent.take();
+            let present = weak.as_ref().is_some_and(|w| w.upgrade().is_some());
+            layout.style_node.node.parent.set(weak);
+            present
+        };
+        if has_parent
+            && matches!(
+                layout.style_node.node.data,
+                markup5ever_rcdom::NodeData::Element { .. }
+            )
+        {
             out.insert(
                 js::node_path_key(&layout.style_node.node),
                 js::LayoutMetrics {
                     x: layout.dimensions.x,
                     y: layout.dimensions.y,
-                    width: layout.dimensions.width,
-                    height: layout.dimensions.height,
+                    // `getBoundingClientRect` reports the border box. `dimensions`
+                    // holds the content box on an axis a stated value settled and
+                    // the border box on one that was measured, so a control with
+                    // `height: 40px; box-sizing: border-box` reported 22 — its
+                    // height shorn of the padding and border it is supposed to
+                    // include. `outer_*` is the border box either way.
+                    width: layout::outer_width(layout),
+                    height: layout::outer_height(layout),
                 },
             );
         }
