@@ -1257,18 +1257,20 @@ fn build_radial_gradient_shader<'a>(
         Some((x, y)) => (r.x + x.resolve(r.width), r.y + y.resolve(r.height)),
         None => (r.x + r.width / 2.0, r.y + r.height / 2.0),
     };
-    let radius = extent.radius(r, cx, cy);
+    let (rx, ry) = extent.radii(r, cx, cy);
     let center = SkPoint::from_xy(cx, cy);
 
-    RadialGradient::new(
-        center,
-        0.0,
-        center,
-        radius,
-        skia_stops,
-        SpreadMode::Pad,
-        Transform::identity(),
-    )
+    // The gradient is built round and then squashed about its own centre, which
+    // is how an elliptical `radial-gradient` differs from a circular one.
+    let shape = if (ry - rx).abs() < 0.01 {
+        Transform::identity()
+    } else {
+        Transform::from_translate(cx, cy)
+            .pre_scale(1.0, ry / rx)
+            .pre_translate(-cx, -cy)
+    };
+
+    RadialGradient::new(center, 0.0, center, rx, skia_stops, SpreadMode::Pad, shape)
 }
 
 /// How much a glyph's partial coverage is darkened before it is blended.

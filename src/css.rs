@@ -87,11 +87,28 @@ pub enum RadialExtent {
     FarthestSide,
     #[default]
     FarthestCorner,
+    /// Radii stated outright — `radial-gradient(140% 115% at 87% 55%, …)`.
+    /// The horizontal one is a percentage of the box's width, the vertical one
+    /// of its height, which is what makes the shape an ellipse.
+    Explicit(TranslateLength, TranslateLength),
 }
 
 impl RadialExtent {
     /// The radius this extent gives, for a centre at `(cx, cy)` inside `rect`.
     pub fn radius(self, rect: crate::layout::Rect, cx: f32, cy: f32) -> f32 {
+        let (rx, _) = self.radii(rect, cx, cy);
+        rx
+    }
+
+    /// The horizontal and vertical radii this extent gives. They differ only for
+    /// `Explicit`, which is the one form that can state an ellipse.
+    pub fn radii(self, rect: crate::layout::Rect, cx: f32, cy: f32) -> (f32, f32) {
+        if let RadialExtent::Explicit(rx, ry) = self {
+            return (
+                rx.resolve(rect.width).max(1.0),
+                ry.resolve(rect.height).max(1.0),
+            );
+        }
         let dx = [(cx - rect.x).abs(), (rect.x + rect.width - cx).abs()];
         let dy = [(cy - rect.y).abs(), (rect.y + rect.height - cy).abs()];
         let corner = |x: f32, y: f32| (x * x + y * y).sqrt();
@@ -100,8 +117,10 @@ impl RadialExtent {
             RadialExtent::FarthestSide => dx[0].max(dx[1]).max(dy[0]).max(dy[1]),
             RadialExtent::ClosestCorner => corner(dx[0].min(dx[1]), dy[0].min(dy[1])),
             RadialExtent::FarthestCorner => corner(dx[0].max(dx[1]), dy[0].max(dy[1])),
+            RadialExtent::Explicit(..) => unreachable!("handled above"),
         };
-        r.max(1.0)
+        let r = r.max(1.0);
+        (r, r)
     }
 }
 
@@ -2397,11 +2416,21 @@ pub fn parse_gradient(val: &str) -> Option<GradientValue> {
         // `farthest-side`, `ellipse closest-corner at 30% 40%`.
         let mut stop_start = 0;
         let first = args[0].trim().to_lowercase();
+        // The shape argument may also be the radii themselves, with no keyword
+        // at all — `radial-gradient(141.53% 114.68% at 87.46% 55.27%, …)`, which
+        // is how github writes its hero glow. Such an argument is told from a
+        // colour stop by its first token being a bare length.
+        let starts_with_radius = first
+            .split_whitespace()
+            .next()
+            .and_then(parse_length)
+            .is_some_and(|v| matches!(v, Value::Length(..)));
         let is_shape_arg = first.starts_with("circle")
             || first.starts_with("ellipse")
             || first.starts_with("closest")
             || first.starts_with("farthest")
-            || first.starts_with("at ");
+            || first.starts_with("at ")
+            || starts_with_radius;
         let (circle, center, extent) = if is_shape_arg {
             stop_start = 1;
             parse_radial_shape(&first)
@@ -2432,6 +2461,12 @@ fn parse_radial_shape(
     };
     let mut circle = false;
     let mut extent = RadialExtent::default();
+    // Radii may be stated outright instead of by keyword — two of them make an
+    // ellipse, one a circle. github's hero glow is
+    // `radial-gradient(141.53% 114.68% at 87.46% 55.27%, …)`, and reading the
+    // numbers as unknown words left it the default farthest-corner circle,
+    // which is a very different wash.
+    let mut radii: Vec<TranslateLength> = Vec::new();
     for word in shape_part.split_whitespace() {
         match word {
             "circle" => circle = true,
@@ -2440,8 +2475,24 @@ fn parse_radial_shape(
             "closest-corner" => extent = RadialExtent::ClosestCorner,
             "farthest-side" => extent = RadialExtent::FarthestSide,
             "farthest-corner" => extent = RadialExtent::FarthestCorner,
-            _ => {}
+            _ => match parse_length(word) {
+                Some(Value::Length(v, Unit::Percent)) => {
+                    radii.push(TranslateLength::Percent(OrderedFloat(v)))
+                }
+                Some(Value::Length(v, Unit::Px)) => {
+                    radii.push(TranslateLength::Px(OrderedFloat(v)))
+                }
+                _ => {}
+            },
         }
+    }
+    match radii.as_slice() {
+        [r] => {
+            circle = true;
+            extent = RadialExtent::Explicit(*r, *r);
+        }
+        [rx, ry, ..] => extent = RadialExtent::Explicit(*rx, *ry),
+        [] => {}
     }
     let center = at_part.and_then(|a| {
         let parts: Vec<&str> = a.split_whitespace().collect();
@@ -2911,6 +2962,46 @@ fn named_color(s: &str) -> Option<Color> {
 
 #[cfg(test)]
 mod tests {
+    /// A radial gradient may state its radii outright instead of naming an
+    /// extent keyword, and two of them make an ellipse. Reading the numbers as
+    /// unknown words left github's hero glow the default farthest-corner
+    /// circle, which is a very different wash.
+    #[test]
+    fn test_radial_gradient_radii_stated_outright() {
+        use super::{parse_gradient, GradientValue, RadialExtent, TranslateLength};
+        let box_rect = crate::layout::Rect { x: 0.0, y: 0.0, width: 800.0, height: 120.0 };
+
+        let ellipse = parse_gradient(
+            "radial-gradient(141.53% 114.68% at 87.46% 55.27%, rgb(154,124,255) 36.75%, rgba(14,10,162,0) 100%)",
+        )
+        .expect("an ellipse with stated radii");
+        let GradientValue::Radial { extent, center, .. } = ellipse else {
+            panic!("expected a radial gradient");
+        };
+        assert!(matches!(extent, RadialExtent::Explicit(..)), "got {extent:?}");
+        let (rx, ry) = extent.radii(box_rect, 0.0, 0.0);
+        assert!((rx - 800.0 * 1.4153).abs() < 0.5, "rx is a share of the width, got {rx}");
+        assert!((ry - 120.0 * 1.1468).abs() < 0.5, "ry is a share of the height, got {ry}");
+        assert_eq!(
+            center,
+            Some((
+                TranslateLength::Percent(super::OrderedFloat(87.46)),
+                TranslateLength::Percent(super::OrderedFloat(55.27))
+            )),
+            "the centre survives alongside the radii"
+        );
+
+        // A single radius is a circle, and a plain length works as well as a
+        // percentage.
+        let circle = parse_gradient("radial-gradient(120px at 50% 50%, #0c8 0%, rgba(0,204,136,0) 100%)")
+            .expect("a circle with a stated radius");
+        let GradientValue::Radial { extent, circle: is_circle, .. } = circle else {
+            panic!("expected a radial gradient");
+        };
+        assert!(is_circle);
+        assert_eq!(extent.radii(box_rect, 0.0, 0.0), (120.0, 120.0));
+    }
+
     use super::*;
 
     /// `@font-face` is the one at-rule whose contents matter to layout: it is

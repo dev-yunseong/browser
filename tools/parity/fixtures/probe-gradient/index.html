@@ -18,6 +18,11 @@
   .w2 { filter: blur(60px); background: radial-gradient(#a7a2ff 30%, rgba(147,80,255,.5)); width: 40%; height: 50%; top: 20%; left: 52%; }
   /* `border-radius: 50%` on a wide box is a pill, not a 50px corner. */
   .pill { position: absolute; bottom: 8px; left: 5%; width: 40%; height: 40px; border-radius: 50%; background: linear-gradient(90deg, #fc9, #9cf); }
+  /* Radii stated outright make an ellipse, and the percentages are of the
+     box's own width and height. github's hero glow is written this way. */
+  .ell { height: 120px; background: radial-gradient(141.53% 114.68% at 87.46% 55.27%, rgb(154,124,255) 36.75%, rgba(14,10,162,0) 100%); }
+  .ell2 { height: 120px; background: radial-gradient(40% 90% at 30% 50%, #ffc58b 10%, #e1a6ff 40%, rgba(53,44,238,0) 100%); }
+  .ell3 { height: 120px; background: radial-gradient(120px at 50% 50%, #0c8 0%, rgba(0,204,136,0) 100%); }
   .sharp { position: absolute; bottom: 8px; left: 52%; width: 40%; height: 40px; border-radius: 50%; background: linear-gradient(90deg, #fc9, #9cf); filter: blur(6px); }
 </style>
 </head>
@@ -27,6 +32,9 @@
   <div class="four"></div>
   <div class="positioned"></div>
   <div class="mixed"></div>
+  <div class="ell"></div>
+  <div class="ell2"></div>
+  <div class="ell3"></div>
   <div class="washes">
     <div class="wash w1"></div>
     <div class="wash w2"></div>
