@@ -2764,13 +2764,13 @@ impl<'a> LayoutBox<'a> {
                 ChildKind::Inline => {
                     let (avail_w, left_indent) =
                         float_ctx.available_at(line_start_y, cur_line.height.max(16.0));
-                    let remaining_w = (avail_w - cur_line.width).max(0.0);
-                    let child_is_text = matches!(entry.node.node.data, NodeData::Text { .. });
-                    let child_container_width = if child_is_text {
-                        remaining_w
-                    } else {
-                        avail_w
-                    };
+                    // The line's available width, whole. A text child must not be
+                    // handed `avail_w - cur_line.width`: it is built with its
+                    // start x already advanced past what the line holds, and
+                    // takes that off itself. Subtracting here as well left the
+                    // run with half the room it had, so a tag whose text exactly
+                    // filled its box came out broken across two lines.
+                    let child_container_width = avail_w;
                     let (cb_opt, _, _) = build_layout_tree_with_cb_cached(
                         entry.node,
                         container_x + left_indent,
@@ -2804,12 +2804,7 @@ impl<'a> LayoutBox<'a> {
                             flush_line!();
                             // Re-lay out for new line with updated float-aware width
                             let (aw2, li2) = float_ctx.available_at(line_start_y, 16.0);
-                            let remaining_w2 = (aw2 - cur_line.width).max(0.0);
-                            let child_container_width2 = if child_is_text {
-                                remaining_w2
-                            } else {
-                                aw2
-                            };
+                            let child_container_width2 = aw2;
                             let (cb2_opt, _, _) = build_layout_tree_with_cb_cached(
                                 entry.node,
                                 container_x + li2,
@@ -3079,6 +3074,12 @@ impl<'a> LayoutBox<'a> {
         let mut lines_count = 1;
         let mut line_w: f32 = 0.0;
         let mut max_w: f32 = 0.0;
+        // A line may only break *between* two words. The leading inter-element
+        // space counts toward the width but is not something to break after:
+        // treating it as content let the very first word wrap onto a second
+        // line, so a tag whose text exactly filled its box came out split in
+        // two where the browser keeps it whole.
+        let mut word_on_line = false;
 
         // Leading inter-element space (counts toward width but is invisible).
         if has_leading_space {
@@ -3093,14 +3094,16 @@ impl<'a> LayoutBox<'a> {
                     line_w += space_w;
                 }
                 line_w += word_w;
+                word_on_line = true;
                 continue;
             }
 
             // If word is too long for current line
-            if container_width.is_finite() && line_w + word_w > container_width && line_w > 0.0 {
+            if container_width.is_finite() && line_w + word_w > container_width && word_on_line {
                 max_w = max_w.max(line_w);
                 line_w = 0.0;
                 lines_count += 1;
+                word_on_line = false;
             }
 
             // If a single word is LONGER than the entire container, we must break it char-by-char
@@ -3114,11 +3117,13 @@ impl<'a> LayoutBox<'a> {
                     }
                     line_w += char_w;
                 }
+                word_on_line = true;
             } else {
-                if line_w > 0.0 {
+                if word_on_line {
                     line_w += space_w;
                 }
                 line_w += word_w;
+                word_on_line = true;
             }
         }
 
@@ -6372,6 +6377,50 @@ mod tests {
             a.dimensions.width < 120.0,
             "with min-width: 0 the item may shrink freely, got {}",
             a.dimensions.width
+        );
+    }
+
+    /// A text run gets the line's whole width, not what is left of it: the run
+    /// is built with its start x already advanced past the line's content and
+    /// takes that off itself. Subtracting it at the call site as well left the
+    /// run with half the room it had, so a short word after an inline sibling
+    /// wrapped where the browser keeps it whole.
+    #[test]
+    fn test_text_after_an_inline_sibling_gets_the_rest_of_the_line() {
+        let html = r#"<div style="width:400px"><span id="a">####</span><span id="b">Handgloves</span></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let b = find_element_by_id(&layout, "b").expect("span b");
+        let one_line = crate::font::fonts().normal_line_height(16.0, crate::font::FontStyle::regular());
+        assert!(
+            b.dimensions.height < one_line * 1.8,
+            "the second run stays on one line: height={}, line={one_line}",
+            b.dimensions.height
+        );
+    }
+
+    /// A line may only break between two words, so the first word of a run
+    /// never wraps by itself — not even when an inter-element space precedes
+    /// it. Treating that space as content put the word on a line of its own.
+    #[test]
+    fn test_first_word_of_a_run_never_wraps_alone() {
+        let fonts = crate::font::fonts();
+        let regular = crate::font::FontStyle::regular();
+        let x = fonts.measure("x", 16.0, regular, 0.0);
+        let word = fonts.measure("Hand", 16.0, regular, 0.0);
+        let space = fonts.advance(' ', 16.0, regular);
+        // Wide enough for the word after the first span, too narrow for the
+        // collapsed space in front of it.
+        let width = x + word + space / 2.0;
+        let html = format!(r#"<div id="d" style="width:{width}px"><span>x</span> Hand</div>"#);
+        let (layout, _, _) = layout_from_html(&html, 800.0, 600.0);
+
+        let d = find_element_by_id(&layout, "d").expect("div");
+        let line = fonts.normal_line_height(16.0, regular);
+        assert!(
+            d.dimensions.height < line * 1.8,
+            "everything stays on one line: height={}, line={line}",
+            d.dimensions.height
         );
     }
 
