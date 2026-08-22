@@ -726,6 +726,16 @@ impl LayerTreeBuilder {
                 // Edges are drawn as filled rectangles that meet at the corners.
                 // Mitring is skipped: at the 1-2px widths pages actually use, the
                 // overlap is a single corner pixel.
+                // Snap each edge to the pixel grid. A hairline at a fractional
+                // offset otherwise spreads its coverage over two rows and comes
+                // out as a pale smear instead of the colour the page asked for —
+                // and a design built on hairlines is then wrong everywhere.
+                let snap = |rect: crate::layout::Rect| crate::layout::Rect {
+                    x: rect.x.round(),
+                    y: rect.y.round(),
+                    width: rect.width.round().max(if rect.width > 0.0 { 1.0 } else { 0.0 }),
+                    height: rect.height.round().max(if rect.height > 0.0 { 1.0 } else { 0.0 }),
+                };
                 let edges: [(f32, crate::layout::Rect, &str); 4] = [
                     (b.top, crate::layout::Rect { x: d.x, y: d.y, width: d.width, height: b.top }, "top"),
                     (b.right, crate::layout::Rect { x: d.x + d.width - b.right, y: d.y, width: b.right, height: d.height }, "right"),
@@ -734,7 +744,7 @@ impl LayerTreeBuilder {
                 ];
                 for (width, rect, side) in edges {
                     if width > 0.0 && rect.width > 0.0 && rect.height > 0.0 {
-                        commands.push(PaintCommand::Rect(rect, side_color(side), 0.0));
+                        commands.push(PaintCommand::Rect(snap(rect), side_color(side), 0.0));
                     }
                 }
             }

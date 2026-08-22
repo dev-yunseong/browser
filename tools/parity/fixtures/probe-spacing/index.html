@@ -11,6 +11,25 @@
   .m-calc { margin-top: calc(var(--sp-5) * 2); }
   .m-nested { margin-top: var(--half); }
   .rule { border-top: 2px solid #000; }
+  /* Gaps written in rem, on both grid and flex. */
+  .g { display: grid; grid-template-columns: 38px minmax(0, 1fr); gap: 1.25rem; }
+  .g > :first-child { background: #f00; }
+  .g > :last-child { background: #0f0; }
+  .f { display: flex; gap: 1.25rem; }
+  .f > span { background: #00f; width: 60px; }
+  /* The custom property is set on the same element that consumes it, as
+     Bootstrap's .container does with --bs-gutter-x. */
+  .selfvar { --local-gutter: 1.5rem; padding-left: calc(var(--local-gutter) * .5); background: #fd0; }
+  .selfvar > span { background: #808; }
+  /* Padding must inset block children, not only inline content. */
+  .padded-block { padding-left: 30px; background: #fd0; }
+  .padded-block > div { background: #808; }
+  .maxw { max-width: 720px; margin: 0 auto; padding-left: 12px; background: #cfc; }
+  .maxw > div { background: #063; }
+  /* The same centred container under border-box, as Bootstrap ships it. */
+  .bb, .bb * { box-sizing: border-box; }
+  .bb { max-width: 720px; margin: 0 auto; padding-left: 12px; background: #ccf; }
+  .bb > div { background: #006; }
 </style>
 </head>
 <body>
@@ -18,6 +37,12 @@
   <div class="rule"></div><p class="box">anchor</p><p class="box m-var">var 20px</p>
   <div class="rule"></div><p class="box">anchor</p><p class="box m-calc">calc var 40px</p>
   <div class="rule"></div><p class="box">anchor</p><p class="box m-nested">nested var 24px</p>
+  <div class="rule"></div><div class="g"><div>01</div><div>grid gap 20px</div></div>
+  <div class="rule"></div><div class="f"><span>a</span><span>b</span></div>
+  <div class="rule"></div><div class="selfvar"><span>self-var padding should be 12px</span></div>
+  <div class="rule"></div><div class="padded-block"><div>block child inset by 30px</div></div>
+  <div class="rule"></div><div class="maxw"><div>centred container, child at 52px</div></div>
+  <div class="rule"></div><div class="bb"><div>border-box container, child at 52px</div></div>
   <div class="rule"></div>
 </body>
 </html>

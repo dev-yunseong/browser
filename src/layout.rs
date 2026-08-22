@@ -1030,7 +1030,12 @@ impl<'a> LayoutBox<'a> {
             width = width.max(min_w);
         }
 
-        if is_block && width < container_width {
+        // `margin: 0 auto` centres the box's *border* box. `width` at this point
+        // is the content width, so the padding and border have to be counted in
+        // — leaving them out pushed a centred, padded container half its padding
+        // off to one side and shifted its whole subtree with it.
+        let outer_width = width + self.padding.left + self.padding.right + self.border.left + self.border.right;
+        if is_block && outer_width < container_width {
             let mut is_auto = false;
             for prop in ["margin", "margin-left", "margin-right"] {
                 if let Some(Value::Keyword(s)) = self
@@ -1045,7 +1050,7 @@ impl<'a> LayoutBox<'a> {
                 }
             }
             if is_auto {
-                let leftover = (container_width - width).max(0.0);
+                let leftover = (container_width - outer_width).max(0.0);
                 self.margin.left = leftover / 2.0;
                 self.margin.right = leftover / 2.0;
             }
