@@ -1089,6 +1089,11 @@ fn is_shrink_wrap_for(sn: &StyledNode, d: DisplayType) -> bool {
 /// `true` when the element's own `display` is one of the inline-level container
 /// keywords.
 fn is_inline_level_container(sn: &StyledNode) -> bool {
+    // Out of flow, `inline-flex` blockifies to `flex` like everything else, so
+    // the box neither flows inline nor shrink-wraps for that reason.
+    if is_out_of_flow(sn) {
+        return false;
+    }
     matches!(
         sn.specified_values.get(&crate::css::intern("display")),
         Some(Value::Keyword(k)) if matches!(&**k, "inline-flex" | "inline-grid")
@@ -1302,6 +1307,10 @@ pub struct LayoutBox<'a> {
     /// descendant twice. github's hero carousel put its video 52px right of
     /// where the page has it, exactly the offset of the column it sits in.
     pub escapes_ancestor_offset: bool,
+    /// The static position an out-of-flow box was placed from when its
+    /// containing block belonged to an ancestor further up whose own height was
+    /// not settled yet. That ancestor takes it from here and places it again.
+    pub deferred_static_pos: Option<f32>,
 }
 
 impl<'a> Clone for LayoutBox<'a> {
@@ -1357,6 +1366,7 @@ impl<'a> Clone for LayoutBox<'a> {
                         content_box_width: src.content_box_width,
                         content_box_height: src.content_box_height,
                         escapes_ancestor_offset: src.escapes_ancestor_offset,
+                        deferred_static_pos: src.deferred_static_pos,
                     };
                     let num_children = src.children.len();
                     // Push Post first so it is processed after all children.
@@ -1550,6 +1560,7 @@ impl<'a> LayoutBox<'a> {
             content_box_width: false,
             content_box_height: false,
             escapes_ancestor_offset: false,
+            deferred_static_pos: None,
         };
 
         if let NodeData::Element {
@@ -3848,112 +3859,25 @@ impl<'a> LayoutBox<'a> {
                     }
                 };
 
-                // Intrinsic width for the positioned child.
-                // If both left and right are specified and no explicit width, the element
-                // stretches to fill the space between them (CSS spec §10.3.7).
-                let left_offset = resolve_offset(pos_node, "left", cb_for_child.width, vw, vh);
-                let right_offset = resolve_offset(pos_node, "right", cb_for_child.width, vw, vh);
-                let top_offset = resolve_offset(pos_node, "top", cb_for_child.height, vw, vh);
-                let bottom_offset = resolve_offset(pos_node, "bottom", cb_for_child.height, vw, vh);
-
-                let child_explicit_width =
-                    pos_node.specified_values.get(&crate::css::intern("width"));
-                let child_layout_width = match child_explicit_width {
-                    Some(Value::Length(v, Unit::Px)) => *v,
-                    Some(Value::Length(v, Unit::Percent)) => cb_for_child.width * (v / 100.0),
-                    _ => {
-                        // Both left and right specified without explicit width → stretch.
-                        if let (Some(l), Some(r)) = (left_offset, right_offset) {
-                            (cb_for_child.width - l - r).max(0.0)
-                        } else {
-                            // Shrink-wrap: lay out at max-content width bounded by cb width.
-                            let max_c = intrinsic_cache.max_content_width(pos_node, vw, vh);
-                            max_c.min(cb_for_child.width)
-                        }
-                    }
-                };
-
-                // A child that states its own width resolves it against the
-                // containing block, so that is what it has to be laid out
-                // against: handing it the already-resolved width instead made
-                // `width: 40%` mean 40% of 40%, and a wash pinned across half a
-                // section came out a fifth of it.
-                let container_for_child = if child_explicit_width.is_some() {
-                    cb_for_child.width
-                } else {
-                    child_layout_width
-                };
-                // Build the child in a temporary origin; we'll reposition it below.
-                let (pc_opt, _, _) = build_layout_tree_with_cb_cached(
+                if let Some(mut pc) = place_positioned_child(
                     pos_node,
-                    0.0,
-                    0.0,
-                    0.0,
-                    container_for_child.max(1.0),
+                    static_y,
+                    cb_for_child,
                     vw,
                     vh,
-                    Some(cb_for_child),
                     intrinsic_cache,
-                );
-                if let Some(mut pc) = pc_opt {
-                    // Both `top` and `bottom` with no stated height stretches the
-                    // box between them, the vertical mirror of the width rule
-                    // above (CSS 2.2 §10.6.4). Without it an overlay written as
-                    // `position: absolute; inset: 0` came out its content's
-                    // height — zero, for the empty element a gradient wash is —
-                    // and never painted.
-                    let child_states_height = pc
-                        .style_node
-                        .specified_values
-                        .contains_key(&crate::css::intern("height"));
-                    if !child_states_height {
-                        if let (Some(t), Some(b)) = (top_offset, bottom_offset) {
-                            let stretched = (cb_for_child.height
-                                - t
-                                - b
-                                - pc.margin.top
-                                - pc.margin.bottom)
-                                .max(0.0);
-                            if stretched > outer_height(&pc) {
-                                pc.dimensions.height = stretched;
-                                pc.content_box_height = false;
-                            }
-                        }
-                    }
-                    // Determine final x.
-                    let target_x = match (left_offset, right_offset) {
-                        (Some(l), _) => cb_for_child.x + l + pc.margin.left,
-                        (None, Some(r)) => {
-                            cb_for_child.x + cb_for_child.width
-                                - r
-                                - pc.dimensions.width
-                                - pc.margin.right
-                        }
-                        (None, None) => cb_for_child.x + pc.margin.left, // default to CB origin
-                    };
-                    // Determine final y.
-                    let target_y = match (top_offset, bottom_offset) {
-                        (Some(t), _) => cb_for_child.y + t + pc.margin.top,
-                        (None, Some(b)) => {
-                            cb_for_child.y + cb_for_child.height
-                                - b
-                                - pc.dimensions.height
-                                - pc.margin.bottom
-                        }
-                        // Neither offset given: the box stays where it would have
-                        // been in flow. Falling back to the containing block's
-                        // origin instead pulls it to the top of its ancestor, so a
-                        // hero pinned below a header jumped to the page top.
-                        (None, None) => static_y + pc.margin.top,
-                    };
-
-                    let dx = target_x - pc.dimensions.x;
-                    let dy = target_y - pc.dimensions.y;
-                    offset_layout_box(&mut pc, dx, dy);
+                ) {
                     // Placed against a containing block further up than its
                     // parent, so it is already in page coordinates — see
                     // `escapes_ancestor_offset`.
                     pc.escapes_ancestor_offset = !self_establishes_cb;
+                    // The inherited block's height is only known once the
+                    // ancestor that establishes it has finished its own layout,
+                    // and that has not happened yet. Record what this box was
+                    // placed from so that ancestor can place it again.
+                    if !self_establishes_cb && child_pos_type != PositionType::Fixed {
+                        pc.deferred_static_pos = Some(static_y);
+                    }
 
                     let at = (sibling_index + inserted).min(self.children.len());
                     self.children.insert(at, pc);
@@ -3962,6 +3886,28 @@ impl<'a> LayoutBox<'a> {
             }
         }
 
+        // An absolute box laid out by a *static* ancestor was sized against a
+        // containing block whose height was still zero: this box's own height is
+        // not settled until its in-flow children are, and the descendant was
+        // placed before that. Now that it is settled, place them again. Until
+        // this ran, `height: 100%` on such a box — how github's hero lays its
+        // glow behind the carousel — came out nothing and never painted.
+        if self_establishes_cb {
+            let settled_cb = padding_box_of(&self);
+            let mut pending = Vec::new();
+            collect_deferred_positioned(&mut self, &mut pending);
+            for (path, static_y, node) in pending {
+                if let Some(pc) =
+                    place_positioned_child(node, static_y, settled_cb, vw, vh, intrinsic_cache)
+                {
+                    if let Some(slot) = child_at_path_mut(&mut self, &path) {
+                        let mut replacement = pc;
+                        replacement.escapes_ancestor_offset = true;
+                        *slot = replacement;
+                    }
+                }
+            }
+        }
         // Flow advances past the *border* box. `dimensions` is only that when
         // nothing was stated for the axis — see the note where `width` is
         // computed — so a box that states a height and carries padding used to
@@ -4501,6 +4447,144 @@ fn specified_width_percent(sn: &StyledNode) -> Option<f32> {
     }
 }
 
+/// Lay out one out-of-flow child against `cb`, at `static_y` when it states no
+/// offsets, and return it in page coordinates.
+fn place_positioned_child<'a>(
+    pos_node: &'a StyledNode,
+    static_y: f32,
+    cb: Rect,
+    vw: f32,
+    vh: f32,
+    intrinsic_cache: &mut IntrinsicSizeCache,
+) -> Option<LayoutBox<'a>> {
+    // If both left and right are specified and no explicit width, the element
+    // stretches to fill the space between them (CSS spec §10.3.7).
+    let left_offset = resolve_offset(pos_node, "left", cb.width, vw, vh);
+    let right_offset = resolve_offset(pos_node, "right", cb.width, vw, vh);
+    let top_offset = resolve_offset(pos_node, "top", cb.height, vw, vh);
+    let bottom_offset = resolve_offset(pos_node, "bottom", cb.height, vw, vh);
+
+    let child_explicit_width = pos_node.specified_values.get(&crate::css::intern("width"));
+    let child_layout_width = match child_explicit_width {
+        Some(Value::Length(v, Unit::Px)) => *v,
+        Some(Value::Length(v, Unit::Percent)) => cb.width * (v / 100.0),
+        _ => {
+            // Both left and right specified without explicit width → stretch.
+            if let (Some(l), Some(r)) = (left_offset, right_offset) {
+                (cb.width - l - r).max(0.0)
+            } else {
+                // Shrink-wrap: lay out at max-content width bounded by cb width.
+                let max_c = intrinsic_cache.max_content_width(pos_node, vw, vh);
+                max_c.min(cb.width)
+            }
+        }
+    };
+
+    // A child that states its own width resolves it against the containing
+    // block, so that is what it has to be laid out against: handing it the
+    // already-resolved width instead made `width: 40%` mean 40% of 40%, and a
+    // wash pinned across half a section came out a fifth of it.
+    let container_for_child = if child_explicit_width.is_some() {
+        cb.width
+    } else {
+        child_layout_width
+    };
+    // Build the child at a temporary origin; we reposition it below.
+    let (pc_opt, _, _) = build_layout_tree_with_cb_cached(
+        pos_node,
+        0.0,
+        0.0,
+        0.0,
+        container_for_child.max(1.0),
+        vw,
+        vh,
+        Some(cb),
+        intrinsic_cache,
+    );
+    let mut pc = pc_opt?;
+
+    // Both `top` and `bottom` with no stated height stretches the box between
+    // them, the vertical mirror of the width rule above (CSS 2.2 §10.6.4).
+    // Without it an overlay written as `position: absolute; inset: 0` came out
+    // its content's height — zero, for the empty element a gradient wash is —
+    // and never painted.
+    let child_states_height = pc
+        .style_node
+        .specified_values
+        .contains_key(&crate::css::intern("height"));
+    if !child_states_height {
+        if let (Some(t), Some(b)) = (top_offset, bottom_offset) {
+            let stretched = (cb.height - t - b - pc.margin.top - pc.margin.bottom).max(0.0);
+            if stretched > outer_height(&pc) {
+                pc.dimensions.height = stretched;
+                pc.content_box_height = false;
+            }
+        }
+    }
+    let target_x = match (left_offset, right_offset) {
+        (Some(l), _) => cb.x + l + pc.margin.left,
+        (None, Some(r)) => cb.x + cb.width - r - pc.dimensions.width - pc.margin.right,
+        (None, None) => cb.x + pc.margin.left, // default to CB origin
+    };
+    let target_y = match (top_offset, bottom_offset) {
+        (Some(t), _) => cb.y + t + pc.margin.top,
+        (None, Some(b)) => cb.y + cb.height - b - pc.dimensions.height - pc.margin.bottom,
+        // Neither offset given: the box stays where it would have been in flow.
+        // Falling back to the containing block's origin instead pulls it to the
+        // top of its ancestor, so a hero pinned below a header jumped to the
+        // page top.
+        (None, None) => static_y + pc.margin.top,
+    };
+
+    let dx = target_x - pc.dimensions.x;
+    let dy = target_y - pc.dimensions.y;
+    offset_layout_box(&mut pc, dx, dy);
+    Some(pc)
+}
+
+/// Gather every descendant that was placed against an inherited containing
+/// block, as `(path from `root`, static position, style node)`.
+///
+/// The search does not cross into a box that establishes a containing block of
+/// its own: what is deferred inside that one is its business, not `root`'s.
+fn collect_deferred_positioned<'a>(
+    root: &mut LayoutBox<'a>,
+    out: &mut Vec<(Vec<usize>, f32, &'a StyledNode)>,
+) {
+    fn walk<'a>(
+        boxes: &mut [LayoutBox<'a>],
+        prefix: &mut Vec<usize>,
+        out: &mut Vec<(Vec<usize>, f32, &'a StyledNode)>,
+    ) {
+        for (i, child) in boxes.iter_mut().enumerate() {
+            prefix.push(i);
+            if let Some(static_y) = child.deferred_static_pos.take() {
+                out.push((prefix.clone(), static_y, child.style_node));
+            } else {
+                let establishes = !matches!(child.position, PositionType::Static);
+                if !establishes {
+                    walk(&mut child.children, prefix, out);
+                }
+            }
+            prefix.pop();
+        }
+    }
+    let mut prefix = Vec::new();
+    walk(&mut root.children, &mut prefix, out);
+}
+
+/// The box at `path` under `root`, where each step indexes `children`.
+fn child_at_path_mut<'a, 'b>(
+    root: &'b mut LayoutBox<'a>,
+    path: &[usize],
+) -> Option<&'b mut LayoutBox<'a>> {
+    let mut cur = root;
+    for &i in path {
+        cur = cur.children.get_mut(i)?;
+    }
+    Some(cur)
+}
+
 fn get_display_type(sn: &StyledNode) -> DisplayType {
     if let NodeData::Text { .. } = sn.node.data {
         return DisplayType::Inline;
@@ -4529,7 +4613,7 @@ fn get_display_type(sn: &StyledNode) -> DisplayType {
             "block" if is_form_control => return DisplayType::Input,
             "block" => return DisplayType::Block,
             "inline-block" if is_form_control => return DisplayType::Input,
-            "inline-block" => return DisplayType::InlineBlock,
+            "inline-block" => return blockify_out_of_flow(sn, DisplayType::InlineBlock),
             "flex" => return DisplayType::Flex,
             "grid" => return DisplayType::Grid,
             // `inline-flex` lays its children out exactly like `flex`; the
@@ -4543,7 +4627,7 @@ fn get_display_type(sn: &StyledNode) -> DisplayType {
             _ => {}
         }
     }
-    if let NodeData::Element { ref name, .. } = sn.node.data {
+    let tag_display = if let NodeData::Element { ref name, .. } = sn.node.data {
         match name.local.to_string().as_str() {
             // Genuine block-level elements (fill container width, force line break)
             "html" | "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "body" | "header"
@@ -4572,7 +4656,42 @@ fn get_display_type(sn: &StyledNode) -> DisplayType {
         }
     } else {
         DisplayType::Block
+    };
+    blockify_out_of_flow(sn, tag_display)
+}
+
+/// Taking a box out of flow blockifies it (CSS Display §2.7): an absolutely
+/// positioned or floated box is block-level whatever its `display` said.
+///
+/// Every generated box this engine builds is a `<span>`, so `::before { content:
+/// ""; position: absolute; inset: 0 }` — the way a page lays a wash, a glow or a
+/// disc behind its content — was laid out inline and came out its content's
+/// size, which for an empty generated box is nothing at all. github's hero glow
+/// and the disc behind its play button are both written that way.
+fn blockify_out_of_flow(sn: &StyledNode, d: DisplayType) -> DisplayType {
+    if !is_out_of_flow(sn) {
+        return d;
     }
+    match d {
+        DisplayType::Inline | DisplayType::InlineBlock => DisplayType::Block,
+        // A replaced element and a form control keep their own type: it says
+        // how the box is *drawn*, not how it flows.
+        other => other,
+    }
+}
+
+/// `true` when `position` or `float` takes this box out of normal flow.
+fn is_out_of_flow(sn: &StyledNode) -> bool {
+    if matches!(
+        get_position_type(sn),
+        PositionType::Absolute | PositionType::Fixed
+    ) {
+        return true;
+    }
+    matches!(
+        sn.specified_values.get(&crate::css::intern("float")),
+        Some(Value::Keyword(k)) if matches!(&**k, "left" | "right" | "inline-start" | "inline-end")
+    )
 }
 
 /// Whether a box participates in flow as block-level.
@@ -8593,6 +8712,97 @@ mod tests {
             cb.dimensions.x,
             overlay.dimensions.x
         );
+    }
+
+    /// Taking a box out of flow blockifies it. Every generated box this engine
+    /// builds is a `<span>`, so `::before { content: ""; position: absolute;
+    /// inset: 0 }` — a wash, a glow, a disc behind an icon — was laid out inline
+    /// and came out its content's size, which for an empty one is nothing.
+    #[test]
+    fn test_an_out_of_flow_inline_box_is_blockified() {
+        let html = r#"<div style="width:800px">
+            <div id="host" style="position:relative;height:120px">
+                <span id="overlay" style="position:absolute;top:0;right:0;bottom:0;left:0"></span>
+            </div>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let overlay = find_element_by_id(&layout, "overlay").expect("overlay");
+        assert_eq!(overlay.display, DisplayType::Block, "an absolute inline box is block-level");
+        assert!(
+            (overlay.dimensions.width - 800.0).abs() < 0.5,
+            "`left: 0; right: 0` stretches it across the block; got {}",
+            overlay.dimensions.width
+        );
+        assert!(
+            (overlay.dimensions.height - 120.0).abs() < 0.5,
+            "`top: 0; bottom: 0` stretches it down the block; got {}",
+            overlay.dimensions.height
+        );
+    }
+
+    /// A float is out of flow too, and blockifies the same way.
+    #[test]
+    fn test_a_floated_inline_box_is_blockified() {
+        let html = r#"<div style="width:800px"><span id="f" style="float:left;width:60px;height:60px"></span></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let f = find_element_by_id(&layout, "f").expect("float");
+        assert_eq!(f.display, DisplayType::Block);
+    }
+
+    /// An in-flow inline box stays inline: blockification is about being out of
+    /// flow, not about the properties that usually come with it.
+    #[test]
+    fn test_an_in_flow_inline_box_is_left_alone() {
+        let html = r#"<div style="width:800px"><span id="s" style="position:relative">text</span></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let s = find_element_by_id(&layout, "s").expect("span");
+        assert_eq!(s.display, DisplayType::Inline);
+    }
+
+    /// An absolute box laid out by a *static* parent resolves its percentages
+    /// against an ancestor whose height is not settled when that parent runs.
+    /// Placed once and left there, `height: 100%` came out zero — which is how
+    /// github's hero glow, a `::before` sized exactly that way, went missing.
+    #[test]
+    fn test_a_percentage_sized_absolute_box_under_a_static_parent() {
+        let html = r#"<div style="width:800px">
+            <div id="cb" style="position:relative">
+                <div>
+                    <div id="host" style="height:160px">
+                        <div id="wash" style="position:absolute;top:0;left:0;width:100%;height:100%"></div>
+                    </div>
+                </div>
+            </div>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let wash = find_element_by_id(&layout, "wash").expect("wash");
+        assert!(
+            (wash.dimensions.width - 800.0).abs() < 0.5,
+            "100% of the containing block's width; got {}",
+            wash.dimensions.width
+        );
+        assert!(
+            (wash.dimensions.height - 160.0).abs() < 0.5,
+            "100% of the containing block's settled height; got {}",
+            wash.dimensions.height
+        );
+    }
+
+    /// Half of a settled containing block, to show the second placement reads
+    /// the percentage rather than just filling the block.
+    #[test]
+    fn test_a_half_height_absolute_box_under_a_static_parent() {
+        let html = r#"<div style="width:800px">
+            <div id="cb" style="position:relative">
+                <div><div style="height:200px">
+                    <div id="wash" style="position:absolute;top:0;left:0;width:50%;height:50%"></div>
+                </div></div>
+            </div>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let wash = find_element_by_id(&layout, "wash").expect("wash");
+        assert!((wash.dimensions.width - 400.0).abs() < 0.5, "got {}", wash.dimensions.width);
+        assert!((wash.dimensions.height - 100.0).abs() < 0.5, "got {}", wash.dimensions.height);
     }
 
     /// A generated box is a box, not a text run. `content: ""` with a stated

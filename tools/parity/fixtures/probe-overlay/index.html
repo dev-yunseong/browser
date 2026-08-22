@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Out-of-flow overlay probe</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #0d1117; color: #e6edf3; font: 14px/1.5 sans-serif; }
+  section { border-top: 2px solid #08f; padding: 8px 0 24px; }
+  h2 { font-size: 15px; margin: 0 0 8px; }
+
+  /* Every generated box is a span, and taking a box out of flow blockifies it.
+     An overlay written this way is how a page lays a wash over a card. */
+  .card { position: relative; height: 120px; margin: 0 32px 12px; background: #151a22; }
+  .card::before { content: ""; position: absolute; inset: 0; background: rgba(154, 124, 255, 0.45); }
+  .card2 { position: relative; height: 120px; margin: 0 32px 12px; background: #151a22; }
+  .card2::after { content: ""; position: absolute; top: 0; right: 0; bottom: 0; left: 0;
+                  background: linear-gradient(90deg, rgba(95, 237, 131, 0.5), rgba(95, 237, 131, 0)); }
+  /* The same shape written on a real inline element. */
+  .card3 { position: relative; height: 120px; margin: 0 32px 12px; background: #151a22; }
+
+  /* A percentage-sized overlay whose containing block is a *grandparent*: the
+     ancestor's height is not settled when the static parent between them runs,
+     and the overlay has to be placed again once it is. github's hero glow is
+     exactly this — a `::before` at `width: 100%; height: 100%` under a static
+     wrapper inside a `position: relative` carousel. */
+  .cb { position: relative; margin: 0 32px 12px; }
+  .mid { padding: 0; }
+  .panel { height: 140px; background: rgba(255, 255, 255, 0.15); }
+  .panel::before { content: ""; position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+                   background: radial-gradient(120% 110% at 85% 55%, rgb(154, 124, 255) 35%, rgba(14, 10, 162, 0) 100%); }
+  .half::before { width: 50%; height: 50%; }
+
+  /* `position: relative` with `z-index: auto` is not a stacking context, so a
+     `z-index: -1` child of it paints *below* its own background. With a stated
+     z-index it is one, and the child paints above that background instead. */
+  .stack { position: relative; height: 110px; margin: 0 32px 12px; background: #151a22; }
+  .stack > .under { position: absolute; inset: 0; z-index: -1; background: #f6a; }
+  .ctx { z-index: 0; }
+</style>
+</head>
+<body>
+  <section>
+    <h2>a generated overlay is a block</h2>
+    <div class="card"></div>
+    <div class="card2"></div>
+    <div class="card3"><span style="position:absolute;top:0;right:0;bottom:0;left:0;background:rgba(96,165,250,.45)"></span></div>
+  </section>
+
+  <section>
+    <h2>percentages against a grandparent containing block</h2>
+    <div class="cb"><div class="mid"><div class="panel"></div></div></div>
+    <div class="cb"><div class="mid"><div class="panel half"></div></div></div>
+  </section>
+
+  <section>
+    <h2>a negative z-index under a box that is only positioned</h2>
+    <div class="stack"><div class="under"></div></div>
+    <div class="stack ctx"><div class="under"></div></div>
+  </section>
+</body>
+</html>

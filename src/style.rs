@@ -320,7 +320,7 @@ fn has_relative_match(
     hovered_id: Option<&str>,
     focused_id: Option<&str>,
 ) -> bool {
-    let mut hit = |c: usize| matches_selector_arena(sel, c, arena, hovered_id, focused_id);
+    let hit = |c: usize| matches_selector_arena(sel, c, arena, hovered_id, focused_id);
     match combinator {
         Combinator::Descendant => {
             let mut stack: Vec<usize> = arena[anchor].children_idx.clone();
@@ -1777,50 +1777,75 @@ fn compute_pseudo_injections(
     }
 
     let parent_values = &node.specified_values;
-    let mut before_node: Option<StyledNode> = None;
-    let mut after_node:  Option<StyledNode> = None;
 
-    for rule in all_rules {
+    // Every rule that matches contributes, not just the one that carries
+    // `content`: a design system states the shape once and overrides a size or a
+    // colour in a later, equally specific rule. Taking only the last rule with a
+    // `content` declaration threw the overrides away, so a wash narrowed to half
+    // its host by a modifier class still covered the whole of it.
+    let mut matching: [Vec<(usize, (usize, usize, usize), &crate::css::Rule)>; 2] =
+        [Vec::new(), Vec::new()];
+    for (order, rule) in all_rules.iter().enumerate() {
         for sel in &rule.selectors {
-            let pe = match &sel.pseudo_element {
-                Some(pe) => pe.as_str(),
-                None => continue,
+            let slot = match sel.pseudo_element.as_deref() {
+                Some("before") => 0,
+                Some("after") => 1,
+                _ => continue,
             };
-            if pe != "before" && pe != "after" { continue; }
-
-            if !selector_base_matches_element(sel, node) { continue; }
-
-            // Find `content` declaration; skip the rule if absent or suppressed.
-            let content_decl = rule.declarations.iter().find(|d| d.name.as_ref() == "content");
-            let content_str = match content_decl {
-                Some(decl) => match &decl.value {
-                    Value::Keyword(k) if matches!(k.as_ref(), "none" | "normal") => continue,
-                    Value::Keyword(k) => {
-                        // Strip wrapping quotes that the CSS parser preserves.
-                        let s = k.as_ref();
-                        let inner = if (s.starts_with('"') && s.ends_with('"'))
-                            || (s.starts_with('\'') && s.ends_with('\''))
-                        {
-                            &s[1..s.len() - 1]
-                        } else {
-                            s
-                        };
-                        unescape_css_string(inner)
-                    }
-                    _ => continue,
-                },
-                None => continue,
-            };
-
-            let synthetic = make_pseudo_styled_node(content_str, &rule.declarations, parent_values);
-            match pe {
-                "before" => { before_node = Some(synthetic); }
-                "after"  => { after_node  = Some(synthetic); }
-                _ => {}
+            if !selector_base_matches_element(sel, node) {
+                continue;
             }
+            matching[slot].push((order, sel.specificity(), rule));
+            break;
         }
     }
 
+    let mut built: [Option<StyledNode>; 2] = [None, None];
+    for (slot, rules) in matching.iter_mut().enumerate() {
+        rules.sort_by_key(|(order, spec, _)| (*spec, *order));
+
+        // Cascade order, then the important declarations on top of all of them.
+        let mut declarations: Vec<crate::css::Declaration> = Vec::new();
+        for (_, _, rule) in rules.iter() {
+            declarations.extend(rule.declarations.iter().filter(|d| !d.important).cloned());
+        }
+        for (_, _, rule) in rules.iter() {
+            declarations.extend(rule.declarations.iter().filter(|d| d.important).cloned());
+        }
+
+        // The winning `content` decides whether there is a box at all.
+        let Some(content_str) = declarations
+            .iter()
+            .rev()
+            .find(|d| d.name.as_ref() == "content")
+            .and_then(|decl| match &decl.value {
+                Value::Keyword(k) if matches!(k.as_ref(), "none" | "normal") => None,
+                Value::Keyword(k) => {
+                    // Strip wrapping quotes that the CSS parser preserves.
+                    let s = k.as_ref();
+                    let inner = if (s.starts_with('"') && s.ends_with('"'))
+                        || (s.starts_with('\'') && s.ends_with('\''))
+                    {
+                        &s[1..s.len() - 1]
+                    } else {
+                        s
+                    };
+                    Some(unescape_css_string(inner))
+                }
+                _ => None,
+            })
+        else {
+            continue;
+        };
+
+        built[slot] = Some(make_pseudo_styled_node(
+            content_str,
+            &declarations,
+            parent_values,
+        ));
+    }
+
+    let [before_node, after_node] = built;
     (before_node, after_node)
 }
 
@@ -2437,6 +2462,63 @@ mod tests {
                 "{source:?} should unescape to {want:?}"
             );
         }
+    }
+
+    /// Every matching `::before` rule contributes, not only the one that
+    /// carries `content`. A design system states the shape once and overrides a
+    /// size in a modifier rule; taking the last rule with `content` threw the
+    /// override away, so a wash narrowed to half its host still covered all of it.
+    #[test]
+    fn test_a_generated_box_cascades_every_matching_rule() {
+        fn pseudo_of<'a>(n: &'a StyledNode, host_class: &str) -> Option<&'a StyledNode> {
+            fn find<'a>(n: &'a StyledNode, cls: &str) -> Option<&'a StyledNode> {
+                if let markup5ever_rcdom::NodeData::Element { ref attrs, .. } = n.node.data {
+                    if attrs.borrow().iter().any(|a| {
+                        a.name.local.as_ref() == "class"
+                            && a.value.as_ref().split_whitespace().any(|c| c == cls)
+                    }) {
+                        return n.children.first();
+                    }
+                }
+                n.children.iter().find_map(|c| find(c, cls))
+            }
+            find(n, host_class)
+        }
+
+        let css = r#"
+            .panel::before { content: ""; width: 100%; height: 100%; background: #9a7cff }
+            .half::before { width: 50%; height: 50% }
+            .named::before { content: "x" }
+        "#;
+        let tree = make_tree(
+            r#"<div class="panel"></div><div class="panel half"></div><div class="panel named"></div>"#,
+            css,
+        );
+
+        fn percent(n: &StyledNode, prop: &str) -> Option<f32> {
+            match n.specified_values.get(&intern(prop)) {
+                Some(Value::Length(v, Unit::Percent)) => Some(*v),
+                _ => None,
+            }
+        }
+
+        let plain = pseudo_of(&tree, "panel").expect("the plain panel's box");
+        assert_eq!(percent(plain, "width"), Some(100.0), "percent kept as stated");
+
+        let half = pseudo_of(&tree, "half").expect("the half panel's box");
+        assert_eq!(
+            (percent(half, "width"), percent(half, "height")),
+            (Some(50.0), Some(50.0)),
+            "a modifier rule with no `content` still overrides the size",
+        );
+
+        // The later `content` wins, and the earlier rule's properties survive.
+        let named = pseudo_of(&tree, "named").expect("the named panel's box");
+        assert!(
+            named.specified_values.get(&intern("background")).is_some()
+                || named.specified_values.get(&intern("background-color")).is_some(),
+            "the first rule's background must survive the second rule's `content`",
+        );
     }
 
     /// `:has()` is how a modern design system reacts to what an element

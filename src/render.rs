@@ -174,36 +174,44 @@ fn composite_layer_to_surface(
 
     let (negative, zero, positive) = tree.categorize_children(layer_id);
 
+    // A negative-`z-index` box belongs to the nearest *stacking context* above
+    // it. Under a box that is merely positioned — `position: relative` with
+    // `z-index: auto`, which is not a stacking context — that is somewhere
+    // further up, and the box paints below this one's own background. Painting
+    // it as an ordinary negative child put github's hero glow on top of the
+    // panel the page has it sitting behind.
+    let negative_goes_under_own_background = !layer.is_stacking_context;
+
+    macro_rules! paint_into {
+        ($surface:expr, $rect:expr) => {{
+            if negative_goes_under_own_background {
+                for &child_id in &negative {
+                    composite_layer_to_surface(child_id, tree, $surface, $rect, image_cache, base_url);
+                }
+            }
+            execute_commands_on_tile(&layer.background_commands, $surface, $rect, image_cache, base_url);
+
+            if !negative_goes_under_own_background {
+                for &child_id in &negative {
+                    composite_layer_to_surface(child_id, tree, $surface, $rect, image_cache, base_url);
+                }
+            }
+
+            execute_commands_on_tile(&layer.content_commands, $surface, $rect, image_cache, base_url);
+
+            for &child_id in &zero {
+                composite_layer_to_surface(child_id, tree, $surface, $rect, image_cache, base_url);
+            }
+            for &child_id in &positive {
+                composite_layer_to_surface(child_id, tree, $surface, $rect, image_cache, base_url);
+            }
+        }};
+    }
+
     if let Some(ref mut pixmap) = effect_pixmap {
-        execute_commands_on_tile(&layer.background_commands, pixmap, effect_rect, image_cache, base_url);
-
-        for &child_id in &negative {
-            composite_layer_to_surface(child_id, tree, pixmap, effect_rect, image_cache, base_url);
-        }
-
-        execute_commands_on_tile(&layer.content_commands, pixmap, effect_rect, image_cache, base_url);
-
-        for &child_id in &zero {
-            composite_layer_to_surface(child_id, tree, pixmap, effect_rect, image_cache, base_url);
-        }
-        for &child_id in &positive {
-            composite_layer_to_surface(child_id, tree, pixmap, effect_rect, image_cache, base_url);
-        }
+        paint_into!(pixmap, effect_rect);
     } else {
-        execute_commands_on_tile(&layer.background_commands, target, surface_rect, image_cache, base_url);
-
-        for &child_id in &negative {
-            composite_layer_to_surface(child_id, tree, target, surface_rect, image_cache, base_url);
-        }
-
-        execute_commands_on_tile(&layer.content_commands, target, surface_rect, image_cache, base_url);
-
-        for &child_id in &zero {
-            composite_layer_to_surface(child_id, tree, target, surface_rect, image_cache, base_url);
-        }
-        for &child_id in &positive {
-            composite_layer_to_surface(child_id, tree, target, surface_rect, image_cache, base_url);
-        }
+        paint_into!(target, surface_rect);
     }
 
     if let Some(mut pixmap) = effect_pixmap {

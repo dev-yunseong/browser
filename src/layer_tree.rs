@@ -233,6 +233,15 @@ pub struct Layer {
     /// Retained for use by the future compositor (issue #33); not used during
     /// the flat z-index sorted rendering pass implemented in this issue.
     pub child_layer_ids: Vec<usize>,
+    /// Whether this layer's element actually establishes a stacking context.
+    ///
+    /// Every positioned box gets a layer here so paint order can be expressed,
+    /// but `position: relative` with `z-index: auto` is *not* a stacking
+    /// context: a `z-index: -1` child of it belongs to an ancestor's negative
+    /// list and paints below this box's own background. Painting it as an
+    /// ordinary negative child instead put github's hero glow on top of the
+    /// panel it is supposed to sit behind.
+    pub is_stacking_context: bool,
     /// `mask-image`, when it names a gradient — the shape a page reaches for to
     /// fade a decorative wash in or out. Applied to the finished layer as an
     /// alpha multiply over its own box.
@@ -284,6 +293,7 @@ impl Layer {
             background_commands: Vec::new(),
             content_commands: Vec::new(),
             child_layer_ids: Vec::new(),
+            is_stacking_context: true,
             mask: None,
             blend_mode: None,
         }
@@ -493,6 +503,7 @@ impl LayerTreeBuilder {
                         let mut new_layer = Layer::new(new_id, frame_layout.z_index, opacity, d, triggers, matrix);
                         new_layer.mask = Self::read_mask(frame_layout);
                         new_layer.blend_mode = Self::read_blend_mode(frame_layout);
+                        new_layer.is_stacking_context = Self::establishes_stacking_context(frame_layout);
                         tree.add_layer(new_layer);
 
                         // Record parent → child relationship: access parent index first,
@@ -661,6 +672,54 @@ impl LayerTreeBuilder {
             .collect();
         // rect(top, right, bottom, left): empty when the edges cross or meet.
         matches!(nums.as_slice(), [top, right, bottom, left] if right - left <= 0.0 || bottom - top <= 0.0)
+    }
+
+    /// Whether this box establishes a stacking context, as opposed to merely
+    /// getting a layer so its paint order can be expressed.
+    ///
+    /// The distinction only matters for a negative-`z-index` child: it belongs
+    /// to the nearest *stacking context* above it, so under a box that is only
+    /// positioned it paints below that box's own background.
+    fn establishes_stacking_context(layout: &LayoutBox) -> bool {
+        let sv = &layout.style_node.specified_values;
+
+        // A positioned box is a stacking context only with a numeric z-index;
+        // `fixed` and `sticky` always are.
+        if matches!(layout.position, PositionType::Fixed | PositionType::Sticky) {
+            return true;
+        }
+        let stated_z = matches!(sv.get(&crate::css::intern("z-index")), Some(Value::Number(_)));
+        if stated_z && !matches!(layout.position, PositionType::Static) {
+            return true;
+        }
+        if layout.get_opacity() < 1.0 {
+            return true;
+        }
+        if sv.contains_key(&crate::css::intern("transform"))
+            || sv.contains_key(&crate::css::intern("filter"))
+            || sv.contains_key(&crate::css::intern("mask-image"))
+            || sv.contains_key(&crate::css::intern("will-change"))
+            || sv.contains_key(&crate::css::intern("perspective"))
+        {
+            return true;
+        }
+        if let Some(Value::Keyword(k)) = sv.get(&crate::css::intern("mix-blend-mode")) {
+            if &**k != "normal" {
+                return true;
+            }
+        }
+        if let Some(Value::Keyword(k)) = sv.get(&crate::css::intern("isolation")) {
+            if &**k == "isolate" {
+                return true;
+            }
+        }
+        if let Some(Value::Keyword(k)) = sv.get(&crate::css::intern("contain")) {
+            if k.split_whitespace().any(|w| matches!(w, "paint" | "strict" | "content")) {
+                return true;
+            }
+        }
+        // A grid or flex item with a numeric z-index is one too, even unpositioned.
+        stated_z
     }
 
     /// Inspect a `LayoutBox`'s CSS properties and return the list of
@@ -1683,6 +1742,65 @@ mod tests {
                 "the outer 30px clip must survive the inner 200px one, got {}",
                 clip.height,
             );
+        }
+    }
+
+    /// `position: relative` with `z-index: auto` gets a layer here so paint
+    /// order can be expressed, but it is *not* a stacking context: a negative
+    /// `z-index` child of it belongs further up and paints below this box's own
+    /// background. Treating it as one put github's hero glow on top of the
+    /// panel the page has it sitting behind.
+    #[test]
+    fn test_a_merely_positioned_box_is_not_a_stacking_context() {
+        let tree = build_tree_from_html(
+            r#"<div id="host" style="position:relative;width:200px;height:100px;background-color:#151a22">
+                 <div style="position:absolute;inset:0;z-index:-1;background-color:#9a7cff"></div>
+               </div>"#,
+            "",
+        );
+        let host = tree.layers.iter()
+            .find(|l| l.bounds.width == 200.0 && l.bounds.height == 100.0)
+            .expect("the positioned box's layer");
+        assert!(!host.is_stacking_context, "z-index: auto does not make a stacking context");
+    }
+
+    /// A numeric `z-index` on a positioned box does make one, and then a
+    /// negative child paints above that box's own background.
+    #[test]
+    fn test_a_numeric_z_index_makes_a_stacking_context() {
+        let tree = build_tree_from_html(
+            r#"<div id="host" style="position:relative;z-index:0;width:200px;height:100px;background-color:#151a22">
+                 <div style="position:absolute;inset:0;z-index:-1;background-color:#9a7cff"></div>
+               </div>"#,
+            "",
+        );
+        let host = tree.layers.iter()
+            .find(|l| l.bounds.width == 200.0 && l.bounds.height == 100.0)
+            .expect("the positioned box's layer");
+        assert!(host.is_stacking_context, "a stated z-index makes a stacking context");
+    }
+
+    /// So do the properties that isolate a subtree, whatever the position is.
+    #[test]
+    fn test_isolating_properties_make_a_stacking_context() {
+        for style in [
+            "opacity:0.5",
+            "transform:translateX(1px)",
+            "filter:blur(2px)",
+            "mix-blend-mode:multiply",
+            "isolation:isolate",
+            "contain:paint",
+        ] {
+            let html = format!(
+                r#"<div style="position:relative;width:200px;height:100px;{style}">
+                     <div style="position:absolute;inset:0;z-index:-1;background-color:#9a7cff"></div>
+                   </div>"#
+            );
+            let tree = build_tree_from_html(&html, "");
+            let host = tree.layers.iter()
+                .find(|l| l.bounds.width == 200.0 && l.bounds.height == 100.0)
+                .unwrap_or_else(|| panic!("no layer for {style}"));
+            assert!(host.is_stacking_context, "{style} must establish a stacking context");
         }
     }
 

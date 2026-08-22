@@ -133,6 +133,10 @@ Ordered by how much of a page each one destroyed.
 | `getBoundingClientRect` reporting the content box | It read `dimensions` straight, which holds the content box on an axis a stated value settled. A control at `height: 40px` under `border-box` sizing answered 22 — its height shorn of the padding and border the property includes. |
 | A generated box answering for a real element | `::before` and `::after` are synthesised elements with no parent, so all of them key to the empty document path, and whichever went in last answered for every element whose own key could not be built. |
 | `:has()` unsupported | The pseudo-class a modern design system reacts to its own contents with. github's hero pads itself only when it holds a UI panel — `.lp-SectionHero-visual:has(.…--copilotUI) { padding: 48px 96px }` — and without it the section came out 31px short, which is most of the page's whole height deficit. |
+| Taking a box out of flow did not blockify it | Every generated box this engine builds is a `<span>`, so `::before { content: ""; position: absolute; inset: 0 }` — a wash over a card, a glow behind a panel, the disc behind an icon — was laid out inline and came out its content's size, which for an empty generated box is nothing at all. |
+| An absolute box under a static parent sized against a containing block with no height yet | The block belongs to an ancestor whose own height is not settled until its in-flow children are, and the descendant was placed before that. `height: 100%` came out zero. github's hero glow is a `::before` sized exactly that way, under a static wrapper inside a `position: relative` carousel. |
+| Every positioned box treated as a stacking context | `position: relative` with `z-index: auto` is not one, so a `z-index: -1` child of it belongs further up and paints *below* that box's own background. Painting it as an ordinary negative child put github's hero glow on top of the panel it sits behind. |
+| Only the last `::before` rule carrying `content` applied | A design system states the shape once and overrides a size or a colour in a later, equally specific rule that names no `content` of its own. Those overrides were thrown away outright. |
 | Flow advancing past the content box | A box that states a height and carries padding handed the next block a cursor its own padding too high, and every section below it climbed by that much. |
 
 
@@ -144,7 +148,7 @@ pixels:
 
 | fixture | layout | fold | page | height (chromium -> engine) |
 |---|---|---|---|---|
-| github.com | 1.71% | 3.32% | 2.37% | 10570 -> 10569 |
+| github.com | 1.37% | 2.89% | 1.90% | 10570 -> 10569 |
 | yunseong.dev | 1.46% | 3.22% | 3.90% | 4976 -> 4947 |
 | naver.com | 1.32% | 2.88% | 2.55% | 18658 -> 16384 |
 
