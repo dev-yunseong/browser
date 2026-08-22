@@ -92,7 +92,7 @@ impl IntrinsicSizeCache {
                         } else if let Some(Value::Length(v, Unit::Px)) =
                             node.specified_values.get(&crate::css::intern("width"))
                         {
-                            Some(*v)
+                            Some(stated_outer_width(node, *v))
                         } else {
                             None
                         }
@@ -133,6 +133,41 @@ impl IntrinsicSizeCache {
                         .collect();
                     let start = val_stack.len().saturating_sub(num_children);
                     let child_vals: Vec<f32> = val_stack.drain(start..).collect();
+
+                    // A flex container is not a flow container: its items are
+                    // blockified and laid on the main axis, so a row's
+                    // max-content is the *sum* of its items plus the gaps
+                    // between them however each item's own `display` reads,
+                    // and a column's is the widest single item. Measuring one
+                    // as flow took the max of the block-level items and left
+                    // out the gaps, so a "field + button" row was sized to
+                    // whichever half was wider and its button hung outside it.
+                    if get_display_type(node_ref) == DisplayType::Flex {
+                        let is_row = flex_axis_is_row(node_ref);
+                        let mut sum: f32 = 0.0;
+                        let mut widest: f32 = 0.0;
+                        let mut items = 0usize;
+                        for (child_val, child) in
+                            child_vals.into_iter().zip(non_skip_children.iter())
+                        {
+                            if !is_flex_item(child) {
+                                continue;
+                            }
+                            let total = child_val + horiz_margin(child);
+                            sum += total;
+                            widest = widest.max(total);
+                            items += 1;
+                        }
+                        let gaps = if is_row && items > 1 {
+                            column_gap_px(node_ref) * (items - 1) as f32
+                        } else {
+                            0.0
+                        };
+                        let width = if is_row { sum + gaps } else { widest } + pad_border;
+                        self.max_content.insert(key, width);
+                        val_stack.push(width);
+                        continue;
+                    }
 
                     let mut inline_run_width: f32 = 0.0;
                     let mut max_w: f32 = 0.0;
@@ -187,6 +222,7 @@ impl IntrinsicSizeCache {
         enum Frame<'a> {
             Pre(&'a StyledNode),
             Post {
+                node: *const StyledNode,
                 key: IntrinsicSizeKey,
                 num_children: usize,
                 pad_border: f32,
@@ -243,7 +279,7 @@ impl IntrinsicSizeCache {
                         } else if let Some(Value::Length(v, Unit::Px)) =
                             node.specified_values.get(&crate::css::intern("width"))
                         {
-                            Some(*v)
+                            Some(stated_outer_width(node, *v))
                         } else {
                             None
                         }
@@ -261,6 +297,7 @@ impl IntrinsicSizeCache {
                     let num_children = non_skip.len();
 
                     work.push(Frame::Post {
+                        node: node as *const StyledNode,
                         key,
                         num_children,
                         pad_border,
@@ -270,13 +307,42 @@ impl IntrinsicSizeCache {
                     }
                 }
                 Frame::Post {
+                    node,
                     key,
                     num_children,
                     pad_border,
                 } => {
+                    let node_ref = unsafe { &*node };
                     let start = val_stack.len().saturating_sub(num_children);
-                    let child_vals = val_stack.drain(start..);
-                    let width = child_vals.fold(0.0f32, f32::max) + pad_border;
+                    let child_vals: Vec<f32> = val_stack.drain(start..).collect();
+                    // A single-line flex row cannot narrow past its items laid
+                    // side by side, so its min-content is their sum plus the
+                    // gaps. Only a wrapping row — or a column, whose items
+                    // stack — may narrow to its widest item.
+                    let flex_row_sum = get_display_type(node_ref) == DisplayType::Flex
+                        && flex_axis_is_row(node_ref)
+                        && !flex_container_wraps(node_ref);
+                    let width = if flex_row_sum {
+                        let non_skip_children: Vec<&StyledNode> = node_ref
+                            .children
+                            .iter()
+                            .filter(|c| !should_skip(c))
+                            .collect();
+                        let items: Vec<f32> = child_vals
+                            .iter()
+                            .zip(non_skip_children.iter())
+                            .filter(|(_, c)| is_flex_item(c))
+                            .map(|(v, c)| v + horiz_margin(c))
+                            .collect();
+                        let gaps = if items.len() > 1 {
+                            column_gap_px(node_ref) * (items.len() - 1) as f32
+                        } else {
+                            0.0
+                        };
+                        items.iter().sum::<f32>() + gaps + pad_border
+                    } else {
+                        child_vals.into_iter().fold(0.0f32, f32::max) + pad_border
+                    };
                     self.min_content.insert(key, width);
                     val_stack.push(width);
                 }
@@ -495,6 +561,45 @@ fn horiz_padding_border(sn: &StyledNode) -> f32 {
     read_px_direct(sn, "padding-left") + read_px_direct(sn, "padding-right") + side("left") + side("right")
 }
 
+/// Whether a child of a flex or grid container is not an item of it.
+///
+/// CSS Flexible Box Layout §4: a contiguous run of text between two flex items
+/// becomes an anonymous flex item, but "an anonymous flex item that contains
+/// only white space is not rendered". The newlines and indentation between
+/// markup tags are exactly that. Counting them as items gave a two-item row
+/// four, and charged it the container's `gap` for each of the two it invented.
+fn is_flex_item(child: &StyledNode) -> bool {
+    if should_skip(child) {
+        return false;
+    }
+    if let NodeData::Text { ref contents } = child.node.data {
+        // Browsers drop it whatever `white-space` says — the space between two
+        // flex items never lays out, preserved or not.
+        return !contents.borrow().trim().is_empty();
+    }
+    true
+}
+
+/// Whether a stated width or height on this box already covers its padding and
+/// border.
+fn is_border_box(sn: &StyledNode) -> bool {
+    matches!(
+        sn.specified_values.get(&crate::css::intern("box-sizing")),
+        Some(Value::Keyword(k)) if **k == *"border-box"
+    )
+}
+
+/// The outer width a box with a *stated* `width` contributes to an intrinsic
+/// measurement. Under `border-box` the stated value is already the outer width;
+/// under `content-box` the padding and border sit outside it.
+fn stated_outer_width(sn: &StyledNode, stated: f32) -> f32 {
+    if is_border_box(sn) {
+        stated
+    } else {
+        stated + horiz_padding_border(sn)
+    }
+}
+
 fn horiz_margin(sn: &StyledNode) -> f32 {
     read_px_direct(sn, "margin-left") + read_px_direct(sn, "margin-right")
 }
@@ -634,6 +739,40 @@ fn is_inline_level_container(sn: &StyledNode) -> bool {
         sn.specified_values.get(&crate::css::intern("display")),
         Some(Value::Keyword(k)) if matches!(&**k, "inline-flex" | "inline-grid")
     )
+}
+
+/// The main axis of a flex container. Only meaningful when the node's
+/// `DisplayType` is `Flex`.
+fn flex_axis_is_row(sn: &StyledNode) -> bool {
+    match sn
+        .specified_values
+        .get(&crate::css::intern("flex-direction"))
+    {
+        Some(Value::Keyword(k)) => matches!(&**k, "row" | "row-reverse"),
+        _ => true,
+    }
+}
+
+/// Whether a flex container is allowed to put its items on more than one line.
+fn flex_container_wraps(sn: &StyledNode) -> bool {
+    matches!(
+        sn.specified_values.get(&crate::css::intern("flex-wrap")),
+        Some(Value::Keyword(k)) if matches!(&**k, "wrap" | "wrap-reverse")
+    )
+}
+
+/// The inline-axis gap between a flex or grid container's items, from
+/// `column-gap` or the `gap` shorthand.
+fn column_gap_px(sn: &StyledNode) -> f32 {
+    match sn
+        .specified_values
+        .get(&crate::css::intern("column-gap"))
+        .or_else(|| sn.specified_values.get(&crate::css::intern("gap")))
+    {
+        Some(Value::Length(v, Unit::Px)) => *v,
+        Some(Value::Number(v)) => *v,
+        _ => 0.0,
+    }
 }
 
 fn is_shrink_wrap(d: DisplayType) -> bool {
@@ -1316,6 +1455,21 @@ impl<'a> LayoutBox<'a> {
             _ => 0.0,
         };
 
+        // The mirror of the width rule above: under `border-box` a stated
+        // height already covers the padding and border, so they come off to
+        // leave the content height that paint adds them back to. Without this a
+        // `height: 48px` button drew 62px tall and pushed its whole row down.
+        let height = if box_sizing == "border-box" && height > 0.0 {
+            (height
+                - self.padding.top
+                - self.padding.bottom
+                - self.border.top
+                - self.border.bottom)
+                .max(0.0)
+        } else {
+            height
+        };
+
         if let NodeData::Text { ref contents } = self.style_node.node.data {
             let available_width = if container_width.is_finite() {
                 let consumed = (initial_x - container_start_x).max(0.0);
@@ -1521,7 +1675,7 @@ impl<'a> LayoutBox<'a> {
             let mut flex_positioned_entries: Vec<&StyledNode> = Vec::new();
 
             for child_node in &self.style_node.children {
-                if should_skip(child_node) {
+                if !is_flex_item(child_node) {
                     continue;
                 }
                 // Absolute and fixed children are out of flex flow — collect for
@@ -4222,6 +4376,178 @@ mod tests {
         let (layout_opt, fx, fy) =
             build_layout_tree(style_tree, 0.0, 0.0, 0.0, width, width, height);
         (layout_opt.expect("layout tree"), fx, fy)
+    }
+
+
+    // ── Flex intrinsic sizing ─────────────────────────────────────────────────
+
+    /// A row flex container's max-content is the sum of its items plus the gaps
+    /// between them, not the widest item. Taking the max sized github's signup
+    /// row to whichever of "email field" and "Sign up" was wider, and the other
+    /// one hung outside the white box around them.
+    #[test]
+    fn test_row_flex_max_content_sums_items_and_gaps() {
+        let html = r#"<div id="col" style="display:flex;flex-direction:column;align-items:center">
+            <div id="row" style="display:flex;gap:8px">
+              <div style="width:120px;height:30px"></div>
+              <div style="width:120px;height:30px"></div>
+            </div></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let row = find_element_by_id(&layout, "row").expect("row");
+        assert_eq!(
+            row.dimensions.width, 248.0,
+            "shrink-to-fit row should be 120 + 8 + 120, got {}",
+            row.dimensions.width
+        );
+    }
+
+    /// The sum has to see through items whose own `display` is inline: a flex
+    /// item is blockified, so two inline spans still lay side by side and both
+    /// count.
+    #[test]
+    fn test_row_flex_max_content_sums_block_level_items() {
+        let html = r#"<div id="col" style="display:flex;flex-direction:column;align-items:center">
+            <div id="row" style="display:flex">
+              <div style="display:block;width:100px;height:30px"></div>
+              <div style="display:block;width:60px;height:30px"></div>
+            </div></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let row = find_element_by_id(&layout, "row").expect("row");
+        assert_eq!(
+            row.dimensions.width, 160.0,
+            "two block-level flex items sit side by side, got {}",
+            row.dimensions.width
+        );
+    }
+
+    /// A column flex container stacks its items, so its max-content is the
+    /// widest one — never their sum.
+    #[test]
+    fn test_column_flex_max_content_is_the_widest_item() {
+        let html = r#"<div id="col" style="display:flex;flex-direction:column;align-items:center">
+            <div id="inner" style="display:flex;flex-direction:column;gap:8px">
+              <div style="width:120px;height:30px"></div>
+              <div style="width:60px;height:30px"></div>
+            </div></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let inner = find_element_by_id(&layout, "inner").expect("inner");
+        assert_eq!(
+            inner.dimensions.width, 120.0,
+            "a column's shrink-to-fit width is its widest item, got {}",
+            inner.dimensions.width
+        );
+    }
+
+    /// The newlines and indentation between two flex items are an anonymous
+    /// item that contains only white space, which is not rendered. Counting
+    /// them made a two-item row four items wide and charged it the gap twice
+    /// more than it should have.
+    #[test]
+    fn test_whitespace_between_flex_items_is_not_an_item() {
+        let packed = r#"<div id="col" style="display:flex;flex-direction:column;align-items:center"><div id="row" style="display:flex;gap:16px"><div style="width:100px;height:30px"></div><div style="width:100px;height:30px"></div></div></div>"#;
+        let spaced = r#"<div id="col" style="display:flex;flex-direction:column;align-items:center">
+            <div id="row" style="display:flex;gap:16px">
+              <div style="width:100px;height:30px"></div>
+              <div style="width:100px;height:30px"></div>
+            </div>
+          </div>"#;
+        let (a, _, _) = layout_from_html(packed, 800.0, 600.0);
+        let (b, _, _) = layout_from_html(spaced, 800.0, 600.0);
+        let wa = find_element_by_id(&a, "row").expect("row").dimensions.width;
+        let wb = find_element_by_id(&b, "row").expect("row").dimensions.width;
+        assert_eq!(wa, 216.0, "100 + 16 + 100, got {wa}");
+        assert_eq!(
+            wa, wb,
+            "indenting the markup must not change the layout: {wa} vs {wb}"
+        );
+    }
+
+    /// `white-space: pre` does not save it: browsers drop the space between two
+    /// flex items whatever the property says, so the first item still starts at
+    /// the container's content edge.
+    #[test]
+    fn test_preserved_whitespace_is_still_not_a_flex_item() {
+        let html = r#"<div id="row" style="display:flex;white-space:pre;width:400px"> <b>x</b></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let row = find_element_by_id(&layout, "row").expect("row");
+        assert_eq!(
+            row.children.len(),
+            1,
+            "the leading space is not an item, got {} children",
+            row.children.len()
+        );
+        assert_eq!(
+            row.children[0].dimensions.x, row.dimensions.x,
+            "the first real item starts at the content edge"
+        );
+    }
+
+    // ── `box-sizing: border-box` ──────────────────────────────────────────────
+
+    /// Under `border-box` a stated width is the *outer* width, so an intrinsic
+    /// measurement must not add the padding on top of it again.
+    #[test]
+    fn test_border_box_stated_width_is_the_outer_width_in_max_content() {
+        let html = r#"<div id="col" style="display:flex;flex-direction:column;align-items:center">
+            <div id="row" style="display:flex"><i style="box-sizing:border-box;display:block;width:260px;padding:0 30px;height:30px"></i></div>
+          </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let row = find_element_by_id(&layout, "row").expect("row");
+        assert_eq!(
+            row.dimensions.width, 260.0,
+            "border-box: the padding is inside the 260, got {}",
+            row.dimensions.width
+        );
+    }
+
+    /// Under the default `content-box` the padding sits outside the stated
+    /// width and does count.
+    #[test]
+    fn test_content_box_stated_width_adds_padding_in_max_content() {
+        let html = r#"<div id="col" style="display:flex;flex-direction:column;align-items:center">
+            <div id="row" style="display:flex"><i style="display:block;width:260px;padding:0 30px;height:30px"></i></div>
+          </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let row = find_element_by_id(&layout, "row").expect("row");
+        assert_eq!(
+            row.dimensions.width, 320.0,
+            "content-box: 260 of content plus 60 of padding, got {}",
+            row.dimensions.width
+        );
+    }
+
+    /// The height axis follows the same rule: under `border-box` a stated
+    /// height already covers the padding and border, so a 48px button paints
+    /// 48px tall rather than 62.
+    #[test]
+    fn test_border_box_stated_height_covers_padding_and_border() {
+        let html = r#"<div id="b" style="box-sizing:border-box;height:48px;padding:6px 20px;border:1px solid #000">Sign up</div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let b = find_element_by_id(&layout, "b").expect("b");
+        // A stated height leaves `dimensions.height` as the content box; paint
+        // adds the padding and border back. 48 - 12 - 2 = 34.
+        assert_eq!(
+            b.dimensions.height, 34.0,
+            "border-box height should inset padding and border, got {}",
+            b.dimensions.height
+        );
+        assert_eq!(
+            b.paint_rect().height,
+            48.0,
+            "the painted box is the stated 48, got {}",
+            b.paint_rect().height
+        );
+    }
+
+    /// `content-box` is unchanged: the stated height is the content height and
+    /// the padding is drawn outside it.
+    #[test]
+    fn test_content_box_stated_height_excludes_padding() {
+        let html = r#"<div id="b" style="height:48px;padding:6px 20px;border:1px solid #000">Sign up</div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let b = find_element_by_id(&layout, "b").expect("b");
+        assert_eq!(b.dimensions.height, 48.0);
+        assert_eq!(b.paint_rect().height, 62.0);
     }
 
     #[test]

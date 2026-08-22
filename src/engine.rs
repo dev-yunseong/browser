@@ -712,7 +712,10 @@ pub fn process_html_with_cache(
     let layout_tree = layout_tree_opt.ok_or("Failed to build layout tree")?;
     let layout_elapsed = start.elapsed();
 
-    let height = (final_y.ceil() as u32).clamp(600, 16384);
+    // A page shorter than the viewport still paints its canvas to the bottom of
+    // the viewport, so the raster is at least that tall; a fixed 600 left every
+    // short page 168px shorter than the same page in a browser.
+    let height = (final_y.ceil() as u32).clamp(VIEWPORT_HEIGHT as u32, 16384);
     let w_u32 = width as u32;
 
     let start = Instant::now();
