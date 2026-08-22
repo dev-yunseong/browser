@@ -408,6 +408,21 @@ fn apply_attribute_styles_arena(node: &NodeDataSend, map: &mut HashMap<Arc<str>,
                 if k == "height" { if let Ok(val) = v.trim_end_matches("px").parse::<f32>() { map.insert(intern("height"), Value::Length(val, crate::css::Unit::Px)); } }
             }
         }
+        // `<canvas>`, `<video>` and the embedded-content elements are replaced
+        // too: their box comes from their `width`/`height` attributes, and the
+        // spec's default for all of them is 300x150. A page whose hero is a
+        // canvas loses that whole box otherwise.
+        "canvas" | "video" | "iframe" | "embed" | "object" => {
+            for (k, v) in &node.attrs {
+                if matches!(k.as_str(), "width" | "height") {
+                    if let Some(len) = parse_legacy_length_attr(v) {
+                        map.entry(intern(k)).or_insert(len);
+                    }
+                }
+            }
+            map.entry(intern("width")).or_insert(Value::Length(300.0, crate::css::Unit::Px));
+            map.entry(intern("height")).or_insert(Value::Length(150.0, crate::css::Unit::Px));
+        }
         // An inline `<svg>` is a replaced element and takes up space whether or
         // not anything can draw it. Its size comes from its `width`/`height`
         // attributes, and its proportions from `viewBox`; with neither width nor

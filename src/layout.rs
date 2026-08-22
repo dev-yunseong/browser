@@ -3552,10 +3552,13 @@ fn get_display_type(sn: &StyledNode) -> DisplayType {
             "th" | "td" => DisplayType::TableCell,
             "thead" | "tbody" | "tfoot" | "caption" => DisplayType::Block,
             "input" | "button" | "select" | "textarea" => DisplayType::Input,
-            // An inline `<svg>` is a replaced element: it reserves a box from
-            // its own width, height and `viewBox` whether or not anything can
-            // draw its contents.
-            "img" | "svg" => DisplayType::Image,
+            // Replaced elements reserve a box from their own width, height and
+            // aspect ratio whether or not anything can draw their contents. A
+            // page whose hero is a canvas or a video loses that whole box
+            // otherwise, and everything below it moves up.
+            "img" | "svg" | "canvas" | "video" | "iframe" | "embed" | "object" => {
+                DisplayType::Image
+            }
             _ => DisplayType::Inline,
         }
     } else {
@@ -6640,6 +6643,39 @@ mod tests {
         assert!(
             s.children.is_empty(),
             "SVG contents are a different language and are not laid out as HTML"
+        );
+    }
+
+    /// `<canvas>`, `<video>` and the embedded-content elements are replaced:
+    /// their box comes from their `width`/`height` attributes, and the spec's
+    /// default for all of them is 300x150. A page whose hero is a canvas lost
+    /// that whole box, and everything below it moved up.
+    #[test]
+    fn test_replaced_media_reserves_its_box() {
+        let html = r#"<div style="width:800px">
+            <canvas id="c" width="800" height="950"></canvas>
+            <video id="v"></video>
+            <div id="after">after</div>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let c = find_element_by_id(&layout, "c").expect("canvas");
+        assert!(
+            (c.dimensions.width - 800.0).abs() < 1.0 && (c.dimensions.height - 950.0).abs() < 1.0,
+            "the canvas takes its attributes: {}x{}",
+            c.dimensions.width, c.dimensions.height
+        );
+        let v = find_element_by_id(&layout, "v").expect("video");
+        assert!(
+            (v.dimensions.width - 300.0).abs() < 1.0 && (v.dimensions.height - 150.0).abs() < 1.0,
+            "a video with no stated size is 300x150: {}x{}",
+            v.dimensions.width, v.dimensions.height
+        );
+        let after = find_element_by_id(&layout, "after").expect("after");
+        assert!(
+            after.dimensions.y >= 950.0,
+            "content below sits past the media, got y={}",
+            after.dimensions.y
         );
     }
 
