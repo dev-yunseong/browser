@@ -155,15 +155,19 @@ pixels:
 |---|---|---|---|---|
 | github.com | 1.37% | 2.89% | 1.60% | 10570 -> 10569 |
 | yunseong.dev | 1.45% | 3.21% | 4.10% | 4976 -> 4915 |
-| naver.com | 1.32% | 2.88% | 2.55% | 18658 -> 16384 |
+| naver.com | 1.32% | 2.88% | 2.53% | 18658 -> 16384 |
 
 github.com began this work at 9.14% layout, 13.84% fold and 780px too tall;
-yunseong.dev at 4.24% and 256px too short. Section by section github now
-matches Chromium to within a pixel or two on four of its six sections.
+yunseong.dev at 4.24% and 256px too short. github's page is now within a single
+pixel of Chromium's height, and only about a sixtieth of its pixels differ at
+all. Its remaining vertical drift is around 16px, gained in one section and
+carried down the page; every section's own boxes are within a pixel or two.
 
 Every probe fixture sits at or below 1.7% on the layout metric, and
 `probe-grid`, `probe-transform` and `probe-aspect` are pixel-identical over the
-fold.
+fold. `probe-has`, `probe-overlay` and `probe-grid` cover what this round found;
+`probe-has` still carries a difference of its own in how a lone atomic inline
+sits on its line.
 
 naver.com's number means little: its snapshot was captured without CSS (see
 below), so both renderers are drawing an unstyled page and the comparison only
