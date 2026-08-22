@@ -1407,11 +1407,17 @@ impl<'a> LayoutBox<'a> {
                     if let Some(basis) = flex_basis {
                         basis.min(inner_width).max(0.0)
                     } else if is_row && is_block_level_for(child_node, child_display) && !child_has_explicit_width {
-                        // Shrink-wrap: use max-content so block items don't fill the flex container.
-                        intrinsic_cache
-                            .max_content_width(child_node, vw, vh)
-                            .min(inner_width)
-                            .max(0.0)
+                        // Shrink-wrap: use max-content so block items don't fill the flex
+                        // container. The block sizing path subtracts the item's own margins
+                        // from whatever container width it is handed, so they have to be
+                        // added back here — max-content is the content width and knows
+                        // nothing of them. Without that, an item with a side margin came
+                        // out that much narrower than its own content, and its children
+                        // were then shrunk to fit a box smaller than they needed.
+                        (intrinsic_cache.max_content_width(child_node, vw, vh)
+                            + horiz_margin(child_node))
+                        .min(inner_width)
+                        .max(0.0)
                     } else {
                         inner_width
                     };
@@ -5896,6 +5902,41 @@ mod tests {
             b.dimensions.width >= text + 10.0,
             "item box should cover text plus its 11px of padding and border: width={}, text={text}",
             b.dimensions.width
+        );
+    }
+
+    /// A shrink-wrapped flex item is measured at its max-content width, and the
+    /// block sizing path then subtracts the item's own margins from whatever it
+    /// is handed. Passing max-content alone therefore made an item with a side
+    /// margin that much narrower than its own content, and its children were
+    /// shrunk to fit a box smaller than they needed.
+    #[test]
+    fn test_flex_item_with_side_margin_keeps_its_content_width() {
+        let html = r#"<div style="display:flex;width:800px">
+            <div id="brand" style="display:flex;margin-right:40px">
+                <span id="a">Yunseong</span><span id="b">dev</span>
+            </div>
+            <div id="rest" style="width:56px">x</div>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let brand = find_element_by_id(&layout, "brand").expect("brand");
+        let a = find_element_by_id(&layout, "a").expect("span a");
+        let text = crate::font::fonts().measure(
+            "Yunseong",
+            16.0,
+            crate::font::FontStyle::regular(),
+            0.0,
+        );
+        assert!(
+            a.dimensions.width >= text - 1.0,
+            "the item's own text must not be squeezed: width={}, text={text}",
+            a.dimensions.width
+        );
+        assert!(
+            brand.dimensions.width >= a.dimensions.width,
+            "the brand must be at least as wide as its first child: {} vs {}",
+            brand.dimensions.width, a.dimensions.width
         );
     }
 
