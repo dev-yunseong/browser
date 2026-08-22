@@ -38,6 +38,7 @@ url = "2.5.8"
 axum = { version = "0.7" }
 base64 = "0.22"
 wuff = "0.2.8"
+resvg = { version = "0.48.1", default-features = false }
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }

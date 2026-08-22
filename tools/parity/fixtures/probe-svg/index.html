@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Inline SVG probe</title>
+<style>
+  body { margin: 0; font: 16px/1.4 sans-serif; background: #fff; }
+  section { border-bottom: 2px solid #333; padding: 12px; }
+  /* An icon set draws itself with `fill="currentColor"`, which resolves to the
+     element's own text colour and means nothing to a standalone parser. */
+  .accent { color: #1f883d; }
+  .row { align-items: center; display: flex; gap: 12px; }
+  .fixed { width: 32px; height: 32px; }
+  /* No width or height: the SVG spec's defaults are 100%, and the viewBox
+     supplies the proportions. */
+  .box { width: 120px; }
+</style>
+</head>
+<body>
+  <section><b>sized by attributes</b><br>
+    <svg viewBox="0 0 16 16" width="32" height="32" fill="#0969da"><circle cx="8" cy="8" r="7"/></svg>
+  </section>
+  <section><b>currentColor from the element</b><br>
+    <span class="accent"><svg viewBox="0 0 16 16" width="32" height="32" fill="currentColor"><rect x="1" y="1" width="14" height="14" rx="3"/></svg></span>
+  </section>
+  <section><b>in a flex row with text</b>
+    <div class="row"><svg viewBox="0 0 16 16" width="24" height="24" fill="#8250df"><path d="M8 0l8 16H0z"/></svg><span>label beside an icon</span></div>
+  </section>
+  <section><b>viewBox only, inside a 120px box</b>
+    <div class="box"><svg viewBox="0 0 4 3" fill="#bf3989"><rect width="4" height="3"/></svg></div>
+  </section>
+  <section><b>stroked path</b><br>
+    <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="#24292f" stroke-width="2"><path d="M4 12h16M12 4v16"/></svg>
+  </section>
+  <section><b>malformed source draws nothing</b><br>
+    <svg viewBox="0 0 16 16" width="32" height="32"><path d="not a path"</svg>
+  </section>
+</body>
+</html>

@@ -31,6 +31,11 @@ pub enum PaintCommand {
     Border(LayoutRect, f32, Color, f32),
     /// Image: layout rect, source URL, object-fit mode, alt text
     Image { rect: LayoutRect, url: String, object_fit: ObjectFit, alt: String },
+    /// An inline `<svg>` subtree, as markup, to be rasterised into `rect`.
+    ///
+    /// The element's own `color` travels with it because icon sets are drawn
+    /// with `fill="currentColor"`, which means nothing on its own.
+    Svg { rect: LayoutRect, source: String, current_color: Color },
     /// Text run with clipping rect
     Text {
         rect: LayoutRect,
@@ -777,6 +782,21 @@ impl LayerTreeBuilder {
             }
         }
 
+        // Inline SVG: hand the subtree to the rasteriser as its own document.
+        if let markup5ever_rcdom::NodeData::Element { ref name, .. } = layout.style_node.node.data {
+            if name.local.as_ref() == "svg" && d.width >= 1.0 && d.height >= 1.0 {
+                let current_color = match sv.get(&crate::css::intern("color")) {
+                    Some(Value::Color(c)) => c.clone(),
+                    _ => Color { r: 0, g: 0, b: 0, a: 255 },
+                };
+                commands.push(PaintCommand::Svg {
+                    rect: d,
+                    source: crate::js::serialize_outer_html(&layout.style_node.node),
+                    current_color,
+                });
+            }
+        }
+
         // Image
         if layout.display == DisplayType::Image {
             if let Some(ref url) = layout.image_url {
@@ -965,6 +985,7 @@ impl LayerTreeBuilder {
                 PaintCommand::Rect(r, ..) => *r,
                 PaintCommand::Border(r, ..) => *r,
                 PaintCommand::Image { rect, .. } => *rect,
+                PaintCommand::Svg { rect, .. } => *rect,
                 PaintCommand::Text { rect, .. } => *rect,
                 PaintCommand::Shadow(r, ..) => *r,
                 PaintCommand::LinearGradient { rect, .. } => *rect,

@@ -415,6 +415,12 @@ fn execute_commands_on_tile(
                 adjusted_rect.width = (adjusted_rect.width - *leading_space).max(0.0);
                 render_text_raw(text.clone(), adjusted_rect, *font_size, *line_height, color, adjusted_clip, pixmap, *style, *letter_spacing, *text_decoration);
             }
+            PaintCommand::Svg { rect, source, current_color } => {
+                let mut r = *rect;
+                r.x += tx;
+                r.y += ty;
+                draw_svg(pixmap, r, source, current_color);
+            }
             PaintCommand::Shadow(r, s) => {
                 let blur = *s.blur;
                 let sx = r.x + *s.offset_x - *s.spread;
@@ -1074,6 +1080,77 @@ fn build_radial_gradient_shader<'a>(
 /// approximation of the reference's curve, not a derivation of it.
 const TEXT_COVERAGE_GAMMA: f32 = 1.0 / 1.45;
 
+/// Rasterise an inline `<svg>` subtree into `rect`.
+///
+/// The subtree arrives as its own document, so it is handed to the SVG parser
+/// as written. `currentColor` is substituted first: an icon set draws itself
+/// with `fill="currentColor"`, which resolves to the element's own text colour
+/// and means nothing to a standalone parser.
+///
+/// A subtree that fails to parse simply draws nothing — a page that ships a
+/// malformed icon should lose the icon, not the render.
+fn draw_svg(pixmap: &mut Pixmap, rect: LayoutRect, source: &str, current_color: &Color) {
+    let w = rect.width.round().max(1.0) as u32;
+    let h = rect.height.round().max(1.0) as u32;
+    // A very large icon is a sign of a mis-sized box, not of intent; capping
+    // keeps one bad box from allocating hundreds of megabytes.
+    if w > 4096 || h > 4096 {
+        return;
+    }
+
+    let resolved = source.replace(
+        "currentColor",
+        &format!("#{:02x}{:02x}{:02x}", current_color.r, current_color.g, current_color.b),
+    );
+    let options = resvg::usvg::Options::default();
+    let Ok(tree) = resvg::usvg::Tree::from_str(&resolved, &options) else {
+        return;
+    };
+
+    let Some(mut target) = resvg::tiny_skia::Pixmap::new(w, h) else {
+        return;
+    };
+    // Scale the SVG's own coordinate system onto the box layout gave it.
+    let size = tree.size();
+    if size.width() <= 0.0 || size.height() <= 0.0 {
+        return;
+    }
+    let transform = resvg::tiny_skia::Transform::from_scale(
+        w as f32 / size.width(),
+        h as f32 / size.height(),
+    );
+    resvg::render(&tree, transform, &mut target.as_mut());
+
+    // resvg draws into its own tiny-skia version's pixmap, so the result is
+    // copied across rather than handed over.
+    let ox = rect.x.round() as i32;
+    let oy = rect.y.round() as i32;
+    let src = target.data();
+    for y in 0..h {
+        for x in 0..w {
+            let i = ((y * w + x) * 4) as usize;
+            let a = src[i + 3];
+            if a == 0 {
+                continue;
+            }
+            let (px, py) = (ox + x as i32, oy + y as i32);
+            if px < 0 || py < 0 || px >= pixmap.width() as i32 || py >= pixmap.height() as i32 {
+                continue;
+            }
+            // resvg's output is premultiplied; unpremultiply before blending so
+            // the existing glyph/rect blend path sees straight colours.
+            let inv = 255.0 / a as f32;
+            let colour = Color {
+                r: (src[i] as f32 * inv).min(255.0) as u8,
+                g: (src[i + 1] as f32 * inv).min(255.0) as u8,
+                b: (src[i + 2] as f32 * inv).min(255.0) as u8,
+                a: 255,
+            };
+            blend_glyph_pixel(pixmap, px as u32, py as u32, a as f32 / 255.0, &colour);
+        }
+    }
+}
+
 fn blend_glyph_pixel(pixmap: &mut Pixmap, x: u32, y: u32, coverage: f32, color: &Color) {
     if coverage <= 0.0 { return; }
     let coverage = coverage.clamp(0.0, 1.0).powf(TEXT_COVERAGE_GAMMA);
@@ -1166,6 +1243,41 @@ mod tests {
             whole.data(), half.data(),
             "a run started half a pixel over must not rasterise identically"
         );
+    }
+
+    /// An inline `<svg>` is rasterised into the box layout gave it, and
+    /// `currentColor` resolves to the element's own text colour — an icon set
+    /// draws itself that way and means nothing to a standalone parser.
+    #[test]
+    fn test_inline_svg_draws_and_resolves_current_color() {
+        let mut pixmap = white_pixmap(40, 40);
+        let rect = LayoutRect { x: 0.0, y: 0.0, width: 40.0, height: 40.0 };
+        draw_svg(
+            &mut pixmap,
+            rect,
+            r#"<svg viewBox="0 0 10 10" fill="currentColor"><rect width="10" height="10"/></svg>"#,
+            &Color { r: 0, g: 128, b: 0, a: 255 },
+        );
+        let px = pixmap.pixel(20, 20).expect("centre pixel").demultiply();
+        assert!(
+            px.green() > 100 && px.red() < 60 && px.blue() < 60,
+            "the square takes the element's colour, got {:?}",
+            (px.red(), px.green(), px.blue())
+        );
+    }
+
+    /// A subtree that will not parse loses the icon, not the render.
+    #[test]
+    fn test_malformed_svg_draws_nothing() {
+        let mut pixmap = white_pixmap(20, 20);
+        let before = pixmap.data().to_vec();
+        draw_svg(
+            &mut pixmap,
+            LayoutRect { x: 0.0, y: 0.0, width: 20.0, height: 20.0 },
+            "<svg><path d=",
+            &Color { r: 0, g: 0, b: 0, a: 255 },
+        );
+        assert_eq!(pixmap.data(), &before[..], "nothing was drawn");
     }
 
     /// `#fff 117%` means the gradient never reaches white inside the box.

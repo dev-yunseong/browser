@@ -5158,6 +5158,16 @@ fn steal_fragment_children(doc: &Handle) -> Vec<Handle> {
     vec![]
 }
 
+/// Serialise a node and its subtree back to markup.
+///
+/// Used for `outerHTML`, and by paint to hand an inline `<svg>` subtree to the
+/// SVG rasteriser as a standalone document.
+pub fn serialize_outer_html(node: &Handle) -> String {
+    let mut out = String::new();
+    serialize_node(node, &mut out, None);
+    out
+}
+
 fn serialize_inner_html(node: &Handle) -> String {
     let mut out = String::new();
     let parent_tag = match &node.data {
