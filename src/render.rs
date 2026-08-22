@@ -995,7 +995,13 @@ fn render_text_raw(
     let trimmed = text.trim();
     if trimmed.is_empty() { return; }
     let fonts = crate::font::fonts();
-    let baseline_offset = font_size * 0.85;
+    // The baseline sits half the leading plus the font's ascent below the line
+    // box's top — the same split `strut_split` gives layout, so paint puts the
+    // glyphs where the line boxes were measured to hold them. A fixed 0.85em
+    // ignored the leading altogether, so text on a line taller than its own
+    // font came out that much too high: at `line-height: 40px` on a 16px face,
+    // ten pixels of it.
+    let baseline_offset = line_height - fonts.below_baseline(font_size, style, line_height);
     let mut current_y = rect.y + baseline_offset;
     let mut current_x = rect.x + first_line_indent;
     let space_w = fonts.advance(' ', font_size, style) + letter_spacing;
@@ -2112,6 +2118,39 @@ mod tests {
         execute_commands_on_tile(&cmds, &mut pixmap, tile_rect, &HashMap::new(), &base_url);
 
         assert_ne!(pixmap.data(), before.as_slice(), "zero-blur shadow must modify the pixmap");
+    }
+
+    /// The baseline sits half the leading plus the font's ascent below the line
+    /// box's top. A fixed 0.85em ignored the leading, so text on a line taller
+    /// than its own font came out that much too high — ten pixels of it at
+    /// `line-height: 40px` on a 16px face.
+    #[test]
+    fn test_the_baseline_follows_the_line_s_leading() {
+        use crate::font::{fonts, FontStyle};
+        let style = FontStyle::regular();
+        for (font_size, line_height) in [(16.0_f32, 40.0_f32), (16.0, 24.0), (14.0, 21.0)] {
+            let below = fonts().below_baseline(font_size, style, line_height);
+            let baseline = line_height - below;
+            // The glyphs' own band is the font's ascent and descent; the rest of
+            // the line is leading, split evenly above and below.
+            let natural = fonts().normal_line_height(font_size, style);
+            let half_leading = ((line_height - natural) / 2.0).max(0.0);
+            assert!(
+                baseline > half_leading,
+                "the baseline is below the leading: {baseline} vs {half_leading}",
+            );
+            assert!(
+                (below - (line_height - baseline)).abs() < 0.01,
+                "what is above and what is below make up the line",
+            );
+        }
+        // A taller line pushes the baseline down by half of what it added.
+        let tight = 24.0 - fonts().below_baseline(16.0, style, 24.0);
+        let loose = 40.0 - fonts().below_baseline(16.0, style, 40.0);
+        assert!(
+            (loose - tight - 8.0).abs() < 0.5,
+            "16px more leading moves the baseline down 8px: {tight} -> {loose}",
+        );
     }
 
     /// A clip rect that is empty along one axis clips its subtree away. The path

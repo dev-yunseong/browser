@@ -146,6 +146,9 @@ Ordered by how much of a page each one destroyed.
 | A character no bundled face covers never looked at the system's fonts | A browser resolves a family it cannot satisfy through the system's own fonts, and the fallback for an uncovered codepoint is the same search. This engine went straight to the bundled NanumGothic, whose Hangul advance is 0.94em against the 1.00em of the Unifont Chromium picks here, so every Korean run on yunseong.dev came out 5.5% narrow — enough to keep a line the reference wraps. |
 | An atomic inline aligned to the line's top instead of its baseline | Everything on a line hangs from one baseline, and an empty `inline-block` — the twelve-pixel square an icon is — rests its bottom margin edge there. Top-aligning it put every icon beside a run of text three pixels too high. |
 | A block's bottom margin dropped before inline content | The margin is held back to collapse with the *next block's* top margin; inline content after it forms an anonymous block, which has none to collapse with, so the held margin is simply space before it. Held and never spent, it vanished. |
+| The baseline placed a fixed 0.85em below the line's top | It sits half the *leading* plus the font's ascent below it, which is the split layout already measured its line boxes with. Ignoring the leading drew every run on a line taller than its own font that much too high — three pixels at the `line-height: 1.5` a design system writes, ten at `line-height: 40px` on a 16px face. |
+| `text-decoration` never reaching the text it underlines | It does not inherit, but the line an ancestor draws runs under its in-flow descendants — and the text node carrying the glyphs is where the line is actually drawn. Nothing carried it there, so no link on any page was underlined. |
+| A comment counted as content between two blocks | It took an empty inline box, which broke the two blocks' margins collapsing: a comment written between a heading and a paragraph pushed the paragraph down by the heading's whole margin. |
 | Flow advancing past the content box | A box that states a height and carries padding handed the next block a cursor its own padding too high, and every section below it climbed by that much. |
 
 
@@ -157,9 +160,9 @@ pixels:
 
 | fixture | layout | fold | page | height (chromium -> engine) |
 |---|---|---|---|---|
-| github.com | 1.37% | 2.90% | 1.61% | 10570 -> 10553 |
-| yunseong.dev | 1.41% | 3.18% | 3.05% | 4976 -> 4976 |
-| naver.com | 1.26% | 2.91% | 2.52% | 18658 -> 16384 |
+| github.com | 1.20% | 2.84% | 1.55% | 10570 -> 10553 |
+| yunseong.dev | 1.03% | 2.56% | 2.68% | 4976 -> 4976 |
+| naver.com | 1.21% | 3.10% | 2.68% | 18658 -> 16384 |
 
 github.com began this work at 9.14% layout, 13.84% fold and 780px too tall;
 yunseong.dev at 4.24% and 256px too short. github's page is now within a single

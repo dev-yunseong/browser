@@ -39,5 +39,17 @@
   </section>
   <div class="indent"><span><span class="lead">Plan with clarity.</span> Organize everything from high-level roadmaps to everyday tasks.</span></div>
   <div class="after"><span class="prefix">prefix</span> This sentence wraps against the whole line box on every line but its first, which starts after the box to its left.</div>
+  <section>
+    <h2>text decoration</h2>
+    <!-- `text-decoration` does not inherit; the line an ancestor draws runs
+         under its in-flow descendants, and stops at an atomic inline. -->
+    <p><a href="#">a plain link</a></p>
+    <p><a href="#"><span>a link with a span inside it</span></a></p>
+    <p><a href="#" style="text-decoration: none">a link that turns it off</a></p>
+    <p><a href="#" style="display: inline-flex">an inline-flex link</a></p>
+    <p style="text-decoration: underline">a paragraph that underlines <em>everything inside it</em></p>
+    <p style="text-decoration: underline">and it stops at <span style="display: inline-block; background: #eef">an atomic inline</span> here</p>
+    <p style="text-decoration: line-through">struck through, <span>span included</span></p>
+  </section>
 </body>
 </html>

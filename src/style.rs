@@ -1026,6 +1026,30 @@ fn build_final_tree(
                             specified_values.entry(prop_arc).or_insert_with(|| v.clone());
                         }
                     }
+
+                    // `text-decoration` does not inherit, but the line an
+                    // ancestor draws runs under its in-flow descendants — and
+                    // since the text node carrying the glyphs is where the line
+                    // is actually drawn, propagating it is what puts it there.
+                    // Nothing did, so no link on any page was underlined.
+                    //
+                    // It stops at an atomic inline, which starts a decoration
+                    // context of its own: a button inside a link is not
+                    // underlined.
+                    let decoration = intern("text-decoration");
+                    let starts_own_context = matches!(
+                        specified_values.get(&intern("display")),
+                        Some(Value::Keyword(k))
+                            if matches!(
+                                &**k,
+                                "inline-block" | "inline-flex" | "inline-grid" | "inline-table" | "table"
+                            )
+                    );
+                    if !starts_own_context {
+                        if let Some(v) = p.get(&decoration) {
+                            specified_values.entry(decoration).or_insert_with(|| v.clone());
+                        }
+                    }
                 }
 
                 // --- Step 3: Resolve font-size em/% first (needs parent font-size) ---
@@ -2529,6 +2553,61 @@ mod tests {
                 || named.specified_values.get(&intern("background-color")).is_some(),
             "the first rule's background must survive the second rule's `content`",
         );
+    }
+
+    /// `text-decoration` does not inherit, but the line an ancestor draws runs
+    /// under its in-flow descendants — and the text node carrying the glyphs is
+    /// where the line is actually drawn, so it has to reach there. Nothing
+    /// carried it, and no link on any page was underlined.
+    #[test]
+    fn test_text_decoration_reaches_the_text_it_underlines() {
+        fn decoration_of<'a>(n: &'a StyledNode, text: &str) -> Option<String> {
+            if let markup5ever_rcdom::NodeData::Text { ref contents } = n.node.data {
+                if contents.borrow().trim() == text {
+                    return match n.specified_values.get(&intern("text-decoration")) {
+                        Some(Value::Keyword(k)) => Some(k.to_string()),
+                        _ => Some("<unset>".to_string()),
+                    };
+                }
+            }
+            n.children.iter().find_map(|c| decoration_of(c, text))
+        }
+
+        let tree = make_tree(
+            r##"<a href="#">a link</a>
+               <a href="#"><span>a link with a span</span></a>
+               <a href="#" style="text-decoration: none">a bare link</a>
+               <p style="text-decoration: underline">underlined <em>and stressed</em></p>"##,
+            "",
+        );
+        assert_eq!(decoration_of(&tree, "a link").as_deref(), Some("underline"));
+        assert_eq!(decoration_of(&tree, "a link with a span").as_deref(), Some("underline"));
+        assert_eq!(decoration_of(&tree, "a bare link").as_deref(), Some("none"));
+        assert_eq!(decoration_of(&tree, "and stressed").as_deref(), Some("underline"));
+    }
+
+    /// It stops at an atomic inline, which starts a decoration context of its
+    /// own: a button inside a link is not underlined.
+    #[test]
+    fn test_text_decoration_stops_at_an_atomic_inline() {
+        fn decoration_of<'a>(n: &'a StyledNode, text: &str) -> Option<String> {
+            if let markup5ever_rcdom::NodeData::Text { ref contents } = n.node.data {
+                if contents.borrow().trim() == text {
+                    return match n.specified_values.get(&intern("text-decoration")) {
+                        Some(Value::Keyword(k)) => Some(k.to_string()),
+                        _ => Some("<unset>".to_string()),
+                    };
+                }
+            }
+            n.children.iter().find_map(|c| decoration_of(c, text))
+        }
+
+        let tree = make_tree(
+            r##"<a href="#">before <span style="display: inline-block">a button</span> after</a>"##,
+            "",
+        );
+        assert_eq!(decoration_of(&tree, "before").as_deref(), Some("underline"));
+        assert_eq!(decoration_of(&tree, "a button").as_deref(), Some("<unset>"));
     }
 
     /// Cascade layer order beats specificity: an unlayered rule wins over one

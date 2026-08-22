@@ -4883,7 +4883,17 @@ fn is_none_display(sn: &StyledNode) -> bool {
 }
 
 fn should_skip(child: &StyledNode) -> bool {
-    // First check the CSS display property — display:none always hides the element.
+    // A comment is not content: it takes no box and, being nothing, does not
+    // stand between two blocks whose margins collapse. Laying one out as an
+    // empty inline broke that collapse, so a comment written between a heading
+    // and a paragraph pushed the paragraph down by the heading's whole margin.
+    if matches!(
+        child.node.data,
+        NodeData::Comment { .. } | NodeData::ProcessingInstruction { .. } | NodeData::Doctype { .. }
+    ) {
+        return true;
+    }
+    // Then the CSS display property — display:none always hides the element.
     if is_none_display(child) {
         return true;
     }

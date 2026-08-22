@@ -39,5 +39,16 @@
     <li><a class="a pad" href="#">Copilot</a></li>
     <li><a class="a pad" href="#">Security</a></li>
   </ul></section>
+  <section>
+    <h2>the leading a taller line adds is split above and below</h2>
+    <!-- The baseline sits half the leading plus the font's ascent below the
+         line box's top, so a line taller than its own font pushes its text
+         down by half of what it added. -->
+    <p style="line-height: 1; background: #eef">line-height 1 — Hxy</p>
+    <p style="line-height: 1.5; background: #eef">line-height 1.5 — Hxy</p>
+    <p style="line-height: 2.5; background: #eef">line-height 2.5 — Hxy</p>
+    <p style="line-height: 40px; font-size: 16px; background: #eef">40px on a 16px face — Hxy</p>
+    <p style="line-height: 40px; font-size: 16px; background: #eef">and it wraps the same way over a second line when the run is long enough to need one — Hxy</p>
+  </section>
 </body>
 </html>
