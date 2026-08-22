@@ -144,7 +144,7 @@ impl IntrinsicSizeCache {
                             continue;
                         }
                         let child_disp = get_display_type(child);
-                        if is_block_level(child_disp) {
+                        if is_block_level_for(child, child_disp) {
                             max_w = max_w.max(inline_run_width);
                             inline_run_width = 0.0;
                             max_w = max_w.max(child_total);
@@ -918,7 +918,7 @@ impl<'a> LayoutBox<'a> {
         containing_block: Option<Rect>,
         intrinsic_cache: &mut IntrinsicSizeCache,
     ) -> (Option<LayoutBox<'a>>, f32, f32) {
-        let is_block = is_block_level(self.display);
+        let is_block = is_block_level_for(self.style_node, self.display);
 
         // Block formatting context or similar check
         if is_block && initial_x > container_start_x {
@@ -1306,7 +1306,7 @@ impl<'a> LayoutBox<'a> {
                 let measure_width =
                     if let Some(basis) = flex_basis {
                         basis.min(inner_width).max(0.0)
-                    } else if is_row && is_block_level(child_display) && !child_has_explicit_width {
+                    } else if is_row && is_block_level_for(child_node, child_display) && !child_has_explicit_width {
                         // Shrink-wrap: use max-content so block items don't fill the flex container.
                         intrinsic_cache
                             .max_content_width(child_node, vw, vh)
@@ -2204,7 +2204,7 @@ impl<'a> LayoutBox<'a> {
             let child_disp = get_display_type(child_node);
             let kind = if let Some(side) = float_side {
                 ChildKind::Float(side)
-            } else if is_block_level(child_disp) {
+            } else if is_block_level_for(child_node, child_disp) {
                 ChildKind::Block
             } else {
                 ChildKind::Inline
@@ -3034,15 +3034,25 @@ fn get_display_type(sn: &StyledNode) -> DisplayType {
     } else {
         false
     };
+    // An image is a replaced element: `display` decides how its box participates
+    // in flow, not whether it still draws an image. `display: block` on an <img>
+    // is how nearly every stylesheet removes the inline baseline gap under a
+    // picture, and treating that as "become a plain block" stopped the image
+    // being painted at all and left the box with no intrinsic height.
+    let is_image = matches!(
+        sn.node.data,
+        NodeData::Element { ref name, .. } if name.local.as_ref() == "img"
+    );
     if let Some(Value::Keyword(d)) = sn.specified_values.get(&crate::css::intern("display")) {
         match &**d {
+            "none" => return DisplayType::Inline,
+            _ if is_image => return DisplayType::Image,
             "block" if is_form_control => return DisplayType::Input,
             "block" => return DisplayType::Block,
             "inline-block" if is_form_control => return DisplayType::Input,
             "inline-block" => return DisplayType::InlineBlock,
             "flex" => return DisplayType::Flex,
             "grid" => return DisplayType::Grid,
-            "none" => return DisplayType::Inline,
             _ => {}
         }
     }
@@ -3070,6 +3080,22 @@ fn get_display_type(sn: &StyledNode) -> DisplayType {
     } else {
         DisplayType::Block
     }
+}
+
+/// Whether a box participates in flow as block-level.
+///
+/// A replaced element keeps its own `DisplayType` so it still draws, which means
+/// that type no longer says how the box flows: `display: block` on an `<img>`
+/// must put it on its own line, and reading block-ness off the type alone left
+/// such images overlapping the content around them.
+fn is_block_level_for(sn: &StyledNode, d: DisplayType) -> bool {
+    if is_block_level(d) {
+        return true;
+    }
+    matches!(
+        sn.specified_values.get(&crate::css::intern("display")),
+        Some(Value::Keyword(k)) if matches!(&**k, "block" | "flex" | "grid" | "list-item" | "table")
+    )
 }
 
 fn is_block_level(d: DisplayType) -> bool {

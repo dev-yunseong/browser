@@ -346,54 +346,47 @@ fn execute_commands_on_tile(
                         let img_h = rgba.height() as f32;
                         if let Some(mut img_pixmap) = Pixmap::new(rgba.width(), rgba.height()) {
                             img_pixmap.data_mut().copy_from_slice(&rgba);
-                            match object_fit {
-                                ObjectFit::Fill => {
-                                    // Stretch to fill — existing behavior
-                                    pixmap.draw_pixmap(r.x as i32, r.y as i32, img_pixmap.as_ref(),
-                                        &PixmapPaint::default(),
-                                        transform.post_scale(r.width / img_w, r.height / img_h), active_mask!());
-                                }
-                                ObjectFit::Contain => {
-                                    // Scale uniformly to fit inside rect; letterbox with transparency
-                                    let s = (r.width / img_w).min(r.height / img_h);
-                                    let sw = img_w * s;
-                                    let sh = img_h * s;
-                                    let ox = r.x + (r.width - sw) / 2.0;
-                                    let oy = r.y + (r.height - sh) / 2.0;
-                                    pixmap.draw_pixmap(ox as i32, oy as i32, img_pixmap.as_ref(),
-                                        &PixmapPaint::default(),
-                                        transform.post_scale(s, s), active_mask!());
-                                }
-                                ObjectFit::Cover => {
-                                    // Scale uniformly to fill rect; draw into a temp pixmap to clip overflow
-                                    let s = (r.width / img_w).max(r.height / img_h);
-                                    let sw = img_w * s;
-                                    let sh = img_h * s;
-                                    let rw = r.width as u32;
-                                    let rh = r.height as u32;
-                                    if let Some(mut tmp) = Pixmap::new(rw.max(1), rh.max(1)) {
-                                        let local_ox = (r.width - sw) / 2.0;
-                                        let local_oy = (r.height - sh) / 2.0;
-                                        tmp.draw_pixmap(local_ox as i32, local_oy as i32,
-                                            img_pixmap.as_ref(), &PixmapPaint::default(),
-                                            Transform::from_scale(s, s), None);
-                                        pixmap.draw_pixmap(r.x as i32, r.y as i32, tmp.as_ref(),
-                                            &PixmapPaint::default(), transform, active_mask!());
+                            // Every fit mode scales the source into a temporary
+                            // pixmap the size of the destination box, then blits
+                            // that at the box's position.
+                            //
+                            // Scaling during the blit instead would scale the
+                            // destination offset along with the image —
+                            // `draw_pixmap` applies its transform to the placed
+                            // result, not just to the source — so a scaled-down
+                            // image landed at a fraction of its intended y and
+                            // painted over whatever was above it.
+                            let dest_w = r.width.round().max(1.0) as u32;
+                            let dest_h = r.height.round().max(1.0) as u32;
+                            if let Some(mut tmp) = Pixmap::new(dest_w, dest_h) {
+                                match object_fit {
+                                    ObjectFit::Fill => {
+                                        tmp.draw_pixmap(0, 0, img_pixmap.as_ref(), &PixmapPaint::default(),
+                                            Transform::from_scale(r.width / img_w, r.height / img_h), None);
                                     }
-                                }
-                                ObjectFit::None => {
-                                    // Intrinsic size (1:1 scale), clip to rect using a temp pixmap
-                                    let rw = r.width as u32;
-                                    let rh = r.height as u32;
-                                    if let Some(mut tmp) = Pixmap::new(rw.max(1), rh.max(1)) {
+                                    ObjectFit::Contain | ObjectFit::Cover => {
+                                        // Contain fits inside the box and letterboxes;
+                                        // Cover fills it and lets the overflow be
+                                        // cropped by the temporary pixmap's edges.
+                                        let s = if matches!(object_fit, ObjectFit::Contain) {
+                                            (r.width / img_w).min(r.height / img_h)
+                                        } else {
+                                            (r.width / img_w).max(r.height / img_h)
+                                        };
+                                        let ox = (r.width - img_w * s) / 2.0;
+                                        let oy = (r.height - img_h * s) / 2.0;
+                                        tmp.draw_pixmap(ox as i32, oy as i32, img_pixmap.as_ref(),
+                                            &PixmapPaint::default(), Transform::from_scale(s, s), None);
+                                    }
+                                    ObjectFit::None => {
                                         let ox = (r.width - img_w) / 2.0;
                                         let oy = (r.height - img_h) / 2.0;
                                         tmp.draw_pixmap(ox as i32, oy as i32, img_pixmap.as_ref(),
                                             &PixmapPaint::default(), Transform::identity(), None);
-                                        pixmap.draw_pixmap(r.x as i32, r.y as i32, tmp.as_ref(),
-                                            &PixmapPaint::default(), transform, active_mask!());
                                     }
                                 }
+                                pixmap.draw_pixmap(r.x as i32, r.y as i32, tmp.as_ref(),
+                                    &PixmapPaint::default(), transform, active_mask!());
                             }
                             true
                         } else { false }
