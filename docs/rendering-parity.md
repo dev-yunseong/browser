@@ -79,15 +79,52 @@ Ordered by how much of a page each one destroyed.
 | A text run given half the line | The caller subtracted what the line already held, and the run subtracted it again from its own start position. Every run after an inline sibling was laid out in half the room it had. |
 | A line broken before its first word | The leading inter-element space counted as content, so the first word of a run could wrap onto a line of its own. |
 | Collapsed inter-run space dropped when measuring | The intrinsic measurement trimmed the whitespace layout keeps, so a box sized from max-content was narrower than the run it had to hold and wrapped inside itself. |
+| Flex containers measured as flow containers | A row's max-content took the *max* of its block-level children instead of their sum, so a "field + button" row was sized to whichever half was wider and the other hung outside it. The `gap` between items was left out of both intrinsic measurements as well, and the whitespace between two tags was counted as an item — a two-item row became four, and paid the gap twice more than it should have. |
+| `box-sizing: border-box` honoured in layout but not in measurement | A stated width had its padding added on top again, and a stated *height* was never inset at all, so a `height: 48px` button drew 62px tall and pushed its row down. |
+| Out-of-flow children counted toward intrinsic width | An absolutely positioned box is sized against its containing block and adds nothing to its parent's content width. github floats its "Enter your email" label over the field with `position: absolute`; counting it made the field 105px wider than the field. |
+| Cascade layers unmodelled | An unlayered declaration beats every layer, and layers apply in the order they are named. github writes `.CtaFormControl-input::placeholder { opacity: 0 }` unlayered and lets it beat the `@layer primer-brand` rule 700KB later in the same page. |
+| `::placeholder` unrecognised | A page that replaces the placeholder with its own floating label hides it with `opacity: 0`; the engine drew both, on top of each other. |
+| Parent/child margins dropped rather than transferred | A first child's top margin and a last child's bottom margin *become* the parent's, which is what makes the space land outside the parent. Dropping them pulled the top of every page up by its first paragraph's margin. |
+| Negative margins thrown away by the collapse | Two adjoining margins collapse to the largest positive plus the most negative; taking the plain maximum meant a negative margin met by zero simply vanished, and a page that overlaps two sections on purpose got a gap where the overlap should be. |
+| CSS logical properties unrecognised | `padding-inline`, `margin-block`, `inset-inline-start`, `inline-size` and the rest were dropped outright. github's marketing header states its 24px side padding as `padding-inline` alone, so the header ran edge to edge and pushed "Sign in" off the viewport. |
+| `top` and `bottom` together did not stretch a box | An overlay written as `position: absolute; inset: 0` came out its content's height — zero, for the empty element a gradient wash is — and never painted. |
+| Percentage heights unresolved, percentage widths applied twice | `height: 50%` resolved to nothing; a positioned child's `width: 40%` was resolved against its own already-resolved width, giving 40% of 40%. |
+| `filter: blur()` unparsed | A design system's decorative washes are gradients under a heavy blur, drawn as hard-edged blobs without it. The box blur behind it was wrong too — it seeded the accumulator with one window and slid it as if centred on another, so a blurred square came out as two bright bands with a hole between them. |
+| `border-radius` in percent read as pixels | `border-radius: 50%` on a wide box is a full ellipse; reading the 50 as a pixel count drew a barely-rounded rectangle. |
+| Broken images painted as a grey slab | A browser leaves the box transparent, outlines it and writes the `alt`. Filling it with light grey turned every unreachable image into the loudest thing on the page. |
+| An `<svg>` with no `viewBox` had no intrinsic ratio | Its `width` and `height` attributes *are* its intrinsic size. github ships `<svg width="2280" height="1200">` as a spacer, and getting it wrong made that block 112px too tall. |
+| Font stacks read as a set, not a list | Matching walks the stack in order and takes the first family the system can satisfy. Asking only whether the stack mentions `serif` or `monospace` anywhere sent every modern stack to the sans default — and `system-ui`, which yunseong.dev's stack reaches first, resolves to a face markedly wider than `sans-serif`. Every line of that page was measured in the wrong face. |
+| `ch` and `ex` measured in the default face | They are metrics of the element's *own* font, so a `max-width: 46ch` cap came out 59px narrower than the browser's. |
+| The space before a word left out of the fit test | A line could end up a space wider than its container — one line's difference in the height of any paragraph whose last word misses by less than a space. Paint already did it the right way, which is exactly why the two disagreed. |
+| Kerning not applied | Advances were summed without it, so a DejaVu Sans line measured about a pixel wider than the browser draws it. |
+| `white-space: pre-line` ignored | The source's own newlines were re-flowed away. |
+| Grid items always stretched | They fill their cell only under `stretch`. `align-items: center` is how a page puts a portrait beside a taller column of text without letting the portrait grow to match it. |
+| Bold threshold at 600 | CSS font matching with two weights takes the heavier face for any desired weight *above 500*, so `font-weight: 560` came out at book weight. |
+| Only the first line of a run indented — for every line | A run after an inline element was measured against the leftover width for all of its lines, not just the first, so any paragraph with an inline element in it wrapped early. github's section headings — a bold lead-in span followed by the rest of the sentence — came out a line taller than the browser draws them, once per heading. |
+| A stated height lost on a flex or grid container | Both paths derived a height from their content whenever `dimensions.height` had not been set yet, which is always. A `display: flex` button with `height: 48px` came out however tall its label made it. |
+| A form control identified by its `display` | Primer sets `display: flex` on its text inputs; reading the display instead of the element collapsed github's email field to its own top padding. |
+| A `var()` in a border shorthand placed by position alone | `border: solid var(--borderWidth-thin) transparent` has its only open slot at the *end*, and the width was dropped, leaving the button with no border at all. |
+| The `background` shorthand did not reset the colour | Chromium serialises `background: none` back as `background: 0px 0px`, and github's accordions ship exactly that to turn off the UA's grey button fill — which stayed on, as a light bar behind every heading. |
 
 ## Where it stands
 
-Thirteen of the fifteen probe fixtures sit at or below 1% of a 16px block-mean
-diff, and `probe-gradient` is pixel-identical over the first fold. The two that
-are not — `probe-controls` at 2.6% and `probe-sizing` at 0.8% — are held back by
-the box model, below. Of the three sites, yunseong.dev is at 3.7% and
-github.com at 15.3%; naver.com cannot be measured until its snapshot is
-re-captured with CSS in it.
+Measured with `node tools/parity/diff.mjs`, as a 16px block-mean difference
+over the whole page, over the first fold's pixels, and over the whole page's
+pixels:
+
+| fixture | layout | fold | page | height (chromium -> engine) |
+|---|---|---|---|---|
+| github.com | 2.56% | 3.37% | 12.51% | 10570 -> 10654 |
+| yunseong.dev | 1.51% | 3.34% | 3.99% | 4976 -> 5012 |
+| naver.com | 1.32% | 2.89% | 2.56% | 18658 -> 16384 |
+
+Sixteen of the twenty probe fixtures sit at or below 1%, and `probe-grid` is
+pixel-identical over the fold. github.com began this run at 9.14% / 13.84% and
+780px too tall; yunseong.dev at 4.24% and 256px too short.
+
+naver.com's number means little: its snapshot was captured without CSS (see
+below), so both renderers are drawing an unstyled page and the comparison only
+exercises the UA stylesheet.
 
 ## What still limits parity
 
@@ -95,13 +132,23 @@ re-captured with CSS in it.
   landing page is largely a WebGL canvas and a video, so a large share of its
   remaining difference is content this engine does not draw at all rather than
   draws wrongly.
+- **`filter: blur()` applies to an element's own background, not to its
+  subtree.** The decorative washes it exists for are empty boxes, so that is
+  the whole effect there; a filtered element with content of its own keeps that
+  content sharp.
+- **`justify-items` other than `stretch` is not modelled** — a grid item always
+  fills its cell on the inline axis.
+- **`transform` is not applied to painted boxes**, so a wash the page rotates
+  or offsets sits square and where it was written.
 - **Two box models coexist** — see `tools/parity/README.md` for the two failed
-  migrations and what each one hit. The visible cost is a shrink-to-fit control
-  coming out narrower than its own label (`probe-controls`).
-- **Inline runs do not fragment across lines**, so a wrapped run's continuation
-  is indented to wherever the run began (`probe-inline`).
+  migrations and what each one hit.
+- **Inline runs do not fragment across lines.** A run's box spans the line box
+  and its first line is indented, which is enough for line *breaking* to match;
+  a wrapped run still cannot have a different height or background per line.
 - **A snapshot can only be as good as its capture.** `capture.mjs` now inlines
   fonts as well as stylesheets and images, but a snapshot taken before that
   still points at a CDN, and a page rendered against a fallback face is a
-  difference in the snapshot rather than in either renderer. Re-capture before
-  reading a font-heavy page's numbers.
+  difference in the snapshot rather than in either renderer. naver.com's
+  snapshot has no CSS in it at all and cannot be re-captured from a sandbox
+  with no outbound network; re-capture before reading its numbers or a
+  font-heavy page's.
