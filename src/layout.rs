@@ -361,6 +361,34 @@ fn read_grid_placement(sn: &StyledNode, axis: &str) -> GridPlacement {
     }
 }
 
+/// Clamp a computed height to `min-height` / `max-height`.
+///
+/// Every formatting context has to apply these, not just block: a flex or grid
+/// container whose height came from its own algorithm still answers to them,
+/// and skipping the clamp there let a navbar sized by `min-height` collapse to
+/// its content.
+fn clamp_height(sn: &StyledNode, box_sizing: &str, padding: &EdgeSizes, border: &EdgeSizes, height: f32) -> f32 {
+    let inset = |v: f32| {
+        if box_sizing == "border-box" {
+            (v - padding.top - padding.bottom - border.top - border.bottom).max(0.0)
+        } else {
+            v
+        }
+    };
+    let read = |prop: &str| match sn.specified_values.get(&crate::css::intern(prop)) {
+        Some(Value::Length(v, Unit::Px)) => Some(inset(*v)),
+        _ => None,
+    };
+    let mut height = height;
+    if let Some(max_h) = read("max-height") {
+        height = height.min(max_h);
+    }
+    if let Some(min_h) = read("min-height") {
+        height = height.max(min_h);
+    }
+    height
+}
+
 fn read_aspect_ratio(sn: &StyledNode) -> Option<f32> {
     let value = sn.specified_values.get(&crate::css::intern("aspect-ratio"))?;
     let ratio = match value {
@@ -1738,6 +1766,13 @@ impl<'a> LayoutBox<'a> {
             if self.dimensions.height <= 0.0 || height <= 0.0 {
                 self.dimensions.height = if is_row { total_cross } else { column_main };
             }
+            self.dimensions.height = clamp_height(
+                self.style_node,
+                box_sizing,
+                &self.padding,
+                &self.border,
+                self.dimensions.height,
+            );
 
             // ── Layout absolutely/fixedly positioned children inside flex container ──
             // Same logic as the block layout path: position after container size is known.
@@ -2156,6 +2191,13 @@ impl<'a> LayoutBox<'a> {
             if self.dimensions.height <= 0.0 || height <= 0.0 {
                 self.dimensions.height = content_height;
             }
+            self.dimensions.height = clamp_height(
+                self.style_node,
+                box_sizing,
+                &self.padding,
+                &self.border,
+                self.dimensions.height,
+            );
 
             let final_x = container_start_x; // grid containers are block-level
             let final_y = self.dimensions.y + self.dimensions.height + self.margin.bottom;
@@ -2584,34 +2626,9 @@ impl<'a> LayoutBox<'a> {
 
         let content_height =
             (cursor_y - self.dimensions.y + self.padding.bottom + self.border.bottom).max(0.0);
-        let mut final_h = if height > 0.0 { height } else { content_height };
-        if let Some(Value::Length(v, Unit::Px)) = self
-            .style_node
-            .specified_values
-            .get(&crate::css::intern("max-height"))
-        {
-            let max_h = if box_sizing == "border-box" {
-                (*v - self.padding.top - self.padding.bottom - self.border.top - self.border.bottom)
-                    .max(0.0)
-            } else {
-                *v
-            };
-            final_h = final_h.min(max_h);
-        }
-        if let Some(Value::Length(v, Unit::Px)) = self
-            .style_node
-            .specified_values
-            .get(&crate::css::intern("min-height"))
-        {
-            let min_h = if box_sizing == "border-box" {
-                (*v - self.padding.top - self.padding.bottom - self.border.top - self.border.bottom)
-                    .max(0.0)
-            } else {
-                *v
-            };
-            final_h = final_h.max(min_h);
-        }
-        self.dimensions.height = final_h;
+        let final_h = if height > 0.0 { height } else { content_height };
+        self.dimensions.height =
+            clamp_height(self.style_node, box_sizing, &self.padding, &self.border, final_h);
 
         // ── Layout absolutely/fixedly positioned children ─────────────────────
         // Now that self has its final dimensions, we can resolve absolute offsets against it.
