@@ -1536,6 +1536,26 @@ mod tests {
         build_style_tree(&dom.document, &stylesheet, None, &js_overrides, None, None, None)
     }
 
+    /// The same case rule applies to a custom property set in a `style`
+    /// attribute: lowercasing `--Spacer-size` there meant every `var()` naming
+    /// it missed, and the declaration fell through to its own fallback — which
+    /// is how a 20px spacer came out 112px tall.
+    #[test]
+    fn test_inline_custom_property_names_are_case_sensitive() {
+        let html = r#"<div style="--Spacer-size: 20px"><div id="s" style="height: var(--Spacer-size, 112px)">x</div></div>"#;
+        let tree = make_tree(html, "");
+        fn find_id<'a>(n: &'a StyledNode, id: &str) -> Option<&'a StyledNode> {
+            if let markup5ever_rcdom::NodeData::Element { ref attrs, .. } = n.node.data {
+                if attrs.borrow().iter().any(|a| a.name.local.as_ref() == "id" && a.value.as_ref() == id) {
+                    return Some(n);
+                }
+            }
+            n.children.iter().find_map(|c| find_id(c, id))
+        }
+        let s = find_id(&tree, "s").expect("spacer");
+        assert_eq!(get_length_px(s, "height"), Some(20.0));
+    }
+
     /// A design system's tokens are mixed-case — `--borderColor-default`, not
     /// `--bordercolor-default`. Custom property names are case-sensitive, so
     /// lowercasing them at parse time made every `var()` naming one look up a
@@ -1973,7 +1993,16 @@ pub fn parse_inline_style_into_vec(style_str: &str, list: &mut Vec<crate::css::D
         let decl = decl.trim();
         if decl.is_empty() { continue; }
         let mut kv = decl.splitn(2, ':');
-        let key = intern(&kv.next().unwrap_or("").trim().to_lowercase());
+        // Property names are case-insensitive, custom property names are not —
+        // the same rule the stylesheet parser follows. Lowercasing a
+        // `--Spacer-size` set in a `style` attribute meant every `var()` naming
+        // it missed, and the declaration fell through to its own fallback.
+        let raw_key = kv.next().unwrap_or("").trim();
+        let key = if raw_key.starts_with("--") {
+            intern(raw_key)
+        } else {
+            intern(&raw_key.to_lowercase())
+        };
         let val_raw = kv.next().unwrap_or("").trim();
         if key.is_empty() || val_raw.is_empty() { continue; }
 
