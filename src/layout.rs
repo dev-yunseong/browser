@@ -2133,6 +2133,13 @@ impl<'a> LayoutBox<'a> {
                 if !is_row && lines.len() == 1 {
                     line_cross = line_cross.max(inner_width);
                 }
+                // The row equivalent: a single line in a container with a
+                // definite height fills that height, so `align-items: center`
+                // centres against the container rather than against the tallest
+                // item — which by definition fills the line.
+                if is_row && lines.len() == 1 && height > 0.0 {
+                    line_cross = line_cross.max(height);
+                }
 
                 // Place each item.
                 for (idx_in_line, &i) in line_indices.iter().enumerate() {
@@ -2251,7 +2258,13 @@ impl<'a> LayoutBox<'a> {
                     total_cross
                 };
             }
-            if self.dimensions.height <= 0.0 || height <= 0.0 {
+            // A stated height is the height, as it is in flow: deriving one from
+            // the content whenever `dimensions.height` had not been set yet
+            // threw it away, so a `display: flex` button with `height: 48px`
+            // came out however tall its label made it.
+            if height > 0.0 {
+                self.dimensions.height = height;
+            } else if self.dimensions.height <= 0.0 {
                 // `total_cross` is the sum of the line heights, which is the
                 // content box; a row container's own padding and border sit
                 // outside it and have to be added back.
@@ -2749,11 +2762,12 @@ impl<'a> LayoutBox<'a> {
             // pixels short.
             let content_height = (child_y - self.dimensions.y
                 + self.padding.bottom + self.border.bottom).max(0.0);
-            if self.dimensions.height <= 0.0 || height <= 0.0 {
+            // A stated height is the height; see the same rule in the flex path.
+            if height > 0.0 {
+                self.dimensions.height = height;
+            } else if self.dimensions.height <= 0.0 {
                 self.dimensions.height = match read_aspect_ratio(self.style_node) {
-                    Some(ratio) if height <= 0.0 && self.dimensions.width > 0.0 => {
-                        self.dimensions.width / ratio
-                    }
+                    Some(ratio) if self.dimensions.width > 0.0 => self.dimensions.width / ratio,
                     _ => content_height,
                 };
             }
@@ -4675,6 +4689,50 @@ mod tests {
         let wash = find_element_by_id(&layout, "wash").expect("wash");
         assert_eq!(wash.dimensions.width, 320.0, "40% of 800");
         assert_eq!(wash.dimensions.x, 40.0, "5% of 800");
+    }
+
+    // ── Flex container sizing ─────────────────────────────────────────────────
+
+    /// A stated height is the height of a flex container too. Deriving one from
+    /// the content whenever it had not been set yet threw it away, so a
+    /// `display: flex` button with `height: 48px` — which is how a design
+    /// system builds every button that centres its label — came out however
+    /// tall its label made it.
+    #[test]
+    fn test_a_flex_container_keeps_its_stated_height() {
+        let html = r#"<div id="b" style="display:flex;align-items:center;height:48px;padding:6px 20px;border:1px solid #000;box-sizing:border-box"><span>Sign up</span></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let b = find_element_by_id(&layout, "b").expect("b");
+        assert_eq!(b.paint_rect().height, 48.0, "the box is the stated 48");
+    }
+
+    /// The same for a grid container.
+    #[test]
+    fn test_a_grid_container_keeps_its_stated_height() {
+        let html = r#"<div id="g" style="display:grid;height:120px;grid-template-columns:1fr"><div style="height:10px"></div></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        assert_eq!(
+            find_element_by_id(&layout, "g").expect("g").paint_rect().height,
+            120.0
+        );
+    }
+
+    /// A single flex line in a container with a definite height fills that
+    /// height, so `align-items: center` centres against the container rather
+    /// than against the tallest item — which by definition fills the line.
+    #[test]
+    fn test_a_single_flex_line_fills_a_definite_height() {
+        let html = r#"<div id="row" style="display:flex;align-items:center;width:300px;height:100px">
+            <div id="a" style="width:80px;height:30px"></div>
+          </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let row = find_element_by_id(&layout, "row").expect("row");
+        let a = find_element_by_id(&layout, "a").expect("a");
+        assert_eq!(
+            a.dimensions.y - row.dimensions.y,
+            35.0,
+            "(100 - 30) / 2 from the container's top"
+        );
     }
 
     // ── Grid item alignment ───────────────────────────────────────────────────
