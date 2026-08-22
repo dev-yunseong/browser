@@ -751,6 +751,36 @@ fn line_contribution(cb: &LayoutBox<'_>, container: &StyledNode) -> f32 {
     own.max(above) + below
 }
 
+/// The width and height a run of text takes when wrapped into `available`.
+///
+/// Greedy line breaking on spaces, the same rule `layout_text` follows, so the
+/// two agree about how many lines a string needs.
+fn wrapped_text_extent(sn: &StyledNode, text: &str, available: f32) -> (f32, f32) {
+    let font_size = node_font_size(sn);
+    let style = resolved_font_style(sn);
+    let letter_spacing = resolved_letter_spacing_px(sn);
+    let line_height = resolved_line_height_px(sn);
+    let fonts = crate::font::fonts();
+    let space = fonts.advance(' ', font_size, style) + letter_spacing;
+
+    let mut lines = 1usize;
+    let mut line_w = 0.0f32;
+    let mut widest = 0.0f32;
+    for word in text.split_whitespace() {
+        let w = fonts.measure(word, font_size, style, letter_spacing);
+        let with_space = if line_w > 0.0 { line_w + space + w } else { w };
+        if line_w > 0.0 && with_space > available {
+            widest = widest.max(line_w);
+            lines += 1;
+            line_w = w;
+        } else {
+            line_w = with_space;
+        }
+    }
+    widest = widest.max(line_w);
+    (widest.min(available.max(0.0)), lines as f32 * line_height)
+}
+
 fn ratio_border_box_height(
     border_box: bool,
     padding: &EdgeSizes,
@@ -1837,6 +1867,45 @@ impl<'a> LayoutBox<'a> {
         // dimensions based on CSS-specified values. The object-fit logic at render time
         // will use the actual decoded image dimensions.
         if self.display == DisplayType::Image {
+            // An image whose bytes never arrived is its alt text: a browser lays
+            // the text out in the element's own box, so a broken image with a
+            // sentence of alt is as tall as that sentence wrapped, not a fixed
+            // placeholder. `aspect-ratio` is injected from the decoded bytes, so
+            // its absence is what says the image has nothing of its own to be
+            // sized by. github's pillar screenshots are all remote, and reading
+            // them as a fixed box left each of its security columns 38px short.
+            let broken = read_aspect_ratio(self.style_node).is_none() && height <= 0.0;
+            let alt = self.alt_text.as_deref().unwrap_or("").trim().to_string();
+            // An image that says nothing about itself and has nothing to say in
+            // its place takes no room at all, which is what `alt=""` asks for
+            // and what a browser gives a source it could not fetch.
+            if broken && alt.is_empty() && auto_width {
+                self.dimensions.width = 0.0;
+                self.dimensions.height = 0.0;
+                self.content_box_width = false;
+                let final_x = self.dimensions.x + self.margin.right;
+                let final_y = self.dimensions.y + self.margin.bottom;
+                return (Some(self), final_x, final_y);
+            }
+            let alt_fallback = broken && !alt.is_empty();
+            if alt_fallback {
+                let avail = if auto_width {
+                    container_width
+                } else {
+                    self.dimensions.width
+                };
+                let (text_w, text_h) = wrapped_text_extent(self.style_node, &alt, avail);
+                if auto_width {
+                    // A block-level image fills its line the way a block does;
+                    // an inline one is only as wide as its text.
+                    self.dimensions.width = if is_block { avail } else { text_w };
+                    self.content_box_width = false;
+                }
+                self.dimensions.height = text_h.max(1.0);
+                let final_x = self.dimensions.x + outer_width(&self) + self.margin.right;
+                let final_y = self.dimensions.y + outer_height(&self) + self.margin.bottom;
+                return (Some(self), final_x, final_y);
+            }
             // width is already set by the shrink-wrap / explicit-CSS path above.
             // If no CSS width was specified, the shrink-wrap path returns a value from
             // compute_max_content_width (100px default for images). Keep that or fall back to 150.
@@ -3567,7 +3636,13 @@ impl<'a> LayoutBox<'a> {
                         intrinsic_cache,
                     );
                     if let Some(mut cb) = cb_opt {
+                        // An image that came out zero wide meant it: it has
+                        // nothing decoded and nothing to say in its place, and a
+                        // browser gives it no room. Every other inline box that
+                        // measured nothing is one this engine failed to size, so
+                        // it falls back to its content.
                         if cb.dimensions.width == 0.0
+                            && cb.display != DisplayType::Image
                             && !matches!(entry.node.node.data, NodeData::Text { .. })
                         {
                             let fallback_w = intrinsic_cache.max_content_width(entry.node, vw, vh);
@@ -3614,6 +3689,7 @@ impl<'a> LayoutBox<'a> {
                             );
                             if let Some(mut cb2) = cb2_opt {
                                 if cb2.dimensions.width == 0.0
+                                    && cb2.display != DisplayType::Image
                                     && !matches!(entry.node.node.data, NodeData::Text { .. })
                                 {
                                     let fallback_w =
@@ -6884,7 +6960,9 @@ mod tests {
 
     #[test]
     fn test_image_no_dimensions_gets_default() {
-        // No width or height — must fall back to ~150px default.
+        // Nothing stated, nothing decoded and nothing to say in its place: the
+        // image reserves no room at all, which is what a browser gives a source
+        // it has not got.
         let html = r#"<img src="x.png">"#;
         let dom = dom::parse_html(html);
         let ss = css::parse_css("");
@@ -6893,13 +6971,23 @@ mod tests {
         let (layout_opt, _, _) = build_layout_tree(&style, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
         let layout = layout_opt.expect("layout tree must be built");
         let img = find_image_box(&layout).expect("img node must be found");
+        assert_eq!(outer_width(img), 0.0, "an image with nothing to show is not there");
+        assert_eq!(outer_height(img), 0.0);
+
+        // With alt text it is that text: the box is as tall as the text wrapped
+        // into the width available to it.
+        let html = r#"<div style="width:200px"><img id="a" style="display:block" src="x.png" alt="A long alternative description that has to wrap across several lines to fit"></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let img = find_element_by_id(&layout, "a").expect("img");
         assert!(
-            img.dimensions.width > 0.0,
-            "image with no dimensions must have non-zero width"
+            (outer_width(img) - 200.0).abs() < 0.5,
+            "a block-level one fills its line, got {}",
+            outer_width(img)
         );
         assert!(
-            img.dimensions.height > 0.0,
-            "image with no dimensions must have non-zero height"
+            outer_height(img) > 40.0,
+            "and is as tall as its alt text wrapped, got {}",
+            outer_height(img)
         );
     }
 

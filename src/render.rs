@@ -450,7 +450,7 @@ fn execute_commands_on_tile(
                     }
                 }
             }
-            PaintCommand::Image { rect: r, url, object_fit, alt, alt_color, alt_font_size } => {
+            PaintCommand::Image { rect: r, url, object_fit, alt, alt_color, alt_font_size, alt_line_height } => {
                 let resolved_url = if image_cache.contains_key(url) {
                     None
                 } else {
@@ -514,7 +514,7 @@ fn execute_commands_on_tile(
                 } else { false };
 
                 if !drawn {
-                    draw_broken_image(pixmap, *r, alt, alt_color, *alt_font_size, transform);
+                    draw_broken_image(pixmap, *r, alt, alt_color, *alt_font_size, *alt_line_height, transform);
                 }
             }
             PaintCommand::Text { rect, text, font_size, line_height, leading_space, color, clip, style, letter_spacing, text_decoration, preserve_newlines } => {
@@ -829,40 +829,48 @@ fn draw_broken_image(
     alt: &str,
     color: &Color,
     font_size: f32,
+    line_height: f32,
     transform: Transform,
 ) {
-    // A hairline in the text colour, faint enough to read as an outline on a
-    // light and a dark page alike.
-    let mut border_paint = Paint::default();
-    border_paint.set_color_rgba8(color.r, color.g, color.b, 90);
-    let mut stroke = Stroke::default();
-    stroke.width = 1.0;
-    let mut pb = PathBuilder::new();
-    if let Some(tr) = tiny_skia::Rect::from_xywh(
-        r.x + 0.5, r.y + 0.5,
-        (r.width - 1.0).max(0.0), (r.height - 1.0).max(0.0),
-    ) {
-        pb.push_rect(tr);
-        if let Some(path) = pb.finish() {
-            pixmap.stroke_path(&path, &border_paint, &stroke, transform, None);
+    if alt.trim().is_empty() {
+        // Nothing to say about the image, so a browser leaves the space empty
+        // rather than drawing a frame around it. A hairline in the text colour
+        // marks it out for the case where the box was reserved by a stated size.
+        let mut border_paint = Paint::default();
+        border_paint.set_color_rgba8(color.r, color.g, color.b, 90);
+        let mut stroke = Stroke::default();
+        stroke.width = 1.0;
+        let mut pb = PathBuilder::new();
+        if let Some(tr) = tiny_skia::Rect::from_xywh(
+            r.x + 0.5, r.y + 0.5,
+            (r.width - 1.0).max(0.0), (r.height - 1.0).max(0.0),
+        ) {
+            pb.push_rect(tr);
+            if let Some(path) = pb.finish() {
+                pixmap.stroke_path(&path, &border_paint, &stroke, transform, None);
+            }
         }
-    }
-    if alt.is_empty() || r.width < 8.0 || r.height < font_size {
         return;
     }
-    // Indented past where a browser puts its broken-image icon.
+    if r.width < 8.0 || r.height < font_size {
+        return;
+    }
+    // The alt text is the image: it wraps across the whole box the way a
+    // browser lays it out, with only the first line indented past where the
+    // broken-image icon sits. Drawing one line of it left every sentence of alt
+    // cut off at the box's first line.
     let inset = 20.0f32.min(r.width / 2.0);
     let text_rect = LayoutRect {
-        x: r.x + inset,
-        y: r.y + 1.0,
-        width: (r.width - inset - 2.0).max(0.0),
-        height: font_size,
+        x: r.x + 1.0,
+        y: r.y,
+        width: (r.width - 2.0).max(0.0),
+        height: r.height,
     };
     render_text_raw(
         alt.to_string(),
         text_rect,
         font_size,
-        font_size * 1.2,
+        line_height.max(font_size),
         color,
         text_rect,
         pixmap,
@@ -870,7 +878,7 @@ fn draw_broken_image(
         0.0,
         0,
         false,
-        0.0,
+        inset,
     );
 }
 
@@ -1706,6 +1714,7 @@ mod tests {
             "",
             &Color { r: 0, g: 0, b: 0, a: 255 },
             16.0,
+            19.2,
             Transform::identity(),
         );
         // The middle of the box is untouched; only its edge is drawn on.
@@ -1733,6 +1742,7 @@ mod tests {
             "Duolingo",
             &Color { r: 220, g: 0, b: 0, a: 255 },
             16.0,
+            19.2,
             Transform::identity(),
         );
         let reddish = pixmap
@@ -2112,6 +2122,7 @@ mod tests {
             alt: String::new(),
             alt_color: Color { r: 0, g: 0, b: 0, a: 255 },
             alt_font_size: 16.0,
+            alt_line_height: 19.2,
         }];
         let base_url = Url::parse("https://example.com/path").unwrap();
         let mut image_cache = HashMap::new();

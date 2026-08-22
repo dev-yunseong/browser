@@ -65,6 +65,9 @@ pub enum PaintCommand {
         /// place of an image it could not load.
         alt_color: Color,
         alt_font_size: f32,
+        /// The line height the alt text wraps on, so paint lays it out the way
+        /// layout sized the box for it.
+        alt_line_height: f32,
     },
     /// An inline `<svg>` subtree, as markup, to be rasterised into `rect`.
     ///
@@ -953,6 +956,7 @@ impl LayerTreeBuilder {
                     alt,
                     alt_color,
                     alt_font_size,
+                    alt_line_height: crate::layout::resolved_line_height_px(layout.style_node),
                 });
             }
         }
