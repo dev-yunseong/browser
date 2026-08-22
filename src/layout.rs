@@ -1781,12 +1781,15 @@ impl<'a> LayoutBox<'a> {
             }
 
             // Finalize flex container size.
-            // cross_cursor already accumulated line heights + cross_gaps; subtract the last
-            // trailing cross_gap (we don't add one after the last line).
-            let total_cross = if cross_cursor > 0.0 && lines.len() > 1 {
-                cross_cursor - cross_gap
-            } else {
+            // cross_cursor added a cross_gap after every line, including the last
+            // one, so one trailing gap always has to come back off. Taking it off
+            // only for multi-line containers — as this did — made every single-line
+            // flex row exactly one `gap` too tall, which on a page built from flex
+            // rows accumulates into a visible drift down the page.
+            let total_cross = if lines.is_empty() {
                 cross_cursor
+            } else {
+                (cross_cursor - cross_gap).max(0.0)
             };
             // For column containers, derive the main-axis (height) from the actual child
             // positions rather than main_container_size (which is near-zero when height is auto).
@@ -5678,6 +5681,42 @@ mod tests {
             b.dimensions.x < c.dimensions.x,
             "B should be to the left of C: b.x={}, c.x={}",
             b.dimensions.x, c.dimensions.x
+        );
+    }
+
+    /// A single-line flex row is as tall as its line — `gap` sits *between*
+    /// lines, so a lone line gets no gap at all. Keeping the trailing gap made
+    /// every flex row one gap too tall, and the error accumulated down a page.
+    #[test]
+    fn test_flex_single_line_height_excludes_gap() {
+        let html = r#"<div id="f" style="display:flex;gap:20px;width:400px;">
+            <div id="a" style="width:60px;height:30px;">a</div>
+            <div id="b" style="width:60px;height:30px;">b</div>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let f = find_element_by_id(&layout, "f").expect("flex container");
+        assert!(
+            (f.dimensions.height - 30.0).abs() < 2.0,
+            "single-line flex row should be as tall as its line (30px), got {}",
+            f.dimensions.height
+        );
+    }
+
+    /// Two wrapped lines take one gap between them, not two.
+    #[test]
+    fn test_flex_wrapped_lines_take_one_gap_between_them() {
+        let html = r#"<div id="f" style="display:flex;flex-wrap:wrap;gap:20px;width:150px;">
+            <div id="a" style="width:100px;height:30px;">a</div>
+            <div id="b" style="width:100px;height:30px;">b</div>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let f = find_element_by_id(&layout, "f").expect("flex container");
+        assert!(
+            (f.dimensions.height - 80.0).abs() < 2.0,
+            "two 30px lines plus one 20px gap should be 80px tall, got {}",
+            f.dimensions.height
         );
     }
 
