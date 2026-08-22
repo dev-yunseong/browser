@@ -1,4 +1,4 @@
-use crate::css::{parse_selector, AttributeMatch, Combinator, Selector};
+use crate::css::{parse_selector, Combinator, Selector};
 use lazy_static::lazy_static;
 use markup5ever_rcdom::{Handle, NodeData};
 use serde::{Deserialize, Serialize};
@@ -5376,13 +5376,7 @@ fn selector_subject_matches_handle(node: &Handle, selector: &Selector) -> bool {
     }
     for attr_sel in &selector.attributes {
         let matched = attrs_ref.iter().any(|attr| {
-            if attr.name.local.to_string() != attr_sel.name {
-                return false;
-            }
-            match &attr_sel.value {
-                AttributeMatch::Exists => true,
-                AttributeMatch::Equals(expected) => attr.value.to_string() == *expected,
-            }
+            attr.name.local.as_ref() == attr_sel.name && attr_sel.value.matches(attr.value.as_ref())
         });
         if !matched {
             return false;

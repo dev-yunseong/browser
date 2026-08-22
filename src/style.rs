@@ -322,11 +322,9 @@ fn matches_selector_arena(selector: &Selector, idx: usize, arena: &[NodeDataSend
     for attr_sel in &selector.attributes {
         let mut matched = false;
         for (k, v) in &node.attrs {
-            if k == &attr_sel.name {
-                match &attr_sel.value {
-                    crate::css::AttributeMatch::Exists => { matched = true; break; }
-                    crate::css::AttributeMatch::Equals(val) => { if v == val { matched = true; break; } }
-                }
+            if k == &attr_sel.name && attr_sel.value.matches(v) {
+                matched = true;
+                break;
             }
         }
         if !matched { return false; }
@@ -1372,11 +1370,7 @@ fn compound_matches_element(sel: &Selector, handle: &Handle) -> bool {
             return false;
         };
         let matched = attrs.borrow().iter().any(|a| {
-            a.name.local.as_ref() == attr_sel.name
-                && match &attr_sel.value {
-                    crate::css::AttributeMatch::Exists => true,
-                    crate::css::AttributeMatch::Equals(v) => a.value.as_ref() == v,
-                }
+            a.name.local.as_ref() == attr_sel.name && attr_sel.value.matches(a.value.as_ref())
         });
         if !matched {
             return false;
@@ -2157,6 +2151,53 @@ mod tests {
         assert_eq!(s.class, vec!["clearfix".to_string()]);
         assert_eq!(s.pseudo_element, Some("after".to_string()));
         assert!(s.pseudo_class.is_none());
+    }
+
+    /// The character before `=` picks the attribute match. Reading every form
+    /// as a plain equality left the operator stuck on the attribute's name, so
+    /// the selector matched nothing — and github styles every one of its links
+    /// through `[class^="Primer_Brand__Link-module__Link___"]`.
+    #[test]
+    fn test_attribute_selector_operators() {
+        use crate::css::{parse_selector, AttributeMatch};
+        let cases: [(&str, AttributeMatch, &[&str], &[&str]); 5] = [
+            ("[class^=\"Link__\"]", AttributeMatch::Prefix("Link__".into()), &["Link__a b"], &["x Link__a"]),
+            ("[class$=\"-end\"]", AttributeMatch::Suffix("-end".into()), &["a-end"], &["a-end b"]),
+            ("[class*=\"mid\"]", AttributeMatch::Contains("mid".into()), &["a midb"], &["a b"]),
+            ("[class~=\"one\"]", AttributeMatch::Includes("one".into()), &["one two", "two one"], &["oneone"]),
+            ("[lang|=\"en\"]", AttributeMatch::DashMatch("en".into()), &["en", "en-GB"], &["eng", "fr"]),
+        ];
+        for (source, expected, hits, misses) in cases {
+            let sel = parse_selector(source);
+            assert_eq!(sel.attributes.len(), 1, "{source} should parse one attribute selector");
+            assert_eq!(sel.attributes[0].value, expected, "{source} picked the wrong match");
+            assert!(
+                sel.attributes[0].name == "class" || sel.attributes[0].name == "lang",
+                "{source} left the operator on the name: {}",
+                sel.attributes[0].name
+            );
+            for hit in hits {
+                assert!(sel.attributes[0].value.matches(hit), "{source} should match {hit:?}");
+            }
+            for miss in misses {
+                assert!(!sel.attributes[0].value.matches(miss), "{source} should not match {miss:?}");
+            }
+        }
+    }
+
+    /// An empty operand matches nothing, per the selectors spec — and keeps
+    /// `[class^=""]` from styling every element on the page.
+    #[test]
+    fn test_empty_attribute_operand_matches_nothing() {
+        use crate::css::AttributeMatch;
+        for m in [
+            AttributeMatch::Prefix(String::new()),
+            AttributeMatch::Suffix(String::new()),
+            AttributeMatch::Contains(String::new()),
+            AttributeMatch::Includes(String::new()),
+        ] {
+            assert!(!m.matches("anything"), "{m:?} should match nothing");
+        }
     }
 
     #[test]

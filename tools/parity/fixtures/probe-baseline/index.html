@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Atomic inline baseline probe</title>
+<style>
+  body { margin: 0; background: #fff; color: #111; font: 14px/1.5 sans-serif; }
+  section { border-top: 2px solid #08f; margin: 0; }
+  .row { background: #eef; }
+  /* An atomic inline rests its bottom edge on the baseline, so the line box
+     still holds the strut's descender space underneath it. A list of links
+     built this way — which is how a footer's link columns are built — is
+     several pixels taller per row than the boxes themselves. */
+  .a { display: inline-flex; align-items: center; background: #fd8; }
+  .ib { display: inline-block; background: #8fd; }
+  .pad { padding-bottom: 0.15em; }
+  .plain { background: #dfd; }
+  /* `contain: layout` makes a box's baseline its own bottom edge, so the line
+     keeps the strut's descender space under it. github puts `contain: content`
+     on every link. */
+  .contained { contain: content; }
+  ul { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 12px; }
+  li { line-height: 21px; background: #f8f8f8; }
+  .cl a { contain: content; }
+  .big { font-size: 24px; }
+  .tallbox { display: inline-block; width: 40px; height: 40px; background: #f88; }
+</style>
+</head>
+<body>
+  <section><div class="row"><span class="plain">plain inline text</span></div></section>
+  <section><div class="row"><a class="a" href="#">an inline-flex link</a></div></section>
+  <section><div class="row"><a class="a pad" href="#">the same with 0.15em under it</a></div></section>
+  <section><div class="row"><span class="ib">an inline-block</span></div></section>
+  <section><div class="row">text before <span class="ib">an inline-block</span> and after</div></section>
+  <section><div class="row"><span class="tallbox"></span> beside a 40px box</div></section>
+  <section><div class="row big">a bigger strut <span class="ib" style="font-size:14px">holding a small box</span></div></section>
+  <section><div class="row"><a class="a pad contained" href="#">a contained link</a></div></section>
+  <section><ul class="cl">
+    <li><a class="a pad" href="#">Features</a></li>
+    <li><a class="a pad" href="#">Enterprise</a></li>
+    <li><a class="a pad" href="#">Copilot</a></li>
+    <li><a class="a pad" href="#">Security</a></li>
+  </ul></section>
+</body>
+</html>

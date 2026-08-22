@@ -329,6 +329,28 @@ impl FontSet {
         height * (font_size / units)
     }
 
+    /// How much of a line box sits below the baseline, for text of `font_size`
+    /// in `style` on a line of `line_height`.
+    ///
+    /// A line box is the font's ascent and descent plus the leading split
+    /// evenly above and below, so this is the room a line always keeps under
+    /// the baseline — whatever else is sitting on it.
+    pub fn below_baseline(&self, font_size: f32, style: FontStyle, line_height: f32) -> f32 {
+        let face_id = style
+            .web_family
+            .and_then(|f| faces_for(f, style.bold, style.italic).first().map(|(i, _)| FaceId::Web(*i)))
+            .unwrap_or_else(|| style.face());
+        let face = self.face(face_id);
+        let units = face.units_per_em().unwrap_or(1000.0);
+        let scale = font_size / units;
+        let ascent = face.ascent_unscaled() * scale;
+        // `descent_unscaled` is measured downwards from the baseline and so is
+        // negative; the half-leading below is what is left of the line once the
+        // font's own content area is taken out of it.
+        let descent = -face.descent_unscaled() * scale;
+        (descent + (line_height - ascent - descent) / 2.0).max(0.0)
+    }
+
     /// Advance width of the "0" glyph — the CSS `ch` unit.
     ///
     /// Both `ch` and `ex` are metrics of *the element's own* font, not of the

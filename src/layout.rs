@@ -645,6 +645,84 @@ fn apply_ratio_main_size(cb: &mut LayoutBox<'_>, is_row: bool) {
     }
 }
 
+/// Whether this box hides its own baseline from the line it sits on.
+///
+/// An atomic inline normally lends the line the baseline of the text inside it,
+/// and lines up with the surrounding text. Three things stop that, and each
+/// makes the box's baseline its own bottom margin edge instead — so the whole
+/// box sits above the line's baseline and the strut's descender space is still
+/// kept underneath it:
+///
+///   * `contain: layout` (and the `content` and `strict` shorthands that
+///     include it), per css-contain-2 §3.1 — github puts `contain: content` on
+///     every link, which is 6px a row down its footer's link columns;
+///   * a scroll container, since a scrolled baseline would not stay put;
+///   * having no in-flow content to take a baseline from at all, which is what
+///     an empty spacer or icon box is.
+fn hides_own_baseline(cb: &LayoutBox<'_>) -> bool {
+    // A form control's text is its value or its placeholder, which is not a
+    // child node — so an empty child list does not mean an empty box, and the
+    // control still lends the line the baseline of the line it holds.
+    if cb.children.is_empty()
+        && cb.display != DisplayType::Input
+        && !is_form_control(cb.style_node)
+    {
+        return true;
+    }
+    let keyword = |prop: &str| match cb.style_node.specified_values.get(&crate::css::intern(prop)) {
+        Some(Value::Keyword(k)) => Some(k.clone()),
+        _ => None,
+    };
+    if let Some(k) = keyword("contain") {
+        if k.split_whitespace()
+            .any(|word| matches!(word, "layout" | "content" | "strict"))
+        {
+            return true;
+        }
+    }
+    ["overflow", "overflow-y"].iter().any(|prop| {
+        keyword(prop).is_some_and(|k| {
+            k.split_whitespace()
+                .any(|word| matches!(word, "hidden" | "scroll" | "auto" | "clip"))
+        })
+    })
+}
+
+/// The room a line box in this container keeps below the baseline, and above it.
+fn strut_split(sn: &StyledNode) -> (f32, f32) {
+    let line_height = resolved_line_height_px(sn);
+    let below = crate::font::fonts().below_baseline(
+        node_font_size(sn),
+        resolved_font_style(sn),
+        line_height,
+    );
+    ((line_height - below).max(0.0), below)
+}
+
+/// The height a line box has to be to hold `cb`, given the container's strut.
+///
+/// An atomic inline whose baseline is its own bottom edge sits entirely above
+/// the line's baseline, so the strut's descender space is added under it.
+/// Everything else contributes its own height, which is what this engine's line
+/// boxes have always measured.
+fn line_contribution(cb: &LayoutBox<'_>, container: &StyledNode) -> f32 {
+    let own = outer_height(cb) + cb.margin.top + cb.margin.bottom;
+    let atomic = matches!(
+        cb.display,
+        DisplayType::InlineBlock
+            | DisplayType::Flex
+            | DisplayType::Grid
+            | DisplayType::Table
+            | DisplayType::Image
+            | DisplayType::Input
+    );
+    if !atomic || !hides_own_baseline(cb) {
+        return own;
+    }
+    let (above, below) = strut_split(container);
+    own.max(above) + below
+}
+
 fn ratio_border_box_height(
     border_box: bool,
     padding: &EdgeSizes,
@@ -3001,7 +3079,17 @@ impl<'a> LayoutBox<'a> {
                         - item.cb.border.top - item.cb.border.bottom
                     ).max(0.0);
                     let definite_row = row_is_definite.get(item.row).copied().unwrap_or(false);
-                    if definite_row || avail_cell_h > outer_height(&item.cb) {
+                    // `avail_cell_h` is what is left for the item's *content*
+                    // once its own insets come off, so the comparison has to be
+                    // against the item's content height too. Weighing it against
+                    // the border box instead meant a padded item never looked
+                    // short enough to stretch, and github's footer columns each
+                    // kept their own height where the row makes them equal.
+                    let item_content_h = (outer_height(&item.cb)
+                        - item.cb.padding.top - item.cb.padding.bottom
+                        - item.cb.border.top - item.cb.border.bottom)
+                        .max(0.0);
+                    if definite_row || avail_cell_h > item_content_h {
                         item.cb.dimensions.height = avail_cell_h;
                         item.cb.content_box_height = true;
                     }
@@ -3486,8 +3574,7 @@ impl<'a> LayoutBox<'a> {
                                 }
                                 cur_line.width =
                                     outer_width(&cb2) + cb2.margin.left + cb2.margin.right;
-                                cur_line.height =
-                                    outer_height(&cb2) + cb2.margin.top + cb2.margin.bottom;
+                                cur_line.height = line_contribution(&cb2, self.style_node);
                                 cur_line.members.push(cb2);
                             }
                         } else {
@@ -3497,9 +3584,8 @@ impl<'a> LayoutBox<'a> {
                                 apply_relative_offset(&mut cb, vw, vh);
                             }
                             cur_line.width += item_w;
-                            cur_line.height = cur_line
-                                .height
-                                .max(outer_height(&cb) + cb.margin.top + cb.margin.bottom);
+                            cur_line.height =
+                                cur_line.height.max(line_contribution(&cb, self.style_node));
                             cur_line.members.push(cb);
                         }
                     }
@@ -8289,6 +8375,41 @@ mod tests {
             (r.dimensions.width - 240.0).abs() < 1.0,
             "120 tall at 2:1 is 240 wide, got {}",
             r.dimensions.width
+        );
+    }
+
+    /// An atomic inline normally lends the line the baseline of the text inside
+    /// it. A box that hides its own baseline — `contain: layout`, a scroll
+    /// container, or one with nothing in it — rests its whole box on the
+    /// baseline instead, so the line still keeps the strut's descender space
+    /// underneath. github puts `contain: content` on every link, which is 6px a
+    /// row down its footer's link columns.
+    #[test]
+    fn test_a_contained_atomic_inline_leaves_the_struts_descender_space() {
+        let html = r#"<div style="width:800px;font-size:14px;line-height:21px">
+            <div id="plain"><span style="display:inline-block">an inline-block</span></div>
+            <div id="held"><span style="display:inline-block;contain:content">an inline-block</span></div>
+            <div id="empty"><span style="display:inline-block;width:40px;height:40px"></span></div>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let plain = outer_height(find_element_by_id(&layout, "plain").expect("plain"));
+        let held = outer_height(find_element_by_id(&layout, "held").expect("held"));
+        assert!(
+            (plain - 21.0).abs() < 0.5,
+            "an ordinary inline-block lines its text up with the strut, got {plain}"
+        );
+        assert!(
+            held > plain + 2.0,
+            "a contained one leaves the descender space under it: {held} should exceed {plain}"
+        );
+
+        // An empty box has no baseline of its own either, so the same rule puts
+        // the strut's descender space below its 40px.
+        let empty = outer_height(find_element_by_id(&layout, "empty").expect("empty"));
+        assert!(
+            empty > 42.0,
+            "an empty 40px box sits above the baseline, got {empty}"
         );
     }
 

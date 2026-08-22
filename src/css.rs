@@ -1601,6 +1601,39 @@ pub enum Combinator {
 pub enum AttributeMatch {
     Exists,
     Equals(String),
+    /// `[attr^=v]` — the value starts with `v`.
+    Prefix(String),
+    /// `[attr$=v]` — the value ends with `v`.
+    Suffix(String),
+    /// `[attr*=v]` — the value contains `v`.
+    Contains(String),
+    /// `[attr~=v]` — one of the value's whitespace-separated words is `v`.
+    Includes(String),
+    /// `[attr|=v]` — the value is `v`, or begins `v-`.
+    DashMatch(String),
+}
+
+impl AttributeMatch {
+    /// Whether an attribute holding `actual` satisfies this match.
+    ///
+    /// An empty operand never matches for the substring forms, which is what
+    /// the selectors spec says and also keeps `[class^=""]` from matching
+    /// everything on the page.
+    pub fn matches(&self, actual: &str) -> bool {
+        match self {
+            AttributeMatch::Exists => true,
+            AttributeMatch::Equals(v) => actual == v,
+            AttributeMatch::Prefix(v) => !v.is_empty() && actual.starts_with(v.as_str()),
+            AttributeMatch::Suffix(v) => !v.is_empty() && actual.ends_with(v.as_str()),
+            AttributeMatch::Contains(v) => !v.is_empty() && actual.contains(v.as_str()),
+            AttributeMatch::Includes(v) => {
+                !v.is_empty() && actual.split_whitespace().any(|w| w == v)
+            }
+            AttributeMatch::DashMatch(v) => {
+                actual == v || (actual.len() > v.len() && actual.starts_with(v.as_str()) && actual.as_bytes()[v.len()] == b'-')
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1825,9 +1858,39 @@ fn parse_pseudo_class(token: &str) -> PseudoClass {
     }
 }
 
+/// Space out the combinators in a selector so it can be split on whitespace —
+/// but only where they *are* combinators.
+///
+/// `>`, `+` and `~` are all legal inside brackets, parentheses and quoted
+/// strings: `[class~="one"]` is an attribute match, not a sibling combinator,
+/// and rewriting it blindly tore the selector in half so it matched nothing.
+fn space_out_combinators(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    for c in s.chars() {
+        match c {
+            _ if quote == Some(c) => quote = None,
+            '"' | '\'' if quote.is_none() => quote = Some(c),
+            _ if quote.is_some() => {}
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth = depth.saturating_sub(1),
+            '>' | '+' | '~' if depth == 0 => {
+                out.push(' ');
+                out.push(c);
+                out.push(' ');
+                continue;
+            }
+            _ => {}
+        }
+        out.push(c);
+    }
+    out
+}
+
 pub fn parse_selector(s: &str) -> Selector {
     // Pre-process string to ensure spaces around combinators for easy splitting
-    let s = s.replace('>', " > ").replace('+', " + ").replace('~', " ~ ");
+    let s = space_out_combinators(s);
     let parts: Vec<&str> = s.split_whitespace().collect();
     if parts.is_empty() { return Selector::new(); }
 
@@ -1906,12 +1969,28 @@ pub fn parse_selector(s: &str) -> Selector {
                             }
                             if !attr_content.is_empty() {
                                 if let Some(eq_idx) = attr_content.find('=') {
-                                    let name = attr_content[..eq_idx].trim().to_string();
+                                    // The character before `=` picks the match:
+                                    // `^= $= *= ~= |=`. Reading every form as a
+                                    // plain equality left the operator stuck on
+                                    // the attribute's name, so the selector
+                                    // matched nothing at all — and github styles
+                                    // every one of its links through
+                                    // `[class^="Primer_Brand__Link-module__Link___"]`.
+                                    let (name_end, op) = match attr_content[..eq_idx].chars().last() {
+                                        Some(c @ ('^' | '$' | '*' | '~' | '|')) => (eq_idx - c.len_utf8(), Some(c)),
+                                        _ => (eq_idx, None),
+                                    };
+                                    let name = attr_content[..name_end].trim().to_string();
                                     let val = attr_content[eq_idx+1..].trim().trim_matches('"').trim_matches('\'').to_string();
-                                    current_sel.attributes.push(AttributeSelector {
-                                        name,
-                                        value: AttributeMatch::Equals(val),
-                                    });
+                                    let value = match op {
+                                        Some('^') => AttributeMatch::Prefix(val),
+                                        Some('$') => AttributeMatch::Suffix(val),
+                                        Some('*') => AttributeMatch::Contains(val),
+                                        Some('~') => AttributeMatch::Includes(val),
+                                        Some('|') => AttributeMatch::DashMatch(val),
+                                        _ => AttributeMatch::Equals(val),
+                                    };
+                                    current_sel.attributes.push(AttributeSelector { name, value });
                                 } else {
                                     current_sel.attributes.push(AttributeSelector {
                                         name: attr_content.trim().to_string(),
