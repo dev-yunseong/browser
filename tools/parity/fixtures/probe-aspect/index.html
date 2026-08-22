@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Aspect-ratio in flex probe</title>
+<style>
+  body { margin: 0; background: #0d1117; color: #fff; font: 14px/1.5 sans-serif; }
+  .row { display: flex; flex-direction: row; }
+  /* The shape github's hero uses: a `flex: 1 1 0%` column with symmetric
+     padding, holding one ratio-sized frame that centres itself with auto
+     margins. Every number here has to come out of the percentage width and
+     the ratio, so a wrong percentage base shows up as a wrong height too. */
+  .visual { flex: 1 1 0%; width: 100%; display: flex; align-items: center;
+            padding: 48px 96px; background: #21262d; }
+  .frame { width: 43.2%; aspect-ratio: 1000 / 1196; margin: 0 auto; padding: 8px;
+           border: 1px solid #ffffff44; box-sizing: border-box; display: flex;
+           position: relative; background: #ffffff33; }
+  .frame > div { width: 100%; height: 100%; background: #2f81f7; }
+
+  /* Same frame, but the column is a plain block: the percentage base is the
+     block's content box either way. */
+  .blockvisual { padding: 48px 96px; background: #30363d; }
+
+  /* A ratio-sized flex item wide enough to overflow its line, so shrinking
+     and the ratio have to agree on the final box. */
+  .wide { width: 120%; aspect-ratio: 1000 / 1196; flex: 0 1 auto; padding: 8px;
+          border: 1px solid #ffffff44; box-sizing: border-box; background: #ffffff33; }
+
+  /* Ratio with no width at all: the height comes from the stretched cross
+     size and the width follows from it. */
+  .noflexbasis { aspect-ratio: 2 / 1; background: #a371f7; flex: 0 1 auto; }
+  .tall { height: 120px; display: flex; align-items: stretch; padding: 8px; background: #21262d; }
+
+  /* A width bound written as a percentage or a `calc()`, which is how a page
+     keeps a hero inset from the viewport edge. */
+  .bounded { max-width: calc(100% - 2 * 32px); margin: 0 auto; height: 60px;
+             background: #3fb950; }
+  .pct { max-width: 50%; margin: 8px auto 0; height: 40px; background: #db6d28; }
+</style>
+</head>
+<body>
+  <div class="row"><div class="visual"><div class="frame"><div></div></div></div></div>
+  <div class="blockvisual"><div class="frame"><div></div></div></div>
+  <div class="row"><div class="visual"><div class="wide"></div></div></div>
+  <div class="row tall"><div class="noflexbasis"></div></div>
+  <div class="bounded"></div>
+  <div class="pct"></div>
+</body>
+</html>

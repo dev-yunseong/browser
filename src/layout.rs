@@ -549,6 +549,147 @@ pub fn apply_text_transform(text: &str, sv: &crate::style::PropertyMap) -> Strin
     }
 }
 
+/// The border-box height `aspect-ratio` gives a box whose border-box width is
+/// `border_w`.
+///
+/// The ratio sizes whichever box `box-sizing` names, so under `content-box` the
+/// padding and border come off before it is applied and go back on after.
+/// Applying it to the content box either way left a `border-box` frame short by
+/// its own padding and border: github's hero frame — a `1000 / 1196` box with
+/// 8px of padding and a 1px border — came out 21px short, and each of the four
+/// hero sections ended that much high.
+/// Re-derive a flex item's cross size from its `aspect-ratio` once flexing has
+/// settled its main size.
+///
+/// `aspect-ratio` binds the two axes together, so growing or shrinking an item
+/// along the main axis moves the other axis with it. Laying the item out again
+/// re-derives its size from its *stated* width — the one flexing just overrode
+/// — so a shrunk, ratio-sized frame kept the height it would have had at its
+/// unshrunk width. On github's hero that is ~120px of extra height per section.
+///
+/// A stated size on the cross axis wins over the ratio, and is left alone.
+fn apply_ratio_cross_size(cb: &mut LayoutBox<'_>, is_row: bool) {
+    let Some(ratio) = read_aspect_ratio(cb.style_node) else {
+        return;
+    };
+    let border_box = is_border_box(cb.style_node);
+    if is_row {
+        if has_stated(cb, "height") {
+            return;
+        }
+        let bw = outer_width(cb);
+        if bw <= 0.0 {
+            return;
+        }
+        cb.dimensions.height =
+            ratio_border_box_height(border_box, &cb.padding, &cb.border, ratio, bw);
+        cb.content_box_height = false;
+    } else {
+        if has_stated(cb, "width") {
+            return;
+        }
+        let bh = outer_height(cb);
+        if bh <= 0.0 {
+            return;
+        }
+        let horiz = cb.padding.left + cb.padding.right + cb.border.left + cb.border.right;
+        let vert = cb.padding.top + cb.padding.bottom + cb.border.top + cb.border.bottom;
+        cb.dimensions.width = if border_box {
+            bh * ratio
+        } else {
+            (bh - vert).max(0.0) * ratio + horiz
+        };
+        cb.content_box_width = false;
+    }
+}
+
+/// The mirror of `apply_ratio_cross_size`: take a ratio-sized item's *main*
+/// size from the cross size that stretching just gave it.
+///
+/// Only applied when the main axis has nothing of its own to go on — no stated
+/// size and nothing measured — so an item that shrink-wrapped around real
+/// content keeps that width. An empty ratio-sized box has neither, and without
+/// this came out zero along the main axis and never painted.
+fn apply_ratio_main_size(cb: &mut LayoutBox<'_>, is_row: bool) {
+    let Some(ratio) = read_aspect_ratio(cb.style_node) else {
+        return;
+    };
+    let border_box = is_border_box(cb.style_node);
+    let horiz = cb.padding.left + cb.padding.right + cb.border.left + cb.border.right;
+    let vert = cb.padding.top + cb.padding.bottom + cb.border.top + cb.border.bottom;
+    if is_row {
+        if has_stated(cb, "width") || outer_width(cb) > 0.0 {
+            return;
+        }
+        let bh = outer_height(cb);
+        if bh <= 0.0 {
+            return;
+        }
+        cb.dimensions.width = if border_box {
+            bh * ratio
+        } else {
+            (bh - vert).max(0.0) * ratio + horiz
+        };
+        cb.content_box_width = false;
+    } else {
+        if has_stated(cb, "height") || outer_height(cb) > 0.0 {
+            return;
+        }
+        let bw = outer_width(cb);
+        if bw <= 0.0 {
+            return;
+        }
+        cb.dimensions.height =
+            ratio_border_box_height(border_box, &cb.padding, &cb.border, ratio, bw);
+        cb.content_box_height = false;
+    }
+}
+
+fn ratio_border_box_height(
+    border_box: bool,
+    padding: &EdgeSizes,
+    border: &EdgeSizes,
+    ratio: f32,
+    border_w: f32,
+) -> f32 {
+    let horiz = padding.left + padding.right + border.left + border.right;
+    let vert = padding.top + padding.bottom + border.top + border.bottom;
+    if border_box {
+        border_w / ratio
+    } else {
+        (border_w - horiz).max(0.0) / ratio + vert
+    }
+}
+
+/// Resolve a size constraint — `min-width`, `max-width` and their block-axis
+/// counterparts — to pixels against the containing block.
+///
+/// Anything that is not a length resolves to `None`, which is what `none` and
+/// `auto` mean: no bound.
+fn resolve_constraint_px(
+    value: &Value,
+    container: f32,
+    vw: f32,
+    vh: f32,
+    sn: &StyledNode,
+) -> Option<f32> {
+    match value {
+        Value::Length(v, Unit::Px) => Some(*v),
+        Value::Length(v, Unit::Percent) => Some(container * (v / 100.0)),
+        Value::Length(v, Unit::Vw) => Some(vw * (v / 100.0)),
+        Value::Length(v, Unit::Vh) => Some(vh * (v / 100.0)),
+        m @ Value::Math(_) => resolve_math_px(
+            m,
+            container,
+            vw,
+            vh,
+            node_font_size(sn),
+            resolved_font_style(sn),
+        ),
+        _ => None,
+    }
+}
+
 fn read_aspect_ratio(sn: &StyledNode) -> Option<f32> {
     let value = sn.specified_values.get(&crate::css::intern("aspect-ratio"))?;
     let ratio = match value {
@@ -671,23 +812,23 @@ fn has_stated(cb: &LayoutBox<'_>, prop: &str) -> bool {
         .contains_key(&crate::css::intern(prop))
 }
 
-/// The width a line box has to reserve for an inline-level child.
+/// This box's border-box width, whichever way `dimensions.width` was arrived at.
 ///
 /// `border_box_width` adds padding and border unconditionally, which double
 /// counts them for the common auto-width box whose `dimensions` already covers
 /// them — a padded button then reserved its padding twice and the line came out
 /// that much too wide.
 fn outer_width(cb: &LayoutBox<'_>) -> f32 {
-    if has_stated(cb, "width") {
+    if cb.content_box_width {
         border_box_width(cb)
     } else {
         cb.dimensions.width
     }
 }
 
-/// The height a line box has to reserve for an inline-level child.
+/// This box's border-box height. See `outer_width`.
 fn outer_height(cb: &LayoutBox<'_>) -> f32 {
-    if has_stated(cb, "height") {
+    if cb.content_box_height {
         border_box_height(cb)
     } else {
         cb.dimensions.height
@@ -988,6 +1129,14 @@ pub struct LayoutBox<'a> {
     /// Marker text for list items (e.g. "•" for disc, "1." for decimal).
     /// `None` when `list-style-type: none` or the element is not a list item.
     pub list_marker: Option<String>,
+    /// Whether `dimensions.width` holds the *content* box rather than the border
+    /// box. Both are needed: a stated width has the padding and border taken off
+    /// it, while a width arrived at by filling or shrink-wrapping already counts
+    /// them. Everything outside layout goes through `outer_width`, which reads
+    /// this to answer in the border box every reader expects.
+    pub content_box_width: bool,
+    /// The height axis of `content_box_width`.
+    pub content_box_height: bool,
 }
 
 impl<'a> Clone for LayoutBox<'a> {
@@ -1040,6 +1189,8 @@ impl<'a> Clone for LayoutBox<'a> {
                         z_index: src.z_index,
                         position: src.position,
                         list_marker: src.list_marker.clone(),
+                        content_box_width: src.content_box_width,
+                        content_box_height: src.content_box_height,
                     };
                     let num_children = src.children.len();
                     // Push Post first so it is processed after all children.
@@ -1230,6 +1381,8 @@ impl<'a> LayoutBox<'a> {
             z_index,
             position,
             list_marker: None,
+            content_box_width: false,
+            content_box_height: false,
         };
 
         if let NodeData::Element {
@@ -1362,6 +1515,13 @@ impl<'a> LayoutBox<'a> {
             .get(&crate::css::intern("width"));
         let auto_width = specified_width.is_none();
 
+        // Whether the arm below yields a content-box width. A *stated* width is
+        // one; a width arrived at by filling the line or shrink-wrapping the
+        // content already counts the padding and border. `width: auto` is
+        // written down but states nothing, so it belongs with the second group —
+        // reading "the property is present" instead counted github's insets
+        // twice and left the page hundreds of pixels tall.
+        let mut width_is_content_box = true;
         let mut width = match specified_width {
             Some(Value::Length(v, Unit::Px)) => *v,
             Some(Value::Length(v, Unit::Percent)) => container_width * (v / 100.0),
@@ -1393,6 +1553,7 @@ impl<'a> LayoutBox<'a> {
                 max_c.min(available).max(min_c)
             }
             _ => {
+                width_is_content_box = false;
                 if is_floated || is_shrink_wrap_for(self.style_node, self.display) {
                     let max_c = intrinsic_cache.max_content_width(self.style_node, vw, vh);
                     let min_c = intrinsic_cache.min_content_width(self.style_node, vw, vh);
@@ -1448,19 +1609,25 @@ impl<'a> LayoutBox<'a> {
                 _ => stated,
             }
         };
-        if let Some(Value::Length(v, Unit::Px)) = self
-            .style_node
-            .specified_values
-            .get(&crate::css::intern("max-width"))
-        {
-            width = width.min(in_width_space(*v));
+        // A bound is a length like any other: `max-width: 60%` and
+        // `max-width: calc(100% - 64px)` bind exactly as `max-width: 480px`
+        // does. Reading only plain pixels dropped both — github's hero carousel
+        // is held to `calc(100% - 2 * 32px)` and ran the full width of the
+        // viewport instead, taking its glow off the edge of the page with it.
+        let bound = |prop: &str| -> Option<f32> {
+            resolve_constraint_px(
+                self.style_node.specified_values.get(&crate::css::intern(prop))?,
+                container_width,
+                vw,
+                vh,
+                self.style_node,
+            )
+        };
+        if let Some(v) = bound("max-width") {
+            width = width.min(in_width_space(v));
         }
-        if let Some(Value::Length(v, Unit::Px)) = self
-            .style_node
-            .specified_values
-            .get(&crate::css::intern("min-width"))
-        {
-            width = width.max(in_width_space(*v));
+        if let Some(v) = bound("min-width") {
+            width = width.max(in_width_space(v));
         }
 
         // `margin: 0 auto` centres the box's *border* box. `width` at this point
@@ -1492,6 +1659,7 @@ impl<'a> LayoutBox<'a> {
         self.dimensions.x = container_start_x + self.margin.left;
         self.dimensions.y = current_y + self.margin.top;
         self.dimensions.width = width;
+        self.content_box_width = width_is_content_box;
 
         let height = match self
             .style_node
@@ -1525,6 +1693,11 @@ impl<'a> LayoutBox<'a> {
             _ => 0.0,
         };
 
+        // A height that came out of a stated value is a content height; anything
+        // else leaves the box to be measured, and a measured height is a border
+        // box. `height: auto`, and a percentage against a containing block that
+        // has no definite height of its own, both fall in the second group.
+        self.content_box_height = height > 0.0;
         // The mirror of the width rule above: under `border-box` a stated
         // height already covers the padding and border, so they come off to
         // leave the content height that paint adds them back to. Without this a
@@ -1563,6 +1736,7 @@ impl<'a> LayoutBox<'a> {
             // compute_max_content_width (100px default for images). Keep that or fall back to 150.
             if self.dimensions.width <= 0.0 {
                 self.dimensions.width = 150.0_f32.min(container_width);
+                self.content_box_width = false;
             }
             // Use CSS height if specified; otherwise derive it from the image's
             // aspect ratio. `aspect-ratio` is injected from the decoded bytes once
@@ -1624,6 +1798,32 @@ impl<'a> LayoutBox<'a> {
             width: vw,
             height: vh,
         };
+        // A height that is settled before the children are laid out — stated
+        // outright, or handed over by `aspect-ratio` once the width is known —
+        // is a definite containing block, and percentage heights inside resolve
+        // against it. Leaving it at zero meant the media that fills a
+        // ratio-sized frame (`width: 100%; height: 100%`, which is how github's
+        // hero holds its screenshot) resolved to `auto` and never painted.
+        let vert_pad_border =
+            self.padding.top + self.padding.bottom + self.border.top + self.border.bottom;
+        let definite_content_height = if height > 0.0 {
+            height
+        } else {
+            let bw = outer_width(&self);
+            read_aspect_ratio(self.style_node)
+                .filter(|_| bw > 0.0)
+                .map(|ratio| {
+                    (ratio_border_box_height(
+                        box_sizing == "border-box",
+                        &self.padding,
+                        &self.border,
+                        ratio,
+                        bw,
+                    ) - vert_pad_border)
+                        .max(0.0)
+                })
+                .unwrap_or(0.0)
+        };
         let self_cb_rect = Rect {
             x: self.dimensions.x + self.padding.left + self.border.left,
             y: self.dimensions.y + self.padding.top + self.border.top,
@@ -1633,7 +1833,7 @@ impl<'a> LayoutBox<'a> {
                 - self.border.left
                 - self.border.right)
                 .max(0.0),
-            height: 0.0, // height not finalised yet
+            height: definite_content_height,
         };
         let child_cb = if self_establishes_cb {
             Some(self_cb_rect)
@@ -1830,6 +2030,13 @@ impl<'a> LayoutBox<'a> {
                 if let Some(mut cb) = cb_opt {
                     if let Some(basis) = flex_basis {
                         cb.dimensions.width = basis.min(inner_width).max(0.0);
+                        // `flex-basis` sizes the box `box-sizing` names, exactly
+                        // as `width` does — so a `flex: 1 1 0%` item starts at
+                        // zero *content* width and still reserves its own
+                        // padding on the line. Treating the basis as a border
+                        // box instead handed every such item its padding as free
+                        // space, and a padded column came out that much wide.
+                        cb.content_box_width = !is_border_box(cb.style_node);
                     }
                     if cb.dimensions.width > inner_width {
                         cb.dimensions.width = inner_width;
@@ -1846,6 +2053,8 @@ impl<'a> LayoutBox<'a> {
                     if cb.dimensions.width == 0.0 && flex_basis.is_none() {
                         let max_c = intrinsic_cache.max_content_width(child_node, vw, vh);
                         cb.dimensions.width = max_c.min(inner_width).max(0.0);
+                        // A max-content measurement already counts the insets.
+                        cb.content_box_width = false;
                     }
                     let grow = child_node
                         .specified_values
@@ -2096,6 +2305,14 @@ impl<'a> LayoutBox<'a> {
                     }
                 }
 
+                // The main size is settled; an `aspect-ratio` item's cross size
+                // follows from it. Doing this after the reflow above rather than
+                // inside it is what makes it stick: the reflow re-reads the
+                // item's own stated width, which flexing has just overruled.
+                for &i in line_indices {
+                    apply_ratio_cross_size(&mut raw_items[i].cb, is_row);
+                }
+
                 // Recompute totals after grow/shrink/reflow.
                 let gaps_total2 = if line_indices.len() > 1 {
                     main_gap * (line_indices.len() - 1) as f32
@@ -2161,13 +2378,22 @@ impl<'a> LayoutBox<'a> {
 
                     // Stretch cross axis if needed.
                     if effective_align == "stretch" {
+                        // `line_cross` is a margin-box measurement, so what is
+                        // left after the margins is the border box.
                         if is_row {
                             item.cb.dimensions.height =
                                 (line_cross - item.cb.margin.top - item.cb.margin.bottom).max(0.0);
+                            item.cb.content_box_height = false;
                         } else {
                             item.cb.dimensions.width =
                                 (line_cross - item.cb.margin.left - item.cb.margin.right).max(0.0);
+                            item.cb.content_box_width = false;
                         }
+                        // Stretching settles the cross size, so for a
+                        // ratio-sized item the *main* size now follows from it.
+                        // Without this a `aspect-ratio: 2 / 1` item with nothing
+                        // in it came out zero wide and never painted.
+                        apply_ratio_main_size(&mut item.cb, is_row);
                     }
 
                     // Cross-axis offset within the line.
@@ -2232,6 +2458,8 @@ impl<'a> LayoutBox<'a> {
             for mut item in raw_items {
                 item.cb.dimensions.width = outer_width(&item.cb);
                 item.cb.dimensions.height = outer_height(&item.cb);
+                item.cb.content_box_width = false;
+                item.cb.content_box_height = false;
                 self.children.push(item.cb);
             }
 
@@ -2268,6 +2496,8 @@ impl<'a> LayoutBox<'a> {
                 } else {
                     total_cross
                 };
+                // Measured from the children out, so the insets are in it already.
+                self.content_box_width = false;
             }
             // A stated height is the height, as it is in flow: deriving one from
             // the content whenever `dimensions.height` had not been set yet
@@ -2292,9 +2522,16 @@ impl<'a> LayoutBox<'a> {
                 // height, which is how a media wrapper reserves its space when
                 // everything inside it is positioned. Without it the container
                 // collapsed to nothing and the section below it moved up.
+                let ratio_border_w = outer_width(&self);
                 if let Some(ratio) = read_aspect_ratio(self.style_node) {
-                    if height <= 0.0 && self.dimensions.width > 0.0 {
-                        self.dimensions.height = self.dimensions.width / ratio;
+                    if height <= 0.0 && ratio_border_w > 0.0 {
+                        self.dimensions.height = ratio_border_box_height(
+                            box_sizing == "border-box",
+                            &self.padding,
+                            &self.border,
+                            ratio,
+                            ratio_border_w,
+                        );
                     }
                 }
                 // A form control holds a line of its own even with no items in
@@ -2726,6 +2963,8 @@ impl<'a> LayoutBox<'a> {
                     - item.cb.padding.left - item.cb.padding.right
                     - item.cb.border.left - item.cb.border.right
                 ).max(0.0);
+                // What is left after the item's own insets is its content box.
+                item.cb.content_box_width = true;
 
                 let align = keyword_of(item.cb.style_node, "align-self")
                     .or_else(|| container_align.clone())
@@ -2744,8 +2983,9 @@ impl<'a> LayoutBox<'a> {
                         - item.cb.padding.top - item.cb.padding.bottom
                         - item.cb.border.top - item.cb.border.bottom
                     ).max(0.0);
-                    if avail_cell_h > item.cb.dimensions.height {
+                    if avail_cell_h > outer_height(&item.cb) {
                         item.cb.dimensions.height = avail_cell_h;
+                        item.cb.content_box_height = true;
                     }
                 }
 
@@ -2790,8 +3030,15 @@ impl<'a> LayoutBox<'a> {
             if height > 0.0 {
                 self.dimensions.height = height;
             } else if self.dimensions.height <= 0.0 {
+                let ratio_border_w = outer_width(&self);
                 self.dimensions.height = match read_aspect_ratio(self.style_node) {
-                    Some(ratio) if self.dimensions.width > 0.0 => self.dimensions.width / ratio,
+                    Some(ratio) if ratio_border_w > 0.0 => ratio_border_box_height(
+                        box_sizing == "border-box",
+                        &self.padding,
+                        &self.border,
+                        ratio,
+                        ratio_border_w,
+                    ),
                     _ => content_height,
                 };
             }
@@ -3036,7 +3283,7 @@ impl<'a> LayoutBox<'a> {
                             side,
                         });
                         max_child_x = max_child_x
-                            .max(cb.dimensions.x + border_box_width(&cb) + cb.margin.right);
+                            .max(cb.dimensions.x + outer_width(&cb) + cb.margin.right);
                         result.push(cb);
                     }
                     // cursor_y does NOT advance for floats
@@ -3117,8 +3364,13 @@ impl<'a> LayoutBox<'a> {
                         // We want the content box to land at cursor_y + collapsed.
                         let dy = (cursor_y + collapsed) - cb.dimensions.y;
                         offset_layout_box(&mut cb, 0.0, dy);
-                        // cursor_y advances using pre-offset (normal-flow) bottom edge.
-                        let normal_flow_bottom = cb.dimensions.y + cb.dimensions.height;
+                        // cursor_y advances using pre-offset (normal-flow) bottom
+                        // edge — of the *border* box. `dimensions.height` is only
+                        // that when no height was stated (see the note where
+                        // `width` is computed), so reading it directly let a
+                        // `height: 100px; padding: 8px` block hand the next one a
+                        // cursor 16px too high, and everything below it climbed.
+                        let normal_flow_bottom = cb.dimensions.y + outer_height(&cb);
                         // Apply relative offset AFTER computing normal-flow bottom so sibling
                         // placement is not affected (position:relative is a visual-only nudge).
                         if cb.position == PositionType::Relative {
@@ -3127,7 +3379,7 @@ impl<'a> LayoutBox<'a> {
                         cursor_y = normal_flow_bottom;
                         prev_margin_bottom = cb.margin.bottom;
                         max_child_x = max_child_x
-                            .max(cb.dimensions.x + border_box_width(&cb) + cb.margin.right);
+                            .max(cb.dimensions.x + outer_width(&cb) + cb.margin.right);
                         result.push(cb);
                     }
                     line_start_y = cursor_y; // keep line_start_y in sync after block advances cursor_y
@@ -3161,6 +3413,7 @@ impl<'a> LayoutBox<'a> {
                         {
                             let fallback_w = intrinsic_cache.max_content_width(entry.node, vw, vh);
                             cb.dimensions.width = fallback_w.min(child_container_width).max(0.0);
+                            cb.content_box_width = false;
                         }
                         // Only reset prev_margin_bottom when a visible inline element is
                         // actually placed.  Empty/whitespace-only text nodes return None and
@@ -3261,6 +3514,8 @@ impl<'a> LayoutBox<'a> {
             } else {
                 derived
             };
+            // Measured from the children out, so the insets are in it already.
+            self.content_box_width = false;
         }
 
         let content_height =
@@ -3270,9 +3525,20 @@ impl<'a> LayoutBox<'a> {
         // Applying it only to replaced elements left every such box the height
         // of its content — zero, when the content inside it is positioned — and
         // the whole section below it moved up.
+        // The ratio has to be applied to the box it sizes, which is the border
+        // box under `border-box` sizing — see `ratio_border_box_height`.
+        let ratio_border_w = outer_width(&self);
         let ratio_height = read_aspect_ratio(self.style_node)
-            .filter(|_| height <= 0.0 && self.dimensions.width > 0.0)
-            .map(|ratio| self.dimensions.width / ratio);
+            .filter(|_| height <= 0.0 && ratio_border_w > 0.0)
+            .map(|ratio| {
+                ratio_border_box_height(
+                    box_sizing == "border-box",
+                    &self.padding,
+                    &self.border,
+                    ratio,
+                    ratio_border_w,
+                )
+            });
         let mut final_h = match (height > 0.0, ratio_height) {
             (true, _) => height,
             (false, Some(h)) => h,
@@ -3399,8 +3665,9 @@ impl<'a> LayoutBox<'a> {
                                 - pc.margin.top
                                 - pc.margin.bottom)
                                 .max(0.0);
-                            if stretched > pc.dimensions.height {
+                            if stretched > outer_height(&pc) {
                                 pc.dimensions.height = stretched;
+                                pc.content_box_height = false;
                             }
                         }
                     }
@@ -3440,13 +3707,18 @@ impl<'a> LayoutBox<'a> {
             }
         }
 
+        // Flow advances past the *border* box. `dimensions` is only that when
+        // nothing was stated for the axis — see the note where `width` is
+        // computed — so a box that states a height and carries padding used to
+        // hand the next block a cursor its own padding too high, and every
+        // section below it climbed by that much.
         let final_x = if is_block {
             container_start_x
         } else {
-            self.dimensions.x + self.dimensions.width + self.margin.right
+            self.dimensions.x + outer_width(&self) + self.margin.right
         };
         let final_y = if is_block {
-            self.dimensions.y + self.dimensions.height + self.margin.bottom
+            self.dimensions.y + outer_height(&self) + self.margin.bottom
         } else {
             cursor_y
         };
@@ -7916,6 +8188,129 @@ mod tests {
                 after.dimensions.y
             );
         }
+    }
+
+    /// `aspect-ratio` sizes whichever box `box-sizing` names. Under
+    /// `border-box` that is the padding and border included, so applying the
+    /// ratio to the content box left github's hero frame — 8px of padding and a
+    /// 1px border around a `1000 / 1196` box — short by its own insets.
+    #[test]
+    fn test_aspect_ratio_follows_box_sizing() {
+        let html = r#"<div style="width:800px">
+            <div id="bb" style="width:200px;padding:8px;border:1px solid #000;box-sizing:border-box;aspect-ratio:2/1"></div>
+            <div id="cb" style="width:200px;padding:8px;border:1px solid #000;box-sizing:content-box;aspect-ratio:2/1"></div>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        // border-box: the 200px *is* the border box, so the ratio gives a 100px
+        // border box back.
+        let bb = find_element_by_id(&layout, "bb").expect("bb");
+        assert!(
+            (bb.dimensions.height - 100.0).abs() < 0.5,
+            "border-box 200 wide at 2:1 is a 100px border box, got {}",
+            bb.dimensions.height
+        );
+        // content-box: the ratio applies to the 200px content box, and the 18px
+        // of insets sit outside the resulting 100px.
+        let cb = find_element_by_id(&layout, "cb").expect("cb");
+        assert!(
+            (cb.dimensions.height - 118.0).abs() < 0.5,
+            "content-box 200 wide at 2:1 is 100 tall plus 18 of insets, got {}",
+            cb.dimensions.height
+        );
+    }
+
+    /// A height that `aspect-ratio` settles before the children are laid out is
+    /// definite, so `height: 100%` inside resolves against it. Without that the
+    /// media that fills a ratio-sized frame came out `auto` — zero — and never
+    /// painted.
+    #[test]
+    fn test_percentage_height_resolves_against_a_ratio_sized_parent() {
+        let html = r#"<div style="width:800px"><div id="frame" style="position:relative;width:200px;aspect-ratio:2/1"><div id="fill" style="width:100%;height:100%"></div></div></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let fill = find_element_by_id(&layout, "fill").expect("fill");
+        assert!(
+            (fill.dimensions.height - 100.0).abs() < 0.5,
+            "100% of a 100px ratio-sized frame is 100px, got {}",
+            fill.dimensions.height
+        );
+    }
+
+    /// Flexing overrides an item's stated main size, and `aspect-ratio` ties the
+    /// two axes together — so the cross size has to be re-derived from the size
+    /// flexing settled on, not from the one the item asked for.
+    #[test]
+    fn test_a_shrunk_flex_item_takes_its_height_from_its_final_width() {
+        let html = r#"<div style="width:800px"><div style="display:flex;width:400px"><div id="w" style="width:120%;flex:0 1 auto;aspect-ratio:2/1"></div></div></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let w = find_element_by_id(&layout, "w").expect("w");
+        assert!(
+            (w.dimensions.width - 400.0).abs() < 1.0,
+            "480 shrinks to the 400px line, got {}",
+            w.dimensions.width
+        );
+        assert!(
+            (w.dimensions.height - 200.0).abs() < 1.0,
+            "and 400 at 2:1 is 200 tall, not the 240 it asked for, got {}",
+            w.dimensions.height
+        );
+    }
+
+    /// The ratio runs the other way too: stretching settles the cross size, and
+    /// an item with nothing of its own along the main axis takes that size from
+    /// the ratio instead of collapsing to nothing.
+    #[test]
+    fn test_a_stretched_ratio_item_takes_its_width_from_its_height() {
+        let html = r#"<div style="width:800px"><div style="display:flex;align-items:stretch;height:120px"><div id="r" style="aspect-ratio:2/1"></div></div></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let r = find_element_by_id(&layout, "r").expect("r");
+        assert!(
+            (r.dimensions.width - 240.0).abs() < 1.0,
+            "120 tall at 2:1 is 240 wide, got {}",
+            r.dimensions.width
+        );
+    }
+
+    /// `max-width` and `min-width` are lengths like any other: a percentage and
+    /// a `calc()` bind exactly as a pixel value does. github's hero carousel is
+    /// held to `calc(100% - 2 * 32px)` and, unbounded, ran the full width of the
+    /// viewport.
+    #[test]
+    fn test_width_bounds_accept_percentages_and_calc() {
+        let html = r#"<div style="width:800px">
+            <div id="pct" style="max-width:50%"></div>
+            <div id="calc" style="max-width:calc(100% - 64px)"></div>
+            <div id="floor" style="width:100px;min-width:25%"></div>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        for (id, want) in [("pct", 400.0), ("calc", 736.0), ("floor", 200.0)] {
+            let b = find_element_by_id(&layout, id).expect(id);
+            assert!(
+                (outer_width(b) - want).abs() < 0.5,
+                "#{id} should be {want} wide, got {}",
+                outer_width(b)
+            );
+        }
+    }
+
+    /// Flow advances past a box's *border* box. A stated height leaves
+    /// `dimensions.height` as the content box, so reading it directly handed the
+    /// next block a cursor the box's own padding too high.
+    #[test]
+    fn test_a_stated_height_advances_flow_by_the_border_box() {
+        let html = r#"<div style="width:800px"><div id="a" style="height:100px;padding:8px;border:2px solid #000"></div><div id="after">after</div></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let after = find_element_by_id(&layout, "after").expect("after");
+        assert!(
+            (after.dimensions.y - 120.0).abs() < 0.5,
+            "100 of content plus 16 of padding and 4 of border is 120, got y={}",
+            after.dimensions.y
+        );
     }
 
     /// `justify-content: center` must center flex children horizontally within
