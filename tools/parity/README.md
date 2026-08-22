@@ -105,11 +105,15 @@ which is what the first version of this change got wrong: comparing a
 content-box bound against a border-box width made a `min-width: 85px` box 24px
 too wide and overflowed a floated header cluster.
 
+The child content width now follows the same rule: a padded block lays its
+children out against `width` less its padding when the width is auto, and
+against `width` unchanged when it was stated. Before, a padded block handed its
+children its own outer width and their text ran past its padding.
+
 Paint reads `dimensions` as the border box, so what remains is the *stated*-width
 case: a box with a declared width and padding paints its padding short. Fixing
-that needs paint, the flex re-layout pass and the child content width moved
-together — the first attempt showed that changing one at a time renders worse
-than either model alone.
+that needs paint and the flex re-layout pass moved together — the first attempt
+showed that changing one at a time renders worse than either model alone.
 
 A flex item is the one other path that has been migrated, and only because its
 conversion could be done in one place: through the flex algorithm `dimensions`

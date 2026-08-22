@@ -1343,8 +1343,23 @@ impl<'a> LayoutBox<'a> {
             return (Some(self), final_x, final_y);
         }
 
+        // The width children are laid out against. `width` is a content box when
+        // it came from a stated value and a border box when it did not — see the
+        // note where it is computed — so the padding comes off only in the
+        // second case. Leaving it on meant a padded block handed its children
+        // its own outer width, and their text ran the full width of the box
+        // instead of stopping at its padding.
         let inner_width = if width > 0.0 {
-            width
+            if auto_width {
+                (width
+                    - self.padding.left
+                    - self.padding.right
+                    - self.border.left
+                    - self.border.right)
+                    .max(0.0)
+            } else {
+                width
+            }
         } else {
             (container_width
                 - self.padding.left
@@ -6476,6 +6491,27 @@ mod tests {
             p.dimensions.height < line * 1.8,
             "so it stays on one line: height={}, line={line}",
             p.dimensions.height
+        );
+    }
+
+    /// A padded block lays its children out against its *content* width. It
+    /// used to hand them its own outer width, so their text ran the full width
+    /// of the box instead of stopping at its padding.
+    #[test]
+    fn test_padded_block_narrows_the_width_its_children_get() {
+        let html = r#"<div style="width:800px"><section id="s" style="padding:8px"><div id="a">x</div></section></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let a = find_element_by_id(&layout, "a").expect("child");
+        assert!(
+            (a.dimensions.width - 784.0).abs() < 1.0,
+            "800 less the section's 16px of padding, got {}",
+            a.dimensions.width
+        );
+        assert!(
+            (a.dimensions.x - 8.0).abs() < 1.0,
+            "and it starts inside the padding, got x={}",
+            a.dimensions.x
         );
     }
 
