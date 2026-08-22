@@ -3326,7 +3326,14 @@ impl<'a> LayoutBox<'a> {
         // Each entry carries the flow cursor at the point the child was skipped:
         // that is its static position, which is where CSS puts an out-of-flow box
         // whose offsets are `auto`.
-        let mut positioned_entries: Vec<(&StyledNode, f32)> = Vec::new();
+        // The third field is where the box belongs among its siblings. An
+        // out-of-flow child is laid out after the in-flow ones — it has to be,
+        // since its offsets resolve against a box whose size is not known until
+        // then — but paint order among positioned boxes is *tree* order, so the
+        // finished box goes back where the document put it. Appending them
+        // instead let github's hero carousel paint its video under the two
+        // gradients that sit behind it in the markup.
+        let mut positioned_entries: Vec<(&StyledNode, f32, usize)> = Vec::new();
 
         // Counter for ordered list item markers (1., 2., …).
         // Only incremented when a ListItem child is placed in normal flow.
@@ -3337,7 +3344,7 @@ impl<'a> LayoutBox<'a> {
                 // ── Absolutely / fixedly positioned child — skip normal flow ──
                 ChildKind::Positioned => {
                     // Collect for deferred layout after normal-flow finalisation.
-                    positioned_entries.push((entry.node, cursor_y));
+                    positioned_entries.push((entry.node, cursor_y, result.len()));
                 }
 
                 // ── Forced line break (`<br>`) ───────────────────────────────
@@ -3688,7 +3695,10 @@ impl<'a> LayoutBox<'a> {
                     .max(0.0),
             };
 
-            for (pos_node, static_y) in positioned_entries {
+            // Every insertion shifts the ones after it, and the entries are in
+            // document order, so the offset is just how many have gone in.
+            let mut inserted = 0usize;
+            for (pos_node, static_y, sibling_index) in positioned_entries {
                 let child_pos_type = get_position_type(pos_node);
                 // fixed: containing block = viewport; absolute: nearest positioned ancestor.
                 let cb_for_child = if child_pos_type == PositionType::Fixed {
@@ -3806,7 +3816,9 @@ impl<'a> LayoutBox<'a> {
                     let dy = target_y - pc.dimensions.y;
                     offset_layout_box(&mut pc, dx, dy);
 
-                    self.children.push(pc);
+                    let at = (sibling_index + inserted).min(self.children.len());
+                    self.children.insert(at, pc);
+                    inserted += 1;
                 }
             }
         }
@@ -8375,6 +8387,41 @@ mod tests {
             (r.dimensions.width - 240.0).abs() < 1.0,
             "120 tall at 2:1 is 240 wide, got {}",
             r.dimensions.width
+        );
+    }
+
+    /// Paint order among positioned boxes is document order, so an out-of-flow
+    /// child — which has to be laid out after the in-flow ones, since its
+    /// offsets resolve against a box whose size is not known until then — goes
+    /// back where the document put it. Appending them instead let github's hero
+    /// carousel paint its video under the two gradients that sit behind it in
+    /// the markup.
+    #[test]
+    fn test_a_positioned_child_keeps_its_place_among_its_siblings() {
+        let html = r#"<div id="root" style="position:relative;width:400px;height:200px">
+            <div id="under" style="position:absolute;inset:0"></div>
+            <div id="flow">in flow</div>
+            <div id="over" style="position:absolute;inset:0"></div>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let root = find_element_by_id(&layout, "root").expect("root");
+        let order: Vec<String> = root
+            .children
+            .iter()
+            .filter_map(|c| match c.style_node.node.data {
+                NodeData::Element { ref attrs, .. } => attrs
+                    .borrow()
+                    .iter()
+                    .find(|a| &a.name.local == "id")
+                    .map(|a| a.value.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec!["under".to_string(), "flow".to_string(), "over".to_string()],
+            "children come back in document order"
         );
     }
 
