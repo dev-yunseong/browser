@@ -157,9 +157,9 @@ pixels:
 
 | fixture | layout | fold | page | height (chromium -> engine) |
 |---|---|---|---|---|
-| github.com | 1.37% | 2.89% | 1.60% | 10570 -> 10553 |
-| yunseong.dev | 1.43% | 3.18% | 3.05% | 4976 -> 4976 |
-| naver.com | 1.25% | 2.91% | 2.52% | 18658 -> 16384 |
+| github.com | 1.37% | 2.90% | 1.61% | 10570 -> 10553 |
+| yunseong.dev | 1.41% | 3.18% | 3.05% | 4976 -> 4976 |
+| naver.com | 1.26% | 2.91% | 2.52% | 18658 -> 16384 |
 
 github.com began this work at 9.14% layout, 13.84% fold and 780px too tall;
 yunseong.dev at 4.24% and 256px too short. github's page is now within a single
@@ -181,9 +181,12 @@ exercises the UA stylesheet.
 - **Glyph rasterisation.** Most of what is left on a text-heavy fixture is not
   layout: converting both renders to greyscale removes only a twentieth of the
   difference, so it is glyph shape and hinting rather than the reference's
-  subpixel antialiasing. The engine draws about 12% less ink than Chromium over
-  `probe-generics`, with the text-coverage curve already compensating for most
-  of the gap.
+  subpixel antialiasing. Advance widths agree — across the whole of github.com
+  only three text leaves differ in width by 4px or more, and across yunseong.dev
+  only two — and both renderers position glyphs at quarter-pixel phases. What
+  differs is that FreeType hints stems onto the pixel grid and this rasteriser
+  does not. The text-coverage curve now brings the ink to within 4-10% of the
+  reference's, from 6-13% short.
 - **Canvas, video and script-driven content do not render.** github.com's
   landing page is largely a WebGL canvas and a video, so a share of its
   remaining difference is content this engine does not draw at all.

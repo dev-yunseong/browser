@@ -1457,11 +1457,13 @@ fn build_radial_gradient_shader<'a>(
 ///
 /// The reference renderer runs glyph coverage through a contrast curve before
 /// compositing, which is why the same face at the same size carries visibly more
-/// ink there than a straight linear blend produces. Measured over the whole
-/// `probe-generics` fixture, its text carried about a quarter more ink than ours
-/// and a third more fully-dark pixels; this exponent closes that gap. It is an
-/// approximation of the reference's curve, not a derivation of it.
-const TEXT_COVERAGE_GAMMA: f32 = 1.0 / 1.45;
+/// ink there than a straight linear blend produces. The exponent is fitted to
+/// the ink and fully-dark-pixel counts across five text-heavy fixtures, which
+/// this brings to within 4-10% of the reference's — from 6-13% short. It is an
+/// approximation of the reference's curve, not a derivation of it, and what is
+/// left is glyph *shape*: FreeType hints stems onto the pixel grid and this
+/// rasteriser does not, which no coverage curve can make up.
+const TEXT_COVERAGE_GAMMA: f32 = 1.0 / 1.75;
 
 /// Rasterise an inline `<svg>` subtree into `rect`.
 ///
