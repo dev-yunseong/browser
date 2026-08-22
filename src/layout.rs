@@ -511,6 +511,27 @@ pub fn compute_min_content_width(sn: &StyledNode, vw: f32, vh: f32) -> f32 {
     cache.min_content_width(sn, vw, vh)
 }
 
+/// Whether a box sizes itself to its content rather than filling its container.
+///
+/// `inline-flex` and `inline-grid` need the element to answer this, not just its
+/// `DisplayType`: they lay out their children like the block-level forms but
+/// size the box like an inline-block.
+fn is_shrink_wrap_for(sn: &StyledNode, d: DisplayType) -> bool {
+    if is_inline_level_container(sn) {
+        return true;
+    }
+    is_shrink_wrap(d)
+}
+
+/// `true` when the element's own `display` is one of the inline-level container
+/// keywords.
+fn is_inline_level_container(sn: &StyledNode) -> bool {
+    matches!(
+        sn.specified_values.get(&crate::css::intern("display")),
+        Some(Value::Keyword(k)) if matches!(&**k, "inline-flex" | "inline-grid")
+    )
+}
+
 fn is_shrink_wrap(d: DisplayType) -> bool {
     matches!(
         d,
@@ -1021,6 +1042,18 @@ impl<'a> LayoutBox<'a> {
         }
 
         let is_floated = get_float(self.style_node).is_some();
+        // What `dimensions.width` ends up meaning depends on where it came from,
+        // and every reader below depends on knowing which:
+        //
+        //   * a **stated** width leaves it as the *content* box, since
+        //     `border-box` sizing takes the padding and border back off;
+        //   * an **auto** width leaves it as the *border* box, because both ways
+        //     of arriving at one — shrink-to-fit from max-content, and a block
+        //     filling `container_width - margins` — already count them in.
+        //
+        // Paint reads it as the border box, so an auto-width box draws correctly
+        // and a stated-width one draws its padding short. See
+        // `tools/parity/README.md` for why that has not been unified yet.
         let specified_width = self
             .style_node
             .specified_values
@@ -1058,7 +1091,7 @@ impl<'a> LayoutBox<'a> {
                 max_c.min(available).max(min_c)
             }
             _ => {
-                if is_floated || is_shrink_wrap(self.display) {
+                if is_floated || is_shrink_wrap_for(self.style_node, self.display) {
                     let max_c = intrinsic_cache.max_content_width(self.style_node, vw, vh);
                     let min_c = intrinsic_cache.min_content_width(self.style_node, vw, vh);
                     // Auto-width floats use shrink-to-fit sizing instead of filling the line.
@@ -1084,7 +1117,12 @@ impl<'a> LayoutBox<'a> {
             })
             .unwrap_or("content-box");
 
-        if box_sizing == "border-box" && width > 0.0 {
+        // `border-box` means a *stated* width already covers padding and border,
+        // so they come off to leave the content width. An auto width has nothing
+        // stated: shrink-to-fit already sized the box around its content, and
+        // taking the padding off again made a button exactly its own padding too
+        // narrow — so its label was drawn past the end of its background.
+        if box_sizing == "border-box" && width > 0.0 && !auto_width {
             width = (width
                 - self.padding.left
                 - self.padding.right
@@ -1093,31 +1131,34 @@ impl<'a> LayoutBox<'a> {
                 .max(0.0);
         }
 
+        // `min-width` and `max-width` have to be compared against `width` in the
+        // space it is held in. A stated width leaves `width` as the content box;
+        // an auto one leaves it as the border box, because shrink-to-fit sizes
+        // the box around its content, padding and border included.
+        let pad_border =
+            self.padding.left + self.padding.right + self.border.left + self.border.right;
+        let in_width_space = |stated: f32| -> f32 {
+            match (box_sizing == "border-box", auto_width) {
+                // The bound covers padding and border; `width` does not.
+                (true, false) => (stated - pad_border).max(0.0),
+                // The bound is a content width; `width` covers more than that.
+                (false, true) => stated + pad_border,
+                _ => stated,
+            }
+        };
         if let Some(Value::Length(v, Unit::Px)) = self
             .style_node
             .specified_values
             .get(&crate::css::intern("max-width"))
         {
-            let max_w = if box_sizing == "border-box" {
-                (*v - self.padding.left - self.padding.right - self.border.left - self.border.right)
-                    .max(0.0)
-            } else {
-                *v
-            };
-            width = width.min(max_w);
+            width = width.min(in_width_space(*v));
         }
         if let Some(Value::Length(v, Unit::Px)) = self
             .style_node
             .specified_values
             .get(&crate::css::intern("min-width"))
         {
-            let min_w = if box_sizing == "border-box" {
-                (*v - self.padding.left - self.padding.right - self.border.left - self.border.right)
-                    .max(0.0)
-            } else {
-                *v
-            };
-            width = width.max(min_w);
+            width = width.max(in_width_space(*v));
         }
 
         // `margin: 0 auto` centres the box's *border* box. `width` at this point
@@ -3315,6 +3356,14 @@ fn get_display_type(sn: &StyledNode) -> DisplayType {
             "inline-block" => return DisplayType::InlineBlock,
             "flex" => return DisplayType::Flex,
             "grid" => return DisplayType::Grid,
+            // `inline-flex` lays its children out exactly like `flex`; the
+            // difference is in how the box itself flows, which
+            // `is_block_level_for` and `is_shrink_wrap_for` read off the
+            // keyword. Falling through to the tag default instead left every
+            // Primer button an ordinary inline box, so a "Sign in" pill was
+            // drawn the full width of the header.
+            "inline-flex" => return DisplayType::Flex,
+            "inline-grid" => return DisplayType::Grid,
             _ => {}
         }
     }
@@ -3351,6 +3400,10 @@ fn get_display_type(sn: &StyledNode) -> DisplayType {
 /// must put it on its own line, and reading block-ness off the type alone left
 /// such images overlapping the content around them.
 fn is_block_level_for(sn: &StyledNode, d: DisplayType) -> bool {
+    // An inline-level container flows inline however it lays its children out.
+    if is_inline_level_container(sn) {
+        return false;
+    }
     if is_block_level(d) {
         return true;
     }
@@ -4515,10 +4568,13 @@ mod tests {
             "app launcher should stay inside the viewport, got right edge {}",
             apps.dimensions.x + border_box_width(apps)
         );
+        // `.gb_Td` has no stated width, so `dimensions.width` is its border box
+        // already: `min-width: 85px` under the default `content-box` gives 85 of
+        // content plus its 24px of padding.
         assert!(
-            login.dimensions.x + border_box_width(login) <= 800.0,
+            login.dimensions.x + login.dimensions.width <= 800.0,
             "login button should stay inside the viewport, got right edge {}",
-            login.dimensions.x + border_box_width(login)
+            login.dimensions.x + login.dimensions.width
         );
     }
 
@@ -4544,7 +4600,10 @@ mod tests {
         let layout = layout_opt.expect("layout");
         let login = find_element_by_id(&layout, "login").expect("login not found");
 
-        let border_w = login.dimensions.width + login.padding.left + login.padding.right + login.border.left + login.border.right;
+        // The width is auto, so `dimensions.width` is already the border box —
+        // see the note in `perform_layout`. Under `border-box` sizing a
+        // `min-width` is a border-box bound, so the box is exactly 85 wide.
+        let border_w = login.dimensions.width;
         let border_h = login.dimensions.height + login.padding.top + login.padding.bottom + login.border.top + login.border.bottom;
 
         assert!(
@@ -6032,6 +6091,63 @@ mod tests {
             a.dimensions.width > 700.0,
             "a stretched item fills the column: width={}",
             a.dimensions.width
+        );
+    }
+
+    /// `inline-flex` lays its children out like `flex` but sizes the box like
+    /// an inline-block. Falling through to the tag default left every button
+    /// built that way an ordinary inline box, so a "Sign in" pill was drawn the
+    /// full width of its header.
+    #[test]
+    fn test_inline_flex_shrink_wraps_but_still_lays_out_as_flex() {
+        let html = r#"<div style="width:800px">
+            <a id="btn" style="display:inline-flex;gap:8px"><span id="a">Sign</span><span id="b">in</span></a>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let btn = find_element_by_id(&layout, "btn").expect("button");
+        let a = find_element_by_id(&layout, "a").expect("span a");
+        let b = find_element_by_id(&layout, "b").expect("span b");
+
+        assert!(
+            btn.dimensions.width < 200.0,
+            "an inline-flex box shrink-wraps rather than filling its container: width={}",
+            btn.dimensions.width
+        );
+        assert!(
+            (a.dimensions.y - b.dimensions.y).abs() < 2.0,
+            "its children still lay out as flex items on one line: a.y={}, b.y={}",
+            a.dimensions.y, b.dimensions.y
+        );
+        assert!(
+            b.dimensions.x >= a.dimensions.x + a.dimensions.width + 6.0,
+            "and the gap between them applies: a ends at {}, b starts at {}",
+            a.dimensions.x + a.dimensions.width, b.dimensions.x
+        );
+    }
+
+    /// A shrink-to-fit box is sized around its content, padding and border
+    /// included. Taking the padding off again under `box-sizing: border-box`
+    /// made a button exactly its own padding too narrow, so its label was drawn
+    /// past the end of its background.
+    #[test]
+    fn test_shrink_to_fit_button_covers_its_own_label() {
+        let html = r#"<div style="width:800px">
+            <button id="b" style="box-sizing:border-box;padding:10px 18px;font-size:16px">Sign up for GitHub</button>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let b = find_element_by_id(&layout, "b").expect("button");
+        let label = crate::font::fonts().measure(
+            "Sign up for GitHub",
+            16.0,
+            crate::font::FontStyle::regular(),
+            0.0,
+        );
+        assert!(
+            b.dimensions.width >= label + 36.0 - 1.0,
+            "the box must cover the label plus its 36px of padding: width={}, label={label}",
+            b.dimensions.width
         );
     }
 

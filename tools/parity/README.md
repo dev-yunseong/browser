@@ -69,10 +69,9 @@ a regression points at a mechanism rather than at "github.com looks wrong":
   child content width is taken as `dimensions` unchanged — both of which only
   hold if it is the content box.
 
-The visible cost is a shrink-to-fit control coming out narrower than its own
-label: `fit-content` already counts the padding, the border-box adjustment takes
-it off again, and the label is clipped (`probe-controls`). Nested padding also
-fails to reduce the width passed to children.
+The visible cost left is a box with a *stated* width and padding painting its
+padding short. Nested padding also fails to reduce the width passed to children,
+so text can wrap later than it should.
 
 Fixing it means picking one meaning and migrating every reader — the width
 computation, `border_box_width`/`margin_box_width`, the flex and grid track
@@ -89,22 +88,30 @@ width back in as a containing-block width, and the padding is then taken off a
 second time. The tests do not cover that interaction; only the pixel diff caught
 it.
 
-The second tried the smallest possible version: stop taking padding off a
-*shrink-to-fit* width under `border-box`, on the grounds that `max-content`
-already counts it, so the painted box would cover the label. That does fix the
-clipped button — and immediately breaks `min-width`. The bounds are compared
-against `width` in the content-box space the rest of the function assumes, so a
-`min-width: 85px` box came out 85px of *content* plus its padding, 24px too wide,
-and a floated header cluster overflowed the viewport. Mapping the bounds into the
-other space fixes that pair and breaks the next one along.
+The second attempt was narrower and did land, so the rule is now at least
+statable:
 
-Both attempts say the same thing: the meaning of `dimensions` cannot be changed
-for one path at a time. The next attempt needs the width computation, the
-min/max bounds, the flex re-layout pass and paint in a single change, with
-`test_button_coordinate_collection` and `test_border_box_min_size_includes_padding`
-rewritten to the chosen model.
+> An **auto** width leaves `dimensions.width` as the **border box**; a **stated**
+> width leaves it as the **content box**.
 
-A flex item is the one path that has been migrated, and only because its
+That holds because both ways of arriving at an auto width — shrink-to-fit from
+max-content, and a block filling `container_width - margins` — already count
+padding and border in, while `border-box` sizing takes them back off a stated
+one. Before, an auto width under `border-box` had its padding taken off as well,
+so a shrink-to-fit button came out exactly its own padding too narrow and its
+label was drawn past the end of its background (`probe-controls`). `min-width`
+and `max-width` are now mapped into whichever space `width` is being held in,
+which is what the first version of this change got wrong: comparing a
+content-box bound against a border-box width made a `min-width: 85px` box 24px
+too wide and overflowed a floated header cluster.
+
+Paint reads `dimensions` as the border box, so what remains is the *stated*-width
+case: a box with a declared width and padding paints its padding short. Fixing
+that needs paint, the flex re-layout pass and the child content width moved
+together — the first attempt showed that changing one at a time renders worse
+than either model alone.
+
+A flex item is the one other path that has been migrated, and only because its
 conversion could be done in one place: through the flex algorithm `dimensions`
 holds the content box, which is what flex-basis and grow operate on, and it is
 converted to the border box once, after the algorithm finishes.

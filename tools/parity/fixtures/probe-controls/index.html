@@ -13,6 +13,11 @@
   .varbtn { background-color: var(--accent, #8250df); color: #fff; border: 0; border-radius: 999px; padding: 8px 16px; }
   a.btn { display: inline-block; background: #24292f; color: #fff; padding: 10px 18px; border-radius: 6px; text-decoration: none; }
   .plainbtn { appearance: none; -webkit-appearance: none; background: #bf3989; color: #fff; border: 0; padding: 10px 18px; }
+  /* A design system builds its buttons as `inline-flex`: the children lay out
+     as flex items, but the box itself sizes like an inline-block. Treating it
+     as an ordinary inline box draws the pill the full width of its bar. */
+  .pill { align-items: center; display: inline-flex; gap: 8px; background: #0969da; color: #fff; border: 1px solid transparent; border-radius: 6px; padding: 8px 16px; text-decoration: none; }
+  .bar { display: flex; justify-content: flex-end; background: #f6f8fa; padding: 8px; }
 </style>
 </head>
 <body>
@@ -22,5 +27,7 @@
   <section><b>button, background from var</b><br><button class="varbtn">Var background</button></section>
   <section><b>anchor styled as button</b><br><a class="btn" href="#">Anchor button</a></section>
   <section><b>button, appearance none</b><br><button class="plainbtn">Appearance none</button></section>
+  <section><b>inline-flex pill</b><br><a class="pill" href="#"><span>Sign</span><span>in</span></a></section>
+  <section><b>inline-flex pill in a bar</b><div class="bar"><a class="pill" href="#"><span>Sign in</span></a></div></section>
 </body>
 </html>
