@@ -1965,41 +1965,6 @@ impl<'a> LayoutBox<'a> {
             let total_col_gaps = if num_cols > 1 { col_gap * (num_cols - 1) as f32 } else { 0.0 };
             let available_for_cols = (inner_width - total_col_gaps).max(0.0);
 
-            // Sum of fixed (non-fr, non-auto) column widths.
-            let col_fixed_total: f32 = col_tracks.iter().map(|t| match t {
-                Value::Length(v, Unit::Px) => *v,
-                Value::Length(v, Unit::Percent) => inner_width * (v / 100.0),
-                _ => 0.0,
-            }).sum();
-
-            // Total fr units across all column tracks.
-            let col_fr_total: f32 = col_tracks.iter().map(|t| match t {
-                Value::Length(v, crate::css::Unit::Fr) => *v,
-                _ => 0.0,
-            }).sum();
-
-            // Space remaining after fixed tracks — split among fr/auto tracks.
-            let col_fr_space = (available_for_cols - col_fixed_total).max(0.0);
-
-            // Count auto columns (share fr space equally if no fr tracks).
-            let auto_count = col_tracks.iter().filter(|t| matches!(t, Value::Keyword(k) if k.as_ref() == "auto")).count() as f32;
-
-            let col_widths: Vec<f32> = if col_tracks.is_empty() {
-                vec![inner_width]
-            } else {
-                col_tracks.iter().map(|t| match t {
-                    Value::Length(v, Unit::Px) => *v,
-                    Value::Length(v, Unit::Percent) => inner_width * (v / 100.0),
-                    Value::Length(v, crate::css::Unit::Fr) => {
-                        if col_fr_total > 0.0 { (v / col_fr_total) * col_fr_space } else { 0.0 }
-                    }
-                    Value::Keyword(k) if k.as_ref() == "auto" => {
-                        if auto_count > 0.0 { col_fr_space / auto_count } else { 0.0 }
-                    }
-                    _ => 0.0,
-                }).collect()
-            };
-
             // Collect in-flow children (skip positioned / display:none / whitespace-only text nodes).
             let mut grid_children: Vec<&StyledNode> = Vec::new();
             for child_node in &self.style_node.children {
@@ -2079,6 +2044,60 @@ impl<'a> LayoutBox<'a> {
             }
 
             let num_rows_needed = occupied.len();
+
+            // ── Resolve column widths ─────────────────────────────────────
+            // Fixed tracks take their stated size; `auto` tracks take the widest
+            // content placed in them; `fr` tracks share whatever is left. Sizing
+            // `auto` from the free space instead — as this did — left nothing for
+            // the `fr` beside it, so the second column of an `auto 1fr` sidebar
+            // came out empty.
+            let col_fixed_total: f32 = col_tracks.iter().map(|t| match t {
+                Value::Length(v, Unit::Px) => *v,
+                Value::Length(v, Unit::Percent) => inner_width * (v / 100.0),
+                _ => 0.0,
+            }).sum();
+
+            let mut auto_widths: Vec<f32> = vec![0.0; num_cols];
+            for (child_node, placement) in grid_children.iter().zip(&placements) {
+                // Only an item confined to one track can size that track.
+                if placement.col_span != 1 || placement.col >= num_cols {
+                    continue;
+                }
+                if matches!(col_tracks.get(placement.col), Some(Value::Keyword(k)) if k.as_ref() == "auto") {
+                    let content = intrinsic_cache.max_content_width(child_node, vw, vh);
+                    auto_widths[placement.col] = auto_widths[placement.col].max(content);
+                }
+            }
+            let auto_total: f32 = auto_widths.iter().sum();
+
+            let col_fr_total: f32 = col_tracks.iter().map(|t| match t {
+                Value::Length(v, crate::css::Unit::Fr) => *v,
+                _ => 0.0,
+            }).sum();
+            let col_fr_space = (available_for_cols - col_fixed_total - auto_total).max(0.0);
+
+            let col_widths: Vec<f32> = if col_tracks.is_empty() {
+                vec![inner_width]
+            } else {
+                col_tracks.iter().enumerate().map(|(idx, t)| match t {
+                    Value::Length(v, Unit::Px) => *v,
+                    Value::Length(v, Unit::Percent) => inner_width * (v / 100.0),
+                    Value::Length(v, crate::css::Unit::Fr) => {
+                        if col_fr_total > 0.0 { (v / col_fr_total) * col_fr_space } else { 0.0 }
+                    }
+                    Value::Keyword(k) if k.as_ref() == "auto" => {
+                        // With no flexible track to absorb it, an auto track
+                        // spreads into the free space rather than hugging content.
+                        if col_fr_total > 0.0 {
+                            auto_widths[idx]
+                        } else {
+                            auto_widths[idx] + col_fr_space / auto_widths.iter().filter(|w| **w > 0.0).count().max(1) as f32
+                        }
+                    }
+                    _ => 0.0,
+                }).collect()
+            };
+
 
             // Width of a run of tracks, gaps between them included.
             let span_width = |col: usize, span: usize| -> f32 {
@@ -6000,6 +6019,59 @@ mod tests {
             (a.dimensions.y - b.dimensions.y).abs() < 2.0,
             "A and B should be on the same row: a.y={}, b.y={}",
             a.dimensions.y, b.dimensions.y
+        );
+    }
+
+    /// `grid-template-columns: auto 1fr` → the auto track hugs its content and
+    /// the fr track takes the rest. Sizing `auto` out of the free space instead
+    /// left nothing for the `fr`, so a sidebar's main column came out empty.
+    #[test]
+    fn test_grid_auto_track_hugs_content_leaving_room_for_fr() {
+        let html = r#"<div id="grid">
+            <div id="a">Nav</div>
+            <div id="b">Main</div>
+        </div>"#;
+        let css_src = "#grid { display: grid; grid-template-columns: auto 1fr; }";
+        let (layout, _, _) = layout_from_html_css(html, css_src, 800.0, 600.0);
+
+        let a = find_element_by_id(&layout, "a").expect("cell A");
+        let b = find_element_by_id(&layout, "b").expect("cell B");
+
+        assert!(
+            a.dimensions.width > 0.0 && a.dimensions.width < 200.0,
+            "auto column should hug its content, got {}",
+            a.dimensions.width
+        );
+        assert!(
+            b.dimensions.width > 600.0,
+            "fr column should take the remaining space, got {}",
+            b.dimensions.width
+        );
+        assert!(
+            (a.dimensions.y - b.dimensions.y).abs() < 2.0,
+            "A and B should share a row: a.y={}, b.y={}",
+            a.dimensions.y, b.dimensions.y
+        );
+    }
+
+    /// With no flexible track to absorb it, `auto auto` still spans the
+    /// container rather than leaving the row half empty.
+    #[test]
+    fn test_grid_auto_tracks_without_fr_fill_container() {
+        let html = r#"<div id="grid">
+            <div id="a">A</div>
+            <div id="b">B</div>
+        </div>"#;
+        let css_src = "#grid { display: grid; grid-template-columns: auto auto; }";
+        let (layout, _, _) = layout_from_html_css(html, css_src, 800.0, 600.0);
+
+        let a = find_element_by_id(&layout, "a").expect("cell A");
+        let b = find_element_by_id(&layout, "b").expect("cell B");
+
+        assert!(
+            a.dimensions.width + b.dimensions.width > 700.0,
+            "auto tracks with no fr beside them should fill the container, got {} + {}",
+            a.dimensions.width, b.dimensions.width
         );
     }
 
