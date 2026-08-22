@@ -302,8 +302,11 @@ fn matches_selector_arena(selector: &Selector, idx: usize, arena: &[NodeDataSend
     let has_constraint = selector.tag.is_some() || selector.id.is_some() || !selector.class.is_empty() || !selector.attributes.is_empty() || !selector.pseudo_classes.is_empty();
     if !has_constraint { return false; }
 
+    // `*` matches any element; treating it as a literal tag name meant a rule
+    // like `* { box-sizing: border-box }` — which nearly every stylesheet opens
+    // with — never applied, so padded boxes came out wider than their container.
     if let Some(ref s_tag) = selector.tag {
-        if &node.tag != s_tag { return false; }
+        if s_tag != "*" && &node.tag != s_tag { return false; }
     }
     if let Some(ref s_id) = selector.id {
         if node.id.as_deref() != Some(s_id) { return false; }
@@ -1093,7 +1096,7 @@ fn compound_matches_element(sel: &Selector, handle: &Handle) -> bool {
     let Some((tag, id, classes)) = element_info(handle) else {
         return false;
     };
-    if sel.tag.as_ref().is_some_and(|t| *t != tag) {
+    if sel.tag.as_ref().is_some_and(|t| t != "*" && *t != tag) {
         return false;
     }
     if sel.id.as_ref().is_some_and(|i| id.as_deref() != Some(i)) {

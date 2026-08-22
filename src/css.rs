@@ -1124,7 +1124,8 @@ impl Selector {
                 _ => b += 1,
             }
         }
-        if self.tag.is_some() { c += 1; }
+        // A universal selector matches everything and adds no specificity.
+        if self.tag.is_some() && !self.matches_any_tag() { c += 1; }
 
         if let Some(ref d) = self.ancestor {
             let (da, db, dc) = d.specificity();
@@ -1143,9 +1144,17 @@ impl Selector {
             return SelectorKey::Class(cls.clone());
         }
         if let Some(ref tag) = self.tag {
-            return SelectorKey::Tag(tag.clone());
+            if tag != "*" {
+                return SelectorKey::Tag(tag.clone());
+            }
         }
         SelectorKey::Universal
+    }
+
+    /// `true` when the subject compound places no constraint on the element
+    /// itself — a bare `*`, or `*` qualified only by an ancestor.
+    pub fn matches_any_tag(&self) -> bool {
+        self.tag.as_deref() == Some("*")
     }
 }
 
