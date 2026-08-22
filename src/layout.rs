@@ -2302,7 +2302,10 @@ impl<'a> LayoutBox<'a> {
             };
         }
 
-        let mut positioned_entries: Vec<&StyledNode> = Vec::new();
+        // Each entry carries the flow cursor at the point the child was skipped:
+        // that is its static position, which is where CSS puts an out-of-flow box
+        // whose offsets are `auto`.
+        let mut positioned_entries: Vec<(&StyledNode, f32)> = Vec::new();
 
         // Counter for ordered list item markers (1., 2., …).
         // Only incremented when a ListItem child is placed in normal flow.
@@ -2313,7 +2316,7 @@ impl<'a> LayoutBox<'a> {
                 // ── Absolutely / fixedly positioned child — skip normal flow ──
                 ChildKind::Positioned => {
                     // Collect for deferred layout after normal-flow finalisation.
-                    positioned_entries.push(entry.node);
+                    positioned_entries.push((entry.node, cursor_y));
                 }
 
                 // ── Forced line break (`<br>`) ───────────────────────────────
@@ -2621,7 +2624,7 @@ impl<'a> LayoutBox<'a> {
                     .max(0.0),
             };
 
-            for pos_node in positioned_entries {
+            for (pos_node, static_y) in positioned_entries {
                 let child_pos_type = get_position_type(pos_node);
                 // fixed: containing block = viewport; absolute: nearest positioned ancestor.
                 let cb_for_child = if child_pos_type == PositionType::Fixed {
@@ -2694,7 +2697,11 @@ impl<'a> LayoutBox<'a> {
                                 - pc.dimensions.height
                                 - pc.margin.bottom
                         }
-                        (None, None) => cb_for_child.y + pc.margin.top, // default to CB origin
+                        // Neither offset given: the box stays where it would have
+                        // been in flow. Falling back to the containing block's
+                        // origin instead pulls it to the top of its ancestor, so a
+                        // hero pinned below a header jumped to the page top.
+                        (None, None) => static_y + pc.margin.top,
                     };
 
                     let dx = target_x - pc.dimensions.x;
@@ -3955,9 +3962,15 @@ mod tests {
         let first = find_text_box_containing(&layout, "first").expect("first text");
         let second = find_element_by_id(&layout, "second").expect("second span");
 
+        // Two <br>s move the cursor down two line boxes: one ends the first line,
+        // the second leaves a blank one. Expressed in terms of the font's own
+        // line height rather than a fixed number, so the assertion still means
+        // "two lines" if the bundled face changes.
+        let line = crate::font::fonts().normal_line_height(16.0);
         assert!(
-            second.dimensions.y >= first.dimensions.y + 40.0,
-            "consecutive <br> should create a blank line of vertical space: first.y={}, second.y={}",
+            second.dimensions.y >= first.dimensions.y + line * 2.0 - 1.0,
+            "consecutive <br> should create a blank line of vertical space: \
+             first.y={}, second.y={}, line height={line}",
             first.dimensions.y,
             second.dimensions.y
         );
