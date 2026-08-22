@@ -863,6 +863,40 @@ impl LayerTreeBuilder {
             }
         }
 
+        // An empty text field shows its placeholder, muted, the way a browser
+        // draws it. A field left blank where a page put prompt text reads as a
+        // broken control.
+        if let Some(ref text) = layout.input_placeholder {
+            if !text.is_empty() {
+                let font_size = match sv.get(&crate::css::intern("font-size")) {
+                    Some(Value::Length(v, _)) => *v,
+                    _ => 13.0,
+                };
+                let color = Color { r: 117, g: 117, b: 117, a: 255 };
+                // The renderer puts the baseline at rect.y + font_size * 0.85, so
+                // shift the rect to centre the line in the field.
+                let mid_y = d.y + d.height / 2.0;
+                let text_rect = crate::layout::Rect {
+                    x: d.x + layout.padding.left + layout.border.left,
+                    y: mid_y - font_size * 0.85,
+                    width: (d.width - layout.padding.left - layout.padding.right).max(0.0),
+                    height: font_size,
+                };
+                commands.push(PaintCommand::Text {
+                    rect: text_rect,
+                    text: text.clone(),
+                    font_size,
+                    line_height: crate::layout::resolved_line_height_px(layout.style_node),
+                    leading_space: 0.0,
+                    color,
+                    clip: d,
+                    bold: false,
+                    italic: false,
+                    text_decoration: 0,
+                });
+            }
+        }
+
         // Distribute commands to correct list
         if is_root_of_layer {
             layer.background_commands.extend(commands.clone());

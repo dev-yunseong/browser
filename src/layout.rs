@@ -639,6 +639,9 @@ pub struct LayoutBox<'a> {
     /// Sourced from the `value` attribute of `<input type="submit|button|reset">`.
     /// Rendered centered inside the button rect by the paint pass.
     pub input_label: Option<String>,
+    /// Placeholder text for an empty text field, drawn muted the way a browser
+    /// draws it.
+    pub input_placeholder: Option<String>,
     pub event_handlers: HashMap<String, String>,
     pub display: DisplayType,
     pub z_index: i32,
@@ -692,6 +695,7 @@ impl<'a> Clone for LayoutBox<'a> {
                         text_leading: src.text_leading,
                         alt_text: src.alt_text.clone(),
                         input_label: src.input_label.clone(),
+                        input_placeholder: src.input_placeholder.clone(),
                         event_handlers: src.event_handlers.clone(),
                         display: src.display,
                         z_index: src.z_index,
@@ -881,6 +885,7 @@ impl<'a> LayoutBox<'a> {
             text_leading: 0.0,
             alt_text: None,
             input_label: None,
+            input_placeholder: None,
             event_handlers: HashMap::new(),
             display,
             z_index,
@@ -897,6 +902,7 @@ impl<'a> LayoutBox<'a> {
             let tag = name.local.to_string();
             let mut input_type = String::new();
             let mut input_value: Option<String> = None;
+            let mut input_placeholder: Option<String> = None;
             for attr in attrs.borrow().iter() {
                 let name = attr.name.local.to_string();
                 let value = attr.value.to_string();
@@ -909,6 +915,9 @@ impl<'a> LayoutBox<'a> {
                     }
                     "type" if tag == "input" => input_type = value.to_ascii_lowercase(),
                     "value" if tag == "input" => input_value = Some(value),
+                    "placeholder" if tag == "input" || tag == "textarea" => {
+                        input_placeholder = Some(value)
+                    }
                     _ => {}
                 }
             }
@@ -924,6 +933,13 @@ impl<'a> LayoutBox<'a> {
                         _        => String::new(),
                     },
                 });
+            } else if input_value.as_deref().unwrap_or("").is_empty() {
+                // Only the placeholder is painted. A field's typed value is drawn
+                // by the real text widget the GUI overlays on the raster, so
+                // painting it here as well would double-draw it.
+                if let Some(placeholder) = input_placeholder.filter(|p| !p.is_empty()) {
+                    layout.input_placeholder = Some(placeholder);
+                }
             }
         }
         layout
