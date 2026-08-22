@@ -73,15 +73,21 @@ Ordered by how much of a page each one destroyed.
 | A padded inline child's box counted twice | Line boxes added padding and border on top of `dimensions`, which for an auto-sized box already covers them. A section holding a padded button came out 20px too tall, once per section down the page. |
 | Form controls inherited the page's `line-height` | The UA sheet gives them a font of their own, which is why a button inside `body { line-height: 1.4 }` is not 1.4 lines tall. |
 | Void elements serialised with an end tag | `</br>` is parsed as *another* `<br>`, and the serialised DOM is what the second render parses — so every page gained a blank line per line break each time it was re-rendered. |
+| Grid and flex containers measured from their content edge | That counts the bottom padding but drops the top one, so every padded container came out exactly its `padding-top` short. A page built from padded entries ended hundreds of pixels short. |
+| A padded flex item counted twice in its line | The line reserved the item's outer size by adding padding on top of `dimensions`, which for an auto-sized item already covers it. |
+| No automatic minimum size on flex items | `min-width: auto` resolves to min-content, so shrinking never squeezes a box below its longest word. Without that floor a row of tags came out with each tag broken across two lines. |
+| A text run given half the line | The caller subtracted what the line already held, and the run subtracted it again from its own start position. Every run after an inline sibling was laid out in half the room it had. |
+| A line broken before its first word | The leading inter-element space counted as content, so the first word of a run could wrap onto a line of its own. |
+| Collapsed inter-run space dropped when measuring | The intrinsic measurement trimmed the whitespace layout keeps, so a box sized from max-content was narrower than the run it had to hold and wrapped inside itself. |
 
 ## Where it stands
 
-Thirteen of the fifteen probe fixtures sit at or near 1% of a 16px block-mean
+Thirteen of the fifteen probe fixtures sit at or below 1% of a 16px block-mean
 diff, and `probe-gradient` is pixel-identical over the first fold. The two that
-are not — `probe-controls` at 2.0% and `probe-inline` at 1.5% — are held back by
-the box model and by inline fragmentation, both below. Of the three sites,
-yunseong.dev is at 4.2% and github.com at 14.5%; naver.com cannot be measured
-until its snapshot is re-captured with CSS in it.
+are not — `probe-controls` at 2.6% and `probe-sizing` at 0.8% — are held back by
+the box model, below. Of the three sites, yunseong.dev is at 3.7% and
+github.com at 15.3%; naver.com cannot be measured until its snapshot is
+re-captured with CSS in it.
 
 ## What still limits parity
 
