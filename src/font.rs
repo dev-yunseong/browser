@@ -8,8 +8,11 @@
 //! the same way wherever this runs. Which faces are bundled is not a matter of
 //! taste: they are the ones a browser resolves the CSS generic families to on
 //! the Linux systems this renders against — Liberation Sans for `sans-serif`,
-//! Liberation Serif for `serif`, DejaVu Sans Mono for `monospace` — established
-//! by measuring the same string in both. A face with different advance widths
+//! Liberation Serif for `serif`, DejaVu Sans Mono for `monospace`, DejaVu Sans
+//! for `system-ui` — established by measuring the same string in both. They are
+//! not interchangeable: DejaVu Sans is a good deal wider than Liberation Sans,
+//! so a page whose stack ends in `system-ui` lays out at a different measure
+//! from one ending in `sans-serif`. A face with different advance widths
 //! breaks lines in different places, so the wrong choice makes a page the wrong
 //! length however correct the layout code is. NanumGothic covers the CJK ranges
 //! none of them have glyphs for.
@@ -23,6 +26,8 @@ const SERIF: &[u8] = include_bytes!("../assets/fonts/LiberationSerif-Regular.ttf
 const SERIF_BOLD: &[u8] = include_bytes!("../assets/fonts/LiberationSerif-Bold.ttf");
 const MONO: &[u8] = include_bytes!("../assets/fonts/DejaVuSansMono.ttf");
 const MONO_BOLD: &[u8] = include_bytes!("../assets/fonts/DejaVuSansMono-Bold.ttf");
+const SYSTEM_UI: &[u8] = include_bytes!("../assets/fonts/DejaVuSans.ttf");
+const SYSTEM_UI_BOLD: &[u8] = include_bytes!("../assets/fonts/DejaVuSans-Bold.ttf");
 const FALLBACK: &[u8] = include_bytes!("../assets/fonts/NanumGothic.ttf");
 
 /// Which bundled face a glyph came from.
@@ -37,9 +42,27 @@ pub enum FaceId {
     SerifBold,
     Mono,
     MonoBold,
+    SystemUi,
+    SystemUiBold,
     Fallback,
     /// A face the page shipped through `@font-face`, by registration order.
     Web(u32),
+}
+
+/// The bundled family a `font-family` stack resolves to.
+///
+/// These are the generics a browser can actually satisfy here; a stack that
+/// names none of them gets `Sans`, as a browser's default does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum GenericFamily {
+    #[default]
+    Sans,
+    Serif,
+    Mono,
+    /// `system-ui`, `-apple-system` and `BlinkMacSystemFont` — the platform's
+    /// own UI face, which on the Linux this renders against is DejaVu Sans and
+    /// is markedly wider than the `sans-serif` default.
+    SystemUi,
 }
 
 /// The parts of an element's font that change which face is used.
@@ -50,8 +73,7 @@ pub enum FaceId {
 pub struct FontStyle {
     pub bold: bool,
     pub italic: bool,
-    pub monospace: bool,
-    pub serif: bool,
+    pub family: GenericFamily,
     /// A registered web-font family, if the element's `font-family` names one.
     /// `None` means the bundled faces.
     pub web_family: Option<u16>,
@@ -59,19 +81,26 @@ pub struct FontStyle {
 
 impl FontStyle {
     pub const fn regular() -> Self {
-        FontStyle { bold: false, italic: false, monospace: false, serif: false, web_family: None }
+        FontStyle {
+            bold: false,
+            italic: false,
+            family: GenericFamily::Sans,
+            web_family: None,
+        }
     }
 
     /// The bundled face this style asks for, before any fallback for missing
     /// glyphs. Web faces are consulted first, in `FontSet::glyph`.
     pub fn face(self) -> FaceId {
-        match (self.monospace, self.serif, self.bold) {
-            (true, _, true) => FaceId::MonoBold,
-            (true, _, false) => FaceId::Mono,
-            (false, true, true) => FaceId::SerifBold,
-            (false, true, false) => FaceId::Serif,
-            (false, false, true) => FaceId::SansBold,
-            (false, false, false) => FaceId::Sans,
+        match (self.family, self.bold) {
+            (GenericFamily::Mono, true) => FaceId::MonoBold,
+            (GenericFamily::Mono, false) => FaceId::Mono,
+            (GenericFamily::Serif, true) => FaceId::SerifBold,
+            (GenericFamily::Serif, false) => FaceId::Serif,
+            (GenericFamily::SystemUi, true) => FaceId::SystemUiBold,
+            (GenericFamily::SystemUi, false) => FaceId::SystemUi,
+            (GenericFamily::Sans, true) => FaceId::SansBold,
+            (GenericFamily::Sans, false) => FaceId::Sans,
         }
     }
 }
@@ -178,6 +207,8 @@ pub struct FontSet {
     serif_bold: FontRef<'static>,
     mono: FontRef<'static>,
     mono_bold: FontRef<'static>,
+    system_ui: FontRef<'static>,
+    system_ui_bold: FontRef<'static>,
     fallback: FontRef<'static>,
 }
 
@@ -190,6 +221,8 @@ impl FontSet {
             FaceId::SerifBold => &self.serif_bold,
             FaceId::Mono => &self.mono,
             FaceId::MonoBold => &self.mono_bold,
+            FaceId::SystemUi => &self.system_ui,
+            FaceId::SystemUiBold => &self.system_ui_bold,
             FaceId::Fallback => &self.fallback,
             // A registered face is parsed from leaked bytes, so the reference
             // outlives this borrow; the bundled sans stands in if the id is
@@ -235,14 +268,46 @@ impl FontSet {
         face.h_advance_unscaled(gid) * (font_size / units)
     }
 
+    /// The kerning between two adjacent glyphs, in pixels.
+    ///
+    /// A pair only kerns within one face, so a run that falls back mid-word
+    /// gets none across the seam — which is what a shaper does too. Leaving
+    /// kerning out entirely made a DejaVu Sans line about a pixel wider than
+    /// the browser draws it, and a wrap decision that came down to 1.4px then
+    /// went the other way.
+    pub fn kern(
+        &self,
+        prev: Option<(FaceId, GlyphId)>,
+        current: (FaceId, GlyphId),
+        font_size: f32,
+    ) -> f32 {
+        let Some((prev_face, prev_gid)) = prev else {
+            return 0.0;
+        };
+        if prev_face != current.0 {
+            return 0.0;
+        }
+        let face = self.face(current.0);
+        let units = face.units_per_em().unwrap_or(1000.0);
+        face.kern_unscaled(prev_gid, current.1) * (font_size / units)
+    }
+
     /// Advance width of a whole run, with no wrapping applied.
     ///
     /// `letter_spacing` is added after every character, as CSS specifies — the
     /// trailing one included, which is what browsers do.
     pub fn measure(&self, text: &str, font_size: f32, style: FontStyle, letter_spacing: f32) -> f32 {
-        text.chars()
-            .map(|c| self.advance(c, font_size, style) + letter_spacing)
-            .sum()
+        let mut total = 0.0;
+        let mut prev: Option<(FaceId, GlyphId)> = None;
+        for c in text.chars() {
+            let (face_id, gid) = self.glyph(c, style);
+            total += self.kern(prev, (face_id, gid), font_size);
+            let face = self.face(face_id);
+            let units = face.units_per_em().unwrap_or(1000.0);
+            total += face.h_advance_unscaled(gid) * (font_size / units) + letter_spacing;
+            prev = Some((face_id, gid));
+        }
+        total
     }
 
     /// The height of one line when `line-height: normal`.
@@ -265,19 +330,25 @@ impl FontSet {
     }
 
     /// Advance width of the "0" glyph — the CSS `ch` unit.
-    pub fn zero_advance(&self, font_size: f32) -> f32 {
-        self.advance('0', font_size, FontStyle::regular())
+    ///
+    /// Both `ch` and `ex` are metrics of *the element's own* font, not of the
+    /// default one: a design that caps its prose at `46ch` gets a wider measure
+    /// under `system-ui` than under `sans-serif`, and measuring both against
+    /// the sans face wrapped one of them a line early.
+    pub fn zero_advance(&self, font_size: f32, style: FontStyle) -> f32 {
+        self.advance('0', font_size, style)
     }
 
     /// The font's x-height — the CSS `ex` unit.
     ///
     /// Measured from the "x" glyph's outline; a face with no such glyph falls
     /// back to the half-em the spec names as the default.
-    pub fn x_height(&self, font_size: f32) -> f32 {
-        let glyph = self.sans.glyph_id('x');
-        match self.sans.outline(glyph) {
+    pub fn x_height(&self, font_size: f32, style: FontStyle) -> f32 {
+        let face = self.face(style.face());
+        let glyph = face.glyph_id('x');
+        match face.outline(glyph) {
             Some(outline) => {
-                outline.bounds.height() * (font_size / self.sans.units_per_em().unwrap_or(1000.0))
+                outline.bounds.height() * (font_size / face.units_per_em().unwrap_or(1000.0))
             }
             None => font_size * 0.5,
         }
@@ -303,6 +374,9 @@ pub fn fonts() -> &'static FontSet {
         serif_bold: FontRef::try_from_slice(SERIF_BOLD).expect("bundled serif bold font should parse"),
         mono: FontRef::try_from_slice(MONO).expect("bundled mono font should parse"),
         mono_bold: FontRef::try_from_slice(MONO_BOLD).expect("bundled mono bold font should parse"),
+        system_ui: FontRef::try_from_slice(SYSTEM_UI).expect("bundled system-ui font should parse"),
+        system_ui_bold: FontRef::try_from_slice(SYSTEM_UI_BOLD)
+            .expect("bundled system-ui bold font should parse"),
         fallback: FontRef::try_from_slice(FALLBACK).expect("bundled fallback font should parse"),
     })
 }

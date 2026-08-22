@@ -383,6 +383,15 @@ fn collapsed_space_width(node: &StyledNode, raw: &str, font_size: f32) -> f32 {
 /// Measure the width of `text` rendered at `font_size` px.
 /// When `wrap_width` is `f32::INFINITY`, no wrapping occurs (max-content).
 /// When finite, line-breaks at word boundaries (min-content: longest word).
+/// How much a line may exceed its container before a word is pushed off it.
+///
+/// A browser lays text out in fixed-point units of 1/64 px, so a fit test there
+/// is never decided by a difference smaller than that. This engine measures in
+/// `f32`, where a shrink-to-fit box and the run inside it are summed in
+/// different orders and land a few ULPs apart — enough, with an exact `>`, to
+/// wrap a button's label that fits its own box exactly.
+const LINE_FIT_EPSILON: f32 = 1.0 / 64.0;
+
 fn measure_text_width(
     text: &str,
     font_size: f32,
@@ -403,7 +412,13 @@ fn measure_text_width(
 
     for word in trimmed.split_whitespace() {
         let word_w = fonts.measure(word, font_size, style, letter_spacing);
-        if wrap_width.is_finite() && line_w + word_w > wrap_width && line_w > 0.0 {
+        // The space that goes before this word has to fit too — see the same
+        // test in `layout_text`, which decides where the lines actually break.
+        let needed = if line_w > 0.0 { space_w + word_w } else { word_w };
+        if wrap_width.is_finite()
+            && line_w + needed > wrap_width + LINE_FIT_EPSILON
+            && line_w > 0.0
+        {
             max_w = max_w.max(line_w);
             line_w = 0.0;
         }
@@ -1331,7 +1346,7 @@ impl<'a> LayoutBox<'a> {
             Some(Value::Length(v, Unit::Vw)) => vw * (v / 100.0),
             Some(Value::Length(v, Unit::Vh)) => vh * (v / 100.0),
             Some(v @ Value::Math(_)) => {
-                resolve_math_px(v, container_width, vw, vh, node_font_size(self.style_node))
+                resolve_math_px(v, container_width, vw, vh, node_font_size(self.style_node), resolved_font_style(self.style_node))
                     .unwrap_or(container_width)
             }
             // CSS Intrinsic & Extrinsic Sizing Level 3
@@ -3352,7 +3367,10 @@ impl<'a> LayoutBox<'a> {
             .get(&crate::css::intern("white-space"))
             .and_then(|v| if let Value::Keyword(k) = v { Some(&**k as &str) } else { None })
             .unwrap_or("normal");
-        let no_wrap = white_space == "nowrap";
+        // `pre` and `nowrap` both stop wrapping; `pre-line` and `pre-wrap` wrap
+        // as usual but keep the source's own line breaks.
+        let no_wrap = white_space == "nowrap" || white_space == "pre";
+        let preserve_newlines = preserves_newlines(white_space);
 
         // CSS white-space: normal — whitespace-only text nodes between inline
         // elements collapse to a single inter-element space.  We only insert
@@ -3398,44 +3416,68 @@ impl<'a> LayoutBox<'a> {
             line_w += space_w;
         }
 
-        for word in trimmed.split_whitespace() {
-            let word_w = fonts.measure(word, font_size, font_style, letter_spacing);
-
-            if no_wrap {
-                if line_w > 0.0 {
-                    line_w += space_w;
-                }
-                line_w += word_w;
-                word_on_line = true;
-                continue;
-            }
-
-            // If word is too long for current line
-            if container_width.is_finite() && line_w + word_w > container_width && word_on_line {
+        let segments: Vec<&str> = if preserve_newlines {
+            trimmed.split('\n').collect()
+        } else {
+            vec![trimmed]
+        };
+        for (segment_index, segment) in segments.into_iter().enumerate() {
+            if segment_index > 0 {
+                // A newline the source kept: close the line whatever is on it.
                 max_w = max_w.max(line_w);
                 line_w = 0.0;
                 lines_count += 1;
                 word_on_line = false;
             }
+            for word in segment.split_whitespace() {
+                let word_w = fonts.measure(word, font_size, font_style, letter_spacing);
 
-            // If a single word is LONGER than the entire container, we must break it char-by-char
-            if container_width.is_finite() && word_w > container_width {
-                for c in word.chars() {
-                    let char_w = fonts.advance(c, font_size, font_style) + letter_spacing;
-                    if line_w + char_w > container_width && line_w > 0.0 {
-                        max_w = max_w.max(line_w);
-                        line_w = 0.0;
-                        lines_count += 1;
+                if no_wrap {
+                    if line_w > 0.0 {
+                        line_w += space_w;
                     }
-                    line_w += char_w;
+                    line_w += word_w;
+                    word_on_line = true;
+                    continue;
                 }
-                word_on_line = true;
-            } else {
-                if word_on_line {
-                    line_w += space_w;
+
+                // Does this word still fit? The space that will be put before
+                // it is part of what has to fit: leaving it out of the test but
+                // adding it to the line afterwards let a line end up a space
+                // wider than its container, so a last word that misses the
+                // line by a hair stayed on it — which is one line's difference
+                // in the height of every paragraph it happens to.
+                let needed = if word_on_line { space_w + word_w } else { word_w };
+                if container_width.is_finite()
+                    && line_w + needed > container_width + LINE_FIT_EPSILON
+                    && word_on_line
+                {
+                    max_w = max_w.max(line_w);
+                    line_w = 0.0;
+                    lines_count += 1;
+                    word_on_line = false;
                 }
-                line_w += word_w;
-                word_on_line = true;
+
+                // If a single word is LONGER than the entire container, we must
+                // break it char-by-char
+                if container_width.is_finite() && word_w > container_width {
+                    for c in word.chars() {
+                        let char_w = fonts.advance(c, font_size, font_style) + letter_spacing;
+                        if line_w + char_w > container_width + LINE_FIT_EPSILON && line_w > 0.0 {
+                            max_w = max_w.max(line_w);
+                            line_w = 0.0;
+                            lines_count += 1;
+                        }
+                        line_w += char_w;
+                    }
+                    word_on_line = true;
+                } else {
+                    if word_on_line {
+                        line_w += space_w;
+                    }
+                    line_w += word_w;
+                    word_on_line = true;
+                }
             }
         }
 
@@ -3520,7 +3562,7 @@ fn resolve_offset(
         Some(Value::Length(v, Unit::Percent)) => Some(container_size * (v / 100.0)),
         Some(Value::Length(v, Unit::Vw)) => Some(vw * (v / 100.0)),
         Some(Value::Length(v, Unit::Vh)) => Some(vh * (v / 100.0)),
-        Some(v @ Value::Math(_)) => resolve_math_px(v, container_size, vw, vh, node_font_size(sn)),
+        Some(v @ Value::Math(_)) => resolve_math_px(v, container_size, vw, vh, node_font_size(sn), resolved_font_style(sn)),
         // Unitless 0 is a valid <length> in CSS (the only unitless length allowed).
         Some(Value::Number(v)) if *v == 0.0 => Some(0.0),
         Some(Value::Keyword(k)) if **k == *"auto" => None,
@@ -3593,17 +3635,66 @@ pub fn resolved_font_style(sn: &StyledNode) -> crate::font::FontStyle {
         sv.get(&crate::css::intern("font-style")),
         Some(Value::Keyword(k)) if matches!(k.as_ref(), "italic" | "oblique")
     );
-    // Which generic the stack asks for. `ui-monospace, SFMono-Regular, ...,
-    // monospace` wants a fixed pitch; `Georgia, serif` wants a serif. A stack
-    // that names neither gets the sans-serif default, as a browser does.
-    let stack = match sv.get(&crate::css::intern("font-family")) {
+    let family = font_family_stack(sv)
+        .as_deref()
+        .map(generic_family_for)
+        .unwrap_or_default();
+    crate::font::FontStyle { bold, italic, family, web_family: web_family_for(sv) }
+}
+
+/// The element's `font-family` as written, if it has one.
+fn font_family_stack(sv: &crate::style::PropertyMap) -> Option<String> {
+    match sv.get(&crate::css::intern("font-family")) {
         Some(Value::Keyword(k)) => Some(k.to_string()),
         Some(Value::RawCustomProp(s)) => Some(s.to_string()),
         _ => None,
-    };
-    let monospace = stack.as_deref().is_some_and(family_is_monospace);
-    let serif = !monospace && stack.as_deref().is_some_and(family_is_serif);
-    crate::font::FontStyle { bold, italic, monospace, serif, web_family: web_family_for(sv) }
+    }
+}
+
+/// Which bundled family a `font-family` stack resolves to.
+///
+/// Font matching walks the stack **in order** and takes the first family the
+/// system can satisfy, so the order is the whole answer: a page that writes
+/// `"Pretendard Variable", Pretendard, -apple-system, system-ui, ..., sans-serif`
+/// gets `system-ui` here, not `sans-serif`, because that is the first name this
+/// renderer has a face for. Reading the stack as a set and asking only whether
+/// it mentions `serif` or `monospace` anywhere let every such stack fall
+/// through to the sans default — and DejaVu Sans, which `system-ui` resolves
+/// to, is wide enough that the whole page then laid out at the wrong measure.
+///
+/// Which names count as satisfiable was measured against the reference
+/// renderer, not assumed: `-apple-system`, `BlinkMacSystemFont`, `ui-sans-serif`
+/// and the rest of the `ui-*` generics resolve to nothing there and are stepped
+/// over, and so is any face by its own name. Only the generic keywords this
+/// bundles a face for stop the walk.
+pub fn generic_family_for(stack: &str) -> crate::font::GenericFamily {
+    stack
+        .split(',')
+        .find_map(|family| {
+            let name = family
+                .trim()
+                .trim_matches(|c| c == '"' || c == '\'')
+                .to_ascii_lowercase();
+            satisfiable_family(&name)
+        })
+        // A stack this renderer can satisfy nothing in falls to the standard
+        // font, which the reference sets to a serif.
+        .unwrap_or(crate::font::GenericFamily::Serif)
+}
+
+/// The bundled family one `font-family` name asks for, or `None` when this
+/// renderer has no face for it and matching moves on to the next name.
+fn satisfiable_family(name: &str) -> Option<crate::font::GenericFamily> {
+    use crate::font::GenericFamily;
+    Some(match name {
+        "monospace" => GenericFamily::Mono,
+        "serif" => GenericFamily::Serif,
+        "system-ui" => GenericFamily::SystemUi,
+        // The reference resolves these to the same metrics as `sans-serif`,
+        // being metric-compatible with the face it bundles for it.
+        "sans-serif" | "arial" | "helvetica" => GenericFamily::Sans,
+        _ => return None,
+    })
 }
 
 /// The registered web-font family an element's `font-family` stack selects.
@@ -3626,27 +3717,30 @@ fn web_family_for(sv: &crate::style::PropertyMap) -> Option<u16> {
         .find_map(crate::font::web_family_id)
 }
 
-/// Whether a `font-family` stack asks for a fixed-pitch face.
+/// Whether a `white-space` value keeps the newlines in the source text.
 ///
-/// Only the generic keyword is recognised by name; a stack that names real
-/// monospace faces is caught by the same keyword appearing at its end, which is
-/// how every such stack is written.
-fn family_is_monospace(stack: &str) -> bool {
-    stack
-        .split(',')
-        .map(|f| f.trim().trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase())
-        .any(|f| f == "monospace" || f == "ui-monospace" || f.ends_with(" mono") || f.ends_with("-mono"))
+/// `pre-line` is how a page writes a paragraph whose line breaks are part of
+/// the copy: it still collapses runs of spaces, but every newline is a break
+/// the browser honours. Treating one as ordinary whitespace re-flowed such a
+/// paragraph to whatever width it happened to have, so it came out a line short
+/// and everything below it moved up.
+pub fn preserves_newlines(white_space: &str) -> bool {
+    matches!(white_space, "pre" | "pre-line" | "pre-wrap" | "break-spaces")
 }
 
-/// Whether a `font-family` stack asks for a serif face.
-///
-/// Only the generic keyword is matched: a stack naming real serif faces ends in
-/// that keyword, which is how such a stack is written.
-fn family_is_serif(stack: &str) -> bool {
-    stack
-        .split(',')
-        .map(|f| f.trim().trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase())
-        .any(|f| f == "serif" || f == "ui-serif")
+/// The `white-space` an element computes to.
+pub fn resolved_white_space(sn: &StyledNode) -> &'static str {
+    match sn.specified_values.get(&crate::css::intern("white-space")) {
+        Some(Value::Keyword(k)) => match &**k {
+            "pre" => "pre",
+            "pre-line" => "pre-line",
+            "pre-wrap" => "pre-wrap",
+            "break-spaces" => "break-spaces",
+            "nowrap" => "nowrap",
+            _ => "normal",
+        },
+        _ => "normal",
+    }
 }
 
 /// `letter-spacing` in pixels. `normal` is zero.
@@ -3695,12 +3789,20 @@ fn get_line_break_clear(sn: &StyledNode) -> Option<ClearValue> {
 ///
 /// Expressions without percentages are already folded to pixels during style
 /// computation; only the ones needing a containing-block basis reach here.
-fn resolve_math_px(value: &Value, cb: f32, vw: f32, vh: f32, font_size: f32) -> Option<f32> {
+fn resolve_math_px(
+    value: &Value,
+    cb: f32,
+    vw: f32,
+    vh: f32,
+    font_size: f32,
+    font_style: crate::font::FontStyle,
+) -> Option<f32> {
     let Value::Math(expr) = value else { return None };
     expr.resolve(&crate::css::MathContext {
         viewport_width: vw,
         viewport_height: vh,
         font_size,
+        font_style,
         root_font_size: font_size,
         percent_basis: Some(cb),
     })
@@ -3724,7 +3826,7 @@ fn get_prop(sn: &StyledNode, p1: &str, p2: &str, cw: f32, vw: f32, vh: f32) -> f
         Some(Value::Length(v, Unit::Percent)) => cw * (v / 100.0),
         Some(Value::Length(v, Unit::Vw)) => vw * (v / 100.0),
         Some(Value::Length(v, Unit::Vh)) => vh * (v / 100.0),
-        Some(v @ Value::Math(_)) => resolve_math_px(v, cw, vw, vh, node_font_size(sn)).unwrap_or(0.0),
+        Some(v @ Value::Math(_)) => resolve_math_px(v, cw, vw, vh, node_font_size(sn), resolved_font_style(sn)).unwrap_or(0.0),
         _ => 0.0,
     }
 }
@@ -4442,6 +4544,177 @@ mod tests {
         (layout_opt.expect("layout tree"), fx, fy)
     }
 
+
+    // ── Line breaking ─────────────────────────────────────────────────────────
+
+    /// The space that goes before a word is part of what has to fit. Testing
+    /// only the word and adding the space afterwards let a line end up a space
+    /// wider than its container, so a last word that misses the line by a hair
+    /// stayed on it — one line's difference in the height of every paragraph it
+    /// happens to.
+    #[test]
+    fn test_the_space_before_a_word_counts_toward_the_fit() {
+        // Two words whose widths plus one space just exceed the box.
+        let (probe, _, _) = layout_from_html(
+            r#"<div id="p" style="font:16px sans-serif;white-space:nowrap;position:absolute">aaaa bbbb</div>"#,
+            800.0,
+            600.0,
+        );
+        let full = find_element_by_id(&probe, "p").expect("p").dimensions.width;
+        // A box one pixel narrower than the pair cannot hold both on one line.
+        let html = format!(
+            r#"<div id="b" style="font:16px sans-serif;width:{}px">aaaa bbbb</div>"#,
+            full - 1.0
+        );
+        let (layout, _, _) = layout_from_html(&html, 800.0, 600.0);
+        let b = find_element_by_id(&layout, "b").expect("b");
+        assert!(
+            b.dimensions.height > 20.0,
+            "the pair should have wrapped to two lines, got height {}",
+            b.dimensions.height
+        );
+        // And a box exactly as wide as the pair holds both.
+        let html = format!(
+            r#"<div id="b" style="font:16px sans-serif;width:{full}px">aaaa bbbb</div>"#
+        );
+        let (layout, _, _) = layout_from_html(&html, 800.0, 600.0);
+        let b = find_element_by_id(&layout, "b").expect("b");
+        assert!(
+            b.dimensions.height < 20.0,
+            "and at exactly its own width it stays on one line, got height {}",
+            b.dimensions.height
+        );
+    }
+
+    /// A shrink-to-fit box is sized to its own content, so that content must
+    /// not then wrap inside it. The two widths are summed in different orders
+    /// and land a few ULPs apart, which an exact `>` turned into a wrapped
+    /// button label.
+    #[test]
+    fn test_a_shrink_to_fit_label_does_not_wrap_in_its_own_box() {
+        let html = r#"<div style="display:flex"><a id="btn" style="display:inline-flex;padding:10px 18px;border:1px solid #000;font:16px sans-serif">Try GitHub Copilot</a></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let btn = find_element_by_id(&layout, "btn").expect("btn");
+        assert!(
+            btn.dimensions.height < 45.0,
+            "the label should stay on one line in the box built for it, got height {}",
+            btn.dimensions.height
+        );
+    }
+
+    /// `pre-line` keeps the source's own newlines as line breaks while still
+    /// collapsing runs of spaces.
+    #[test]
+    fn test_pre_line_keeps_the_sources_newlines() {
+        let flowed = "<div id=\"d\" style=\"font-size:16px;line-height:20px;width:600px\">one\ntwo\nthree</div>";
+        let kept = "<div id=\"d\" style=\"font-size:16px;line-height:20px;width:600px;white-space:pre-line\">one\ntwo\nthree</div>";
+        let (a, _, _) = layout_from_html(flowed, 800.0, 600.0);
+        let (b, _, _) = layout_from_html(kept, 800.0, 600.0);
+        let ha = find_element_by_id(&a, "d").expect("d").dimensions.height;
+        let hb = find_element_by_id(&b, "d").expect("d").dimensions.height;
+        assert_eq!(ha, 20.0, "without pre-line the three words share a line");
+        assert_eq!(hb, 60.0, "with it each is its own line, got {hb}");
+    }
+
+    /// Kerning is what a shaper applies and this has to match it, or a line
+    /// measures wider than the browser draws it and wraps a word early.
+    #[test]
+    fn test_kerning_narrows_a_run_that_has_kern_pairs() {
+        use crate::font::{FontStyle, GenericFamily};
+        let fonts = crate::font::fonts();
+        let style = FontStyle { family: GenericFamily::SystemUi, ..FontStyle::regular() };
+        let kerned = fonts.measure("AVATAR Yo To We", 16.0, style, 0.0);
+        let unkerned: f32 = "AVATAR Yo To We"
+            .chars()
+            .map(|c| fonts.advance(c, 16.0, style))
+            .sum();
+        assert!(
+            kerned < unkerned,
+            "the kern pairs should pull the run in: {kerned} vs {unkerned}"
+        );
+    }
+
+    // ── Font stack resolution ─────────────────────────────────────────────────
+
+    /// Font matching walks the stack in order and takes the first family it can
+    /// satisfy. Reading it as a set — asking only whether `serif` or
+    /// `monospace` appears anywhere — sent every modern stack to the sans
+    /// default, and `system-ui` resolves to a face wide enough that the whole
+    /// page then laid out at the wrong measure.
+    #[test]
+    fn test_font_stack_takes_the_first_family_it_can_satisfy() {
+        use crate::font::GenericFamily;
+        assert_eq!(generic_family_for("sans-serif"), GenericFamily::Sans);
+        assert_eq!(generic_family_for("serif"), GenericFamily::Serif);
+        assert_eq!(generic_family_for("monospace"), GenericFamily::Mono);
+        assert_eq!(generic_family_for("system-ui"), GenericFamily::SystemUi);
+        // yunseong.dev's stack: `system-ui` comes before `sans-serif`.
+        assert_eq!(
+            generic_family_for(
+                "\"Pretendard Variable\", Pretendard, -apple-system, system-ui, \"Apple SD Gothic Neo\", \"Malgun Gothic\", sans-serif"
+            ),
+            GenericFamily::SystemUi
+        );
+        // github.com's: nothing before `sans-serif` can be satisfied here, so
+        // `-apple-system` and `BlinkMacSystemFont` are stepped over rather than
+        // treated as the system face.
+        assert_eq!(
+            generic_family_for(
+                "\"Mona Sans\", MonaSansFallback, -apple-system, BlinkMacSystemFont, \"Segoe UI\", Helvetica, Arial, sans-serif"
+            ),
+            GenericFamily::Sans
+        );
+        // A `ui-*` generic resolves to nothing in the reference, so the walk
+        // continues to the plain one.
+        assert_eq!(
+            generic_family_for("ui-monospace, SFMono-Regular, monospace"),
+            GenericFamily::Mono
+        );
+    }
+
+    /// A face named on its own, with no generic after it, is not something this
+    /// renderer has — the standard font stands in, as it does in the reference.
+    #[test]
+    fn test_unsatisfiable_stack_falls_to_the_standard_font() {
+        use crate::font::GenericFamily;
+        assert_eq!(generic_family_for("\"Nope Font XYZ\""), GenericFamily::Serif);
+        assert_eq!(generic_family_for("Georgia"), GenericFamily::Serif);
+    }
+
+    /// The faces are not interchangeable — that is the whole reason the stack
+    /// has to resolve correctly.
+    #[test]
+    fn test_the_bundled_families_have_different_advances() {
+        use crate::font::{FontStyle, GenericFamily};
+        let width = |family| {
+            crate::font::fonts().zero_advance(
+                16.0,
+                FontStyle { family, ..FontStyle::regular() },
+            )
+        };
+        let sans = width(GenericFamily::Sans);
+        let system = width(GenericFamily::SystemUi);
+        let mono = width(GenericFamily::Mono);
+        assert!(
+            system > sans && mono > sans,
+            "system-ui and monospace are both wider than sans: {sans} {system} {mono}"
+        );
+    }
+
+    /// `ch` is a metric of the element's own face, so the same `max-width`
+    /// gives a wider measure under `system-ui` than under `sans-serif`.
+    #[test]
+    fn test_ch_measures_in_the_elements_own_font() {
+        let html = r#"<div id="a" style="font-family:system-ui;max-width:20ch">x</div>
+            <div id="b" style="font-family:sans-serif;max-width:20ch">x</div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let a = find_element_by_id(&layout, "a").expect("a").dimensions.width;
+        let b = find_element_by_id(&layout, "b").expect("b").dimensions.width;
+        assert!(
+            a > b,
+            "20ch of system-ui is wider than 20ch of sans-serif: {a} vs {b}"
+        );
+    }
 
     // ── Absolute positioning ──────────────────────────────────────────────────
 
@@ -6709,7 +6982,7 @@ mod tests {
         let bold = fonts.measure(
             "Yunseong",
             16.0,
-            crate::font::FontStyle { bold: true, italic: false, monospace: false, serif: false, web_family: None },
+            crate::font::FontStyle { bold: true, ..crate::font::FontStyle::regular() },
             0.0,
         );
         assert!(

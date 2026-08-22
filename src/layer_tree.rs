@@ -63,6 +63,10 @@ pub enum PaintCommand {
         letter_spacing: f32,
         /// Bitmask: bit 0 = underline, bit 1 = line-through, bit 2 = overline
         text_decoration: u8,
+        /// Whether the source's own newlines are line breaks, as `pre-line`
+        /// and friends make them. Layout counted its lines that way, so paint
+        /// has to draw them that way.
+        preserve_newlines: bool,
     },
     /// Outer box-shadow
     Shadow(LayoutRect, BoxShadow),
@@ -887,6 +891,9 @@ impl LayerTreeBuilder {
                     style: font_style,
                     letter_spacing,
                     text_decoration,
+                    preserve_newlines: crate::layout::preserves_newlines(
+                        crate::layout::resolved_white_space(layout.style_node),
+                    ),
                 });
             }
         }
@@ -923,6 +930,7 @@ impl LayerTreeBuilder {
                     style: crate::font::FontStyle::regular(),
                     letter_spacing: 0.0,
                     text_decoration: 0,
+                    preserve_newlines: false,
                 });
             }
         }
@@ -964,6 +972,7 @@ impl LayerTreeBuilder {
                     style: crate::font::FontStyle::regular(),
                     letter_spacing: 0.0,
                     text_decoration: 0,
+                    preserve_newlines: false,
                 });
             }
         }
@@ -1018,6 +1027,7 @@ impl LayerTreeBuilder {
                     style: crate::font::FontStyle::regular(),
                     letter_spacing: 0.0,
                     text_decoration: 0,
+                    preserve_newlines: false,
                 });
             }
         }

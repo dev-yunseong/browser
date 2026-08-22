@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Font stack probe</title>
+<style>
+  body { margin: 0; font-size: 16px; }
+  /* Each row shows where the walk stops. A background makes the shrink-wrapped
+     width visible, so a face with different advances shows up as a different
+     coloured run even when the glyphs look alike. */
+  p { margin: 0; white-space: pre; background: #eef; display: inline-block; }
+  div { margin-bottom: 2px; }
+</style>
+</head>
+<body>
+  <div><p style="font-family: sans-serif">sans-serif 0000000000 MWmw Hamburgefons</p></div>
+  <div><p style="font-family: serif">serif 0000000000 MWmw Hamburgefons</p></div>
+  <div><p style="font-family: monospace">monospace 0000000000 MWmw Hamburgefons</p></div>
+  <div><p style="font-family: system-ui">system-ui 0000000000 MWmw Hamburgefons</p></div>
+  <div><p style="font-family: Arial, sans-serif">Arial 0000000000 MWmw Hamburgefons</p></div>
+  <div><p style="font-family: Helvetica, Arial, sans-serif">Helvetica 0000000000 MWmw Hamburgefons</p></div>
+  <!-- The walk has to step over names this renderer cannot satisfy. -->
+  <div><p style="font-family: 'Nope Font XYZ', monospace">unknown then monospace</p></div>
+  <div><p style="font-family: -apple-system, BlinkMacSystemFont, sans-serif">-apple-system then sans-serif</p></div>
+  <div><p style="font-family: 'Pretendard Variable', Pretendard, -apple-system, system-ui, sans-serif">the yunseong.dev stack: system-ui wins</p></div>
+  <div><p style="font-family: ui-monospace, SFMono-Regular, monospace">ui-monospace then monospace</p></div>
+  <div><p style="font-family: 'Mona Sans', MonaSansFallback, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">the github.com stack: sans-serif wins</p></div>
+  <!-- `ch` comes from the resolved face, so the measure a design caps its
+       prose at moves with the stack. -->
+  <div><p style="font-family: system-ui; max-width: 20ch; white-space: normal">20ch of system-ui prose wraps where the system face says it does</p></div>
+  <div><p style="font-family: sans-serif; max-width: 20ch; white-space: normal">20ch of sans-serif prose wraps where the sans face says it does</p></div>
+  <!-- The exact sentence yunseong.dev sets in `system-ui` at 16px, unwrapped.
+       A wrap decision there came down to 1.4px, so the advances have to agree
+       to well under a pixel over a whole line. -->
+  <div><p style="font-family: system-ui; font-size: 16px">backend systems, relentlessly pursuing great</p></div>
+  <div><p style="font-family: sans-serif; font-size: 16px">backend systems, relentlessly pursuing great</p></div>
+  <div><p style="font-family: system-ui; font-size: 16px">I bridge theory and practice to design AI, game, and</p></div>
+  <div><p style="font-family: monospace; font-size: 16px">I bridge theory and practice to design AI</p></div>
+  <div><p style="font-family: system-ui; font-size: 16px">backend systems, relentlessly pursuing great architecture.</p></div>
+  <!-- The wrap that decides yunseong.dev's hero height, verbatim: a measure in
+       `ch` of the system face, and a last word that misses the line by 1.4px. -->
+  <div><p style="font-family: system-ui; font-size: 16px; line-height: 1.75; max-width: 46ch; white-space: pre-line; background: #dfd">I bridge theory and practice to design AI, game, and backend systems, relentlessly pursuing great architecture.</p></div>
+</body>
+</html>

@@ -688,6 +688,7 @@ pub fn resolve_math_values(node: &mut StyledNode, viewport_width: f32, viewport_
                 viewport_width,
                 viewport_height,
                 font_size,
+                font_style: crate::layout::resolved_font_style(node),
                 root_font_size,
                 percent_basis: None,
             };
@@ -897,22 +898,43 @@ fn build_final_tree(
                     .and_then(|p| p.get(&fs_key))
                     .and_then(|v| if let Value::Length(pv, crate::css::Unit::Px) = v { Some(*pv) } else { None })
                     .unwrap_or(16.0);
+                // A `font-size` in `ch` or `ex` is measured in the parent's
+                // font, not this element's, which is what is being computed.
+                let parent_font = {
+                    let family = match parent_pm
+                        .as_ref()
+                        .and_then(|p| p.get(&intern("font-family")))
+                    {
+                        Some(Value::Keyword(k)) => crate::layout::generic_family_for(k),
+                        Some(Value::RawCustomProp(raw)) => crate::layout::generic_family_for(raw),
+                        _ => crate::font::GenericFamily::default(),
+                    };
+                    crate::font::FontStyle { family, ..crate::font::FontStyle::regular() }
+                };
                 // A font size may be written in any of these units, and may arrive
                 // through a custom property — design systems keep their type scale
                 // in one. Resolving a var() only when it already held pixels left
                 // every `font-size: var(--scale-step)` unresolved, so headings
                 // silently inherited body size.
-                fn font_size_px(value: &Value, parent_fs: f32, root_fs: f32) -> Option<f32> {
+                fn font_size_px(
+                    value: &Value,
+                    parent_fs: f32,
+                    root_fs: f32,
+                    parent_font: crate::font::FontStyle,
+                ) -> Option<f32> {
                     match value {
                         Value::Length(v, crate::css::Unit::Px) => Some(*v),
                         Value::Length(v, crate::css::Unit::Percent) => Some(parent_fs * (v / 100.0)),
                         Value::Length(v, crate::css::Unit::Em) => Some(parent_fs * v),
                         Value::Length(v, crate::css::Unit::Rem) => Some(root_fs * v),
+                        // A `font-size` in `ch` or `ex` is measured in the
+                        // *parent's* font, since this element's is what is
+                        // being computed.
                         Value::Length(v, crate::css::Unit::Ch) => {
-                            Some(crate::font::fonts().zero_advance(parent_fs) * v)
+                            Some(crate::font::fonts().zero_advance(parent_fs, parent_font) * v)
                         }
                         Value::Length(v, crate::css::Unit::Ex) => {
-                            Some(crate::font::fonts().x_height(parent_fs) * v)
+                            Some(crate::font::fonts().x_height(parent_fs, parent_font) * v)
                         }
                         Value::Keyword(kw) if kw.as_ref() == "inherit" => Some(parent_fs),
                         Value::Keyword(kw) if kw.as_ref() == "initial" => Some(16.0),
@@ -923,8 +945,8 @@ fn build_final_tree(
                     let resolved_fs = match val {
                         Value::CssVar { .. } => resolve_var(val, &custom_props, 0)
                             .as_ref()
-                            .and_then(|resolved| font_size_px(resolved, parent_fs, root_fs)),
-                        other => font_size_px(other, parent_fs, root_fs),
+                            .and_then(|resolved| font_size_px(resolved, parent_fs, root_fs, parent_font)),
+                        other => font_size_px(other, parent_fs, root_fs, parent_font),
                     };
                     if let Some(fs) = resolved_fs {
                         specified_values.insert(fs_key.clone(), Value::Length(fs, crate::css::Unit::Px));
@@ -933,6 +955,27 @@ fn build_final_tree(
                 let own_fs = specified_values.get(&fs_key)
                     .and_then(|v| if let Value::Length(pv, crate::css::Unit::Px) = v { Some(*pv) } else { None })
                     .unwrap_or(parent_fs);
+                // `ch` and `ex` are metrics of the element's *own* face, so the
+                // stack has to be resolved before either unit can be. A design
+                // that caps its prose at `46ch` gets a wider measure under
+                // `system-ui` than under `sans-serif`.
+                let own_font = {
+                    let ff_key = intern("font-family");
+                    let stated = specified_values
+                        .get(&ff_key)
+                        .cloned()
+                        .or_else(|| parent_pm.as_ref().and_then(|p| p.get(&ff_key)).cloned());
+                    let stack = match stated.as_ref() {
+                        Some(v @ Value::CssVar { .. }) => resolve_var(v, &custom_props, 0),
+                        other => other.cloned(),
+                    };
+                    let family = match stack.as_ref() {
+                        Some(Value::Keyword(k)) => crate::layout::generic_family_for(k),
+                        Some(Value::RawCustomProp(raw)) => crate::layout::generic_family_for(raw),
+                        _ => crate::font::GenericFamily::default(),
+                    };
+                    crate::font::FontStyle { family, ..crate::font::FontStyle::regular() }
+                };
                 // The root element is visited before anything that can reference
                 // it, so its font size is known by the time a `rem` needs it.
                 if is_root_element {
@@ -989,10 +1032,10 @@ fn build_final_tree(
                                     Value::Length(n, crate::css::Unit::Em) => Value::Length(n * own_fs, crate::css::Unit::Px),
                                     Value::Length(n, crate::css::Unit::Rem) => Value::Length(n * root_fs, crate::css::Unit::Px),
                                     Value::Length(n, crate::css::Unit::Ch) => {
-                                        Value::Length(n * crate::font::fonts().zero_advance(own_fs), crate::css::Unit::Px)
+                                        Value::Length(n * crate::font::fonts().zero_advance(own_fs, own_font), crate::css::Unit::Px)
                                     }
                                     Value::Length(n, crate::css::Unit::Ex) => {
-                                        Value::Length(n * crate::font::fonts().x_height(own_fs), crate::css::Unit::Px)
+                                        Value::Length(n * crate::font::fonts().x_height(own_fs, own_font), crate::css::Unit::Px)
                                     }
                                     // A custom property may itself hold a math
                                     // expression naming further properties —
@@ -1043,11 +1086,11 @@ fn build_final_tree(
                         // in `ch` is how a design caps its measure, so ignoring the
                         // unit lets prose run the full width of its container.
                         Value::Length(n, crate::css::Unit::Ch) => Some(Value::Length(
-                            n * crate::font::fonts().zero_advance(own_fs),
+                            n * crate::font::fonts().zero_advance(own_fs, own_font),
                             crate::css::Unit::Px,
                         )),
                         Value::Length(n, crate::css::Unit::Ex) => Some(Value::Length(
-                            n * crate::font::fonts().x_height(own_fs),
+                            n * crate::font::fonts().x_height(own_fs, own_font),
                             crate::css::Unit::Px,
                         )),
                         _ => None,

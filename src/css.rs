@@ -126,6 +126,8 @@ pub struct MathContext {
     pub viewport_width: f32,
     pub viewport_height: f32,
     pub font_size: f32,
+    /// The element's own font, which `ch` and `ex` are metrics of.
+    pub font_style: crate::font::FontStyle,
     /// The root element's font size, which `rem` resolves against.
     pub root_font_size: f32,
     /// Basis for percentages, or `None` when it is not yet known — an expression
@@ -141,8 +143,12 @@ impl MathExpr {
                 None | Some(Unit::Px) => Some(*n),
                 Some(Unit::Em) => Some(n * ctx.font_size),
                 Some(Unit::Rem) => Some(n * ctx.root_font_size),
-                Some(Unit::Ch) => Some(n * crate::font::fonts().zero_advance(ctx.font_size)),
-                Some(Unit::Ex) => Some(n * crate::font::fonts().x_height(ctx.font_size)),
+                Some(Unit::Ch) => {
+                    Some(n * crate::font::fonts().zero_advance(ctx.font_size, ctx.font_style))
+                }
+                Some(Unit::Ex) => {
+                    Some(n * crate::font::fonts().x_height(ctx.font_size, ctx.font_style))
+                }
                 Some(Unit::Vw) => Some(ctx.viewport_width * (n / 100.0)),
                 Some(Unit::Vh) => Some(ctx.viewport_height * (n / 100.0)),
                 Some(Unit::Percent) => ctx.percent_basis.map(|b| b * (n / 100.0)),
