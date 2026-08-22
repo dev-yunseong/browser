@@ -223,32 +223,6 @@ fn is_bold(sv: &crate::style::PropertyMap) -> bool {
     }
 }
 
-/// Apply `text-transform` to a text run.
-///
-/// Labels set in small caps through `text-transform: uppercase` are common in
-/// page furniture, and rendering them in their authored case reads as a
-/// different design rather than as a rendering bug.
-fn apply_text_transform(text: &str, sv: &crate::style::PropertyMap) -> String {
-    let Some(Value::Keyword(k)) = sv.get(&crate::css::intern("text-transform")) else {
-        return text.to_string();
-    };
-    match k.as_ref() {
-        "uppercase" => text.to_uppercase(),
-        "lowercase" => text.to_lowercase(),
-        "capitalize" => text
-            .split_inclusive(char::is_whitespace)
-            .map(|word| {
-                let mut chars = word.chars();
-                match chars.next() {
-                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                    None => String::new(),
-                }
-            })
-            .collect(),
-        _ => text.to_string(),
-    }
-}
-
 impl LayerTree {
     fn new() -> Self {
         Self { layers: Vec::new() }
@@ -799,7 +773,7 @@ impl LayerTreeBuilder {
             if font_size >= 0.5 {
                 commands.push(PaintCommand::Text {
                     rect: d,
-                    text: apply_text_transform(&contents.borrow(), sv),
+                    text: crate::layout::apply_text_transform(&contents.borrow(), sv),
                     font_size,
                     line_height: crate::layout::resolved_line_height_px(layout.style_node),
                     leading_space: layout.text_leading,

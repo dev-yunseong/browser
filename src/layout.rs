@@ -65,8 +65,12 @@ impl IntrinsicSizeCache {
                                 Some(Value::Length(v, Unit::Px)) => *v,
                                 _ => 16.0,
                             };
+                        // Measure what will actually be drawn: `text-transform`
+                        // changes a run's width, and sizing a box from the
+                        // untransformed source makes uppercased text wrap inside
+                        // a box built for its lowercase original.
                         Some(measure_text_width(
-                            &contents.borrow(),
+                            &apply_text_transform(&contents.borrow(), &node.specified_values),
                             font_size,
                             f32::INFINITY,
                         ))
@@ -201,7 +205,7 @@ impl IntrinsicSizeCache {
                                 Some(Value::Length(v, Unit::Px)) => *v,
                                 _ => 16.0,
                             };
-                        let text = contents.borrow();
+                        let text = apply_text_transform(&contents.borrow(), &node.specified_values);
                         let trimmed = text.trim();
                         if trimmed.is_empty() {
                             Some(0.0)
@@ -387,6 +391,32 @@ fn clamp_height(sn: &StyledNode, box_sizing: &str, padding: &EdgeSizes, border: 
         height = height.max(min_h);
     }
     height
+}
+
+/// Apply `text-transform` to a text run.
+///
+/// Labels set in small caps through `text-transform: uppercase` are common in
+/// page furniture, and rendering them in their authored case reads as a
+/// different design rather than as a rendering bug.
+pub fn apply_text_transform(text: &str, sv: &crate::style::PropertyMap) -> String {
+    let Some(Value::Keyword(k)) = sv.get(&crate::css::intern("text-transform")) else {
+        return text.to_string();
+    };
+    match k.as_ref() {
+        "uppercase" => text.to_uppercase(),
+        "lowercase" => text.to_lowercase(),
+        "capitalize" => text
+            .split_inclusive(char::is_whitespace)
+            .map(|word| {
+                let mut chars = word.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect(),
+        _ => text.to_string(),
+    }
 }
 
 fn read_aspect_ratio(sn: &StyledNode) -> Option<f32> {
@@ -2761,6 +2791,9 @@ impl<'a> LayoutBox<'a> {
         current_y: f32,
         container_width: f32,
     ) -> (Option<LayoutBox<'a>>, f32, f32) {
+        // Line breaking has to see the run as it will be drawn, so the transform
+        // is applied before anything is measured.
+        let text = apply_text_transform(&text, &self.style_node.specified_values);
         let trimmed = text.trim();
         let font_size = match self
             .style_node
@@ -6031,4 +6064,9 @@ mod tests {
             c.dimensions.y, a.dimensions.y
         );
     }
+}
+
+/// The resolved display type of a styled node, for diagnostics.
+pub fn debug_display_type(sn: &StyledNode) -> DisplayType {
+    get_display_type(sn)
 }
