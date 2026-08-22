@@ -983,6 +983,15 @@ fn contributes_to_intrinsic_size(child: &StyledNode) -> bool {
 /// only white space is not rendered". The newlines and indentation between
 /// markup tags are exactly that. Counting them as items gave a two-item row
 /// four, and charged it the container's `gap` for each of the two it invented.
+/// The `order` an item was given, which modifies the document order flex and
+/// grid place their items in. Painting follows the same modified order.
+fn order_of(sn: &StyledNode) -> i32 {
+    match sn.specified_values.get(&crate::css::intern("order")) {
+        Some(Value::Number(n)) => *n as i32,
+        _ => 0,
+    }
+}
+
 fn is_flex_item(child: &StyledNode) -> bool {
     if should_skip(child) {
         return false;
@@ -3022,6 +3031,12 @@ impl<'a> LayoutBox<'a> {
                 if matches!(child_pos, PositionType::Absolute | PositionType::Fixed) { continue; }
                 grid_children.push(child_node);
             }
+
+            // Auto-placement runs over the *order-modified* document order, the
+            // same way it does for flex. github alternates its feature sections
+            // by giving one column `order: 2` and the other `order: 1`, and
+            // ignoring that put the screenshot on the side the text belongs on.
+            grid_children.sort_by_key(|c| order_of(c));
 
             // Auto-placement, honouring explicit lines and spans. Occupancy is
             // tracked so an item with an explicit line does not get overwritten by
@@ -8804,6 +8819,41 @@ mod tests {
             cb.dimensions.x,
             overlay.dimensions.x
         );
+    }
+
+    /// `order` modifies the document order a grid places its items in, the same
+    /// way it does for flex. github alternates its feature sections by giving
+    /// one column `order: 2` and the other `order: 1`, and ignoring that put
+    /// every screenshot on the side the text belongs on.
+    #[test]
+    fn test_grid_items_are_placed_in_order_modified_document_order() {
+        let css = ".g { display: grid; grid-template-columns: 1fr 1fr; }                    #first { order: 2 } #second { order: 1 }";
+        let html = r#"<div style="width:800px"><div class="g">
+            <div id="first">text</div><div id="second">picture</div>
+        </div></div>"#;
+        let (layout, _, _) = layout_from_html_css(html, css, 800.0, 600.0);
+
+        let first = find_element_by_id(&layout, "first").expect("first");
+        let second = find_element_by_id(&layout, "second").expect("second");
+        assert!(
+            first.dimensions.x > second.dimensions.x,
+            "`order: 2` puts the first child in the second column: {} vs {}",
+            first.dimensions.x,
+            second.dimensions.x
+        );
+    }
+
+    /// Without `order`, document order stands.
+    #[test]
+    fn test_grid_items_keep_document_order_by_default() {
+        let css = ".g { display: grid; grid-template-columns: 1fr 1fr; }";
+        let html = r#"<div style="width:800px"><div class="g">
+            <div id="first">text</div><div id="second">picture</div>
+        </div></div>"#;
+        let (layout, _, _) = layout_from_html_css(html, css, 800.0, 600.0);
+        let first = find_element_by_id(&layout, "first").expect("first");
+        let second = find_element_by_id(&layout, "second").expect("second");
+        assert!(first.dimensions.x < second.dimensions.x);
     }
 
     /// CSS drops whitespace at the start and end of a block's inline content,

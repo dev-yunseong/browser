@@ -30,6 +30,13 @@
   .disc.open { grid-template-rows: 1fr; }
   .disc > div { overflow: hidden; }
   .panel { background: #dfd; padding: 8px; }
+
+  /* `order` on grid items. */
+  .alt { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 8px; }
+  .alt .a { background: #cff; order: 2; }
+  .alt .b { background: #fcf; order: 1; }
+  .alt.rev .a { order: 1; }
+  .alt.rev .b { order: 2; }
 </style>
 </head>
 <body>
@@ -41,6 +48,14 @@
   <div class="g c selfstretch"><div class="short"></div><div class="tall"></div></div>
   <div><strong>closed</strong><div class="disc"><div><div class="panel">This panel is closed: the row it sits in is <code>0fr</code>, so it takes no height and its text is clipped away entirely.</div></div></div><strong>after closed</strong></div>
   <div><strong>open</strong><div class="disc open"><div><div class="panel">This panel is open: the row is <code>1fr</code>, so it is as tall as the text inside it.</div></div></div><strong>after open</strong></div>
+  <section>
+    <!-- `order` modifies the document order a grid places its items in, which
+         is how a page alternates its feature sections without moving the
+         markup: the text stays first for a screen reader and swaps sides. -->
+    <div class="alt"><div class="a">text column, order 2</div><div class="b">picture column, order 1</div></div>
+    <div class="alt rev"><div class="a">text column, order 1</div><div class="b">picture column, order 2</div></div>
+  </section>
+
   <div class="pic">
     <img src="portrait.svg" width="132" height="169" alt="portrait">
     <p>A column of text tall enough that the picture beside it would be stretched to match, were the grid not told to centre its items instead. It keeps the height its own proportions give it.</p>
