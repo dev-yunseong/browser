@@ -1,2 +1,6 @@
 /target
 .DS_Store
+
+# Parity harness output: regenerated on every run.
+tools/parity/out/
+tools/parity/node_modules/
