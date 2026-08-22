@@ -138,6 +138,7 @@ Ordered by how much of a page each one destroyed.
 | Every positioned box treated as a stacking context | `position: relative` with `z-index: auto` is not one, so a `z-index: -1` child of it belongs further up and paints *below* that box's own background. Painting it as an ordinary negative child put github's hero glow on top of the panel it sits behind. |
 | Only the last `::before` rule carrying `content` applied | A design system states the shape once and overrides a size or a colour in a later, equally specific rule that names no `content` of its own. Those overrides were thrown away outright. |
 | An intrinsic width measured without the box's own `min-width` | What a box contributes to its parent's intrinsic size is its content bounded by its own constraints. github's hero toggle is five buttons at `min-width: 110px` around shorter labels; measured from the labels the row came out 109px short, and its `overflow: hidden` clipped the last button away. |
+| Whitespace at the edge of a block's content measured as a space | CSS drops it, and the intrinsic measurement did not. A date written as two spans inside a `<p>` indented in the source carries a whitespace-only text node on each side; counting those made the box three spaces wider than the run it holds, and on yunseong.dev that was enough to push the heading beside it onto a second line. |
 | Flow advancing past the content box | A box that states a height and carries padding handed the next block a cursor its own padding too high, and every section below it climbed by that much. |
 
 
@@ -150,7 +151,7 @@ pixels:
 | fixture | layout | fold | page | height (chromium -> engine) |
 |---|---|---|---|---|
 | github.com | 1.37% | 2.89% | 1.88% | 10570 -> 10569 |
-| yunseong.dev | 1.46% | 3.22% | 3.90% | 4976 -> 4947 |
+| yunseong.dev | 1.45% | 3.21% | 4.10% | 4976 -> 4915 |
 | naver.com | 1.32% | 2.88% | 2.55% | 18658 -> 16384 |
 
 github.com began this work at 9.14% layout, 13.84% fold and 780px too tall;
@@ -198,6 +199,16 @@ exercises the UA stylesheet.
 - **Transformed overflow does not extend the page.** A rotated or scaled box
   that reaches past the document's own bottom does not lengthen it, so
   `probe-transform` ends 59px short of Chromium's scroll height.
+- **The two renderers fall back to different fonts for Hangul.** Both agree to
+  the pixel on the Latin stacks these pages name — `sans-serif`, `system-ui`,
+  `monospace` and the full `"Pretendard Variable", …, sans-serif` list all
+  measure identically. What differs is what answers for a Hangul codepoint the
+  chosen face has no glyph for: this engine hands it to the bundled NanumGothic
+  (advance 0.94em), Chromium to the system's Unifont (1.00em). Every Korean run
+  on yunseong.dev is therefore about 5.5% narrower here, which is enough to fit
+  a line Chromium wraps — and that, not layout, is most of what is left on that
+  page. A named system family (`"DejaVu Sans"`, `"Liberation Sans"`) is not
+  resolved at all and falls through to the bundled sans.
 - **A snapshot can only be as good as its capture.** `capture.mjs` now inlines
   fonts as well as stylesheets and images, but a snapshot taken before that
   still points at a CDN, and a page rendered against a fallback face is a

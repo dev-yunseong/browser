@@ -178,7 +178,11 @@ impl IntrinsicSizeCache {
                     let mut max_w: f32 = 0.0;
                     let mut float_width: f32 = 0.0;
                     let mut percent_width_sum: f32 = 0.0;
-                    for (child_val, child) in child_vals.into_iter().zip(non_skip_children.iter()) {
+                    let drops = edge_space_drops(node_ref, &non_skip_children);
+                    for (i, (child_val, child)) in
+                        child_vals.into_iter().zip(non_skip_children.iter()).enumerate()
+                    {
+                        let child_val = (child_val - drops[i]).max(0.0);
                         if is_line_break_element(child) {
                             max_w = max_w.max(inline_run_width);
                             inline_run_width = 0.0;
@@ -362,6 +366,58 @@ impl IntrinsicSizeCache {
 
         val_stack.pop().unwrap_or(0.0)
     }
+}
+
+/// The collapsed space a text node keeps on one edge of its parent's content.
+///
+/// CSS drops whitespace at the start and end of a block's inline content, so an
+/// intrinsic measurement must not keep a space there. A period written as two
+/// spans inside a `<p>` indented in the source carries a whitespace-only text
+/// node on each side of them, and counting those made github-style date boxes
+/// several spaces wider than the run they hold — wide enough to push the
+/// heading beside them onto a second line.
+fn edge_space_width(child: &StyledNode, leading: bool) -> f32 {
+    let NodeData::Text { ref contents } = child.node.data else {
+        return 0.0;
+    };
+    let raw = contents.borrow().to_string();
+    if raw.is_empty() {
+        return 0.0;
+    }
+    let font_size = node_font_size(child).max(1.0);
+    let space = crate::font::fonts().advance(' ', font_size, resolved_font_style(child))
+        + resolved_letter_spacing_px(child);
+    if raw.trim().is_empty() {
+        // The node is nothing but the space, so all of it goes.
+        return space;
+    }
+    let at_edge = if leading {
+        raw.starts_with(|c: char| c.is_whitespace())
+    } else {
+        raw.ends_with(|c: char| c.is_whitespace())
+    };
+    if at_edge {
+        space
+    } else {
+        0.0
+    }
+}
+
+/// How much to take off each child's intrinsic contribution because it sits at
+/// the edge of a block's content. Indexed the same as the children.
+fn edge_space_drops(node: &StyledNode, children: &[&StyledNode]) -> Vec<f32> {
+    let mut drops = vec![0.0; children.len()];
+    // Whitespace is dropped at the edge of a *block container*'s content, which
+    // an inline box is not: there the space still separates this run from the
+    // text beside it. Everything else — a block, an inline-block, a flex or grid
+    // item, a table cell — establishes one.
+    if children.is_empty() || get_display_type(node) == DisplayType::Inline {
+        return drops;
+    }
+    drops[0] += edge_space_width(children[0], true);
+    let last = children.len() - 1;
+    drops[last] += edge_space_width(children[last], false);
+    drops
 }
 
 /// The width of the collapsed whitespace a text node contributes to the run
@@ -8747,6 +8803,30 @@ mod tests {
              with the item it sits in; got {}",
             cb.dimensions.x,
             overlay.dimensions.x
+        );
+    }
+
+    /// CSS drops whitespace at the start and end of a block's inline content,
+    /// so an intrinsic measurement must not keep a space there. A date written
+    /// as two spans inside a `<p>` indented in the source carries a
+    /// whitespace-only text node on each side of them; counting those made the
+    /// box wide enough to push the heading beside it onto a second line.
+    #[test]
+    fn test_edge_whitespace_is_not_measured() {
+        let css = ".row { display: inline-block; font-family: monospace; font-size: 16px }";
+        let html = "<div style=\"width:800px\">             <div id=\"tight\" class=\"row\"><span>ab</span> <span>cd</span></div>             <div id=\"padded\" class=\"row\">
+    <span>ab</span>
+    <span>cd</span>
+  </div>           </div>";
+        let (layout, _, _) = layout_from_html_css(html, css, 800.0, 600.0);
+
+        let tight = find_element_by_id(&layout, "tight").expect("tight");
+        let padded = find_element_by_id(&layout, "padded").expect("padded");
+        assert!(
+            (tight.dimensions.width - padded.dimensions.width).abs() < 0.5,
+            "source indentation must not widen the box: {} vs {}",
+            tight.dimensions.width,
+            padded.dimensions.width
         );
     }
 
