@@ -84,8 +84,20 @@ async function daemonUp() {
   }
 }
 
+/**
+ * Start a daemon of our own.
+ *
+ * Reusing one that happens to be running makes results depend on what it
+ * rendered earlier: its image cache carries over, and a page whose layout
+ * depends on an image's intrinsic size then measures differently on a warm
+ * cache than on a cold one. Each run gets a fresh process.
+ */
 async function startDaemon() {
-  if (await daemonUp()) return null;
+  if (await daemonUp()) {
+    throw new Error(
+      `port ${DAEMON_PORT} is already serving a browser-daemon; stop it so this run starts a clean one`,
+    );
+  }
   if (!existsSync(DAEMON)) throw new Error(`missing ${DAEMON} — run: cargo build --release --bins`);
   const proc = spawn(DAEMON, ['--no-gui', '--port', String(DAEMON_PORT)], {
     stdio: ['ignore', 'ignore', 'ignore'],

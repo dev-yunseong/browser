@@ -521,8 +521,16 @@ pub fn build_style_tree(
             }
         }
 
-        // Sort by specificity (ascending) so higher specificity overwrites lower
-        rule_matches.sort_by_key(|&(_, spec)| spec);
+        // Sort by specificity, then by position in the stylesheet, so that later
+        // declarations overwrite earlier ones.
+        //
+        // The rule index is the tie-break the cascade actually specifies, and
+        // without it equal-specificity rules were applied in whatever order they
+        // came out of the signature cache and the selector index. That order is
+        // not stable between runs, so the same page laid out differently from one
+        // render to the next — and equal specificity is the common case in a
+        // design system, where nearly every rule is a single class.
+        rule_matches.sort_by_key(|&(rule_idx, spec)| (spec, rule_idx));
 
         // Apply matched rules; defer important declarations.
         // Only allocate `important` if needed (most nodes have no !important rules).

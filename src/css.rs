@@ -927,77 +927,78 @@ fn media_range_matches(condition: &str) -> bool {
     }
 }
 
+/// Flatten at-rules into a plain rule list the block parser can read.
+///
+/// `@media` keeps its body only when the query matches. `@layer`, `@supports`
+/// and `@scope` are *grouping* at-rules: their bodies are ordinary rules, so
+/// the body is kept and only the wrapper goes away. Dropping those wholesale —
+/// as this did — throws away most of a modern design system, since that is
+/// where its custom properties and component rules live.
+///
+/// Bodies are processed recursively so an `@media` nested inside an `@layer`
+/// (or vice versa) is still evaluated rather than left as raw text for the
+/// block splitter to trip over.
 fn strip_at_rules(source: &str) -> String {
-    let mut result = String::with_capacity(source.len());
     let chars: Vec<char> = source.chars().collect();
-    let len = chars.len();
+    let mut result = String::with_capacity(source.len());
     let mut i = 0;
 
-    while i < len {
-        if chars[i] == '@' {
-            // Collect the at-keyword and query up to the first '{' or ';'
-            let at_start = i;
-            i += 1; // skip '@'
-            // Read keyword (letters only)
-            let mut keyword = String::new();
-            while i < len && (chars[i].is_alphanumeric() || chars[i] == '-') {
-                keyword.push(chars[i]);
-                i += 1;
-            }
-            let keyword = keyword.to_lowercase();
-
-            if keyword == "media" {
-                // Collect the query text up to the opening '{'
-                let mut query = String::new();
-                while i < len && chars[i] != '{' {
-                    query.push(chars[i]);
-                    i += 1;
-                }
-                if i >= len { break; }
-                i += 1; // consume '{'
-
-                // Decide whether to include the body.
-                let include = evaluate_media_query(&query);
-
-                // Walk the nested braces, copying content only if include == true.
-                let mut depth = 1usize;
-                while i < len && depth > 0 {
-                    let c = chars[i];
-                    if c == '{' { depth += 1; }
-                    else if c == '}' {
-                        depth -= 1;
-                        if depth == 0 { i += 1; break; }
-                    }
-                    if include { result.push(c); }
-                    i += 1;
-                }
-                // closing '}' already consumed by the break above
-            } else {
-                // Non-@media at-rule: skip it entirely.
-                // Determine if it's a block rule (has '{...}') or a simple statement ending with ';'.
-                // Collect up to the first '{' or ';' to decide.
-                let mut preamble = String::new();
-                while i < len && chars[i] != '{' && chars[i] != ';' {
-                    preamble.push(chars[i]);
-                    i += 1;
-                }
-                if i < len && chars[i] == '{' {
-                    i += 1; // consume '{'
-                    let mut depth = 1usize;
-                    while i < len && depth > 0 {
-                        let c = chars[i];
-                        if c == '{' { depth += 1; }
-                        else if c == '}' { depth -= 1; }
-                        i += 1;
-                    }
-                } else if i < len && chars[i] == ';' {
-                    i += 1; // consume ';'
-                }
-                let _ = (at_start, preamble); // suppress unused warnings
-            }
-        } else {
+    while i < chars.len() {
+        if chars[i] != '@' {
             result.push(chars[i]);
             i += 1;
+            continue;
+        }
+
+        i += 1; // '@'
+        let mut keyword = String::new();
+        while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '-') {
+            keyword.push(chars[i]);
+            i += 1;
+        }
+        let keyword = keyword.to_lowercase();
+
+        let mut preamble = String::new();
+        while i < chars.len() && chars[i] != '{' && chars[i] != ';' {
+            preamble.push(chars[i]);
+            i += 1;
+        }
+
+        // Statement form (`@import ...;`, `@layer a, b;`) carries no rules.
+        if i >= chars.len() || chars[i] == ';' {
+            i += 1;
+            continue;
+        }
+
+        i += 1; // '{'
+        let body_start = i;
+        let mut depth = 1usize;
+        while i < chars.len() && depth > 0 {
+            match chars[i] {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        let body_end = if depth == 0 { i - 1 } else { i };
+        let body: String = chars[body_start..body_end].iter().collect();
+
+        let keep = match keyword.as_str() {
+            "media" => evaluate_media_query(&preamble),
+            // Layers only affect cascade order, which this engine does not model;
+            // keeping the rules is much closer than losing them.
+            "layer" | "scope" | "starting-style" => true,
+            // The reference renderer supports essentially everything a page
+            // guards with `@supports`, so the positive form is applied and only
+            // the `not` fallback is skipped.
+            "supports" => !preamble.trim_start().to_lowercase().starts_with("not "),
+            // `@font-face`, `@keyframes`, `@property` and `@container` declare
+            // things this engine cannot act on.
+            _ => false,
+        };
+        if keep {
+            result.push_str(&strip_at_rules(&body));
         }
     }
     result
