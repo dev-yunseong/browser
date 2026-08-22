@@ -510,8 +510,12 @@ pub fn parse_css(source: &str) -> Stylesheet {
         if selectors_str.is_empty() || declarations_str.is_empty() { continue; }
 
         let mut selectors = Vec::new();
-        for s in selectors_str.split(',') {
-            let s = s.trim();
+        // Split the selector list on top-level commas only. `:has(p, div, pre)`
+        // and `:is(...)` carry commas of their own, and cutting there turned one
+        // narrow selector into several wide ones — a fragment as broad as `div`
+        // matched every division on the page and applied the rule's focus ring
+        // to all of them.
+        for s in split_selector_list(selectors_str) {
             if !s.is_empty() {
                 selectors.push(parse_selector(s));
             }
@@ -2240,6 +2244,27 @@ fn named_color(s: &str) -> Option<Color> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `:has(p, div, pre)` carries commas of its own. Splitting the selector
+    /// list on every comma turned one narrow selector into several wide ones —
+    /// a fragment as broad as `div` then matched every division on the page.
+    #[test]
+    fn test_selector_list_splits_only_on_top_level_commas() {
+        let ss = parse_css(".md a:has(p, div, pre):focus-visible, button:focus { outline: 2px solid #1f6feb; }");
+        let rules = ss.all_rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0].selectors.len(),
+            2,
+            "two selectors, not five: {:?}",
+            rules[0].selectors
+        );
+        assert!(
+            !rules[0].selectors.iter().any(|s| s.tag.as_deref() == Some("div")),
+            "no bare `div` selector should fall out of the :has() argument: {:?}",
+            rules[0].selectors
+        );
+    }
 
     #[test]
     fn test_parse_selector() {
