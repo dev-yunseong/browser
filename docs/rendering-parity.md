@@ -143,6 +143,7 @@ Ordered by how much of a page each one destroyed.
 | An `overflow: hidden` clip never reaching a descendant *layer* | A clip is expressed as PushClip/PopClip inside one layer's own command list, and a box that composites on its own — positioned, transformed or blended — never sees it. That only shows on a box whose paint spreads past its own bounds: github's hero glow is blurred by 42px, and its halo escaped the intro section and washed over the whole band below it. |
 | `filter` in a `style` attribute dropped | The inline-style parser had no case for it, so an inline blur never produced the longhand paint reads and the box came out sharp. |
 | Cascade layer order ranked below specificity | Layer order beats specificity outright: an unlayered rule wins over one in any layer however specific that one is. Re-ordering the source so unlayered rules came last only settled *ties*; github states its component rules inside `@layer primer-brand` and overrides them with plain page-level classes, so a four-class `:not()` selector kept its 24px margin over the unlayered rule's 16px and every pillar came out 8px too tall. |
+| A character no bundled face covers never looked at the system's fonts | A browser resolves a family it cannot satisfy through the system's own fonts, and the fallback for an uncovered codepoint is the same search. This engine went straight to the bundled NanumGothic, whose Hangul advance is 0.94em against the 1.00em of the Unifont Chromium picks here, so every Korean run on yunseong.dev came out 5.5% narrow — enough to keep a line the reference wraps. |
 | Flow advancing past the content box | A box that states a height and carries padding handed the next block a cursor its own padding too high, and every section below it climbed by that much. |
 
 
@@ -155,8 +156,8 @@ pixels:
 | fixture | layout | fold | page | height (chromium -> engine) |
 |---|---|---|---|---|
 | github.com | 1.37% | 2.89% | 1.60% | 10570 -> 10553 |
-| yunseong.dev | 1.45% | 3.21% | 4.10% | 4976 -> 4915 |
-| naver.com | 1.32% | 2.88% | 2.53% | 18658 -> 16384 |
+| yunseong.dev | 1.43% | 3.18% | 3.05% | 4976 -> 4969 |
+| naver.com | 1.25% | 2.91% | 2.53% | 18658 -> 16384 |
 
 github.com began this work at 9.14% layout, 13.84% fold and 780px too tall;
 yunseong.dev at 4.24% and 256px too short. github's page is now within a single
@@ -207,16 +208,11 @@ exercises the UA stylesheet.
 - **Transformed overflow does not extend the page.** A rotated or scaled box
   that reaches past the document's own bottom does not lengthen it, so
   `probe-transform` ends 59px short of Chromium's scroll height.
-- **The two renderers fall back to different fonts for Hangul.** Both agree to
-  the pixel on the Latin stacks these pages name — `sans-serif`, `system-ui`,
-  `monospace` and the full `"Pretendard Variable", …, sans-serif` list all
-  measure identically. What differs is what answers for a Hangul codepoint the
-  chosen face has no glyph for: this engine hands it to the bundled NanumGothic
-  (advance 0.94em), Chromium to the system's Unifont (1.00em). Every Korean run
-  on yunseong.dev is therefore about 5.5% narrower here, which is enough to fit
-  a line Chromium wraps — and that, not layout, is most of what is left on that
-  page. A named system family (`"DejaVu Sans"`, `"Liberation Sans"`) is not
-  resolved at all and falls through to the bundled sans.
+- **A named system family is not resolved.** `font-family: "DejaVu Sans"` or
+  `"Liberation Sans"` falls through to the bundled sans rather than loading the
+  file the system has, even though the fallback search now reads those same
+  files. Generic families and the codepoint fallback both match Chromium
+  exactly; only a family named outright does not.
 - **A snapshot can only be as good as its capture.** `capture.mjs` now inlines
   fonts as well as stylesheets and images, but a snapshot taken before that
   still points at a CDN, and a page rendered against a fallback face is a

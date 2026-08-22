@@ -45,6 +45,9 @@ pub enum FaceId {
     SystemUi,
     SystemUiBold,
     Fallback,
+    /// A face found on the system, consulted for a character none of the
+    /// bundled ones cover. Indexed by load order, which is path order.
+    System(u32),
     /// A face the page shipped through `@font-face`, by registration order.
     Web(u32),
 }
@@ -200,6 +203,80 @@ fn faces_for(family: u16, bold: bool, italic: bool) -> Vec<(u32, &'static WebFac
     matching
 }
 
+/// The faces the system has, in a fixed order, loaded the first time a
+/// character none of the bundled faces cover asks for one.
+///
+/// A browser resolves a family it cannot satisfy through the system's own
+/// fonts, and the fallback for an uncovered codepoint is the same search. The
+/// bundled NanumGothic stays as the last resort so a machine with no fonts at
+/// all still draws Hangul, but where a system font exists this engine now picks
+/// the one a browser on that machine picks: Chromium here answers a Hangul
+/// codepoint with Unifont at a full-em advance, and NanumGothic's 0.94em made
+/// every Korean run 5.5% narrow — enough to keep a line the reference wraps.
+///
+/// The list is walked in path order, which is what makes the choice
+/// reproducible. Loading is deferred because most pages never need it, and
+/// capped so a machine with a very large font collection cannot be made to read
+/// all of it into memory.
+fn system_faces() -> &'static [FontRef<'static>] {
+    static SYSTEM: OnceLock<Vec<FontRef<'static>>> = OnceLock::new();
+    SYSTEM.get_or_init(|| {
+        const ROOTS: [&str; 3] = ["/usr/share/fonts", "/usr/local/share/fonts", "/Library/Fonts"];
+        const MAX_BYTES: usize = 96 * 1024 * 1024;
+
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        for root in ROOTS {
+            collect_font_files(std::path::Path::new(root), &mut paths, 0);
+        }
+        paths.sort();
+
+        let mut faces = Vec::new();
+        let mut budget = MAX_BYTES;
+        for path in paths {
+            let Ok(data) = std::fs::read(&path) else { continue };
+            if data.len() > budget {
+                break;
+            }
+            budget -= data.len();
+            let leaked: &'static [u8] = Box::leak(data.into_boxed_slice());
+            // A collection holds several faces; each is a separate candidate.
+            for index in 0..8u32 {
+                match FontRef::try_from_slice_and_index(leaked, index) {
+                    Ok(face) => faces.push(face),
+                    Err(_) => break,
+                }
+            }
+        }
+        faces
+    })
+}
+
+/// Every font file under `dir`, recursively, bounded in depth so a symlink loop
+/// cannot walk forever.
+fn collect_font_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, depth: usize) {
+    if depth > 6 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_font_files(&path, out, depth + 1);
+            continue;
+        }
+        let is_font = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("ttf") || e.eq_ignore_ascii_case("otf") || e.eq_ignore_ascii_case("ttc"))
+            .unwrap_or(false);
+        if is_font {
+            out.push(path);
+        }
+    }
+}
+
 pub struct FontSet {
     sans: FontRef<'static>,
     sans_bold: FontRef<'static>,
@@ -224,6 +301,7 @@ impl FontSet {
             FaceId::SystemUi => &self.system_ui,
             FaceId::SystemUiBold => &self.system_ui_bold,
             FaceId::Fallback => &self.fallback,
+            FaceId::System(idx) => system_faces().get(idx as usize).unwrap_or(&self.fallback),
             // A registered face is parsed from leaked bytes, so the reference
             // outlives this borrow; the bundled sans stands in if the id is
             // stale, which can only happen across a registry reset.
@@ -252,6 +330,18 @@ impl FontSet {
         let primary = self.face(wanted).glyph_id(c);
         if primary.0 != 0 {
             return (wanted, primary);
+        }
+        // ASCII is covered by every bundled face, so a miss there is a missing
+        // glyph rather than a missing script and the system search would only
+        // cost time. Deferring it this way keeps a Latin page from ever
+        // touching the disk.
+        if !c.is_ascii() {
+            for (idx, face) in system_faces().iter().enumerate() {
+                let gid = face.glyph_id(c);
+                if gid.0 != 0 {
+                    return (FaceId::System(idx as u32), gid);
+                }
+            }
         }
         let fallback = self.fallback.glyph_id(c);
         if fallback.0 != 0 {
@@ -401,4 +491,57 @@ pub fn fonts() -> &'static FontSet {
             .expect("bundled system-ui bold font should parse"),
         fallback: FontRef::try_from_slice(FALLBACK).expect("bundled fallback font should parse"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A character none of the bundled faces cover is answered by whichever
+    /// face has it, and the glyph that comes back is a real one.
+    #[test]
+    fn a_hangul_codepoint_resolves_to_a_face_that_has_it() {
+        let (face_id, gid) = fonts().glyph('한', FontStyle::regular());
+        assert_ne!(gid.0, 0, "the fallback search must find a face with the glyph");
+        assert!(
+            !matches!(face_id, FaceId::Sans),
+            "the bundled sans has no Hangul; something else must answer, got {face_id:?}",
+        );
+        assert!(fonts().advance('한', 16.0, FontStyle::regular()) > 0.0);
+    }
+
+    /// Every bundled face covers ASCII, so a Latin page never reaches the
+    /// system search — which is what keeps it from ever touching the disk.
+    #[test]
+    fn ascii_never_leaves_the_bundled_faces() {
+        for c in ['a', 'Z', '0', ' ', '@'] {
+            let (face_id, gid) = fonts().glyph(c, FontStyle::regular());
+            assert_eq!(face_id, FaceId::Sans, "{c:?} must come from the bundled sans");
+            assert_ne!(gid.0, 0);
+        }
+    }
+
+    /// The search is stable: the same character resolves to the same face every
+    /// time, so a page lays out identically from one render to the next.
+    #[test]
+    fn the_fallback_search_is_stable() {
+        let first = fonts().glyph('한', FontStyle::regular());
+        for _ in 0..4 {
+            assert_eq!(fonts().glyph('한', FontStyle::regular()), first);
+        }
+    }
+
+    /// Measuring a run goes through the same search a single character does, so
+    /// layout and paint agree about which face drew what.
+    #[test]
+    fn measuring_a_mixed_run_matches_its_characters() {
+        let style = FontStyle::regular();
+        let text = "a한b";
+        let summed: f32 = text.chars().map(|c| fonts().advance(c, 16.0, style)).sum();
+        let measured = fonts().measure(text, 16.0, style, 0.0);
+        assert!(
+            (summed - measured).abs() < 0.5,
+            "measure() and advance() must agree: {summed} vs {measured}",
+        );
+    }
 }
