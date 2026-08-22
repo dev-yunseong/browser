@@ -948,12 +948,32 @@ impl LayerTreeBuilder {
         // draws it. A field left blank where a page put prompt text reads as a
         // broken control.
         if let Some(ref text) = layout.input_placeholder {
-            if !text.is_empty() {
-                let font_size = match sv.get(&crate::css::intern("font-size")) {
+            // `::placeholder` declarations ride on the field itself under a
+            // prefix — the text has no element of its own to hang them on.
+            let ph = |prop: &str| {
+                sv.get(&crate::css::intern(&format!(
+                    "{}{prop}",
+                    crate::style::PLACEHOLDER_PREFIX
+                )))
+            };
+            // A page that replaces the placeholder with its own floating label
+            // hides it with `opacity: 0`; drawing it anyway left two strings on
+            // top of each other.
+            let opacity = match ph("opacity") {
+                Some(Value::Number(v)) => *v,
+                Some(Value::Length(v, _)) => *v,
+                _ => 1.0,
+            };
+            if !text.is_empty() && opacity > 0.01 {
+                let font_size = match ph("font-size").or_else(|| sv.get(&crate::css::intern("font-size"))) {
                     Some(Value::Length(v, _)) => *v,
                     _ => 13.0,
                 };
-                let color = Color { r: 117, g: 117, b: 117, a: 255 };
+                let mut color = match ph("color") {
+                    Some(Value::Color(c)) => c.clone(),
+                    _ => Color { r: 117, g: 117, b: 117, a: 255 },
+                };
+                color.a = (color.a as f32 * opacity.clamp(0.0, 1.0)).round() as u8;
                 // The renderer puts the baseline at rect.y + font_size * 0.85, so
                 // shift the rect to centre the line in the field.
                 let mid_y = d.y + d.height / 2.0;
@@ -1047,6 +1067,61 @@ mod tests {
         assert_eq!(tree.layers[0].id, 0, "root layer id must be 0");
         assert_eq!(tree.layers[0].z_index, 0, "root layer z_index must be 0");
         assert!((tree.layers[0].opacity - 1.0).abs() < f32::EPSILON, "root opacity must be 1.0");
+    }
+
+    /// Collect every string a layer tree draws.
+    fn painted_text(tree: &LayerTree) -> Vec<String> {
+        let mut out = Vec::new();
+        for layer in &tree.layers {
+            for cmd in layer
+                .background_commands
+                .iter()
+                .chain(layer.content_commands.iter())
+            {
+                if let PaintCommand::Text { text, .. } = cmd {
+                    out.push(text.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// A page that replaces a field's placeholder with its own floating label
+    /// hides the placeholder with `::placeholder { opacity: 0 }`. Drawing it
+    /// anyway left github's hero with "you@domain.com" and "Enter your email"
+    /// on top of each other.
+    #[test]
+    fn test_transparent_placeholder_is_not_drawn() {
+        let html = r#"<input placeholder="you@domain.com">"#;
+        let shown = build_tree_from_html(html, "");
+        let hidden = build_tree_from_html(html, "input::placeholder { opacity: 0 }");
+        assert!(
+            painted_text(&shown).iter().any(|t| t == "you@domain.com"),
+            "the placeholder is drawn by default"
+        );
+        assert!(
+            !painted_text(&hidden).iter().any(|t| t == "you@domain.com"),
+            "an `opacity: 0` placeholder is not drawn"
+        );
+    }
+
+    /// A placeholder colour the page states is the one that gets drawn.
+    #[test]
+    fn test_placeholder_colour_comes_from_the_rule() {
+        let tree = build_tree_from_html(
+            r#"<input placeholder="hint">"#,
+            "input::placeholder { color: #ff0000 }",
+        );
+        let colour = tree
+            .layers
+            .iter()
+            .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
+            .find_map(|cmd| match cmd {
+                PaintCommand::Text { text, color, .. } if text == "hint" => Some(color.clone()),
+                _ => None,
+            })
+            .expect("placeholder text command");
+        assert_eq!((colour.r, colour.g, colour.b), (255, 0, 0));
     }
 
     #[test]

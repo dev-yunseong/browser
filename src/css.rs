@@ -1141,7 +1141,8 @@ fn media_range_matches(condition: &str) -> bool {
     }
 }
 
-/// Flatten at-rules into a plain rule list the block parser can read.
+/// Flatten at-rules into a plain rule list the block parser can read, in
+/// cascade-layer order.
 ///
 /// `@media` keeps its body only when the query matches. `@layer`, `@supports`
 /// and `@scope` are *grouping* at-rules: their bodies are ordinary rules, so
@@ -1152,14 +1153,66 @@ fn media_range_matches(condition: &str) -> bool {
 /// Bodies are processed recursively so an `@media` nested inside an `@layer`
 /// (or vice versa) is still evaluated rather than left as raw text for the
 /// block splitter to trip over.
+///
+/// A cascade layer changes which of two equally specific rules wins, so the
+/// output is re-ordered rather than left in source order: every layer's rules
+/// come first, in the order the layers were named, and unlayered rules come
+/// last because they beat every layer. The block parser downstream breaks ties
+/// by position, so putting the segments in this order is all it takes to make
+/// it agree with the cascade — which is how github's own
+/// `.CtaFormControl-input::placeholder { opacity: 0 }` beats the
+/// `@layer primer-brand` rule that would otherwise show the placeholder it is
+/// there to hide.
+///
+/// `!important` reverses layer order in the real cascade. That is not modelled:
+/// important declarations are applied after the normal ones whatever layer they
+/// came from.
 fn strip_at_rules(source: &str, font_faces: &mut Vec<FontFace>) -> String {
-    let chars: Vec<char> = source.chars().collect();
+    let mut order: Vec<String> = Vec::new();
+    let mut segments: Vec<(Option<String>, String)> = Vec::new();
+    collect_at_rules(source, None, font_faces, &mut order, &mut segments);
+
+    // An unlayered rule outranks every layer, so it sorts last.
+    let rank = |layer: &Option<String>| match layer {
+        None => usize::MAX,
+        Some(name) => order.iter().position(|n| n == name).unwrap_or(order.len()),
+    };
+    let mut positions: Vec<usize> = (0..segments.len()).collect();
+    positions.sort_by_key(|&i| (rank(&segments[i].0), i));
+
     let mut result = String::with_capacity(source.len());
+    for i in positions {
+        result.push_str(&segments[i].1);
+    }
+    result
+}
+
+/// Walk `source`, dropping at-rule wrappers and recording each run of ordinary
+/// rules against the layer it was written in.
+fn collect_at_rules(
+    source: &str,
+    layer: Option<&str>,
+    font_faces: &mut Vec<FontFace>,
+    order: &mut Vec<String>,
+    segments: &mut Vec<(Option<String>, String)>,
+) {
+    let chars: Vec<char> = source.chars().collect();
+    let mut current = String::new();
     let mut i = 0;
+
+    macro_rules! flush {
+        () => {
+            if !current.trim().is_empty() {
+                segments.push((layer.map(str::to_string), std::mem::take(&mut current)));
+            } else {
+                current.clear();
+            }
+        };
+    }
 
     while i < chars.len() {
         if chars[i] != '@' {
-            result.push(chars[i]);
+            current.push(chars[i]);
             i += 1;
             continue;
         }
@@ -1180,6 +1233,13 @@ fn strip_at_rules(source: &str, font_faces: &mut Vec<FontFace>) -> String {
 
         // Statement form (`@import ...;`, `@layer a, b;`) carries no rules.
         if i >= chars.len() || chars[i] == ';' {
+            // `@layer a, b, c;` is how a page fixes its layer order up front,
+            // before any of those layers has any rules in it.
+            if keyword == "layer" {
+                for name in preamble.split(',') {
+                    register_layer(&qualified_layer(layer, name.trim()), order);
+                }
+            }
             i += 1;
             continue;
         }
@@ -1207,11 +1267,17 @@ fn strip_at_rules(source: &str, font_faces: &mut Vec<FontFace>) -> String {
             continue;
         }
 
+        if keyword == "layer" {
+            let name = qualified_layer(layer, preamble.trim());
+            register_layer(&name, order);
+            flush!();
+            collect_at_rules(&body, Some(&name), font_faces, order, segments);
+            continue;
+        }
+
         let keep = match keyword.as_str() {
             "media" => evaluate_media_query(&preamble),
-            // Layers only affect cascade order, which this engine does not model;
-            // keeping the rules is much closer than losing them.
-            "layer" | "scope" | "starting-style" => true,
+            "scope" | "starting-style" => true,
             // The reference renderer supports essentially everything a page
             // guards with `@supports`, so the positive form is applied and only
             // the `not` fallback is skipped.
@@ -1221,10 +1287,30 @@ fn strip_at_rules(source: &str, font_faces: &mut Vec<FontFace>) -> String {
             _ => false,
         };
         if keep {
-            result.push_str(&strip_at_rules(&body, font_faces));
+            // The body stays in whatever layer wraps it.
+            flush!();
+            collect_at_rules(&body, layer, font_faces, order, segments);
         }
     }
-    result
+    flush!();
+}
+
+/// A nested `@layer b` inside `@layer a` names the layer `a.b`; an unnamed one
+/// is its own anonymous layer, distinct from every other.
+fn qualified_layer(parent: Option<&str>, name: &str) -> String {
+    let name = if name.is_empty() { "<anonymous>" } else { name };
+    match parent {
+        Some(p) => format!("{p}.{name}"),
+        None => name.to_string(),
+    }
+}
+
+/// Record a layer name the first time it is seen. Order of first mention is
+/// order in the cascade.
+fn register_layer(name: &str, order: &mut Vec<String>) {
+    if !order.iter().any(|n| n == name) {
+        order.push(name.to_string());
+    }
 }
 
 /// Expand a top/right/bottom/left shorthand such as `padding` or `margin`.
@@ -1516,7 +1602,11 @@ pub fn parse_selector(s: &str) -> Selector {
                             if let Some(pe) = rest.strip_prefix(':') {
                                 // Double-colon pseudo-element: ::before / ::after
                                 let name = pe.to_lowercase();
-                                if name == "before" || name == "after" {
+                                // `::placeholder` styles text the renderer draws
+                                // into a field's own box; its declarations are
+                                // carried on the field. See
+                                // `style::collect_placeholder_style`.
+                                if name == "before" || name == "after" || name == "placeholder" {
                                     (None, Some(name), Vec::new())
                                 } else {
                                     // An unimplemented pseudo-element must not decay into
@@ -2620,6 +2710,99 @@ mod tests {
             }
             other => panic!("expected linear gradient, got {:?}", other),
         }
+    }
+
+    // ── Cascade layers ────────────────────────────────────────────────────────
+
+    /// The order rules come out of the parser in, as `(first selector, colour)`
+    /// pairs — the downstream cascade breaks equal-specificity ties by exactly
+    /// this order.
+    fn rule_order(css: &str) -> Vec<String> {
+        parse_css(css)
+            .all_rules()
+            .iter()
+            .flat_map(|r| {
+                r.declarations
+                    .iter()
+                    .filter(|d| d.name.as_ref() == "color")
+                    .map(|d| format!("{:?}", d.value))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// An unlayered rule beats a layered one whatever the source order, so it
+    /// has to come out last. github writes
+    /// `.CtaFormControl-input::placeholder { opacity: 0 }` unlayered and lets
+    /// it override the `@layer primer-brand` rule that comes after it.
+    #[test]
+    fn test_unlayered_rules_sort_after_layered_ones() {
+        let order = rule_order(
+            "p { color: #000001 } @layer base { p { color: #000002 } }",
+        );
+        assert_eq!(
+            order.len(),
+            2,
+            "both rules should survive the flatten, got {order:?}"
+        );
+        assert!(
+            order[1].contains("1"),
+            "the unlayered rule should win, order was {order:?}"
+        );
+    }
+
+    /// Layers apply in the order they were named, not the order their rules
+    /// appear: a page that declares `@layer a, b;` up front and then fills `b`
+    /// before `a` still lets `b` win.
+    #[test]
+    fn test_layer_statement_fixes_the_order() {
+        let order = rule_order(
+            "@layer a, b; @layer b { p { color: #000002 } } @layer a { p { color: #000001 } }",
+        );
+        assert_eq!(order.len(), 2, "got {order:?}");
+        assert!(
+            order[1].contains("2"),
+            "layer b is named last so it wins, order was {order:?}"
+        );
+    }
+
+    /// With no `@layer` statement, first mention fixes the order.
+    #[test]
+    fn test_layer_order_follows_first_mention() {
+        let order = rule_order(
+            "@layer a { p { color: #000001 } } @layer b { p { color: #000002 } }",
+        );
+        assert_eq!(order.len(), 2, "got {order:?}");
+        assert!(order[1].contains("2"), "order was {order:?}");
+    }
+
+    /// A `@media` inside a layer keeps the layer, and its query is still
+    /// evaluated.
+    #[test]
+    fn test_media_inside_a_layer_keeps_the_layer() {
+        let order = rule_order(
+            "@layer base { @media (max-width: 900px) { p { color: #000002 } } } p { color: #000001 }",
+        );
+        assert_eq!(order.len(), 2, "got {order:?}");
+        assert!(
+            order[1].contains("1"),
+            "the unlayered rule still wins, order was {order:?}"
+        );
+        let dropped = rule_order(
+            "@layer base { @media (min-width: 900px) { p { color: #000002 } } }",
+        );
+        assert!(dropped.is_empty(), "a non-matching query is still dropped");
+    }
+
+    /// A layer nested inside another is a sub-layer of it and stays in its
+    /// parent's position, ahead of a later sibling layer.
+    #[test]
+    fn test_nested_layer_belongs_to_its_parent() {
+        let order = rule_order(
+            "@layer a { @layer inner { p { color: #000001 } } } @layer b { p { color: #000002 } }",
+        );
+        assert_eq!(order.len(), 2, "got {order:?}");
+        assert!(order[1].contains("2"), "order was {order:?}");
     }
 
     #[test]

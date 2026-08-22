@@ -2778,6 +2778,9 @@ impl<'a> LayoutBox<'a> {
         let container_x = self.dimensions.x + self.padding.left + self.border.left;
         let mut float_ctx = FloatContext::new(inner_width);
         let mut cursor_y = self.dimensions.y + self.padding.top + self.border.top;
+        // Where the content box starts, so the parent/first-child collapse below
+        // can tell "nothing placed yet" from "inline content already on a line".
+        let initial_content_top = cursor_y;
         let mut prev_margin_bottom = 0.0f32;
         // True once the first block child has been placed (used for parent-child margin
         // collapsing: Case 2 of the CSS spec).
@@ -2979,10 +2982,23 @@ impl<'a> LayoutBox<'a> {
                         // Case 2 — parent / first-child: when no border or padding separates
                         // the parent's top edge from the first block child, the child's top
                         // margin collapses *into* the parent's top margin (no internal space).
-                        let collapsed = if !first_block_placed && parent_open_top {
-                            // Case 2: no space between parent content edge and first child.
-                            // The child's margin has already been "consumed" by the parent's
-                            // own margin; don't add it as interior spacing.
+                        let collapsed = if !first_block_placed
+                            && parent_open_top
+                            && result.is_empty()
+                            && cursor_y == initial_content_top
+                        {
+                            // Case 2: no space between the parent's content edge
+                            // and its first child. The child's margin does not
+                            // vanish — it *becomes* the parent's top margin, so
+                            // the parent moves down and the space ends up
+                            // outside it. Dropping it instead pulled the top of
+                            // every page up by its first paragraph's margin.
+                            let extra = (cb.margin.top - self.margin.top).max(0.0);
+                            if extra > 0.0 {
+                                self.margin.top += extra;
+                                self.dimensions.y += extra;
+                                cursor_y += extra;
+                            }
                             0.0
                         } else {
                             // Case 1: standard adjacent-sibling collapse.
@@ -3103,12 +3119,15 @@ impl<'a> LayoutBox<'a> {
 
         flush_line!();
         // Case 2 (bottom) — parent / last-child margin collapsing:
-        // When no border or padding separates the parent's bottom edge from the last
-        // block child, the child's bottom margin collapses into the parent's bottom margin
-        // (no interior spacing at the bottom).  Only apply the last child's margin when
-        // the parent *does* have a bottom border or padding.
-        if !parent_open_bottom {
+        // When no border, padding or stated height separates the parent's bottom
+        // edge from its last block child, the child's bottom margin does not
+        // vanish — it *becomes* the parent's bottom margin, so the space lands
+        // below the parent rather than inside it. Dropping it left no gap at all
+        // between a section ending in a paragraph and whatever followed.
+        if !parent_open_bottom || height > 0.0 {
             cursor_y += prev_margin_bottom;
+        } else if first_block_placed {
+            self.margin.bottom = self.margin.bottom.max(prev_margin_bottom);
         }
         // Clearfix: ensure the container is tall enough to cover all floated children.
         cursor_y = cursor_y.max(float_ctx.bottom());
@@ -4400,6 +4419,70 @@ mod tests {
         (layout_opt.expect("layout tree"), fx, fy)
     }
 
+
+    // ── Parent / child margin collapsing ──────────────────────────────────────
+
+    /// A first child's top margin does not vanish into its parent — it becomes
+    /// the parent's own top margin, so the space lands above the parent. The
+    /// old code dropped it, which pulled the top of every page up by its first
+    /// paragraph's margin.
+    #[test]
+    fn test_first_child_top_margin_becomes_the_parents() {
+        let html = r#"<div id="outer"><div id="inner" style="margin-top:30px;height:10px"></div></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let outer = find_element_by_id(&layout, "outer").expect("outer");
+        let inner = find_element_by_id(&layout, "inner").expect("inner");
+        assert_eq!(outer.margin.top, 30.0, "the parent takes the margin on");
+        assert_eq!(
+            outer.dimensions.y, inner.dimensions.y,
+            "and no space is left inside it: outer.y={} inner.y={}",
+            outer.dimensions.y, inner.dimensions.y
+        );
+        assert_eq!(outer.dimensions.y, 30.0, "both start below the margin");
+    }
+
+    /// Padding on the parent stops the collapse: the margin stays interior
+    /// space and the parent does not move.
+    #[test]
+    fn test_padding_stops_the_first_child_collapse() {
+        let html = r#"<div id="outer" style="padding-top:1px"><div id="inner" style="margin-top:30px;height:10px"></div></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let outer = find_element_by_id(&layout, "outer").expect("outer");
+        let inner = find_element_by_id(&layout, "inner").expect("inner");
+        assert_eq!(outer.margin.top, 0.0);
+        assert_eq!(outer.dimensions.y, 0.0);
+        assert_eq!(inner.dimensions.y, 31.0, "1px of padding then 30 of margin");
+    }
+
+    /// The same at the bottom: a last child's bottom margin becomes the
+    /// parent's, so it pushes the parent's next sibling down instead of
+    /// disappearing.
+    #[test]
+    fn test_last_child_bottom_margin_becomes_the_parents() {
+        let html = r#"<div id="outer"><div style="margin-bottom:30px;height:10px"></div></div><div id="next" style="height:10px"></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let outer = find_element_by_id(&layout, "outer").expect("outer");
+        let next = find_element_by_id(&layout, "next").expect("next");
+        assert_eq!(outer.dimensions.height, 10.0, "no interior space is added");
+        assert_eq!(outer.margin.bottom, 30.0, "the parent takes the margin on");
+        assert_eq!(
+            next.dimensions.y, 40.0,
+            "so the next sibling starts 30 below the parent, got {}",
+            next.dimensions.y
+        );
+    }
+
+    /// A stated height separates the parent's bottom edge from its last child,
+    /// so that margin stays inside.
+    #[test]
+    fn test_stated_height_stops_the_last_child_collapse() {
+        let html = r#"<div id="outer" style="height:100px"><div style="margin-bottom:30px;height:10px"></div></div><div id="next" style="height:10px"></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let outer = find_element_by_id(&layout, "outer").expect("outer");
+        let next = find_element_by_id(&layout, "next").expect("next");
+        assert_eq!(outer.margin.bottom, 0.0);
+        assert_eq!(next.dimensions.y, 100.0, "got {}", next.dimensions.y);
+    }
 
     // ── Flex intrinsic sizing ─────────────────────────────────────────────────
 

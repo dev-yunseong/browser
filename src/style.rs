@@ -1497,6 +1497,51 @@ fn compute_pseudo_injections(
     (before_node, after_node)
 }
 
+/// The prefix under which a field's `::placeholder` declarations are stored on
+/// the field's own property map.
+///
+/// `::placeholder` styles text that has no element of its own — the renderer
+/// draws it straight into the field's box — so there is nowhere to hang a
+/// separate style node. Keeping the declarations on the field under a prefix no
+/// real property can collide with lets paint read them where it draws the text.
+pub const PLACEHOLDER_PREFIX: &str = "-placeholder-";
+
+/// Copy the declarations of every matching `input::placeholder` rule onto the
+/// input itself, prefixed.
+///
+/// Without this, github's hero drew "you@domain.com" over the "Enter your
+/// email" label that is meant to replace it: the page hides the placeholder
+/// with `::placeholder { opacity: 0 }` and floats the label on top.
+fn collect_placeholder_style(node: &mut StyledNode, all_rules: &[&crate::css::Rule]) {
+    if !matches!(node.node.data, NodeData::Element { .. }) {
+        return;
+    }
+    let mut found: Vec<(Arc<str>, Value)> = Vec::new();
+    for rule in all_rules {
+        let targets_placeholder = rule.selectors.iter().any(|sel| {
+            sel.pseudo_element.as_deref() == Some("placeholder")
+                && selector_base_matches_element(sel, node)
+        });
+        if !targets_placeholder {
+            continue;
+        }
+        for decl in &rule.declarations {
+            found.push((
+                intern(&format!("{PLACEHOLDER_PREFIX}{}", decl.name)),
+                decl.value.clone(),
+            ));
+        }
+    }
+    if found.is_empty() {
+        return;
+    }
+    let mut values: HashMap<Arc<str>, Value> = (*node.specified_values).clone();
+    for (key, value) in found {
+        values.insert(key, value);
+    }
+    node.specified_values = PropertyMap(Arc::new(values));
+}
+
 /// Walk the entire styled tree and inject synthetic `::before` / `::after` children
 /// wherever a matching CSS rule with a valid `content` property exists.
 ///
@@ -1514,6 +1559,7 @@ fn inject_pseudo_elements(tree: &mut StyledNode, all_rules: &[&crate::css::Rule]
         let (before, after) = compute_pseudo_injections(node, all_rules);
         if let Some(b) = before { node.children.insert(0, b); }
         if let Some(a) = after  { node.children.push(a); }
+        collect_placeholder_style(node, all_rules);
 
         // Step 2: push children onto the work stack after the Vec is stable.
         for child in node.children.iter_mut().rev() {
@@ -1883,6 +1929,67 @@ mod tests {
         assert!(
             find_text_child(&tree, "p", ">> "),
             "::before content '>> ' should be the first child of <p>"
+        );
+    }
+
+    /// `::placeholder` has no element of its own, so its declarations are kept
+    /// on the field under a prefix for paint to read where it draws the text.
+    #[test]
+    fn test_placeholder_rule_lands_on_the_input() {
+        let tree = make_tree(
+            r#"<html><body><input id="e" placeholder="you@domain.com"></body></html>"#,
+            r#"input::placeholder { opacity: 0; color: #ff0000; }"#,
+        );
+        fn find_input(n: &StyledNode) -> Option<&StyledNode> {
+            if let markup5ever_rcdom::NodeData::Element { ref name, .. } = n.node.data {
+                if name.local.as_ref() == "input" {
+                    return Some(n);
+                }
+            }
+            n.children.iter().find_map(find_input)
+        }
+        let input = find_input(&tree).expect("input");
+        assert!(
+            matches!(
+                input
+                    .specified_values
+                    .get(&intern(&format!("{PLACEHOLDER_PREFIX}opacity"))),
+                Some(Value::Number(v)) if *v == 0.0
+            ),
+            "the placeholder's opacity should be stored on the field"
+        );
+        assert!(
+            input
+                .specified_values
+                .get(&intern(&format!("{PLACEHOLDER_PREFIX}color")))
+                .is_some(),
+            "and so should its colour"
+        );
+        // The field's own `color` and `opacity` must be untouched by it.
+        assert!(input.specified_values.get(&intern("opacity")).is_none());
+    }
+
+    /// A `::placeholder` rule that does not match the field leaves it alone.
+    #[test]
+    fn test_placeholder_rule_for_another_selector_is_not_applied() {
+        let tree = make_tree(
+            r#"<html><body><input id="e" placeholder="x"></body></html>"#,
+            r#".other::placeholder { opacity: 0; }"#,
+        );
+        fn find_input(n: &StyledNode) -> Option<&StyledNode> {
+            if let markup5ever_rcdom::NodeData::Element { ref name, .. } = n.node.data {
+                if name.local.as_ref() == "input" {
+                    return Some(n);
+                }
+            }
+            n.children.iter().find_map(find_input)
+        }
+        let input = find_input(&tree).expect("input");
+        assert!(
+            input
+                .specified_values
+                .get(&intern(&format!("{PLACEHOLDER_PREFIX}opacity")))
+                .is_none()
         );
     }
 

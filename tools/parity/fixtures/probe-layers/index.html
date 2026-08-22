@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Cascade layer probe</title>
+<style>
+  body { margin: 0; font: 18px/1.5 sans-serif; background: #fff; }
+  .row { padding: 6px 12px; }
+
+  /* A page fixes its layer order up front, then fills the layers in whatever
+     order its bundler emits them. */
+  @layer base, components;
+
+  @layer components {
+    .b { background: #f88; }
+    .d { background: #f88; }
+  }
+  @layer base {
+    /* Named later in the @layer statement means `components` wins, however
+       early or late `base` is written. */
+    .b { background: #8f8; }
+    /* Only `base` states this one, so it stands. */
+    .c { background: #8f8; }
+  }
+
+  /* An unlayered rule beats every layer, even one written after it. */
+  .d { background: #88f; }
+  @layer components { .d { background: #f88; } }
+
+  /* A media query inside a layer keeps the layer and is still evaluated. */
+  @layer base {
+    @media (max-width: 900px) { .e { background: #8f8; } }
+    @media (min-width: 900px) { .e { background: #000; } }
+  }
+  .e { background: #88f; }
+
+  /* A layer nested in another sits at its parent's place in the order. */
+  @layer base { @layer inner { .f { background: #8f8; } } }
+  @layer components { .f { background: #f88; } }
+</style>
+</head>
+<body>
+  <p class="row b">components wins over base — red</p>
+  <p class="row c">only base states it — green</p>
+  <p class="row d">unlayered beats every layer — blue</p>
+  <p class="row e">unlayered beats a layered media rule — blue</p>
+  <p class="row f">base.inner loses to components — red</p>
+</body>
+</html>

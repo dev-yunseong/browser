@@ -20,6 +20,11 @@
   /* A label floated over the field it names. It is out of flow, so it must not
      widen the field it sits on. */
   .field-label { position: absolute; top: 12px; left: 18px; font-size: 16px; color: #444; }
+  /* The label replaces the placeholder, so the placeholder is hidden. Drawing
+     both left two strings on top of each other. */
+  .field-wrap input::placeholder { opacity: 0; }
+  /* A second field keeps its placeholder, in the colour the page asks for. */
+  .plain input::placeholder { color: #b00; }
   .field-wrap span { width: inherit; }
   .field-wrap input { width: 260px; padding: 18px 12px 0 18px; font-size: 24px; border: 0; background: transparent; }
   .submit { flex-shrink: 0; height: 48px; padding: 6px 20px; border: 1px solid #060; background: #0a0; color: #fff; font-size: 16px; }
@@ -53,6 +58,7 @@
 
   <div class="plain">
     <div><div class="pair"><i></i><i></i></div></div>
+    <input type="text" placeholder="still shown, in red">
   </div>
 </body>
 </html>
