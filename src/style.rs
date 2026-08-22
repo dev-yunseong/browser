@@ -77,10 +77,21 @@ impl SelectorIndex {
                     specificity: sel.specificity(),
                     rule_idx,
                     sel_idx,
-                    // Mark as complex if it has an ancestor combinator OR attribute constraints.
-                    // Attribute selectors depend on per-node attribute values, which are not
-                    // captured in the ElementSignature, so they must bypass the signature cache.
-                    is_complex: sel.ancestor.is_some() || !sel.attributes.is_empty(),
+                    // Mark as complex if the match depends on anything the
+                    // `ElementSignature` cache does not capture, since a
+                    // non-complex selector's verdict is reused for every element
+                    // with the same tag, id and classes.
+                    //
+                    // That is an ancestor combinator, an attribute constraint —
+                    // and any pseudo-class, which is the one that had been
+                    // missed. `:first-child` is decided by where an element sits
+                    // among its siblings, so caching the first `.row:first-child`
+                    // verdict handed it to every `.row` on the page: yunseong's
+                    // project list gave each of its five entries the first one's
+                    // zero top padding and came out 128px short.
+                    is_complex: sel.ancestor.is_some()
+                        || !sel.attributes.is_empty()
+                        || !sel.pseudo_classes.is_empty(),
                 };
                 match sel.key_feature() {
                     SelectorKey::Id(id)    => by_id.entry(id).or_default().push(entry),

@@ -501,26 +501,54 @@ fn read_grid_placement(sn: &StyledNode, axis: &str) -> GridPlacement {
 /// container whose height came from its own algorithm still answers to them,
 /// and skipping the clamp there let a navbar sized by `min-height` collapse to
 /// its content.
-fn clamp_height(sn: &StyledNode, box_sizing: &str, padding: &EdgeSizes, border: &EdgeSizes, height: f32) -> f32 {
-    let inset = |v: f32| {
-        if box_sizing == "border-box" {
-            (v - padding.top - padding.bottom - border.top - border.bottom).max(0.0)
-        } else {
-            v
+/// Apply `min-height` and `max-height`.
+///
+/// The bounds and the height have to be compared in the same box.
+/// `min-height: 48px` on a `border-box` control bounds its *border* box, while
+/// a height measured from the content is already one — so insetting the bound
+/// and leaving the height alone, as this did, compared a bound shorn of its
+/// padding against a height that still carried it, and a 48px search field came
+/// out its content's 45px tall. `content_space` says which box `height` is in;
+/// everything is compared in the border box and handed back the way it came.
+fn clamp_height(
+    sn: &StyledNode,
+    box_sizing: &str,
+    padding: &EdgeSizes,
+    border: &EdgeSizes,
+    height: f32,
+    content_space: bool,
+    vw: f32,
+    vh: f32,
+) -> f32 {
+    let vert = padding.top + padding.bottom + border.top + border.bottom;
+    let bound = |prop: &str| -> Option<f32> {
+        // A percentage bound needs a containing block this function does not
+        // have; passing NaN leaves it non-finite, which is discarded below —
+        // the same as `none`.
+        let v = resolve_constraint_px(
+            sn.specified_values.get(&crate::css::intern(prop))?,
+            f32::NAN,
+            vw,
+            vh,
+            sn,
+        )?;
+        if !v.is_finite() {
+            return None;
         }
+        Some(if box_sizing == "border-box" { v } else { v + vert })
     };
-    let read = |prop: &str| match sn.specified_values.get(&crate::css::intern(prop)) {
-        Some(Value::Length(v, Unit::Px)) => Some(inset(*v)),
-        _ => None,
-    };
-    let mut height = height;
-    if let Some(max_h) = read("max-height") {
-        height = height.min(max_h);
+    let mut border_h = if content_space { height + vert } else { height };
+    if let Some(max_h) = bound("max-height") {
+        border_h = border_h.min(max_h);
     }
-    if let Some(min_h) = read("min-height") {
-        height = height.max(min_h);
+    if let Some(min_h) = bound("min-height") {
+        border_h = border_h.max(min_h);
     }
-    height
+    if content_space {
+        (border_h - vert).max(0.0)
+    } else {
+        border_h.max(0.0)
+    }
 }
 
 /// Apply `text-transform` to a text run.
@@ -2632,6 +2660,9 @@ impl<'a> LayoutBox<'a> {
                 &self.padding,
                 &self.border,
                 self.dimensions.height,
+                self.content_box_height,
+                vw,
+                vh,
             );
 
             // ── Layout absolutely/fixedly positioned children inside flex container ──
@@ -2884,6 +2915,9 @@ impl<'a> LayoutBox<'a> {
                     continue;
                 }
                 if matches!(col_tracks.get(placement.col), Some(Value::Keyword(k)) if k.as_ref() == "auto") {
+                    // An `auto` track is as wide as the widest thing in it, and
+                    // an item is never narrower than its own `min-width` — which
+                    // is how a search button is kept from shrinking to its label.
                     let content = intrinsic_cache.max_content_width(child_node, vw, vh);
                     auto_widths[placement.col] = auto_widths[placement.col].max(content);
                 }
@@ -3109,11 +3143,20 @@ impl<'a> LayoutBox<'a> {
                 offset_layout_box(&mut item.cb, dx, dy);
 
                 max_child_x = max_child_x.max(
-                    item.cb.dimensions.x + border_box_width(&item.cb) + item.cb.margin.right,
+                    item.cb.dimensions.x + outer_width(&item.cb) + item.cb.margin.right,
                 );
                 child_y = child_y.max(
-                    item.cb.dimensions.y + border_box_height(&item.cb) + item.cb.margin.bottom,
+                    item.cb.dimensions.y + outer_height(&item.cb) + item.cb.margin.bottom,
                 );
+            }
+
+            // A grid's content ends at the bottom of its last row, whatever the
+            // items in it came out: a row is as tall as the tallest thing in it,
+            // and an item that does not fill its row still leaves the row's
+            // height behind it. Measuring only the item boxes made every grid
+            // whose last row holds a short item come out that much short.
+            if let (Some(top), Some(h)) = (row_tops.last(), row_heights.last()) {
+                child_y = child_y.max(top + h);
             }
 
             // Move items into self.children.
@@ -3154,6 +3197,9 @@ impl<'a> LayoutBox<'a> {
                 &self.padding,
                 &self.border,
                 self.dimensions.height,
+                self.content_box_height,
+                vw,
+                vh,
             );
 
             let final_x = container_start_x; // grid containers are block-level
@@ -3671,8 +3717,16 @@ impl<'a> LayoutBox<'a> {
                 line + self.padding.top + self.padding.bottom + self.border.top + self.border.bottom,
             );
         }
-        self.dimensions.height =
-            clamp_height(self.style_node, box_sizing, &self.padding, &self.border, final_h);
+        self.dimensions.height = clamp_height(
+            self.style_node,
+            box_sizing,
+            &self.padding,
+            &self.border,
+            final_h,
+            self.content_box_height,
+            vw,
+            vh,
+        );
 
         // ── Layout absolutely/fixedly positioned children ─────────────────────
         // Now that self has its final dimensions, we can resolve absolute offsets against it.
@@ -8387,6 +8441,42 @@ mod tests {
             (r.dimensions.width - 240.0).abs() < 1.0,
             "120 tall at 2:1 is 240 wide, got {}",
             r.dimensions.width
+        );
+    }
+
+    /// A selector's verdict is cached against the element's tag, id and classes,
+    /// so anything the cache cannot see has to opt out of it. `:first-child` is
+    /// decided by where an element sits among its siblings — caching the first
+    /// `.row:first-child` verdict handed it to every `.row` on the page, and
+    /// yunseong's project list gave each of its five entries the first one's
+    /// zero top padding.
+    #[test]
+    fn test_a_positional_pseudo_class_is_matched_per_element() {
+        let css = r#"
+            .row { padding: 32px 0 }
+            .row:first-child { padding-top: 0 }
+            .row:last-child { padding-bottom: 0 }
+        "#;
+        let html = r#"<div style="width:800px">
+            <div class="row" id="one">one</div>
+            <div class="row" id="two">two</div>
+            <div class="row" id="three">three</div>
+        </div>"#;
+        let (layout, _, _) = layout_from_html_css(html, css, 800.0, 600.0);
+
+        let h = |id: &str| outer_height(find_element_by_id(&layout, id).expect(id));
+        // One line of text is ~18px; what matters is which paddings survived.
+        let line = h("two") - 64.0;
+        assert!(line > 8.0 && line < 40.0, "a single line, got {line}");
+        assert!(
+            (h("one") - (line + 32.0)).abs() < 0.5,
+            "the first row keeps only its bottom padding, got {}",
+            h("one")
+        );
+        assert!(
+            (h("three") - (line + 32.0)).abs() < 0.5,
+            "the last row keeps only its top padding, got {}",
+            h("three")
         );
     }
 
