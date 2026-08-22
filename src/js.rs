@@ -3461,6 +3461,45 @@ pub fn extract_script_sources_from_dom(
 
 #[cfg(test)]
 mod tests {
+    /// A void element has no end tag, and writing one is not merely untidy:
+    /// `</br>` is parsed as *another* `<br>`, so a page whose DOM is serialised
+    /// and re-parsed — which is what happens on every re-render — gained a
+    /// blank line per line break and grew taller each time.
+    #[test]
+    fn test_void_elements_serialise_without_an_end_tag() {
+        let dom = crate::dom::parse_html(
+            "<body><section><b>label</b><br><img src=\"a.png\"><input type=\"text\"></section></body>",
+        );
+        fn find(h: &Handle, tag: &str) -> Option<Handle> {
+            if let NodeData::Element { ref name, .. } = h.data {
+                if name.local.as_ref() == tag {
+                    return Some(h.clone());
+                }
+            }
+            for c in h.children.borrow().iter() {
+                if let Some(f) = find(c, tag) {
+                    return Some(f);
+                }
+            }
+            None
+        }
+        let section = find(&dom.document, "section").expect("section");
+        let html = serialize_inner_html(&section);
+        assert!(!html.contains("</br>"), "no end tag for <br>: {html}");
+        assert!(!html.contains("</img>"), "no end tag for <img>: {html}");
+        assert!(!html.contains("</input>"), "no end tag for <input>: {html}");
+        assert!(html.contains("<br>") && html.contains("<img"), "the elements survive: {html}");
+        // The round trip has to be stable, which is the property that actually
+        // matters: re-parsing must not multiply the line breaks.
+        let again = crate::dom::parse_html(&format!("<body><section>{html}</section></body>"));
+        let section2 = find(&again.document, "section").expect("section");
+        assert_eq!(
+            serialize_inner_html(&section2),
+            html,
+            "serialising a re-parsed tree gives the same HTML"
+        );
+    }
+
     use super::*;
     use crate::dom;
 
@@ -5132,6 +5171,15 @@ fn serialize_inner_html(node: &Handle) -> String {
     out
 }
 
+/// The HTML void elements — those that never have an end tag.
+fn is_void_element(tag: &str) -> bool {
+    matches!(
+        tag,
+        "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link"
+            | "meta" | "param" | "source" | "track" | "wbr"
+    )
+}
+
 fn serialize_node(node: &Handle, out: &mut String, parent_tag: Option<&str>) {
     match &node.data {
         NodeData::Element {
@@ -5151,6 +5199,14 @@ fn serialize_node(node: &Handle, out: &mut String, parent_tag: Option<&str>) {
             }
             out.push('>');
             let tag_lower = tag.to_ascii_lowercase();
+            // A void element has no end tag, and writing one is not merely
+            // untidy: `</br>` is parsed as *another* `<br>`, so every re-render
+            // of a page added a blank line per line break and the page grew
+            // taller each time. `</img>` and the rest are dropped outright,
+            // which loses the element on the way back in.
+            if is_void_element(&tag_lower) {
+                return;
+            }
             for child in node.children.borrow().iter() {
                 serialize_node(child, out, Some(&tag_lower));
             }
