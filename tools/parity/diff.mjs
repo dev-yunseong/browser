@@ -28,7 +28,10 @@ const OUT = path.join(HERE, 'out');
 const DAEMON = path.join(ROOT, 'target/release/browser-daemon');
 
 const WIDTH = 800;
-const VIEWPORT_HEIGHT = 1200;
+// The engine's own viewport height. The reference has to render at the same one
+// or the two disagree about `vh` and about every `@media (height ...)` query,
+// which is a difference in the comparison rather than in either renderer.
+const VIEWPORT_HEIGHT = 768;
 const SERVE_PORT = 8099;
 const DAEMON_PORT = 7071;
 const CHROME = '/opt/pw-browsers/chromium';
