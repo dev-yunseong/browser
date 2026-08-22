@@ -78,6 +78,28 @@ impl FontSet {
         height * (font_size / units)
     }
 
+    /// Advance width of the "0" glyph — the CSS `ch` unit.
+    pub fn zero_advance(&self, font_size: f32) -> f32 {
+        self.advance('0', font_size)
+    }
+
+    /// The font's x-height — the CSS `ex` unit.
+    ///
+    /// Measured from the "x" glyph's outline; a face with no such glyph falls
+    /// back to the half-em the spec names as the default.
+    pub fn x_height(&self, font_size: f32) -> f32 {
+        use ab_glyph::ScaleFont as _;
+        let scaled = self.primary.as_scaled(PxScale::from(font_size));
+        let glyph = self.primary.glyph_id('x');
+        match self.primary.outline(glyph) {
+            Some(outline) => outline.bounds.height() * (font_size / self.primary.units_per_em().unwrap_or(1000.0)),
+            None => {
+                let _ = scaled;
+                font_size * 0.5
+            }
+        }
+    }
+
     /// Scale to use with `ab_glyph` for a given face at `font_size`.
     ///
     /// The faces have different units-per-em, so a shared `PxScale` would draw

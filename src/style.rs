@@ -852,6 +852,12 @@ fn build_final_tree(
                         Value::Length(v, crate::css::Unit::Percent) => Some(parent_fs * (v / 100.0)),
                         Value::Length(v, crate::css::Unit::Em) => Some(parent_fs * v),
                         Value::Length(v, crate::css::Unit::Rem) => Some(root_fs * v),
+                        Value::Length(v, crate::css::Unit::Ch) => {
+                            Some(crate::font::fonts().zero_advance(parent_fs) * v)
+                        }
+                        Value::Length(v, crate::css::Unit::Ex) => {
+                            Some(crate::font::fonts().x_height(parent_fs) * v)
+                        }
                         Value::Keyword(kw) if kw.as_ref() == "inherit" => Some(parent_fs),
                         Value::Keyword(kw) if kw.as_ref() == "initial" => Some(16.0),
                         _ => None,
@@ -926,6 +932,12 @@ fn build_final_tree(
                                 match &v {
                                     Value::Length(n, crate::css::Unit::Em) => Value::Length(n * own_fs, crate::css::Unit::Px),
                                     Value::Length(n, crate::css::Unit::Rem) => Value::Length(n * root_fs, crate::css::Unit::Px),
+                                    Value::Length(n, crate::css::Unit::Ch) => {
+                                        Value::Length(n * crate::font::fonts().zero_advance(own_fs), crate::css::Unit::Px)
+                                    }
+                                    Value::Length(n, crate::css::Unit::Ex) => {
+                                        Value::Length(n * crate::font::fonts().x_height(own_fs), crate::css::Unit::Px)
+                                    }
                                     Value::Keyword(kw) if kw.as_ref().eq_ignore_ascii_case("currentcolor") => {
                                         own_color.clone().unwrap_or(v.clone())
                                     }
@@ -958,6 +970,17 @@ fn build_final_tree(
                         Value::Length(n, crate::css::Unit::Rem) => {
                             Some(Value::Length(n * root_fs, crate::css::Unit::Px))
                         }
+                        // `ch` and `ex` come from the font's own metrics. `max-width`
+                        // in `ch` is how a design caps its measure, so ignoring the
+                        // unit lets prose run the full width of its container.
+                        Value::Length(n, crate::css::Unit::Ch) => Some(Value::Length(
+                            n * crate::font::fonts().zero_advance(own_fs),
+                            crate::css::Unit::Px,
+                        )),
+                        Value::Length(n, crate::css::Unit::Ex) => Some(Value::Length(
+                            n * crate::font::fonts().x_height(own_fs),
+                            crate::css::Unit::Px,
+                        )),
                         _ => None,
                     };
                     if let Some(r) = resolved {

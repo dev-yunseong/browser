@@ -141,6 +141,8 @@ impl MathExpr {
                 None | Some(Unit::Px) => Some(*n),
                 Some(Unit::Em) => Some(n * ctx.font_size),
                 Some(Unit::Rem) => Some(n * ctx.root_font_size),
+                Some(Unit::Ch) => Some(n * crate::font::fonts().zero_advance(ctx.font_size)),
+                Some(Unit::Ex) => Some(n * crate::font::fonts().x_height(ctx.font_size)),
                 Some(Unit::Vw) => Some(ctx.viewport_width * (n / 100.0)),
                 Some(Unit::Vh) => Some(ctx.viewport_height * (n / 100.0)),
                 Some(Unit::Percent) => ctx.percent_basis.map(|b| b * (n / 100.0)),
@@ -354,6 +356,10 @@ pub enum Unit {
     Em,
     /// Relative to the root element's font size, not the parent's.
     Rem,
+    /// Width of the "0" glyph in the element's font.
+    Ch,
+    /// The font's x-height.
+    Ex,
     Percent,
     /// CSS Grid fractional unit (flexible tracks).
     Fr,
@@ -1863,6 +1869,8 @@ fn parse_math_term(expr: &str) -> Option<MathExpr> {
         ("px", Some(Unit::Px)),
         ("rem", Some(Unit::Rem)),
         ("em", Some(Unit::Em)),
+        ("ch", Some(Unit::Ch)),
+        ("ex", Some(Unit::Ex)),
         ("vw", Some(Unit::Vw)),
         ("vh", Some(Unit::Vh)),
         ("vmin", Some(Unit::Vw)),
@@ -1874,6 +1882,34 @@ fn parse_math_term(expr: &str) -> Option<MathExpr> {
         }
     }
     lower.parse::<f32>().ok().map(|n| MathExpr::Value(n, None))
+}
+
+/// Parse `<number><unit>`.
+///
+/// The numeric part must actually parse: a keyword that merely ends in a unit's
+/// letters is not a length. `display: flex` ends in `ex`, and reading it as one
+/// turned every flex container into a block.
+fn parse_length(val: &str) -> Option<Value> {
+    // Longer units first, so `rem` is not read as `em`.
+    const UNITS: [(&str, Unit); 9] = [
+        ("px", Unit::Px),
+        ("vw", Unit::Vw),
+        ("vh", Unit::Vh),
+        ("rem", Unit::Rem),
+        ("ch", Unit::Ch),
+        ("ex", Unit::Ex),
+        ("em", Unit::Em),
+        ("fr", Unit::Fr),
+        ("%", Unit::Percent),
+    ];
+    for (suffix, unit) in UNITS {
+        if let Some(num) = val.strip_suffix(suffix) {
+            if let Ok(n) = num.trim().parse::<f32>() {
+                return Some(Value::Length(n, unit));
+            }
+        }
+    }
+    None
 }
 
 pub fn parse_value(val: &str) -> Value {
@@ -1941,20 +1977,8 @@ pub fn parse_value(val: &str) -> Value {
         return Value::FitContent(px_val);
     }
 
-    if val.ends_with("px") {
-        Value::Length(val.trim_end_matches("px").parse().unwrap_or(0.0), Unit::Px)
-    } else if val.ends_with("vw") {
-        Value::Length(val.trim_end_matches("vw").parse().unwrap_or(0.0), Unit::Vw)
-    } else if val.ends_with("vh") {
-        Value::Length(val.trim_end_matches("vh").parse().unwrap_or(0.0), Unit::Vh)
-    } else if let Some(num) = val.strip_suffix("rem") {
-        Value::Length(num.parse().unwrap_or(1.0), Unit::Rem)
-    } else if let Some(num) = val.strip_suffix("em") {
-        Value::Length(num.parse().unwrap_or(1.0), Unit::Em)
-    } else if val.ends_with('%') {
-        Value::Length(val.trim_end_matches('%').parse().unwrap_or(0.0), Unit::Percent)
-    } else if val.ends_with("fr") {
-        Value::Length(val.trim_end_matches("fr").parse().unwrap_or(1.0), Unit::Fr)
+    if let Some(length) = parse_length(val) {
+        length
     } else if let Some(color) = parse_color(val) {
         Value::Color(color)
     } else if let Ok(num) = val.parse::<f32>() {
@@ -2749,19 +2773,8 @@ fn parse_track_token(token: &str) -> Value {
         Value::Keyword(intern("auto"))
     } else if t == "min-content" || t == "max-content" {
         Value::Keyword(intern(&t))
-    } else if t.ends_with("fr") {
-        let n = t.trim_end_matches("fr").parse::<f32>().unwrap_or(1.0);
-        Value::Length(n, Unit::Fr)
-    } else if t.ends_with("px") {
-        let n = t.trim_end_matches("px").parse::<f32>().unwrap_or(0.0);
-        Value::Length(n, Unit::Px)
-    } else if t.ends_with('%') {
-        let n = t.trim_end_matches('%').parse::<f32>().unwrap_or(0.0);
-        Value::Length(n, Unit::Percent)
-    } else if let Some(n) = t.strip_suffix("rem") {
-        Value::Length(n.parse::<f32>().unwrap_or(1.0), Unit::Rem)
-    } else if let Some(n) = t.strip_suffix("em") {
-        Value::Length(n.parse::<f32>().unwrap_or(1.0), Unit::Em)
+    } else if let Some(length) = parse_length(&t) {
+        length
     } else {
         // fallback: try as keyword
         Value::Keyword(intern(token.trim()))
