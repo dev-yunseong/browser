@@ -388,6 +388,108 @@ impl LayerTreeBuilder {
         tree
     }
 
+    /// The bottom edge of the document's scrollable overflow region, in page
+    /// coordinates.
+    ///
+    /// A page is as tall as the content it can be scrolled to, which CSS
+    /// defines as the union of every box's border box — carried through its
+    /// ancestors' transforms and cut back by whatever they clip — not merely
+    /// where the in-flow cursor stopped. An out-of-flow box below the last
+    /// block, or a rotated one whose corner swings past its own edge, makes a
+    /// browser's page that much taller; this engine ended its raster at the
+    /// flow's end and cut both away.
+    ///
+    /// A `filter: blur()` halo is deliberately *not* counted. That is ink
+    /// overflow: a browser paints it, but it does not lengthen the page.
+    pub fn scrollable_overflow_bottom(layout: &LayoutBox) -> f32 {
+        /// The lowest point a rect reaches once `xf` has moved it — the corners
+        /// are mapped one by one because a rotation puts the lowest one
+        /// anywhere.
+        fn transformed_bottom(xf: &tiny_skia::Transform, r: LayoutRect) -> f32 {
+            let mut pts = [
+                tiny_skia::Point::from_xy(r.x, r.y),
+                tiny_skia::Point::from_xy(r.x + r.width, r.y),
+                tiny_skia::Point::from_xy(r.x, r.y + r.height),
+                tiny_skia::Point::from_xy(r.x + r.width, r.y + r.height),
+            ];
+            xf.map_points(&mut pts);
+            pts.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max)
+        }
+
+        struct Frame<'f> {
+            layout: &'f LayoutBox<'f>,
+            /// The ancestors' transforms, composed, in page space.
+            xf: tiny_skia::Transform,
+            /// The lowest edge the clipping ancestors still allow.
+            clip_bottom: f32,
+        }
+
+        let mut bottom = 0.0_f32;
+        let mut stack = vec![Frame {
+            layout,
+            xf: tiny_skia::Transform::identity(),
+            clip_bottom: f32::INFINITY,
+        }];
+
+        while let Some(frame) = stack.pop() {
+            let b = frame.layout;
+            // A fixed box stays where it is however far the page scrolls, so it
+            // never lengthens what there is to scroll through.
+            if b.position == PositionType::Fixed || Self::is_clipped_away(b) {
+                continue;
+            }
+
+            let d = b.paint_rect();
+
+            let mut child_xf = frame.xf;
+            if let Some(Value::Transform(ops)) = b
+                .style_node
+                .specified_values
+                .get(&crate::css::intern("transform"))
+            {
+                // `compute_transform_matrix` states the matrix about the box's
+                // own origin — the same one the painter uses — so it is moved
+                // into page space before it composes with the ancestors'.
+                let m = Self::compute_transform_matrix(ops, b.dimensions.width, b.dimensions.height);
+                let local = tiny_skia::Transform::from_translate(b.dimensions.x, b.dimensions.y)
+                    .pre_concat(m.to_skia())
+                    .pre_translate(-b.dimensions.x, -b.dimensions.y);
+                child_xf = frame.xf.pre_concat(local);
+            }
+
+            // A box's own transform moves the box as well as its descendants,
+            // so its own edge is measured through `child_xf` too.
+            let own = transformed_bottom(&child_xf, d).min(frame.clip_bottom);
+            if own.is_finite() {
+                bottom = bottom.max(own);
+            }
+
+            let mut child_clip = frame.clip_bottom;
+            if Self::has_overflow_hidden(b) {
+                // Overflow clips to the padding box, and the clip travels with
+                // the box, so it is the *transformed* edge that bounds the
+                // descendants.
+                let pad_box = LayoutRect {
+                    x: d.x + b.border.left,
+                    y: d.y + b.border.top,
+                    width: (d.width - b.border.left - b.border.right).max(0.0),
+                    height: (d.height - b.border.top - b.border.bottom).max(0.0),
+                };
+                child_clip = child_clip.min(transformed_bottom(&child_xf, pad_box));
+            }
+
+            for child in &b.children {
+                stack.push(Frame {
+                    layout: child,
+                    xf: child_xf,
+                    clip_bottom: child_clip,
+                });
+            }
+        }
+
+        bottom
+    }
+
     /// Iterative traversal (replaces the formerly recursive implementation).
     ///
     /// Assigns each `LayoutBox` to either a new layer (if it has compositing
@@ -2254,6 +2356,102 @@ mod tests {
             shadow_idx.unwrap() < rect_idx.unwrap(),
             "Shadow command (idx {}) must come before background Rect (idx {})",
             shadow_idx.unwrap(), rect_idx.unwrap()
+        );
+    }
+}
+
+
+#[cfg(test)]
+mod scrollable_overflow_tests {
+    use super::*;
+    use crate::layout::build_layout_tree;
+    use std::collections::HashMap;
+
+    /// The bottom of the document's scrollable overflow region for `html`.
+    fn overflow_bottom(html: &str) -> f32 {
+        let dom = crate::dom::parse_html(html);
+        let stylesheet = crate::css::parse_css("");
+        let style_tree = crate::style::build_style_tree(
+            &dom.document,
+            &stylesheet,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+        );
+        let (layout, _, _) = build_layout_tree(&style_tree, 0.0, 0.0, 0.0, 800.0, 800.0, 600.0);
+        let layout = layout.expect("layout tree should be built");
+        LayerTreeBuilder::scrollable_overflow_bottom(&layout)
+    }
+
+    #[test]
+    fn an_out_of_flow_box_below_the_flow_lengthens_the_page() {
+        let bottom = overflow_bottom(
+            r#"<body style="height: 200px"><div style="position: absolute; top: 300px; width: 50px; height: 50px"></div></body>"#,
+        );
+        assert!(
+            (bottom - 350.0).abs() < 0.5,
+            "the page must reach the absolute box's bottom at 350, got {bottom}"
+        );
+    }
+
+    #[test]
+    fn a_rotated_box_lengthens_the_page_by_the_corner_it_swings_out() {
+        // 300x120 turned 45 degrees about its own centre at y = 160 reaches
+        // (300 + 120) * sin 45 / 2 = 148.49 below it.
+        let bottom = overflow_bottom(
+            r#"<body style="height: 200px"><div style="position: absolute; top: 100px; left: 100px; width: 300px; height: 120px; transform: rotate(-45deg)"></div></body>"#,
+        );
+        assert!(
+            (bottom - 308.49).abs() < 0.5,
+            "the rotated corner must reach 308.49, got {bottom}"
+        );
+    }
+
+    #[test]
+    fn a_page_with_nothing_outside_the_flow_is_as_tall_as_the_flow() {
+        let bottom = overflow_bottom(r#"<body style="height: 200px"></body>"#);
+        assert!(
+            (bottom - 200.0).abs() < 0.5,
+            "the page must stop at the flow's end at 200, got {bottom}"
+        );
+    }
+
+    #[test]
+    fn a_clipping_ancestor_holds_the_page_at_its_own_edge() {
+        let bottom = overflow_bottom(
+            r#"<body style="height: 200px"><div style="position: absolute; top: 0; width: 100px; height: 100px; overflow: hidden"><div style="height: 400px"></div></div></body>"#,
+        );
+        assert!(
+            (bottom - 200.0).abs() < 0.5,
+            "the clipped child must not reach past the flow's 200, got {bottom}"
+        );
+    }
+
+    #[test]
+    fn a_fixed_box_never_lengthens_the_page() {
+        // A fixed box stays put however far the page scrolls, so there is
+        // nothing extra to scroll to.
+        let bottom = overflow_bottom(
+            r#"<body style="height: 200px"><div style="position: fixed; top: 500px; width: 50px; height: 50px"></div></body>"#,
+        );
+        assert!(
+            (bottom - 200.0).abs() < 0.5,
+            "a fixed box must leave the page at 200, got {bottom}"
+        );
+    }
+
+    #[test]
+    fn an_ancestor_s_transform_carries_its_descendants() {
+        // The inner box ends at 200 in its parent's own coordinates; the
+        // parent's 100px shift puts it at 300.
+        let bottom = overflow_bottom(
+            r#"<body style="height: 100px"><div style="position: absolute; top: 0; width: 100px; height: 200px; transform: translateY(100px)"><div style="height: 200px"></div></div></body>"#,
+        );
+        assert!(
+            (bottom - 300.0).abs() < 0.5,
+            "the shifted descendant must reach 300, got {bottom}"
         );
     }
 }

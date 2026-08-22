@@ -153,6 +153,7 @@ Ordered by how much of a page each one destroyed.
 | `:placeholder-shown` never matching | An unimplemented pseudo-class matches nothing, which makes the `:not()` around it always true. github floats its newsletter label with `:has(.CtaFormControl-input:not(:placeholder-shown))`, so the rule fired on an *empty* field and every label sat shrunk to 80% and lifted 8px: 93x11px of ink at x=115 where the reference draws 117x15px at x=102. |
 | A placeholder drawn 0.85em above the field's middle | It is text on a line box, and the line box a single-line field gives it is the field's own content box. Positioning it by a guess at the ascent — and in the regular face at zero letter-spacing rather than the field's own — drew every placeholder off its centre and in the wrong face. |
 | A field's `value` never painted | The raster drew the box, the border and the placeholder, and left an `<input value="...">` looking empty; only the GUI's editable overlay showed the text, so a headless screenshot lost it. A filled field must also suppress the placeholder it no longer shows. |
+| The page as tall as the flow rather than as its scrollable overflow | A page is as tall as the content it can be scrolled to — the union of every box's border box, carried through its ancestors' transforms and cut back by whatever they clip. Measuring only where the in-flow cursor stopped cut off everything out of flow below it, and cut a rotated box's swung-out corner off at its untransformed edge: `probe-transform` ended 59px short of Chromium's scroll height. A `filter: blur()` halo is ink overflow, not scrollable overflow, and is rightly not counted. |
 
 
 ## Where it stands
@@ -173,9 +174,9 @@ pixel of Chromium's height, and only about a sixtieth of its pixels differ at
 all. Its remaining vertical drift is around 16px, gained in one section and
 carried down the page; every section's own boxes are within a pixel or two.
 
-Every probe fixture sits at or below 1.7% on the layout metric, and
-`probe-grid`, `probe-transform` and `probe-aspect` are pixel-identical over the
-fold. `probe-has`, `probe-overlay`, `probe-layers` and `probe-grid` cover what this
+Every probe fixture sits at or below 1.7% on the layout metric; `probe-grid`
+and `probe-aspect` are pixel-identical over the fold, and `probe-transform` is
+now pixel-identical over the whole page. `probe-has`, `probe-overlay`, `probe-layers` and `probe-grid` cover what this
 round found. yunseong.dev's page is now exactly Chromium's height.
 
 naver.com's number means little: its snapshot was captured without CSS (see
@@ -215,9 +216,6 @@ exercises the UA stylesheet.
 - **Inline runs do not fragment across lines.** A run's box spans the line box
   and its first line is indented, which is enough for line *breaking* to match;
   a wrapped run still cannot have a different height or background per line.
-- **Transformed overflow does not extend the page.** A rotated or scaled box
-  that reaches past the document's own bottom does not lengthen it, so
-  `probe-transform` ends 59px short of Chromium's scroll height.
 - **A named system family is not resolved.** `font-family: "DejaVu Sans"` or
   `"Liberation Sans"` falls through to the bundled sans rather than loading the
   file the system has, even though the fallback search now reads those same
