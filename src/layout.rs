@@ -3245,6 +3245,29 @@ impl<'a> LayoutBox<'a> {
                     intrinsic_cache,
                 );
                 if let Some(mut pc) = pc_opt {
+                    // Both `top` and `bottom` with no stated height stretches the
+                    // box between them, the vertical mirror of the width rule
+                    // above (CSS 2.2 §10.6.4). Without it an overlay written as
+                    // `position: absolute; inset: 0` came out its content's
+                    // height — zero, for the empty element a gradient wash is —
+                    // and never painted.
+                    let child_states_height = pc
+                        .style_node
+                        .specified_values
+                        .contains_key(&crate::css::intern("height"));
+                    if !child_states_height {
+                        if let (Some(t), Some(b)) = (top_offset, bottom_offset) {
+                            let stretched = (cb_for_child.height
+                                - t
+                                - b
+                                - pc.margin.top
+                                - pc.margin.bottom)
+                                .max(0.0);
+                            if stretched > pc.dimensions.height {
+                                pc.dimensions.height = stretched;
+                            }
+                        }
+                    }
                     // Determine final x.
                     let target_x = match (left_offset, right_offset) {
                         (Some(l), _) => cb_for_child.x + l + pc.margin.left,
@@ -4419,6 +4442,46 @@ mod tests {
         (layout_opt.expect("layout tree"), fx, fy)
     }
 
+
+    // ── Absolute positioning ──────────────────────────────────────────────────
+
+    /// `top` and `bottom` together with no stated height stretch the box
+    /// between them. An overlay written as `position: absolute; inset: 0` is
+    /// otherwise its content's height — zero, for the empty element a gradient
+    /// wash is — and never paints.
+    #[test]
+    fn test_absolute_with_top_and_bottom_stretches() {
+        let html = r#"<div id="cb" style="position:relative;width:400px;height:300px">
+            <div id="fill" style="position:absolute;inset:0;background:#0a8"></div>
+          </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let fill = find_element_by_id(&layout, "fill").expect("fill");
+        assert_eq!(fill.dimensions.width, 400.0, "stretched across");
+        assert_eq!(fill.dimensions.height, 300.0, "and down");
+    }
+
+    /// Insets on one axis only still stretch that axis.
+    #[test]
+    fn test_absolute_stretches_only_the_axis_with_both_offsets() {
+        let html = r#"<div id="cb" style="position:relative;width:400px;height:300px">
+            <div id="fill" style="position:absolute;top:20px;bottom:40px;left:10px;width:50px"></div>
+          </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let fill = find_element_by_id(&layout, "fill").expect("fill");
+        assert_eq!(fill.dimensions.height, 240.0, "300 - 20 - 40");
+        assert_eq!(fill.dimensions.width, 50.0, "the stated width stands");
+    }
+
+    /// A stated height wins over the stretch.
+    #[test]
+    fn test_stated_height_beats_the_absolute_stretch() {
+        let html = r#"<div id="cb" style="position:relative;width:400px;height:300px">
+            <div id="fill" style="position:absolute;top:0;bottom:0;height:25px"></div>
+          </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let fill = find_element_by_id(&layout, "fill").expect("fill");
+        assert_eq!(fill.dimensions.height, 25.0);
+    }
 
     // ── Parent / child margin collapsing ──────────────────────────────────────
 

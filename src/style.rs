@@ -2096,7 +2096,9 @@ mod tests {
 }
 
 pub fn parse_inline_style_into_vec(style_str: &str, list: &mut Vec<crate::css::Declaration>) {
-    for decl in style_str.split(';') {
+    // A `style` attribute carries logical properties as readily as a stylesheet
+    // does, so it goes through the same rewrite first.
+    for decl in crate::css::expand_logical_declarations(style_str) {
         let decl = decl.trim();
         if decl.is_empty() { continue; }
         let mut kv = decl.splitn(2, ':');

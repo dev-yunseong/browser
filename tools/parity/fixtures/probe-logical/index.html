@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Logical property probe</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 16px/1.5 sans-serif; background: #fff; }
+  .band { background: #eef; margin-bottom: 8px; }
+  .fill { background: #99f; height: 24px; }
+
+  /* A design system states its side padding once, on the inline axis. */
+  .pi { padding-inline: 24px; }
+  /* Two values are start then end. */
+  .pi2 { padding-inline: 10px 60px; }
+  .pb { padding-block: 12px; background: #ffd; }
+  .pis { padding-inline-start: 40px; }
+  .pie { padding-inline-end: 40px; }
+
+  .mi { margin-inline: 32px; background: #dfd; }
+  .mia { margin-inline: auto; width: 200px; background: #dfd; }
+  .mb { margin-block: 20px; background: #fdd; }
+
+  /* Sizes. */
+  .is { inline-size: 240px; background: #cff; }
+  .bs { block-size: 40px; background: #fcf; }
+  .mis { min-inline-size: 300px; background: #ffc; }
+  .mxis { max-inline-size: 120px; background: #cfc; }
+
+  /* Borders. */
+  .bis { border-inline-start: 4px solid #036; padding-inline-start: 8px; }
+  .bbe { border-block-end: 3px dashed #603; }
+  .bi { border-inline: 2px solid #060; }
+
+  /* Offsets. */
+  .rel { position: relative; height: 60px; background: #eee; }
+  .abs { position: absolute; inset-inline-start: 30px; inset-block-start: 10px; width: 80px; height: 20px; background: #f80; }
+  .abs2 { position: absolute; inset-inline-end: 30px; inset-block-end: 10px; width: 80px; height: 20px; background: #08f; }
+  .abs3 { position: absolute; inset-inline: 200px 240px; inset-block: 20px; background: #0a8; }
+
+  /* An inline style carries them too. */
+</style>
+</head>
+<body>
+  <div class="band pi"><div class="fill"></div></div>
+  <div class="band pi2"><div class="fill"></div></div>
+  <div class="band pb"><div class="fill"></div></div>
+  <div class="band pis"><div class="fill"></div></div>
+  <div class="band pie"><div class="fill"></div></div>
+  <div class="band mi"><div class="fill"></div></div>
+  <div class="band"><div class="mia fill"></div></div>
+  <div class="band mb"><div class="fill"></div></div>
+  <div class="band is"><div class="fill"></div></div>
+  <div class="band bs"></div>
+  <div class="band mxis"><div class="fill"></div></div>
+  <div class="band mis" style="inline-size: 100px"><div class="fill"></div></div>
+  <div class="band bis">border-inline-start</div>
+  <div class="band bbe">border-block-end</div>
+  <div class="band bi">border-inline</div>
+  <div class="rel"><div class="abs"></div><div class="abs2"></div><div class="abs3"></div></div>
+  <div class="band" style="padding-inline: 50px; margin-block-start: 16px"><div class="fill"></div></div>
+</body>
+</html>

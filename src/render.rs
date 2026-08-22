@@ -337,7 +337,7 @@ fn execute_commands_on_tile(
                     }
                 }
             }
-            PaintCommand::Image { rect: r, url, object_fit, alt } => {
+            PaintCommand::Image { rect: r, url, object_fit, alt, alt_color, alt_font_size } => {
                 let resolved_url = if image_cache.contains_key(url) {
                     None
                 } else {
@@ -401,7 +401,7 @@ fn execute_commands_on_tile(
                 } else { false };
 
                 if !drawn {
-                    draw_broken_image(pixmap, *r, alt, transform);
+                    draw_broken_image(pixmap, *r, alt, alt_color, *alt_font_size, transform);
                 }
             }
             PaintCommand::Text { rect, text, font_size, line_height, leading_space, color, clip, style, letter_spacing, text_decoration } => {
@@ -588,17 +588,26 @@ fn box_blur_alpha(pixmap: &mut Pixmap, radius: usize) {
     }
 }
 
-/// Draw a broken-image placeholder: gray background, border, and alt text.
-fn draw_broken_image(pixmap: &mut Pixmap, r: LayoutRect, alt: &str, transform: Transform) {
-    // Light gray background
-    let mut paint = Paint::default();
-    paint.set_color_rgba8(240, 240, 240, 255);
-    if let Some(tr) = tiny_skia::Rect::from_xywh(r.x, r.y, r.width, r.height) {
-        pixmap.fill_rect(tr, &paint, transform, None);
-    }
-    // Gray border
+/// Draw what a browser shows in place of an image it could not load: a hairline
+/// outline around the box the image would have filled, and the element's `alt`
+/// on the first line in the page's own text colour.
+///
+/// Filling the box with light grey and stamping "[broken image]" across it —
+/// what this used to do — turns every unreachable image into the loudest thing
+/// on the page. A browser leaves the box transparent, so the page's own
+/// background shows through and the alt reads as the text it is.
+fn draw_broken_image(
+    pixmap: &mut Pixmap,
+    r: LayoutRect,
+    alt: &str,
+    color: &Color,
+    font_size: f32,
+    transform: Transform,
+) {
+    // A hairline in the text colour, faint enough to read as an outline on a
+    // light and a dark page alike.
     let mut border_paint = Paint::default();
-    border_paint.set_color_rgba8(180, 180, 180, 255);
+    border_paint.set_color_rgba8(color.r, color.g, color.b, 90);
     let mut stroke = Stroke::default();
     stroke.width = 1.0;
     let mut pb = PathBuilder::new();
@@ -611,22 +620,29 @@ fn draw_broken_image(pixmap: &mut Pixmap, r: LayoutRect, alt: &str, transform: T
             pixmap.stroke_path(&path, &border_paint, &stroke, transform, None);
         }
     }
-    // Alt text (minimum size guard)
-    if r.width >= 8.0 && r.height >= 16.0 {
-        let display_text = if alt.is_empty() {
-            "[broken image]".to_string()
-        } else {
-            format!("[{}]", alt)
-        };
-        let text_rect = LayoutRect {
-            x: r.x + 4.0,
-            y: r.y + 4.0,
-            width: (r.width - 8.0).max(0.0),
-            height: (r.height - 8.0).max(0.0),
-        };
-        let text_color = Color { r: 100, g: 100, b: 100, a: 255 };
-        render_text_raw(display_text, text_rect, 12.0, 14.0, &text_color, text_rect, pixmap, crate::font::FontStyle::regular(), 0.0, 0);
+    if alt.is_empty() || r.width < 8.0 || r.height < font_size {
+        return;
     }
+    // Indented past where a browser puts its broken-image icon.
+    let inset = 20.0f32.min(r.width / 2.0);
+    let text_rect = LayoutRect {
+        x: r.x + inset,
+        y: r.y + 1.0,
+        width: (r.width - inset - 2.0).max(0.0),
+        height: font_size,
+    };
+    render_text_raw(
+        alt.to_string(),
+        text_rect,
+        font_size,
+        font_size * 1.2,
+        color,
+        text_rect,
+        pixmap,
+        crate::font::FontStyle::regular(),
+        0.0,
+        0,
+    );
 }
 
 fn create_rounded_rect_path(r: LayoutRect, radius: f32) -> Option<tiny_skia::Path> {
@@ -1280,6 +1296,55 @@ mod tests {
         assert_eq!(pixmap.data(), &before[..], "nothing was drawn");
     }
 
+    /// A browser leaves an unloadable image's box transparent: it outlines it
+    /// and writes the `alt`, but paints no fill. Filling it with light grey —
+    /// what this used to do — turned every unreachable image into the loudest
+    /// thing on the page.
+    #[test]
+    fn test_broken_image_paints_no_fill() {
+        let mut pixmap = white_pixmap(60, 40);
+        draw_broken_image(
+            &mut pixmap,
+            LayoutRect { x: 0.0, y: 0.0, width: 60.0, height: 40.0 },
+            "",
+            &Color { r: 0, g: 0, b: 0, a: 255 },
+            16.0,
+            Transform::identity(),
+        );
+        // The middle of the box is untouched; only its edge is drawn on.
+        let mid = ((20 * 60) + 30) * 4;
+        assert_eq!(
+            &pixmap.data()[mid..mid + 3],
+            &[255, 255, 255],
+            "the interior stays the page's own background"
+        );
+        let edge = ((0 * 60) + 30) * 4;
+        assert!(
+            pixmap.data()[edge] < 255,
+            "but the outline is drawn along the top edge"
+        );
+    }
+
+    /// The alt is drawn in the page's own text colour, not a fixed grey, so it
+    /// stays legible on a dark page.
+    #[test]
+    fn test_broken_image_alt_uses_the_inherited_colour() {
+        let mut pixmap = white_pixmap(200, 40);
+        draw_broken_image(
+            &mut pixmap,
+            LayoutRect { x: 0.0, y: 0.0, width: 200.0, height: 40.0 },
+            "Duolingo",
+            &Color { r: 220, g: 0, b: 0, a: 255 },
+            16.0,
+            Transform::identity(),
+        );
+        let reddish = pixmap
+            .data()
+            .chunks_exact(4)
+            .any(|px| px[0] > 180 && px[1] < 120 && px[2] < 120);
+        assert!(reddish, "the alt text should be drawn in the stated colour");
+    }
+
     /// `#fff 117%` means the gradient never reaches white inside the box.
     /// Clamping the stop to 100% made it reach white at the bottom edge, so a
     /// hero faded out a whole shade too early.
@@ -1648,6 +1713,8 @@ mod tests {
             url: "/tiny.png".to_string(),
             object_fit: ObjectFit::Fill,
             alt: String::new(),
+            alt_color: Color { r: 0, g: 0, b: 0, a: 255 },
+            alt_font_size: 16.0,
         }];
         let base_url = Url::parse("https://example.com/path").unwrap();
         let mut image_cache = HashMap::new();

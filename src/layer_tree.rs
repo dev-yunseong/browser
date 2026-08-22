@@ -30,7 +30,16 @@ pub enum PaintCommand {
     /// Stroked rectangle border: (bounds, stroke-width, color, corner-radius)
     Border(LayoutRect, f32, Color, f32),
     /// Image: layout rect, source URL, object-fit mode, alt text
-    Image { rect: LayoutRect, url: String, object_fit: ObjectFit, alt: String },
+    Image {
+        rect: LayoutRect,
+        url: String,
+        object_fit: ObjectFit,
+        alt: String,
+        /// The inherited text colour and size, for the `alt` a browser shows in
+        /// place of an image it could not load.
+        alt_color: Color,
+        alt_font_size: f32,
+    },
     /// An inline `<svg>` subtree, as markup, to be rasterised into `rect`.
     ///
     /// The element's own `color` travels with it because icon sets are drawn
@@ -818,7 +827,22 @@ impl LayerTreeBuilder {
                     _ => ObjectFit::Fill,
                 };
                 let alt = layout.alt_text.clone().unwrap_or_default();
-                commands.push(PaintCommand::Image { rect: d, url: url.clone(), object_fit, alt });
+                let alt_color = match sv.get(&crate::css::intern("color")) {
+                    Some(Value::Color(c)) => c.clone(),
+                    _ => Color { r: 0, g: 0, b: 0, a: 255 },
+                };
+                let alt_font_size = match sv.get(&crate::css::intern("font-size")) {
+                    Some(Value::Length(v, _)) => *v,
+                    _ => 16.0,
+                };
+                commands.push(PaintCommand::Image {
+                    rect: d,
+                    url: url.clone(),
+                    object_fit,
+                    alt,
+                    alt_color,
+                    alt_font_size,
+                });
             }
         }
 

@@ -542,7 +542,7 @@ pub fn parse_css(source: &str) -> Stylesheet {
         if selectors.is_empty() { continue; }
 
         let mut declarations = Vec::new();
-        for decl in declarations_str.split(';') {
+        for decl in expand_logical_declarations(declarations_str) {
             let decl = decl.trim();
             if decl.is_empty() { continue; }
             
@@ -1311,6 +1311,138 @@ fn register_layer(name: &str, order: &mut Vec<String>) {
     if !order.iter().any(|n| n == name) {
         order.push(name.to_string());
     }
+}
+
+/// Rewrite CSS logical properties into the physical ones the rest of the engine
+/// understands.
+///
+/// A modern design system writes its spacing as `padding-inline` and its
+/// offsets as `inset-inline-start`, so a parser that only knows `padding-left`
+/// silently drops it: github's marketing header states its 24px side padding as
+/// `padding-inline` alone, and without it the header row ran edge to edge and
+/// pushed "Sign in" off the right of the viewport.
+///
+/// Everything here assumes `writing-mode: horizontal-tb` and `direction: ltr`,
+/// which is what every page this engine renders uses. Under those, the inline
+/// axis is horizontal and its start is the left.
+pub fn expand_logical_declarations(declarations_str: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for decl in declarations_str.split(';') {
+        let trimmed = decl.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((raw_key, raw_val)) = trimmed.split_once(':') else {
+            out.push(trimmed.to_string());
+            continue;
+        };
+        let key = raw_key.trim().to_lowercase();
+        let mut value = raw_val.trim();
+        let important = value.ends_with("!important");
+        if important {
+            value = value.trim_end_matches("!important").trim();
+        }
+        let suffix = if important { " !important" } else { "" };
+
+        let mut emit = |prop: &str, v: &str| out.push(format!("{prop}: {v}{suffix}"));
+
+        // One-to-one renames.
+        if let Some(physical) = physical_name_for(&key) {
+            emit(physical, value);
+            continue;
+        }
+        // Two-edge shorthands: one value covers both edges, two give start then end.
+        if let Some((start_prop, end_prop)) = physical_pair_for(&key) {
+            let parts = split_respecting_parens(value);
+            match parts.len() {
+                0 => {}
+                1 => {
+                    emit(start_prop, &parts[0]);
+                    emit(end_prop, &parts[0]);
+                }
+                _ => {
+                    emit(start_prop, &parts[0]);
+                    emit(end_prop, &parts[1]);
+                }
+            }
+            continue;
+        }
+        out.push(trimmed.to_string());
+    }
+    out
+}
+
+/// The physical property a single-edge logical property names.
+fn physical_name_for(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "inline-size" => "width",
+        "block-size" => "height",
+        "min-inline-size" => "min-width",
+        "max-inline-size" => "max-width",
+        "min-block-size" => "min-height",
+        "max-block-size" => "max-height",
+
+        "padding-inline-start" => "padding-left",
+        "padding-inline-end" => "padding-right",
+        "padding-block-start" => "padding-top",
+        "padding-block-end" => "padding-bottom",
+
+        "margin-inline-start" => "margin-left",
+        "margin-inline-end" => "margin-right",
+        "margin-block-start" => "margin-top",
+        "margin-block-end" => "margin-bottom",
+
+        "inset-inline-start" => "left",
+        "inset-inline-end" => "right",
+        "inset-block-start" => "top",
+        "inset-block-end" => "bottom",
+
+        "border-inline-start" => "border-left",
+        "border-inline-end" => "border-right",
+        "border-block-start" => "border-top",
+        "border-block-end" => "border-bottom",
+
+        "border-inline-start-width" => "border-left-width",
+        "border-inline-end-width" => "border-right-width",
+        "border-block-start-width" => "border-top-width",
+        "border-block-end-width" => "border-bottom-width",
+        "border-inline-start-style" => "border-left-style",
+        "border-inline-end-style" => "border-right-style",
+        "border-block-start-style" => "border-top-style",
+        "border-block-end-style" => "border-bottom-style",
+        "border-inline-start-color" => "border-left-color",
+        "border-inline-end-color" => "border-right-color",
+        "border-block-start-color" => "border-top-color",
+        "border-block-end-color" => "border-bottom-color",
+
+        "border-start-start-radius" => "border-top-left-radius",
+        "border-start-end-radius" => "border-top-right-radius",
+        "border-end-start-radius" => "border-bottom-left-radius",
+        "border-end-end-radius" => "border-bottom-right-radius",
+        _ => return None,
+    })
+}
+
+/// The pair of physical properties a two-edge logical shorthand covers, in
+/// (start, end) order.
+fn physical_pair_for(key: &str) -> Option<(&'static str, &'static str)> {
+    Some(match key {
+        "padding-inline" => ("padding-left", "padding-right"),
+        "padding-block" => ("padding-top", "padding-bottom"),
+        "margin-inline" => ("margin-left", "margin-right"),
+        "margin-block" => ("margin-top", "margin-bottom"),
+        "inset-inline" => ("left", "right"),
+        "inset-block" => ("top", "bottom"),
+        "border-inline" => ("border-left", "border-right"),
+        "border-block" => ("border-top", "border-bottom"),
+        "border-inline-width" => ("border-left-width", "border-right-width"),
+        "border-block-width" => ("border-top-width", "border-bottom-width"),
+        "border-inline-style" => ("border-left-style", "border-right-style"),
+        "border-block-style" => ("border-top-style", "border-bottom-style"),
+        "border-inline-color" => ("border-left-color", "border-right-color"),
+        "border-block-color" => ("border-top-color", "border-bottom-color"),
+        _ => return None,
+    })
 }
 
 /// Expand a top/right/bottom/left shorthand such as `padding` or `margin`.
@@ -2710,6 +2842,92 @@ mod tests {
             }
             other => panic!("expected linear gradient, got {:?}", other),
         }
+    }
+
+    // ── Logical properties ────────────────────────────────────────────────────
+
+    /// Every declaration a rule produces, as `name=value` strings.
+    fn decls_of(css: &str) -> Vec<String> {
+        parse_css(css)
+            .all_rules()
+            .iter()
+            .flat_map(|r| {
+                r.declarations
+                    .iter()
+                    .map(|d| format!("{}={:?}", d.name, d.value))
+            })
+            .collect()
+    }
+
+    /// A one-value inline shorthand covers both horizontal edges. github's
+    /// marketing header states its 24px side padding this way and nothing else,
+    /// so losing it ran the header edge to edge.
+    #[test]
+    fn test_padding_inline_covers_both_sides() {
+        let d = decls_of("p { padding-inline: 24px }");
+        assert!(d.iter().any(|s| s.starts_with("padding-left=")), "{d:?}");
+        assert!(d.iter().any(|s| s.starts_with("padding-right=")), "{d:?}");
+        assert!(!d.iter().any(|s| s.starts_with("padding-top=")), "{d:?}");
+    }
+
+    /// Two values are start then end, not a quad.
+    #[test]
+    fn test_padding_inline_two_values_are_start_then_end() {
+        let d = decls_of("p { padding-inline: 10px 60px }");
+        assert!(d.contains(&"padding-left=Length(10.0, Px)".to_string()), "{d:?}");
+        assert!(d.contains(&"padding-right=Length(60.0, Px)".to_string()), "{d:?}");
+    }
+
+    #[test]
+    fn test_block_axis_shorthand_covers_top_and_bottom() {
+        let d = decls_of("p { margin-block: 20px 4px }");
+        assert!(d.contains(&"margin-top=Length(20.0, Px)".to_string()), "{d:?}");
+        assert!(d.contains(&"margin-bottom=Length(4.0, Px)".to_string()), "{d:?}");
+    }
+
+    #[test]
+    fn test_logical_sizes_and_offsets_map_to_physical() {
+        let d = decls_of(
+            "p { inline-size: 240px; block-size: 40px; min-inline-size: 300px;              inset-inline-start: 30px; inset-block-end: 10px }",
+        );
+        for expected in [
+            "width=Length(240.0, Px)",
+            "height=Length(40.0, Px)",
+            "min-width=Length(300.0, Px)",
+            "left=Length(30.0, Px)",
+            "bottom=Length(10.0, Px)",
+        ] {
+            assert!(d.contains(&expected.to_string()), "missing {expected} in {d:?}");
+        }
+    }
+
+    /// A logical border shorthand still goes through the border shorthand
+    /// parser, so it produces the width, style and colour longhands.
+    #[test]
+    fn test_logical_border_shorthand_expands() {
+        let d = decls_of("p { border-inline-start: 4px solid #036 }");
+        assert!(d.contains(&"border-left-width=Length(4.0, Px)".to_string()), "{d:?}");
+        assert!(d.iter().any(|s| s.starts_with("border-left-color=")), "{d:?}");
+        assert!(!d.iter().any(|s| s.starts_with("border-right-width=")), "{d:?}");
+    }
+
+    /// `!important` survives the rewrite, on both halves of a two-edge
+    /// shorthand.
+    #[test]
+    fn test_logical_shorthand_keeps_important() {
+        let ss = parse_css("p { padding-inline: 24px !important }");
+        let rules = ss.all_rules();
+        let decls = &rules[0].declarations;
+        assert_eq!(decls.len(), 2, "{decls:?}");
+        assert!(decls.iter().all(|d| d.important), "{decls:?}");
+    }
+
+    /// A property that is not logical passes through untouched.
+    #[test]
+    fn test_non_logical_declarations_are_unchanged() {
+        let d = decls_of("p { padding-left: 5px; color: red }");
+        assert!(d.contains(&"padding-left=Length(5.0, Px)".to_string()), "{d:?}");
+        assert!(d.iter().any(|s| s.starts_with("color=")), "{d:?}");
     }
 
     // ── Cascade layers ────────────────────────────────────────────────────────
