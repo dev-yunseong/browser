@@ -223,25 +223,6 @@ pub struct LayerTree {
     pub layers: Vec<Layer>,
 }
 
-/// Whether a computed style asks for a bold weight.
-///
-/// A numeric `font-weight` parses to a plain number rather than a length, so
-/// matching only on lengths missed `font-weight: 700` — the form nearly every
-/// stylesheet uses — and left every heading and emphasised run at book weight.
-fn is_bold(sv: &crate::style::PropertyMap) -> bool {
-    match sv.get(&crate::css::intern("font-weight")) {
-        Some(Value::Keyword(k)) => match k.as_ref() {
-            "bold" | "bolder" => true,
-            // A keyword that is really a number, e.g. when it arrived through a
-            // shorthand or a custom property.
-            other => other.parse::<f32>().is_ok_and(|w| w >= 600.0),
-        },
-        Some(Value::Number(v)) => *v >= 600.0,
-        Some(Value::Length(v, _)) => *v >= 600.0,
-        _ => false,
-    }
-}
-
 impl LayerTree {
     fn new() -> Self {
         Self { layers: Vec::new() }

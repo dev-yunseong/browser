@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Grid alignment probe</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 16px/1.5 sans-serif; background: #fff; }
+  .g { display: grid; grid-template-columns: 132px minmax(0, 1fr); gap: 24px; background: #eef; margin-bottom: 12px; }
+  .g > * { background: #99f; }
+  .g .tall { background: #cfc; }
+  .short { height: 40px; }
+  .tall { height: 180px; }
+
+  /* The shape yunseong.dev's hero is built on: a fixed portrait column beside
+     a taller text column, centred rather than stretched. */
+  .c { align-items: center; }
+  .e { align-items: end; }
+  .s { align-items: start; }
+  .selfend .short { align-self: end; }
+  .selfstretch .short { align-self: stretch; }
+
+  /* An image in a centred cell keeps its own aspect-derived height. */
+  .pic { display: grid; grid-template-columns: 132px minmax(0, 1fr); gap: 24px; align-items: center; background: #ffe; }
+  .pic img { width: 100%; height: auto; display: block; }
+  .pic p { margin: 0; background: #cff; }
+</style>
+</head>
+<body>
+  <div class="g"><div class="short"></div><div class="tall"></div></div>
+  <div class="g c"><div class="short"></div><div class="tall"></div></div>
+  <div class="g e"><div class="short"></div><div class="tall"></div></div>
+  <div class="g s"><div class="short"></div><div class="tall"></div></div>
+  <div class="g c selfend"><div class="short"></div><div class="tall"></div></div>
+  <div class="g c selfstretch"><div class="short"></div><div class="tall"></div></div>
+  <div class="pic">
+    <img src="portrait.svg" width="132" height="169" alt="portrait">
+    <p>A column of text tall enough that the picture beside it would be stretched to match, were the grid not told to centre its items instead. It keeps the height its own proportions give it.</p>
+  </div>
+</body>
+</html>

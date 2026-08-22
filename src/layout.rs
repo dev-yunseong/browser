@@ -2638,6 +2638,19 @@ impl<'a> LayoutBox<'a> {
                 }
             }
 
+            // CSS Box Alignment: a grid item fills its cell only under
+            // `stretch`, which is the default. `align-items: center` is how a
+            // page puts a portrait beside a taller column of text without
+            // letting the portrait grow to match it — stretching regardless
+            // made that image the height of the text next to it.
+            let keyword_of = |sn: &StyledNode, prop: &str| -> Option<String> {
+                match sn.specified_values.get(&crate::css::intern(prop)) {
+                    Some(Value::Keyword(k)) => Some(k.to_string()),
+                    _ => None,
+                }
+            };
+            let container_align = keyword_of(self.style_node, "align-items");
+
             // Pass 4: position and (optionally) stretch each grid item.
             for item in &mut grid_items {
                 let cell_x = col_lefts.get(item.col).copied().unwrap_or(content_left);
@@ -2649,27 +2662,27 @@ impl<'a> LayoutBox<'a> {
                     .sum::<f32>()
                     + item.row_span.saturating_sub(1) as f32 * row_gap;
 
-                // Default alignment: stretch (item fills cell on both axes).
-                let item_x = cell_x + item.cb.margin.left;
-                let item_y = cell_y + item.cb.margin.top;
-
-                let dx = item_x - item.cb.dimensions.x;
-                let dy = item_y - item.cb.dimensions.y;
-                offset_layout_box(&mut item.cb, dx, dy);
-
-                // Stretch width to the cell's content width.
+                // Width still fills the cell: `justify-items` other than
+                // `stretch` needs the item re-measured shrink-to-fit, which is
+                // not modelled.
                 item.cb.dimensions.width = (cell_w
                     - item.cb.margin.left - item.cb.margin.right
                     - item.cb.padding.left - item.cb.padding.right
                     - item.cb.border.left - item.cb.border.right
                 ).max(0.0);
 
-                // Stretch height only when no explicit height is set.
+                let align = keyword_of(item.cb.style_node, "align-self")
+                    .or_else(|| container_align.clone())
+                    .unwrap_or_else(|| "stretch".to_string());
+                let stretch_block = matches!(align.as_str(), "stretch" | "normal");
+
+                // Stretch height only under `stretch`, and only when no
+                // explicit height is set.
                 let has_explicit_height = matches!(
                     item.cb.style_node.specified_values.get(&crate::css::intern("height")),
                     Some(Value::Length(v, Unit::Px)) if *v > 0.0
                 );
-                if !has_explicit_height {
+                if stretch_block && !has_explicit_height {
                     let avail_cell_h = (cell_h
                         - item.cb.margin.top - item.cb.margin.bottom
                         - item.cb.padding.top - item.cb.padding.bottom
@@ -2679,6 +2692,19 @@ impl<'a> LayoutBox<'a> {
                         item.cb.dimensions.height = avail_cell_h;
                     }
                 }
+
+                // Where the item sits in a cell it does not fill.
+                let free = (cell_h - margin_box_height(&item.cb)).max(0.0);
+                let block_offset = match align.as_str() {
+                    "center" => free / 2.0,
+                    "end" | "flex-end" | "self-end" => free,
+                    _ => 0.0,
+                };
+                let item_x = cell_x + item.cb.margin.left;
+                let item_y = cell_y + item.cb.margin.top + block_offset;
+                let dx = item_x - item.cb.dimensions.x;
+                let dy = item_y - item.cb.dimensions.y;
+                offset_layout_box(&mut item.cb, dx, dy);
 
                 max_child_x = max_child_x.max(
                     item.cb.dimensions.x + border_box_width(&item.cb) + item.cb.margin.right,
@@ -3622,13 +3648,18 @@ fn resolved_font_size_px(sn: &StyledNode) -> f32 {
 /// did and whatever followed sat on top of it.
 pub fn resolved_font_style(sn: &StyledNode) -> crate::font::FontStyle {
     let sv = &sn.specified_values;
+    // CSS font matching with only two weights bundled: a desired weight above
+    // 500 takes the heavier face, 500 and below the lighter one. The threshold
+    // was 600, so a design system asking for 560 — a real value, and what
+    // yunseong.dev's hero links are set in — came out regular.
+    let wants_bold = |weight: f32| weight > 500.0;
     let bold = match sv.get(&crate::css::intern("font-weight")) {
         Some(Value::Keyword(k)) => match k.as_ref() {
             "bold" | "bolder" => true,
-            other => other.parse::<f32>().is_ok_and(|w| w >= 600.0),
+            other => other.parse::<f32>().is_ok_and(wants_bold),
         },
-        Some(Value::Number(v)) => *v >= 600.0,
-        Some(Value::Length(v, _)) => *v >= 600.0,
+        Some(Value::Number(v)) => wants_bold(*v),
+        Some(Value::Length(v, _)) => wants_bold(*v),
         _ => false,
     };
     let italic = matches!(
@@ -4544,6 +4575,60 @@ mod tests {
         (layout_opt.expect("layout tree"), fx, fy)
     }
 
+
+    // ── Grid item alignment ───────────────────────────────────────────────────
+
+    /// A grid item fills its cell only under `stretch`. `align-items: center`
+    /// is how a page puts a portrait beside a taller column of text without
+    /// letting the portrait grow to match it.
+    #[test]
+    fn test_grid_align_items_center_does_not_stretch_the_item() {
+        let html = r#"<div id="g" style="display:grid;align-items:center;grid-template-columns:100px 100px;width:200px">
+            <div id="short" style="height:40px"></div>
+            <div id="tall" style="height:200px"></div>
+          </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let short = find_element_by_id(&layout, "short").expect("short");
+        let tall = find_element_by_id(&layout, "tall").expect("tall");
+        assert_eq!(short.dimensions.height, 40.0, "it keeps its own height");
+        assert_eq!(
+            short.dimensions.y - tall.dimensions.y,
+            80.0,
+            "and sits centred in the 200px row: {} vs {}",
+            short.dimensions.y,
+            tall.dimensions.y
+        );
+    }
+
+    /// The default is still `stretch`.
+    #[test]
+    fn test_grid_stretches_its_items_by_default() {
+        let html = r#"<div id="g" style="display:grid;grid-template-columns:100px 100px;width:200px">
+            <div id="short"></div>
+            <div id="tall" style="height:200px"></div>
+          </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let short = find_element_by_id(&layout, "short").expect("short");
+        assert_eq!(short.dimensions.height, 200.0, "it fills the row");
+        assert_eq!(short.dimensions.y, find_element_by_id(&layout, "tall").expect("tall").dimensions.y);
+    }
+
+    /// `align-self` on the item overrides the container's `align-items`.
+    #[test]
+    fn test_grid_align_self_overrides_the_container() {
+        let html = r#"<div id="g" style="display:grid;align-items:center;grid-template-columns:100px 100px;width:200px">
+            <div id="pinned" style="height:40px;align-self:end"></div>
+            <div id="tall" style="height:200px"></div>
+          </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let pinned = find_element_by_id(&layout, "pinned").expect("pinned");
+        let tall = find_element_by_id(&layout, "tall").expect("tall");
+        assert_eq!(
+            pinned.dimensions.y - tall.dimensions.y,
+            160.0,
+            "`end` puts it at the bottom of the row"
+        );
+    }
 
     // ── Line breaking ─────────────────────────────────────────────────────────
 
