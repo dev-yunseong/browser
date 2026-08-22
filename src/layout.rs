@@ -472,6 +472,37 @@ fn horiz_margin(sn: &StyledNode) -> f32 {
     read_px_direct(sn, "margin-left") + read_px_direct(sn, "margin-right")
 }
 
+/// Whether `dimensions` already covers this box's padding and border on an
+/// axis — true when nothing was stated for it, per the rule in `perform_layout`.
+fn has_stated(cb: &LayoutBox<'_>, prop: &str) -> bool {
+    cb.style_node
+        .specified_values
+        .contains_key(&crate::css::intern(prop))
+}
+
+/// The width a line box has to reserve for an inline-level child.
+///
+/// `border_box_width` adds padding and border unconditionally, which double
+/// counts them for the common auto-width box whose `dimensions` already covers
+/// them — a padded button then reserved its padding twice and the line came out
+/// that much too wide.
+fn outer_width(cb: &LayoutBox<'_>) -> f32 {
+    if has_stated(cb, "width") {
+        border_box_width(cb)
+    } else {
+        cb.dimensions.width
+    }
+}
+
+/// The height a line box has to reserve for an inline-level child.
+fn outer_height(cb: &LayoutBox<'_>) -> f32 {
+    if has_stated(cb, "height") {
+        border_box_height(cb)
+    } else {
+        cb.dimensions.height
+    }
+}
+
 fn border_box_width(cb: &LayoutBox<'_>) -> f32 {
     cb.dimensions.width + cb.padding.left + cb.padding.right + cb.border.left + cb.border.right
 }
@@ -1165,8 +1196,8 @@ impl<'a> LayoutBox<'a> {
         // is the content width, so the padding and border have to be counted in
         // — leaving them out pushed a centred, padded container half its padding
         // off to one side and shifted its whole subtree with it.
-        let outer_width = width + self.padding.left + self.padding.right + self.border.left + self.border.right;
-        if is_block && outer_width < container_width {
+        let self_outer_width = width + self.padding.left + self.padding.right + self.border.left + self.border.right;
+        if is_block && self_outer_width < container_width {
             let mut is_auto = false;
             for prop in ["margin", "margin-left", "margin-right"] {
                 if let Some(Value::Keyword(s)) = self
@@ -1181,7 +1212,7 @@ impl<'a> LayoutBox<'a> {
                 }
             }
             if is_auto {
-                let leftover = (container_width - outer_width).max(0.0);
+                let leftover = (container_width - self_outer_width).max(0.0);
                 self.margin.left = leftover / 2.0;
                 self.margin.right = leftover / 2.0;
             }
@@ -2505,8 +2536,8 @@ impl<'a> LayoutBox<'a> {
                         let dy = cursor_y - (m.dimensions.y - m.margin.top);
                         offset_layout_box(&mut m, dx, dy);
                         max_child_x =
-                            max_child_x.max(m.dimensions.x + border_box_width(&m) + m.margin.right);
-                        lx += margin_box_width(&m);
+                            max_child_x.max(m.dimensions.x + outer_width(&m) + m.margin.right);
+                        lx += outer_width(&m) + m.margin.left + m.margin.right;
                         result.push(m);
                     }
                     cursor_y += cur_line.height;
@@ -2699,7 +2730,7 @@ impl<'a> LayoutBox<'a> {
                         // actually placed.  Empty/whitespace-only text nodes return None and
                         // must NOT interrupt adjacent-block margin collapsing.
                         prev_margin_bottom = 0.0;
-                        let item_w = margin_box_width(&cb);
+                        let item_w = outer_width(&cb) + cb.margin.left + cb.margin.right;
                         let keep_table_cells_on_row =
                             self.display == DisplayType::TableRow && cb.display == DisplayType::TableCell;
                         if !keep_table_cells_on_row
@@ -2741,9 +2772,9 @@ impl<'a> LayoutBox<'a> {
                                     apply_relative_offset(&mut cb2, vw, vh);
                                 }
                                 cur_line.width =
-                                    margin_box_width(&cb2);
+                                    outer_width(&cb2) + cb2.margin.left + cb2.margin.right;
                                 cur_line.height =
-                                    margin_box_height(&cb2);
+                                    outer_height(&cb2) + cb2.margin.top + cb2.margin.bottom;
                                 cur_line.members.push(cb2);
                             }
                         } else {
@@ -2755,7 +2786,7 @@ impl<'a> LayoutBox<'a> {
                             cur_line.width += item_w;
                             cur_line.height = cur_line
                                 .height
-                                .max(margin_box_height(&cb));
+                                .max(outer_height(&cb) + cb.margin.top + cb.margin.bottom);
                             cur_line.members.push(cb);
                         }
                     }
@@ -6148,6 +6179,42 @@ mod tests {
             b.dimensions.width >= label + 36.0 - 1.0,
             "the box must cover the label plus its 36px of padding: width={}, label={label}",
             b.dimensions.width
+        );
+    }
+
+    /// A line box reserves an inline-level child's outer size. For the common
+    /// auto-sized box `dimensions` already covers padding and border, so adding
+    /// them again counted the padding twice and made the line — and the block
+    /// around it — that much too tall.
+    #[test]
+    fn test_line_box_counts_a_padded_inline_child_once() {
+        let html = r#"<div id="s" style="padding:12px"><b>label</b><br><button id="b" style="padding:10px 18px;border:0">Press</button></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let s = find_element_by_id(&layout, "s").expect("block");
+        let b = find_element_by_id(&layout, "b").expect("button");
+        let label_line = b.dimensions.y - (s.dimensions.y + 12.0);
+        let expected = 12.0 + label_line + b.dimensions.height + 12.0;
+        assert!(
+            (s.dimensions.height - expected).abs() < 2.0,
+            "the block is its padding plus its two lines: height={}, expected {expected}",
+            s.dimensions.height
+        );
+    }
+
+    /// A form control does not inherit the page's `line-height`: the UA sheet
+    /// gives it one of its own, which is why a button inside
+    /// `body { line-height: 2 }` is not two lines tall.
+    #[test]
+    fn test_button_does_not_inherit_the_page_line_height() {
+        let html = r#"<div style="line-height:3"><button id="b" style="padding:0;border:0;font-size:16px">Press</button></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let b = find_element_by_id(&layout, "b").expect("button");
+        assert!(
+            b.dimensions.height < 32.0,
+            "the button keeps its own line height, not 3x the font size: height={}",
+            b.dimensions.height
         );
     }
 

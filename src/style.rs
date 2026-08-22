@@ -1088,7 +1088,12 @@ fn apply_default_styles(tag: &str, map: &mut HashMap<Arc<str>, Value>) {
                 map.entry(intern("margin-bottom")).or_insert(Value::Length(1.0, crate::css::Unit::Em));
             }
         }
+        // Form controls do not inherit the page's font: the UA sheet gives them
+        // one of their own, which is why a button inside `body { line-height: 1.4 }`
+        // is not 1.4 lines tall. Inheriting it made every control several pixels
+        // taller than a browser draws it, once per control down the page.
         "input" => {
+            map.entry(intern("line-height")).or_insert(Value::Keyword(intern("normal")));
             map.entry(intern("border-width")).or_insert(Value::Length(1.0, crate::css::Unit::Px));
             map.entry(intern("border-color")).or_insert(Value::Color(crate::css::Color { r: 180, g: 180, b: 180, a: 255 }));
             map.entry(intern("background-color")).or_insert(Value::Color(crate::css::Color { r: 255, g: 255, b: 255, a: 255 }));
@@ -1099,6 +1104,7 @@ fn apply_default_styles(tag: &str, map: &mut HashMap<Arc<str>, Value>) {
             map.entry(intern("height")).or_insert(Value::Length(24.0, crate::css::Unit::Px));
         }
         "textarea" => {
+            map.entry(intern("line-height")).or_insert(Value::Keyword(intern("normal")));
             map.entry(intern("border-width")).or_insert(Value::Length(1.0, crate::css::Unit::Px));
             map.entry(intern("border-color")).or_insert(Value::Color(crate::css::Color { r: 180, g: 180, b: 180, a: 255 }));
             map.entry(intern("background-color")).or_insert(Value::Color(crate::css::Color { r: 255, g: 255, b: 255, a: 255 }));
@@ -1108,6 +1114,7 @@ fn apply_default_styles(tag: &str, map: &mut HashMap<Arc<str>, Value>) {
             map.entry(intern("height")).or_insert(Value::Length(48.0, crate::css::Unit::Px));
         }
         "select" => {
+            map.entry(intern("line-height")).or_insert(Value::Keyword(intern("normal")));
             map.entry(intern("border-width")).or_insert(Value::Length(1.0, crate::css::Unit::Px));
             map.entry(intern("border-color")).or_insert(Value::Color(crate::css::Color { r: 180, g: 180, b: 180, a: 255 }));
             map.entry(intern("background-color")).or_insert(Value::Color(crate::css::Color { r: 255, g: 255, b: 255, a: 255 }));
@@ -1116,6 +1123,7 @@ fn apply_default_styles(tag: &str, map: &mut HashMap<Arc<str>, Value>) {
             map.entry(intern("height")).or_insert(Value::Length(24.0, crate::css::Unit::Px));
         }
         "button" => {
+            map.entry(intern("line-height")).or_insert(Value::Keyword(intern("normal")));
             map.entry(intern("border-width")).or_insert(Value::Length(1.0, crate::css::Unit::Px));
             map.entry(intern("border-color")).or_insert(Value::Color(crate::css::Color { r: 180, g: 180, b: 180, a: 255 }));
             map.entry(intern("background-color")).or_insert(Value::Color(crate::css::Color { r: 240, g: 240, b: 240, a: 255 }));
