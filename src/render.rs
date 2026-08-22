@@ -30,6 +30,13 @@ struct GlyphKey {
     font_size_half_px: u32,
     bold: bool,
     italic: bool,
+    /// Which quarter-pixel the glyph starts on.
+    ///
+    /// A browser rasterises a glyph at its true fractional position; snapping
+    /// every glyph to a whole pixel — as this did — moves each one by up to half
+    /// a pixel, and the accumulated jitter is visible as uneven letter spacing
+    /// even when the line as a whole is exactly the right width.
+    x_phase: u8,
 }
 
 /// Pre-rasterized pixels for one glyph at a specific size and synthesis setting.
@@ -708,12 +715,17 @@ fn render_text_raw(
             line_end_x = current_x;
         }
         for (face, gid, adv, synthetic_bold) in glyphs {
+            // Quarter-pixel phases are what browsers use; finer buys nothing
+            // visible and multiplies the cache.
+            const PHASES: f32 = 4.0;
+            let x_phase = ((current_x - current_x.floor()) * PHASES).round() as u8 % PHASES as u8;
             let key = GlyphKey {
                 face,
                 glyph_id: gid.0,
                 font_size_half_px,
                 bold: synthetic_bold,
                 italic: false, // Italic shear is applied at paint time; do not vary cache by italic
+                x_phase,
             };
 
             // ── Cache lookup ──────────────────────────────────────────────────
@@ -734,8 +746,10 @@ fn render_text_raw(
                 } else {
                     // Cache miss — rasterize using a canonical origin (0, 0) so
                     // that bx_delta/by_delta are position-independent.
-                    let canonical =
-                        gid.with_scale_and_position(fonts.scale(face, font_size), point(0.0, 0.0));
+                    let canonical = gid.with_scale_and_position(
+                        fonts.scale(face, font_size),
+                        point(x_phase as f32 / PHASES, 0.0),
+                    );
                     let entry = if let Some(outline) = fonts.face(face).outline_glyph(canonical) {
                         let bounds = outline.px_bounds();
                         let bx_delta = bounds.min.x.floor() as i32;
@@ -1116,6 +1130,31 @@ mod tests {
             .map(|(s, p)| (p.unwrap_or(0.0), s.color.clone()))
             .collect();
         clip_stops_to_unit(&pairs)
+    }
+
+    /// A glyph is rasterised at the quarter-pixel it actually starts on.
+    /// Snapping every glyph to a whole pixel moved each one by up to half a
+    /// pixel, and the accumulated jitter showed as uneven letter spacing even
+    /// when the line as a whole was exactly the right width.
+    #[test]
+    fn test_glyphs_at_different_subpixel_offsets_differ() {
+        let _guard = cache_guard();
+        let color = black();
+        let mut whole = white_pixmap(80, 30);
+        let mut half = white_pixmap(80, 30);
+        let at = |x: f32| LayoutRect { x, y: 2.0, width: 78.0, height: 26.0 };
+        render_text_raw(
+            "iiii".to_string(), at(4.0), 16.0, 19.2, &color, at(0.0), &mut whole,
+            crate::font::FontStyle::regular(), 0.0, 0,
+        );
+        render_text_raw(
+            "iiii".to_string(), at(4.5), 16.0, 19.2, &color, at(0.0), &mut half,
+            crate::font::FontStyle::regular(), 0.0, 0,
+        );
+        assert_ne!(
+            whole.data(), half.data(),
+            "a run started half a pixel over must not rasterise identically"
+        );
     }
 
     /// `#fff 117%` means the gradient never reaches white inside the box.
