@@ -64,10 +64,17 @@ fails to reduce the width passed to children.
 
 Fixing it means picking one meaning and migrating every reader — the width
 computation, `border_box_width`/`margin_box_width`, the flex and grid track
-code, and the rect collectors — in one change, with
-`test_button_coordinate_collection` and `test_border_box_min_size_includes_padding`
-updated to the chosen model. It is not a local edit; a half-migration renders
-worse than either model alone.
+code, the flex re-layout pass that re-runs an item at its flexed main size, and
+the rect collectors — in one change, with `test_button_coordinate_collection`
+and `test_border_box_min_size_includes_padding` updated to the chosen model.
+
+This has been attempted once, migrating the width computation and painting
+together and leaving the flex paths alone. Every test still passed and nearly
+every fixture got worse: flex cards came out 30px too wide because the re-layout
+pass feeds an item's flexed width back in as a containing-block width, and the
+padding is then taken off a second time. The tests do not cover the interaction;
+only the pixel diff caught it. A half-migration renders worse than either model
+alone, so the next attempt needs the flex paths in the same change.
 
 ## Known limitation: inline runs do not fragment across lines
 
