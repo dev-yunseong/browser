@@ -1239,13 +1239,39 @@ fn strip_at_rules(source: &str, font_faces: &mut Vec<FontFace>) -> String {
     let mut segments: Vec<(Option<String>, String)> = Vec::new();
     collect_at_rules(source, None, font_faces, &mut order, &mut segments);
 
-    // An unlayered rule outranks every layer, so it sorts last.
-    let rank = |layer: &Option<String>| match layer {
-        None => usize::MAX,
-        Some(name) => order.iter().position(|n| n == name).unwrap_or(order.len()),
+    // A layer's place in the cascade is its whole path, compared one level at a
+    // time: `base.inner` sits at `base`'s place among the top-level layers and
+    // only then at its own place among `base`'s sub-layers. Ranking the
+    // qualified name as a single unit instead put every nested layer after
+    // every plain one, purely because it was mentioned later.
+    //
+    // The trailing sentinel is what puts a layer's *own* rules after its
+    // sub-layers, which is the order the cascade gives them: `a` becomes
+    // `[rank(a), MAX]` and `a.inner` `[rank(a), rank(a.inner), MAX]`. An
+    // unlayered rule outranks every layer, so it sorts last of all.
+    let rank = |layer: &Option<String>| -> Vec<usize> {
+        let Some(name) = layer else {
+            return vec![usize::MAX];
+        };
+        let mut path = Vec::new();
+        let mut prefix = String::new();
+        for part in name.split('.') {
+            if !prefix.is_empty() {
+                prefix.push('.');
+            }
+            prefix.push_str(part);
+            path.push(
+                order
+                    .iter()
+                    .position(|n| *n == prefix)
+                    .unwrap_or(order.len()),
+            );
+        }
+        path.push(usize::MAX);
+        path
     };
     let mut positions: Vec<usize> = (0..segments.len()).collect();
-    positions.sort_by_key(|&i| (rank(&segments[i].0), i));
+    positions.sort_by_cached_key(|&i| (rank(&segments[i].0), i));
 
     let mut result = String::with_capacity(source.len());
     for i in positions {
@@ -1375,8 +1401,17 @@ fn qualified_layer(parent: Option<&str>, name: &str) -> String {
 /// Record a layer name the first time it is seen. Order of first mention is
 /// order in the cascade.
 fn register_layer(name: &str, order: &mut Vec<String>) {
-    if !order.iter().any(|n| n == name) {
-        order.push(name.to_string());
+    // `@layer a.b { … }` names `a` as well, and `a` has to have a place of its
+    // own or everything under it ranks as unknown.
+    let mut prefix = String::new();
+    for part in name.split('.') {
+        if !prefix.is_empty() {
+            prefix.push('.');
+        }
+        prefix.push_str(part);
+        if !order.iter().any(|n| *n == prefix) {
+            order.push(prefix.clone());
+        }
     }
 }
 
@@ -2962,6 +2997,40 @@ fn named_color(s: &str) -> Option<Color> {
 
 #[cfg(test)]
 mod tests {
+    /// A layer's place in the cascade is its whole path, compared one level at
+    /// a time — `base.inner` sits at `base`'s place among the top-level layers
+    /// and only then at its own place among `base`'s sub-layers. A layer's own
+    /// rules come after its sub-layers', and an unlayered rule after everything.
+    #[test]
+    fn test_nested_layers_sort_at_their_parents_place() {
+        let source = r#"
+            @layer base, components;
+            @layer base { @layer inner { .f { color: red } } }
+            @layer components { .f { color: green } }
+            @layer base { .g { color: green } @layer inner { .g { color: red } } }
+            @layer components.late { .i { color: green } }
+            @layer base { .i { color: red } }
+        "#;
+        let sheet = super::parse_css(source);
+        // The last rule that names a selector is the one that wins, so reading
+        // the order back is enough to check the sort.
+        let last_colour = |sel: &str| -> Value {
+            sheet
+                .all_rules()
+                .into_iter()
+                .filter(|r| r.selectors.iter().any(|s| s.class == vec![sel.to_string()]))
+                .filter_map(|r| r.declarations.iter().find(|d| &*d.name == "color"))
+                .last()
+                .cloned()
+                .map(|d| d.value)
+                .unwrap_or(Value::Number(0.0))
+        };
+        let green = super::parse_value("green");
+        for sel in ["f", "g", "i"] {
+            assert_eq!(last_colour(sel), green, ".{sel} should end up green");
+        }
+    }
+
     /// A radial gradient may state its radii outright instead of naming an
     /// extent keyword, and two of them make an ellipse. Reading the numbers as
     /// unknown words left github's hero glow the default farthest-corner

@@ -35,6 +35,14 @@
   /* A layer nested in another sits at its parent's place in the order. */
   @layer base { @layer inner { .f { background: #8f8; } } }
   @layer components { .f { background: #f88; } }
+
+  /* A layer's own rules come after its sub-layers'. */
+  @layer base { .g { background: #8f8; } @layer inner { .g { background: #f88; } } }
+  /* Sub-layers of one parent go in order of first mention. */
+  @layer base { @layer one { .h { background: #f88; } } @layer two { .h { background: #8f8; } } }
+  /* A layer named with a dotted path names its parent too. */
+  @layer components.late { .i { background: #8f8; } }
+  @layer base { .i { background: #f88; } }
 </style>
 </head>
 <body>
@@ -43,5 +51,8 @@
   <p class="row d">unlayered beats every layer — blue</p>
   <p class="row e">unlayered beats a layered media rule — blue</p>
   <p class="row f">base.inner loses to components — red</p>
+  <p class="row g">base's own rules beat base.inner — green</p>
+  <p class="row h">base.two beats base.one — green</p>
+  <p class="row i">components.late beats base — green</p>
 </body>
 </html>
