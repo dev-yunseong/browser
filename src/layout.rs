@@ -582,6 +582,17 @@ fn horiz_padding_border(sn: &StyledNode) -> f32 {
     read_px_direct(sn, "padding-left") + read_px_direct(sn, "padding-right") + side("left") + side("right")
 }
 
+/// Whether this element is a form control that holds a line of text of its own.
+fn is_form_control(sn: &StyledNode) -> bool {
+    matches!(
+        sn.node.data,
+        NodeData::Element { ref name, .. } if matches!(
+            name.local.as_ref(),
+            "input" | "textarea" | "select" | "button"
+        )
+    )
+}
+
 /// The single margin two adjoining margins collapse to.
 ///
 /// CSS 2.2 §8.3.1: the largest positive plus the most negative, so a negative
@@ -2286,6 +2297,19 @@ impl<'a> LayoutBox<'a> {
                         self.dimensions.height = self.dimensions.width / ratio;
                     }
                 }
+                // A form control holds a line of its own even with no items in
+                // it — see the same rule in the block path. Primer sets
+                // `display: flex` on its text inputs, and without this
+                // github's email field collapsed to its own top padding.
+                if is_form_control(self.style_node) && self.children.is_empty() {
+                    let line = resolved_line_height_px(self.style_node);
+                    self.dimensions.height = self.dimensions.height.max(
+                        line + self.padding.top
+                            + self.padding.bottom
+                            + self.border.top
+                            + self.border.bottom,
+                    );
+                }
             }
             self.dimensions.height = clamp_height(
                 self.style_node,
@@ -3256,8 +3280,15 @@ impl<'a> LayoutBox<'a> {
         };
         // A form control with no in-flow children still holds one line: its
         // value or its placeholder sits on it, and a browser sizes the control
-        // from that line rather than collapsing it to its padding.
-        if self.display == DisplayType::Input && self.children.is_empty() && height <= 0.0 {
+        // from that line rather than collapsing it to its padding. The element
+        // is what decides this, not its `display`: a design system that sets
+        // `display: flex` on its text inputs — which Primer does — still gets a
+        // control the height of a line, and reading the `display` instead
+        // collapsed github's email field to its own top padding.
+        if (self.display == DisplayType::Input || is_form_control(self.style_node))
+            && self.children.is_empty()
+            && height <= 0.0
+        {
             let line = resolved_line_height_px(self.style_node);
             final_h = final_h.max(
                 line + self.padding.top + self.padding.bottom + self.border.top + self.border.bottom,
@@ -4732,6 +4763,22 @@ mod tests {
             a.dimensions.y - row.dimensions.y,
             35.0,
             "(100 - 30) / 2 from the container's top"
+        );
+    }
+
+    /// A form control holds a line of text of its own whatever its `display`
+    /// says. Primer sets `display: flex` on its text inputs, and reading the
+    /// `display` instead of the element collapsed github's email field to its
+    /// own top padding.
+    #[test]
+    fn test_a_flex_input_still_holds_a_line() {
+        let html = r#"<input id="i" style="display:flex;font-size:16px;line-height:1.5;padding:18px 12px 0 18px;box-sizing:content-box">"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let i = find_element_by_id(&layout, "i").expect("input");
+        assert!(
+            i.paint_rect().height >= 40.0,
+            "one 24px line under 18px of top padding, got {}",
+            i.paint_rect().height
         );
     }
 

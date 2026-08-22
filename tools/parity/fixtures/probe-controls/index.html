@@ -21,6 +21,11 @@
      container with a stated height. Deriving the height from the label instead
      leaves it the wrong size in the row it sits in. */
   .flexbtn { display: flex; align-items: center; justify-content: center; height: 48px; min-height: 43px; padding: 6px 20px; border: 1px solid #060; background: #1f883d; color: #fff; flex-shrink: 0; }
+  /* A design system sets `display: flex` on its text inputs; the control still
+     holds a line of its own, and its border comes from a shorthand whose only
+     unresolved part sits at the end. */
+  .flexinput { display: flex; font-size: 16px; line-height: 1.5; padding: 18px 12px 0 18px; border: solid var(--hairline-width, 1px) #8a8; background: #fff; width: 260px; }
+  .varborder { border: solid var(--hairline-width, 1px) transparent; border-color: #06c; padding: 6px 20px; background: #eef; display: inline-flex; }
   .fieldrow { display: flex; align-items: center; gap: 4px; border: 1px solid #333; padding: 3px; background: #fff; width: 450px; border-radius: 8px; }
   .fieldrow .fill { flex: 1 1 0; height: 20px; background: #eef; }
   .plainbtn { appearance: none; -webkit-appearance: none; background: #bf3989; color: #fff; border: 0; padding: 10px 18px; }
@@ -32,6 +37,10 @@
 </style>
 </head>
 <body>
+  <section>
+    <input class="flexinput" type="email" placeholder="a flex input still holds a line">
+    <a class="varborder" href="#">border width from a var in the last open slot</a>
+  </section>
   <section>
     <div class="fieldrow"><i class="fill"></i><button class="flexbtn"><span><span>Sign up for GitHub</span></span></button></div>
   </section>

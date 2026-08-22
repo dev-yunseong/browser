@@ -1955,21 +1955,37 @@ fn parse_border_shorthand(val: &str, declarations: &mut HashMap<String, Value>) 
         }
     }
 
-    // Place what could not be classified. The grammar allows any order, but the
-    // width is written first in practice, so a leading unresolved value is the
-    // width and any later one is the colour. Guessing the other way is what put
-    // `border-top: var(--borderWidth-thin) solid #fff9` in the colour slot and
-    // then defaulted the width to `medium`, drawing a 3px white rule where the
-    // page asked for a 1px translucent one.
+    // Place what could not be classified, into whichever slot the classified
+    // parts left open. When both are open the width goes first, since that is
+    // the order the shorthand is written in practice — guessing the other way
+    // is what put `border-top: var(--borderWidth-thin) solid #fff9` in the
+    // colour slot and then defaulted the width to `medium`, drawing a 3px
+    // white rule where the page asked for a 1px translucent one. Going by
+    // position alone was just as wrong the other way:
+    // `border: solid var(--borderWidth-thin) transparent` — Primer's own
+    // buttons — has its only open slot at the *end*, and the width was dropped
+    // on the floor, leaving the button with no border at all.
     for (idx, part) in deferred {
         let value = parse_value(part);
-        let is_leading = idx == 0;
-        if is_leading && !saw_width {
-            declarations.insert("border-width".to_string(), value);
-            saw_width = true;
-        } else if !saw_color {
-            declarations.insert("border-color".to_string(), value);
-            saw_color = true;
+        match (saw_width, saw_color) {
+            (false, true) => {
+                declarations.insert("border-width".to_string(), value);
+                saw_width = true;
+            }
+            (true, false) => {
+                declarations.insert("border-color".to_string(), value);
+                saw_color = true;
+            }
+            (false, false) => {
+                if idx == 0 {
+                    declarations.insert("border-width".to_string(), value);
+                    saw_width = true;
+                } else {
+                    declarations.insert("border-color".to_string(), value);
+                    saw_color = true;
+                }
+            }
+            (true, true) => {}
         }
     }
 }
@@ -2898,6 +2914,44 @@ mod tests {
             }
             other => panic!("expected linear gradient, got {:?}", other),
         }
+    }
+
+    // ── The `border` shorthand ────────────────────────────────────────────────
+
+    /// A `var()` in the shorthand goes into whichever slot the parts around it
+    /// left open. `border: solid var(--borderWidth-thin) transparent` — how
+    /// Primer writes every button's border — has its only open slot at the
+    /// *end*, and placing by position alone dropped the width, leaving the
+    /// button with no border at all.
+    #[test]
+    fn test_a_deferred_border_part_fills_the_open_slot() {
+        let d = decls_of("a { border: solid var(--w) transparent }");
+        assert!(
+            d.iter().any(|s| s.starts_with("border-width=CssVar")),
+            "the var is the width, since style and colour are both taken: {d:?}"
+        );
+        assert!(d.contains(&"border-style=Keyword(\"solid\")".to_string()), "{d:?}");
+    }
+
+    /// With both slots open, the width is written first.
+    #[test]
+    fn test_a_leading_deferred_border_part_is_the_width() {
+        let d = decls_of("a { border-top: var(--w) solid #fff9 }");
+        assert!(
+            d.iter().any(|s| s.starts_with("border-top-width=CssVar")),
+            "{d:?}"
+        );
+    }
+
+    /// And a trailing one, with the width already stated, is the colour.
+    #[test]
+    fn test_a_trailing_deferred_border_part_is_the_colour() {
+        let d = decls_of("a { border: 1px solid var(--c) }");
+        assert!(d.contains(&"border-width=Length(1.0, Px)".to_string()), "{d:?}");
+        assert!(
+            d.iter().any(|s| s.starts_with("border-color=CssVar")),
+            "{d:?}"
+        );
     }
 
     // ── The `background` shorthand ────────────────────────────────────────────
