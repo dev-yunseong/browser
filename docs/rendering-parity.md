@@ -150,6 +150,9 @@ Ordered by how much of a page each one destroyed.
 | `text-decoration` never reaching the text it underlines | It does not inherit, but the line an ancestor draws runs under its in-flow descendants — and the text node carrying the glyphs is where the line is actually drawn. Nothing carried it there, so no link on any page was underlined. |
 | A comment counted as content between two blocks | It took an empty inline box, which broke the two blocks' margins collapsing: a comment written between a heading and a paragraph pushed the paragraph down by the heading's whole margin. |
 | Flow advancing past the content box | A box that states a height and carries padding handed the next block a cursor its own padding too high, and every section below it climbed by that much. |
+| `:placeholder-shown` never matching | An unimplemented pseudo-class matches nothing, which makes the `:not()` around it always true. github floats its newsletter label with `:has(.CtaFormControl-input:not(:placeholder-shown))`, so the rule fired on an *empty* field and every label sat shrunk to 80% and lifted 8px: 93x11px of ink at x=115 where the reference draws 117x15px at x=102. |
+| A placeholder drawn 0.85em above the field's middle | It is text on a line box, and the line box a single-line field gives it is the field's own content box. Positioning it by a guess at the ascent — and in the regular face at zero letter-spacing rather than the field's own — drew every placeholder off its centre and in the wrong face. |
+| A field's `value` never painted | The raster drew the box, the border and the placeholder, and left an `<input value="...">` looking empty; only the GUI's editable overlay showed the text, so a headless screenshot lost it. A filled field must also suppress the placeholder it no longer shows. |
 
 
 ## Where it stands
@@ -160,7 +163,7 @@ pixels:
 
 | fixture | layout | fold | page | height (chromium -> engine) |
 |---|---|---|---|---|
-| github.com | 1.20% | 2.84% | 1.55% | 10570 -> 10553 |
+| github.com | 1.16% | 2.84% | 1.55% | 10570 -> 10553 |
 | yunseong.dev | 1.03% | 2.56% | 2.68% | 4976 -> 4976 |
 | naver.com | 1.21% | 3.10% | 2.68% | 18658 -> 16384 |
 

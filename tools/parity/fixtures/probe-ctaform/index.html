@@ -36,6 +36,10 @@
   .plain > div { background: #ffd; }
   .plain .pair { display: flex; gap: 8px; }
   .plain .pair > * { width: 120px; height: 40px; background: #99f; }
+  .floatwrap { position: relative; width: 280px; height: 56px; margin-bottom: 12px; background: #f6f8fa; border-radius: 8px; }
+  .floatlabel { position: absolute; top: 12px; left: 18px; font-size: 16px; line-height: 24px; transform-origin: 0 0; color: #24292f; }
+  .floatinput { position: absolute; inset: 0; padding: 18px 12px 0 18px; font-size: 16px; border: 0; background: transparent; }
+  .floatwrap:has(.floatinput:not(:placeholder-shown)) .floatlabel { transform: translateY(-8px) scale(0.8); }
 </style>
 </head>
 <body>
@@ -60,5 +64,14 @@
     <div><div class="pair"><i></i><i></i></div></div>
     <input type="text" placeholder="still shown, in red">
   </div>
+  <section>
+    <h2>a floating label</h2>
+    <!-- The pattern github's signup form is built on: the label sits over the
+         field and shrinks out of the way once something is typed, keyed off
+         `:has(input:not(:placeholder-shown))`. An empty field keeps it whole. -->
+    <div class="floatwrap"><label class="floatlabel">Enter your email</label><input class="floatinput" placeholder="you@domain.com"></div>
+    <div class="floatwrap"><label class="floatlabel">Enter your email</label><input class="floatinput" placeholder="you@domain.com" value="me@example.com"></div>
+    <div class="floatwrap"><label class="floatlabel">Enter your email</label><input class="floatinput"></div>
+  </section>
 </body>
 </html>

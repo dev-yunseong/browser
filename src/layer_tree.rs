@@ -1283,6 +1283,43 @@ impl LayerTreeBuilder {
             }
         }
 
+        // A field with something in it draws that, in the field's own colour and
+        // on the same line the placeholder would sit on.
+        if let Some(ref value) = layout.input_value {
+            let font_size = match sv.get(&crate::css::intern("font-size")) {
+                Some(Value::Length(v, _)) => *v,
+                _ => 13.0,
+            };
+            let content_top = d.y + layout.padding.top + layout.border.top;
+            let content_h = (d.height
+                - layout.padding.top
+                - layout.padding.bottom
+                - layout.border.top
+                - layout.border.bottom)
+                .max(font_size);
+            commands.push(PaintCommand::Text {
+                rect: crate::layout::Rect {
+                    x: d.x + layout.padding.left + layout.border.left,
+                    y: content_top,
+                    width: (d.width - layout.padding.left - layout.padding.right).max(0.0),
+                    height: content_h,
+                },
+                text: value.clone(),
+                font_size,
+                line_height: content_h,
+                leading_space: 0.0,
+                color: match sv.get(&crate::css::intern("color")) {
+                    Some(Value::Color(c)) => c.clone(),
+                    _ => Color { r: 0, g: 0, b: 0, a: 255 },
+                },
+                clip: d,
+                style: crate::layout::resolved_font_style(layout.style_node),
+                letter_spacing: crate::layout::resolved_letter_spacing_px(layout.style_node),
+                text_decoration: 0,
+                preserve_newlines: false,
+            });
+        }
+
         // An empty text field shows its placeholder, muted, the way a browser
         // draws it. A field left blank where a page put prompt text reads as a
         // broken control.
@@ -1313,25 +1350,37 @@ impl LayerTreeBuilder {
                     _ => Color { r: 117, g: 117, b: 117, a: 255 },
                 };
                 color.a = (color.a as f32 * opacity.clamp(0.0, 1.0)).round() as u8;
-                // The renderer puts the baseline at rect.y + font_size * 0.85, so
-                // shift the rect to centre the line in the field.
-                let mid_y = d.y + d.height / 2.0;
+                // A single-line field's content box *is* the line its text sits
+                // on, so handing the renderer that box lets its own half-leading
+                // split centre the placeholder exactly where the value would go.
+                // Placing it from a fixed fraction of the font size put it at
+                // the top of a padded field, on top of the floating label a page
+                // draws over it.
+                let content_top = d.y + layout.padding.top + layout.border.top;
+                let content_h = (d.height
+                    - layout.padding.top
+                    - layout.padding.bottom
+                    - layout.border.top
+                    - layout.border.bottom)
+                    .max(font_size);
                 let text_rect = crate::layout::Rect {
                     x: d.x + layout.padding.left + layout.border.left,
-                    y: mid_y - font_size * 0.85,
+                    y: content_top,
                     width: (d.width - layout.padding.left - layout.padding.right).max(0.0),
-                    height: font_size,
+                    height: content_h,
                 };
                 commands.push(PaintCommand::Text {
                     rect: text_rect,
                     text: text.clone(),
                     font_size,
-                    line_height: crate::layout::resolved_line_height_px(layout.style_node),
+                    line_height: content_h,
                     leading_space: 0.0,
                     color,
                     clip: d,
-                    style: crate::font::FontStyle::regular(),
-                    letter_spacing: 0.0,
+                    // The field's own face and spacing, not the default one: a
+                    // placeholder is drawn in the text the field would show.
+                    style: crate::layout::resolved_font_style(layout.style_node),
+                    letter_spacing: crate::layout::resolved_letter_spacing_px(layout.style_node),
                     text_decoration: 0,
                     preserve_newlines: false,
                 });
@@ -2034,16 +2083,50 @@ mod tests {
 
     /// `<input type="text">` must NOT emit an extra Text command (only the egui overlay handles it).
     #[test]
-    fn test_input_text_does_not_emit_label_command() {
+    fn test_a_field_paints_the_value_it_holds() {
+        // The raster is what a screenshot and every headless render show, so a
+        // field's value has to be painted into it. A GUI that overlays a real
+        // text widget draws its own background over this, so the two cannot
+        // double up.
         let tree = build_tree_from_html(
             r#"<input type="text" value="user input" style="width:200px;height:30px;">"#,
             "",
         );
-        // The "user input" text must NOT appear as a Text paint command.
         let found = tree.layers.iter()
             .flat_map(|l| l.content_commands.iter().chain(l.background_commands.iter()))
             .any(|cmd| matches!(cmd, PaintCommand::Text { text, .. } if text == "user input"));
-        assert!(!found, "input[type=text] must not emit a Text paint command for value");
+        assert!(found, "a field with a value must paint it");
+    }
+
+    /// A field showing its value does not also show its placeholder.
+    #[test]
+    fn test_a_filled_field_does_not_also_paint_its_placeholder() {
+        let tree = build_tree_from_html(
+            r#"<input type="text" value="typed" placeholder="hint" style="width:200px;height:30px;">"#,
+            "",
+        );
+        let texts: Vec<&str> = tree.layers.iter()
+            .flat_map(|l| l.content_commands.iter().chain(l.background_commands.iter()))
+            .filter_map(|cmd| match cmd {
+                PaintCommand::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.contains(&"typed"));
+        assert!(!texts.contains(&"hint"), "the placeholder is hidden once something is typed");
+    }
+
+    /// A hidden field paints nothing at all.
+    #[test]
+    fn test_a_hidden_field_paints_no_value() {
+        let tree = build_tree_from_html(
+            r#"<input type="hidden" name="source" value="form-home-signup">"#,
+            "",
+        );
+        let found = tree.layers.iter()
+            .flat_map(|l| l.content_commands.iter().chain(l.background_commands.iter()))
+            .any(|cmd| matches!(cmd, PaintCommand::Text { text, .. } if text == "form-home-signup"));
+        assert!(!found, "a hidden field has nothing to draw");
     }
 
     /// `<input style="border-radius: 24px">` must emit a Rect command with radius > 0.

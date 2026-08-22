@@ -1842,6 +1842,12 @@ pub enum PseudoClass {
     Enabled,
     Disabled,
     Checked,
+    /// `:placeholder-shown` — a text control showing its placeholder, which is
+    /// one with a placeholder and nothing typed in it. A floating-label field
+    /// keys its whole animation off `:not(:placeholder-shown)`, so leaving this
+    /// unimplemented — and therefore never matching — made the `:not()` always
+    /// true and shrank the label of every empty field on the page.
+    PlaceholderShown,
     Empty,
     Unsupported,
 }
@@ -2051,6 +2057,7 @@ fn parse_pseudo_class(token: &str) -> PseudoClass {
         "enabled" => PseudoClass::Enabled,
         "disabled" => PseudoClass::Disabled,
         "checked" => PseudoClass::Checked,
+        "placeholder-shown" => PseudoClass::PlaceholderShown,
         "empty" => PseudoClass::Empty,
         _ => PseudoClass::Unsupported,
     }

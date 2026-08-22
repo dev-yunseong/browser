@@ -57,5 +57,14 @@
   <section><b>button, appearance none</b><br><button class="plainbtn">Appearance none</button></section>
   <section><b>inline-flex pill</b><br><a class="pill" href="#"><span>Sign</span><span>in</span></a></section>
   <section><b>inline-flex pill in a bar</b><div class="bar"><a class="pill" href="#"><span>Sign in</span></a></div></section>
+  <section>
+    <h2>a field draws what it holds</h2>
+    <!-- The raster is what a screenshot shows, so a field's value has to be
+         painted into it; an empty one shows its placeholder instead. -->
+    <p><input value="already typed" style="width: 240px; font-size: 16px; padding: 6px 10px"></p>
+    <p><input placeholder="nothing typed yet" style="width: 240px; font-size: 16px; padding: 6px 10px"></p>
+    <p><input value="typed" placeholder="a hint" style="width: 240px; font-size: 16px; padding: 6px 10px"></p>
+    <p><input value="in a tall field" style="width: 240px; height: 56px; font-size: 16px; padding: 0 10px"></p>
+  </section>
 </body>
 </html>

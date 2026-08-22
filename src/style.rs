@@ -297,6 +297,17 @@ fn matches_pseudo_class(
         PseudoClass::Enabled => !has_attr(node, "disabled"),
         PseudoClass::Disabled => has_attr(node, "disabled"),
         PseudoClass::Checked => has_attr(node, "checked") || has_attr(node, "selected"),
+        PseudoClass::PlaceholderShown => {
+            let attr = |name: &str| {
+                node.attrs
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.as_str())
+            };
+            matches!(node.tag.as_str(), "input" | "textarea")
+                && attr("placeholder").is_some_and(|p| !p.is_empty())
+                && attr("value").is_none_or(|v| v.is_empty())
+        }
         PseudoClass::Empty => arena[idx].children_idx.is_empty(),
         PseudoClass::Unsupported => false,
     }
@@ -2662,6 +2673,51 @@ mod tests {
         }
         let p = find_id(&tree, "p").expect("the paragraph");
         assert_eq!(get_length_px(p, "margin-bottom"), Some(24.0));
+    }
+
+    /// `:placeholder-shown` matches a text control with a placeholder and
+    /// nothing typed in it. Left unimplemented it never matched, which made
+    /// `:not(:placeholder-shown)` always true — and github's floating label,
+    /// which keys its whole animation off exactly that, shrank to 80% on every
+    /// empty field on the page.
+    #[test]
+    fn test_placeholder_shown_matches_an_empty_field_with_a_placeholder() {
+        fn scaled(html: &str, css: &str, id: &str) -> bool {
+            fn find<'a>(n: &'a StyledNode, id: &str) -> Option<&'a StyledNode> {
+                if let markup5ever_rcdom::NodeData::Element { ref attrs, .. } = n.node.data {
+                    if attrs.borrow().iter().any(|a| a.name.local.as_ref() == "id" && a.value.as_ref() == id) {
+                        return Some(n);
+                    }
+                }
+                n.children.iter().find_map(|c| find(c, id))
+            }
+            let tree = make_tree(html, css);
+            find(&tree, id)
+                .map(|n| n.specified_values.get(&intern("transform")).is_some())
+                .unwrap_or(false)
+        }
+
+        let css = ".wrap:has(input:not(:placeholder-shown)) .label { transform: scale(0.8) }";
+
+        // Empty with a placeholder: the placeholder is shown, so the `:not()` is
+        // false and the label keeps its size.
+        assert!(!scaled(
+            r#"<div class="wrap"><label id="l" class="label">Email</label><input placeholder="you@domain.com"></div>"#,
+            css,
+            "l",
+        ));
+        // Something typed: the placeholder is gone and the label shrinks.
+        assert!(scaled(
+            r#"<div class="wrap"><label id="l" class="label">Email</label><input placeholder="you@domain.com" value="me@example.com"></div>"#,
+            css,
+            "l",
+        ));
+        // No placeholder at all: there is none to show, so the `:not()` holds.
+        assert!(scaled(
+            r#"<div class="wrap"><label id="l" class="label">Email</label><input></div>"#,
+            css,
+            "l",
+        ));
     }
 
     /// `:has()` is how a modern design system reacts to what an element

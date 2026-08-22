@@ -1404,6 +1404,10 @@ pub struct LayoutBox<'a> {
     /// Placeholder text for an empty text field, drawn muted the way a browser
     /// draws it.
     pub input_placeholder: Option<String>,
+    /// The text a field already holds. Painted like the placeholder but in the
+    /// field's own colour; a GUI that overlays a real text widget draws its own
+    /// background over this, so the raster and the widget cannot double up.
+    pub input_value: Option<String>,
     pub event_handlers: HashMap<String, String>,
     pub display: DisplayType,
     pub z_index: i32,
@@ -1481,6 +1485,7 @@ impl<'a> Clone for LayoutBox<'a> {
                         alt_text: src.alt_text.clone(),
                         input_label: src.input_label.clone(),
                         input_placeholder: src.input_placeholder.clone(),
+                        input_value: src.input_value.clone(),
                         event_handlers: src.event_handlers.clone(),
                         display: src.display,
                         z_index: src.z_index,
@@ -1675,6 +1680,7 @@ impl<'a> LayoutBox<'a> {
             alt_text: None,
             input_label: None,
             input_placeholder: None,
+            input_value: None,
             event_handlers: HashMap::new(),
             display,
             z_index,
@@ -1727,12 +1733,16 @@ impl<'a> LayoutBox<'a> {
                     },
                 });
             } else if input_value.as_deref().unwrap_or("").is_empty() {
-                // Only the placeholder is painted. A field's typed value is drawn
-                // by the real text widget the GUI overlays on the raster, so
-                // painting it here as well would double-draw it.
+                // An empty field shows its placeholder.
                 if let Some(placeholder) = input_placeholder.filter(|p| !p.is_empty()) {
                     layout.input_placeholder = Some(placeholder);
                 }
+            } else if tag == "input" && !matches!(input_type.as_str(), "hidden" | "checkbox" | "radio") {
+                // A field with something in it shows that instead. Leaving it to
+                // the text widget a GUI overlays meant the raster — which is what
+                // a screenshot and every headless render is — showed an empty box
+                // where the page had a filled one.
+                layout.input_value = input_value;
             }
         }
         layout
