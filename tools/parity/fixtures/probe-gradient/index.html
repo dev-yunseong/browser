@@ -23,6 +23,12 @@
   .ell { height: 120px; background: radial-gradient(141.53% 114.68% at 87.46% 55.27%, rgb(154,124,255) 36.75%, rgba(14,10,162,0) 100%); }
   .ell2 { height: 120px; background: radial-gradient(40% 90% at 30% 50%, #ffc58b 10%, #e1a6ff 40%, rgba(53,44,238,0) 100%); }
   .ell3 { height: 120px; background: radial-gradient(120px at 50% 50%, #0c8 0%, rgba(0,204,136,0) 100%); }
+  /* CSS lets the four corners differ, and lets each carry its own horizontal
+     and vertical radius after a slash. */
+  .r1 { height: 60px; background: #6cf; border-radius: 24px 24px 0 0; }
+  .r2 { height: 60px; background: #f96; border-radius: 40px 8px; }
+  .r3 { height: 60px; background: #9c6; border-radius: 60px / 20px; }
+  .r4 { height: 60px; background: #c9f; border-radius: 10% 40% 60% 20% / 20% 60% 40% 10%; }
   .sharp { position: absolute; bottom: 8px; left: 52%; width: 40%; height: 40px; border-radius: 50%; background: linear-gradient(90deg, #fc9, #9cf); filter: blur(6px); }
 </style>
 </head>
@@ -32,6 +38,10 @@
   <div class="four"></div>
   <div class="positioned"></div>
   <div class="mixed"></div>
+  <div class="r1"></div>
+  <div class="r2"></div>
+  <div class="r3"></div>
+  <div class="r4"></div>
   <div class="ell"></div>
   <div class="ell2"></div>
   <div class="ell3"></div>

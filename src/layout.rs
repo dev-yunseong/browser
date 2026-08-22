@@ -1291,6 +1291,17 @@ pub struct LayoutBox<'a> {
     pub content_box_width: bool,
     /// The height axis of `content_box_width`.
     pub content_box_height: bool,
+    /// Whether this box was placed against a containing block outside the
+    /// subtree it sits in — an out-of-flow box whose positioned ancestor is
+    /// further up than its parent.
+    ///
+    /// Such a box is already in page coordinates the moment it is placed, so
+    /// moving the subtree around it must leave it where it is: a flex or grid
+    /// item is laid out at the origin and offset into place afterwards, and
+    /// carrying an absolutely positioned descendant along with it moved that
+    /// descendant twice. github's hero carousel put its video 52px right of
+    /// where the page has it, exactly the offset of the column it sits in.
+    pub escapes_ancestor_offset: bool,
 }
 
 impl<'a> Clone for LayoutBox<'a> {
@@ -1345,6 +1356,7 @@ impl<'a> Clone for LayoutBox<'a> {
                         list_marker: src.list_marker.clone(),
                         content_box_width: src.content_box_width,
                         content_box_height: src.content_box_height,
+                        escapes_ancestor_offset: src.escapes_ancestor_offset,
                     };
                     let num_children = src.children.len();
                     // Push Post first so it is processed after all children.
@@ -1537,6 +1549,7 @@ impl<'a> LayoutBox<'a> {
             list_marker: None,
             content_box_width: false,
             content_box_height: false,
+            escapes_ancestor_offset: false,
         };
 
         if let NodeData::Element {
@@ -2624,7 +2637,7 @@ impl<'a> LayoutBox<'a> {
 
                     let dx = x - item.cb.dimensions.x;
                     let dy = y - item.cb.dimensions.y;
-                    offset_layout_box(&mut item.cb, dx, dy);
+                    offset_item_keeping_escapes(&mut item.cb, dx, dy);
 
                     main_cursor += main_size(&item.cb);
 
@@ -2827,6 +2840,10 @@ impl<'a> LayoutBox<'a> {
                         let dx = target_x - pc.dimensions.x;
                         let dy = target_y - pc.dimensions.y;
                         offset_layout_box(&mut pc, dx, dy);
+                        // Placed against a containing block further up than its
+                        // parent, so it is already in page coordinates — see
+                        // `escapes_ancestor_offset`.
+                        pc.escapes_ancestor_offset = !self_establishes_cb;
                         self.children.push(pc);
                     }
                 }
@@ -3212,7 +3229,7 @@ impl<'a> LayoutBox<'a> {
                 let item_y = cell_y + item.cb.margin.top + block_offset;
                 let dx = item_x - item.cb.dimensions.x;
                 let dy = item_y - item.cb.dimensions.y;
-                offset_layout_box(&mut item.cb, dx, dy);
+                offset_item_keeping_escapes(&mut item.cb, dx, dy);
 
                 max_child_x = max_child_x.max(
                     item.cb.dimensions.x + outer_width(&item.cb) + item.cb.margin.right,
@@ -3933,6 +3950,10 @@ impl<'a> LayoutBox<'a> {
                     let dx = target_x - pc.dimensions.x;
                     let dy = target_y - pc.dimensions.y;
                     offset_layout_box(&mut pc, dx, dy);
+                    // Placed against a containing block further up than its
+                    // parent, so it is already in page coordinates — see
+                    // `escapes_ancestor_offset`.
+                    pc.escapes_ancestor_offset = !self_establishes_cb;
 
                     let at = (sibling_index + inserted).min(self.children.len());
                     self.children.insert(at, pc);
@@ -4664,6 +4685,31 @@ pub fn offset_layout_box(layout: &mut LayoutBox, dx: f32, dy: f32) {
         // SAFETY: Each pointer comes from a uniquely-owned LayoutBox node; no two
         // entries on the stack alias the same allocation.
         let node = unsafe { &mut *ptr };
+        node.dimensions.x += dx;
+        node.dimensions.y += dy;
+        for child in &mut node.children {
+            stack.push(child as *mut LayoutBox);
+        }
+    }
+}
+
+/// Move a flex or grid item into its place, leaving behind the out-of-flow
+/// boxes inside it that were placed against a containing block further up.
+///
+/// Such an item is laid out at the origin and offset afterwards, so everything
+/// measured in its own space has to move — but a descendant already placed in
+/// page coordinates has not, and carrying it along moved it twice. github's
+/// hero carousel put its video 52px right of where the page has it, exactly the
+/// offset of the column it sits in.
+fn offset_item_keeping_escapes(layout: &mut LayoutBox, dx: f32, dy: f32) {
+    let mut stack: Vec<*mut LayoutBox> = vec![layout as *mut LayoutBox];
+    let root: *const LayoutBox = layout as *const LayoutBox;
+    while let Some(ptr) = stack.pop() {
+        // SAFETY: as in `offset_layout_box`.
+        let node = unsafe { &mut *ptr };
+        if !std::ptr::eq(node as *const LayoutBox, root) && node.escapes_ancestor_offset {
+            continue;
+        }
         node.dimensions.x += dx;
         node.dimensions.y += dy;
         for child in &mut node.children {
@@ -8517,6 +8563,35 @@ mod tests {
             (r.dimensions.width - 240.0).abs() < 1.0,
             "120 tall at 2:1 is 240 wide, got {}",
             r.dimensions.width
+        );
+    }
+
+    /// A flex or grid item is laid out at the origin and offset into place
+    /// afterwards, so everything measured in its own space moves with it — but
+    /// an out-of-flow descendant placed against a containing block further up
+    /// is already in page coordinates, and carrying it along moves it twice.
+    /// github's hero carousel put its video 52px right of where the page has
+    /// it, exactly the offset of the column it sits in.
+    #[test]
+    fn test_an_escaping_absolute_box_does_not_move_with_its_flex_item() {
+        let html = r#"<div style="width:800px">
+            <div id="cb" style="position:relative;display:flex">
+                <div style="width:120px">first</div>
+                <div style="width:0">
+                    <div id="overlay" style="position:absolute;left:0;top:0;width:40px;height:40px"></div>
+                </div>
+            </div>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let cb = find_element_by_id(&layout, "cb").expect("cb");
+        let overlay = find_element_by_id(&layout, "overlay").expect("overlay");
+        assert!(
+            (overlay.dimensions.x - cb.dimensions.x).abs() < 0.5,
+            "`left: 0` puts the overlay on the containing block's own edge ({}), not 120px along \
+             with the item it sits in; got {}",
+            cb.dimensions.x,
+            overlay.dimensions.x
         );
     }
 

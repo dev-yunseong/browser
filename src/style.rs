@@ -1576,6 +1576,15 @@ fn make_pseudo_styled_node(
         if decl.name.as_ref() == "content" { continue; }
         let value = match &decl.value {
             v @ Value::CssVar { .. } => resolve_var(v, &custom_props, 0).unwrap_or_else(|| v.clone()),
+            // `border-radius: inherit` is how a generated box takes the shape of
+            // the box it decorates, and it is the element it hangs off that it
+            // inherits from.
+            Value::Keyword(k) if k.as_ref() == "inherit" => {
+                match parent_values.get(&decl.name) {
+                    Some(v) => v.clone(),
+                    None => continue,
+                }
+            }
             v => v.clone(),
         };
         map.insert(decl.name.clone(), value);
@@ -2446,15 +2455,8 @@ pub fn parse_inline_style_into_vec(style_str: &str, list: &mut Vec<crate::css::D
                 list.push(crate::css::Declaration { name: intern("row-gap"), value: row_val, important });
                 list.push(crate::css::Declaration { name: intern("column-gap"), value: col_val, important });
             }
-            // border-radius shorthand: "border-radius: <tl> [<tr> [<br> [<bl>]]]"
-            // Use the first (top-left) value as a uniform radius.  The "/" elliptical syntax
-            // is not supported; we take the text before any "/" as the horizontal radii list
-            // and use the first token from that.
             "border-radius" => {
-                let first = val.split_whitespace().next().unwrap_or("0");
-                let first = first.split('/').next().unwrap_or("0").trim();
-                let value = crate::css::parse_value(first);
-                list.push(crate::css::Declaration { name: key, value, important });
+                crate::css::expand_border_radius(val, important, list);
             }
             "box-shadow" => {
                 if let Some(shadow) = crate::css::parse_box_shadow(val) {

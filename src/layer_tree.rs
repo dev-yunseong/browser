@@ -20,26 +20,54 @@ pub enum ObjectFit {
 
 // ── Paint Commands ────────────────────────────────────────────────────────────
 
-/// A corner radius, horizontal and vertical.
+/// The four corner radii of a box, each horizontal and vertical.
 ///
 /// CSS gives every corner both, and they only coincide when the radius is a
 /// length: `border-radius: 50%` on a wide box is a full ellipse, not a stadium.
+/// It also lets the four corners differ — `border-radius: 24px 24px 0 0` is how
+/// a page rounds the top of a panel and leaves it flush at the bottom — so one
+/// radius for the whole box drew a card square where the page wanted it curved.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct CornerRadii {
-    pub x: f32,
-    pub y: f32,
+    pub top_left: (f32, f32),
+    pub top_right: (f32, f32),
+    pub bottom_right: (f32, f32),
+    pub bottom_left: (f32, f32),
 }
 
 impl CornerRadii {
-    pub const NONE: Self = CornerRadii { x: 0.0, y: 0.0 };
+    pub const NONE: Self = CornerRadii {
+        top_left: (0.0, 0.0),
+        top_right: (0.0, 0.0),
+        bottom_right: (0.0, 0.0),
+        bottom_left: (0.0, 0.0),
+    };
 
-    /// The same radius on both axes — what a length radius gives.
+    /// The same radius on every corner and both axes — what a single length
+    /// radius gives.
     pub fn uniform(r: f32) -> Self {
-        CornerRadii { x: r, y: r }
+        CornerRadii {
+            top_left: (r, r),
+            top_right: (r, r),
+            bottom_right: (r, r),
+            bottom_left: (r, r),
+        }
+    }
+
+    /// One radius per axis, the same on every corner.
+    pub fn elliptical(x: f32, y: f32) -> Self {
+        CornerRadii {
+            top_left: (x, y),
+            top_right: (x, y),
+            bottom_right: (x, y),
+            bottom_left: (x, y),
+        }
     }
 
     pub fn is_rounded(self) -> bool {
-        self.x > 0.0 && self.y > 0.0
+        [self.top_left, self.top_right, self.bottom_right, self.bottom_left]
+            .iter()
+            .any(|(x, y)| *x > 0.0 && *y > 0.0)
     }
 }
 
@@ -423,18 +451,11 @@ impl LayerTreeBuilder {
                         continue;
                     }
 
-                    let border_radius = match frame_layout
-                        .style_node
-                        .specified_values
-                        .get(&crate::css::intern("border-radius"))
-                    {
-                        Some(Value::Length(v, crate::css::Unit::Percent)) => CornerRadii {
-                            x: d.width * (v / 100.0),
-                            y: d.height * (v / 100.0),
-                        },
-                        Some(Value::Length(v, _)) => CornerRadii::uniform(*v),
-                        _ => CornerRadii::NONE,
-                    };
+                    let border_radius = Self::read_corner_radii(
+                        &frame_layout.style_node.specified_values,
+                        d.width,
+                        d.height,
+                    );
 
                     let (triggers, matrix) = Self::detect_triggers(frame_layout);
 
@@ -680,6 +701,45 @@ impl LayerTreeBuilder {
         }
     }
 
+    /// The four corner radii of a box, resolved against its own size.
+    ///
+    /// Each corner has its own longhand, which the `border-radius` shorthand
+    /// expands into. A percentage is a fraction of the box on each axis
+    /// separately, which is what makes `border-radius: 50%` an ellipse.
+    fn read_corner_radii(sv: &crate::style::PropertyMap, width: f32, height: f32) -> CornerRadii {
+        let axis = |v: &Value, extent: f32| -> f32 {
+            match v {
+                Value::Length(n, crate::css::Unit::Percent) => extent * (n / 100.0),
+                Value::Length(n, _) => *n,
+                _ => 0.0,
+            }
+        };
+        let corner = |prop: &str| -> (f32, f32) {
+            match sv.get(&crate::css::intern(prop)) {
+                // `12px 8px` on one corner: the horizontal radius then the
+                // vertical one, kept as a pair the parser could not fold.
+                Some(Value::Keyword(k)) => {
+                    let mut parts = k.split_whitespace();
+                    let x = parts.next().and_then(crate::css::parse_length);
+                    let y = parts.next().and_then(crate::css::parse_length);
+                    match (x, y) {
+                        (Some(x), Some(y)) => (axis(&x, width), axis(&y, height)),
+                        (Some(x), None) => (axis(&x, width), axis(&x, height)),
+                        _ => (0.0, 0.0),
+                    }
+                }
+                Some(v) => (axis(v, width), axis(v, height)),
+                None => (0.0, 0.0),
+            }
+        };
+        CornerRadii {
+            top_left: corner("border-top-left-radius"),
+            top_right: corner("border-top-right-radius"),
+            bottom_right: corner("border-bottom-right-radius"),
+            bottom_left: corner("border-bottom-left-radius"),
+        }
+    }
+
     fn compute_transform_matrix(ops: &[TransformOp], elem_width: f32, elem_height: f32) -> Matrix4x4 {
         let mut result = Matrix4x4::identity();
         for op in ops {
@@ -717,18 +777,8 @@ impl LayerTreeBuilder {
         // `border-radius: 50%` on a wide box is a pill, and reading the 50 as
         // pixels drew a barely-rounded rectangle where the page wanted a soft
         // blob. (CSS makes each corner an ellipse — a percentage of the width
-        // horizontally and of the height vertically; the painter takes one
-        // radius, so the smaller side decides.)
-        let radius = match sv.get(&crate::css::intern("border-radius")) {
-            // A percentage is a fraction of the box on each axis separately,
-            // which is what makes `border-radius: 50%` an ellipse.
-            Some(Value::Length(v, crate::css::Unit::Percent)) => CornerRadii {
-                x: d.width * (v / 100.0),
-                y: d.height * (v / 100.0),
-            },
-            Some(Value::Length(v, _)) => CornerRadii::uniform(*v),
-            _ => CornerRadii::NONE,
-        };
+        // horizontally and of the height vertically.)
+        let radius = Self::read_corner_radii(sv, d.width, d.height);
 
         let mut commands = Vec::new();
 

@@ -353,7 +353,7 @@ fn build_clip_mask(
 
     let local_rect = LayoutRect { x: rect.x + tx, y: rect.y + ty, width: rect.width, height: rect.height };
     let path = if radius.is_rounded() {
-        create_elliptical_rect_path(local_rect, radius.x, radius.y)
+        create_elliptical_rect_path(local_rect, radius)
     } else {
         tiny_skia::Rect::from_xywh(local_rect.x, local_rect.y, local_rect.width, local_rect.height)
             .and_then(|tr| { let mut pb = PathBuilder::new(); pb.push_rect(tr); pb.finish() })
@@ -439,7 +439,7 @@ fn execute_commands_on_tile(
                 let mut stroke = Stroke::default();
                 stroke.width = *w;
                 if radius.is_rounded() {
-                    if let Some(path) = create_elliptical_rect_path(*r, radius.x, radius.y) {
+                    if let Some(path) = create_elliptical_rect_path(*r, *radius) {
                         pixmap.stroke_path(&path, &paint, &stroke, transform, active_mask!());
                     }
                 } else if let Some(tr) = tiny_skia::Rect::from_xywh(r.x + w/2.0, r.y + w/2.0, (r.width - w).max(0.0), (r.height - w).max(0.0)) {
@@ -752,7 +752,7 @@ fn fill_background_shape(
 
     let draw = |target: &mut Pixmap, r: LayoutRect, tf: Transform, mask: Option<&Mask>| {
         if radius.is_rounded() {
-            if let Some(path) = create_elliptical_rect_path(r, radius.x, radius.y) {
+            if let Some(path) = create_elliptical_rect_path(r, radius) {
                 target.fill_path(&path, &paint, FillRule::Winding, tf, mask);
             }
         } else if let Some(tr) = tiny_skia::Rect::from_xywh(r.x, r.y, r.width, r.height) {
@@ -888,20 +888,29 @@ fn draw_broken_image(
 /// coincide when the radius is a length. `border-radius: 50%` on a wide box is
 /// a full ellipse, not a stadium, which is how a page draws a soft blob or a
 /// pill; drawing it with one radius left straight edges along the long sides.
-fn create_elliptical_rect_path(r: LayoutRect, rx: f32, ry: f32) -> Option<tiny_skia::Path> {
+fn create_elliptical_rect_path(r: LayoutRect, radii: CornerRadii) -> Option<tiny_skia::Path> {
     let mut pb = PathBuilder::new();
     let rect = tiny_skia::Rect::from_xywh(r.x, r.y, r.width, r.height)?;
-    let rx = rx.max(0.0).min(rect.width() / 2.0);
-    let ry = ry.max(0.0).min(rect.height() / 2.0);
-    pb.move_to(rect.left() + rx, rect.top());
-    pb.line_to(rect.right() - rx, rect.top());
-    pb.quad_to(rect.right(), rect.top(), rect.right(), rect.top() + ry);
-    pb.line_to(rect.right(), rect.bottom() - ry);
-    pb.quad_to(rect.right(), rect.bottom(), rect.right() - rx, rect.bottom());
-    pb.line_to(rect.left() + rx, rect.bottom());
-    pb.quad_to(rect.left(), rect.bottom(), rect.left(), rect.bottom() - ry);
-    pb.line_to(rect.left(), rect.top() + ry);
-    pb.quad_to(rect.left(), rect.top(), rect.left() + rx, rect.top());
+    // CSS scales every radius down together when two along one side would
+    // overlap, so a `border-radius: 24px 24px 0 0` panel narrower than 48px
+    // keeps its shape rather than having one corner clipped.
+    let half_w = rect.width() / 2.0;
+    let half_h = rect.height() / 2.0;
+    let corner = |(x, y): (f32, f32)| (x.max(0.0).min(half_w), y.max(0.0).min(half_h));
+    let (tlx, tly) = corner(radii.top_left);
+    let (trx, try_) = corner(radii.top_right);
+    let (brx, bry) = corner(radii.bottom_right);
+    let (blx, bly) = corner(radii.bottom_left);
+
+    pb.move_to(rect.left() + tlx, rect.top());
+    pb.line_to(rect.right() - trx, rect.top());
+    pb.quad_to(rect.right(), rect.top(), rect.right(), rect.top() + try_);
+    pb.line_to(rect.right(), rect.bottom() - bry);
+    pb.quad_to(rect.right(), rect.bottom(), rect.right() - brx, rect.bottom());
+    pb.line_to(rect.left() + blx, rect.bottom());
+    pb.quad_to(rect.left(), rect.bottom(), rect.left(), rect.bottom() - bly);
+    pb.line_to(rect.left(), rect.top() + tly);
+    pb.quad_to(rect.left(), rect.top(), rect.left() + tlx, rect.top());
     pb.close();
     pb.finish()
 }
@@ -910,7 +919,7 @@ fn create_rounded_rect_path(r: LayoutRect, radius: f32) -> Option<tiny_skia::Pat
     // A length radius is clamped by the shorter side, so the corners stay
     // circular rather than turning into ellipses on a long box.
     let radius = radius.min(r.width.min(r.height) / 2.0);
-    create_elliptical_rect_path(r, radius, radius)
+    create_elliptical_rect_path(r, CornerRadii::uniform(radius))
 }
 
 
@@ -1633,7 +1642,7 @@ mod tests {
         let cmds = vec![PaintCommand::Rect(
             rect,
             Color { r: 0, g: 0, b: 0, a: 255 },
-            crate::layer_tree::CornerRadii { x: 100.0, y: 30.0 },
+            crate::layer_tree::CornerRadii::elliptical(100.0, 30.0),
             0.0,
         )];
         let base_url = Url::parse("https://example.com/").unwrap();

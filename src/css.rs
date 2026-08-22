@@ -768,17 +768,8 @@ pub fn parse_css(source: &str) -> Stylesheet {
                         });
                     }
                 }
-                // border-radius shorthand: "border-radius: <tl> [<tr> [<br> [<bl>]]]"
-                // CSS allows up to 4 corner values.  We use the top-left (first) value as a
-                // uniform radius for all corners — sufficient for the rounded-input / button
-                // use-case (Google search bar, etc.).  The "/" elliptical syntax is not supported.
                 "border-radius" => {
-                    let parts = split_respecting_parens(&val_raw);
-                    let first = parts.first().map(String::as_str).unwrap_or("0");
-                    // Strip the "/" elliptical part if present (e.g. "8px / 4px")
-                    let first = first.split('/').next().unwrap_or("0").trim();
-                    let value = parse_value(first);
-                    declarations.push(Declaration { name: key, value, important });
+                    expand_border_radius(&val_raw, important, &mut declarations);
                 }
                 "padding" => {
                     let mut temp_map = HashMap::new();
@@ -1545,6 +1536,50 @@ fn physical_pair_for(key: &str) -> Option<(&'static str, &'static str)> {
         "border-block-color" => ("border-top-color", "border-bottom-color"),
         _ => return None,
     })
+}
+
+/// Expand the `border-radius` shorthand into its four corner longhands.
+///
+/// CSS lets the corners differ — `border-radius: 24px 24px 0 0` rounds the top
+/// of a panel and leaves it flush at the bottom — and lets each corner carry a
+/// separate horizontal and vertical radius after a slash. Reading only a single
+/// value drew every such panel square.
+///
+/// A corner whose two radii differ is kept as the pair, since no single `Value`
+/// can hold both; `layer_tree` splits it again when it resolves them against the
+/// box.
+pub fn expand_border_radius(val_raw: &str, important: bool, declarations: &mut Vec<Declaration>) {
+    let (horiz_src, vert_src) = match val_raw.split_once('/') {
+        Some((h, v)) => (h, v),
+        None => (val_raw, val_raw),
+    };
+    let expand = |src: &str| -> Option<[String; 4]> {
+        let parts: Vec<&str> = src.split_whitespace().collect();
+        Some(match parts.as_slice() {
+            [a] => [a.to_string(), a.to_string(), a.to_string(), a.to_string()],
+            [a, b] => [a.to_string(), b.to_string(), a.to_string(), b.to_string()],
+            [a, b, c] => [a.to_string(), b.to_string(), c.to_string(), b.to_string()],
+            [a, b, c, d] => [a.to_string(), b.to_string(), c.to_string(), d.to_string()],
+            _ => return None,
+        })
+    };
+    let (Some(h), Some(v)) = (expand(horiz_src), expand(vert_src)) else {
+        return;
+    };
+    const CORNERS: [&str; 4] = [
+        "border-top-left-radius",
+        "border-top-right-radius",
+        "border-bottom-right-radius",
+        "border-bottom-left-radius",
+    ];
+    for (i, prop) in CORNERS.iter().enumerate() {
+        let value = if h[i] == v[i] {
+            parse_value(&h[i])
+        } else {
+            Value::Keyword(intern(&format!("{} {}", h[i], v[i])))
+        };
+        declarations.push(Declaration { name: intern(prop), value, important });
+    }
 }
 
 /// Expand the `flex` shorthand into its three longhands.
@@ -2759,7 +2794,7 @@ fn parse_math_term(expr: &str) -> Option<MathExpr> {
 /// The numeric part must actually parse: a keyword that merely ends in a unit's
 /// letters is not a length. `display: flex` ends in `ex`, and reading it as one
 /// turned every flex container into a block.
-fn parse_length(val: &str) -> Option<Value> {
+pub fn parse_length(val: &str) -> Option<Value> {
     // Longer units first, so `rem` is not read as `em`.
     const UNITS: [(&str, Unit); 9] = [
         ("px", Unit::Px),
