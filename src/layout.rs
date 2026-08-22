@@ -69,13 +69,19 @@ impl IntrinsicSizeCache {
                         // changes a run's width, and sizing a box from the
                         // untransformed source makes uppercased text wrap inside
                         // a box built for its lowercase original.
-                        Some(measure_text_width(
-                            &apply_text_transform(&contents.borrow(), &node.specified_values),
-                            font_size,
-                            f32::INFINITY,
-                            resolved_font_style(node),
-                            resolved_letter_spacing_px(node),
-                        ))
+                        {
+                            let raw = contents.borrow().to_string();
+                            let text = apply_text_transform(&raw, &node.specified_values);
+                            Some(
+                                measure_text_width(
+                                    &text,
+                                    font_size,
+                                    f32::INFINITY,
+                                    resolved_font_style(node),
+                                    resolved_letter_spacing_px(node),
+                                ) + collapsed_space_width(node, &raw, font_size),
+                            )
+                        }
                     } else {
                         let disp = get_display_type(node);
                         if disp == DisplayType::Image {
@@ -279,6 +285,27 @@ impl IntrinsicSizeCache {
 
         val_stack.pop().unwrap_or(0.0)
     }
+}
+
+/// The width of the collapsed whitespace a text node contributes to the run
+/// around it.
+///
+/// Layout keeps one space where a text node begins or ends with whitespace, so
+/// the intrinsic measurement has to keep it too. Trimming it away — as
+/// `measure_text_width` does — made a run measure narrower than it lays out,
+/// and a date like `2026-02 — Present`, written as two spans, wrapped inside a
+/// box built without the space between them.
+fn collapsed_space_width(node: &StyledNode, raw: &str, font_size: f32) -> f32 {
+    let fonts = crate::font::fonts();
+    let space = fonts.advance(' ', font_size.max(1.0), resolved_font_style(node))
+        + resolved_letter_spacing_px(node);
+    if raw.trim().is_empty() {
+        // A whitespace-only node between two inline siblings is one space.
+        return if raw.is_empty() { 0.0 } else { space };
+    }
+    let leading = raw.starts_with(|c: char| c.is_whitespace());
+    let trailing = raw.ends_with(|c: char| c.is_whitespace());
+    space * (leading as u8 + trailing as u8) as f32
 }
 
 /// Measure the width of `text` rendered at `font_size` px.
@@ -6421,6 +6448,34 @@ mod tests {
             d.dimensions.height < line * 1.8,
             "everything stays on one line: height={}, line={line}",
             d.dimensions.height
+        );
+    }
+
+    /// Layout keeps one space where a text node begins or ends with
+    /// whitespace, so the intrinsic measurement has to keep it too. Trimming it
+    /// away made a run measure narrower than it lays out, and a date written as
+    /// two spans wrapped inside a box built without the space between them.
+    #[test]
+    fn test_max_content_keeps_the_space_between_two_runs() {
+        let html = r#"<div style="width:800px"><p id="p" style="display:inline-block"><span>2026-02</span><span> — Present</span></p></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let p = find_element_by_id(&layout, "p").expect("p");
+        let fonts = crate::font::fonts();
+        let regular = crate::font::FontStyle::regular();
+        let text = fonts.measure("2026-02", 16.0, regular, 0.0)
+            + fonts.advance(' ', 16.0, regular)
+            + fonts.measure("— Present", 16.0, regular, 0.0);
+        assert!(
+            p.dimensions.width >= text - 1.0,
+            "the box covers both runs and the space between them: width={}, text={text}",
+            p.dimensions.width
+        );
+        let line = fonts.normal_line_height(16.0, regular);
+        assert!(
+            p.dimensions.height < line * 1.8,
+            "so it stays on one line: height={}, line={line}",
+            p.dimensions.height
         );
     }
 
