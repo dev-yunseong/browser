@@ -573,6 +573,9 @@ pub struct LayoutBox<'a> {
     pub children: Vec<LayoutBox<'a>>,
     pub link_url: Option<String>,
     pub image_url: Option<String>,
+    /// Width of the collapsed inter-element space reserved at the start of this
+    /// text box, which paint must skip before placing the first glyph.
+    pub text_leading: f32,
     pub alt_text: Option<String>,
     /// Label text for button/submit/reset input elements.
     /// Sourced from the `value` attribute of `<input type="submit|button|reset">`.
@@ -628,6 +631,7 @@ impl<'a> Clone for LayoutBox<'a> {
                         children: Vec::with_capacity(src.children.len()),
                         link_url: src.link_url.clone(),
                         image_url: src.image_url.clone(),
+                        text_leading: src.text_leading,
                         alt_text: src.alt_text.clone(),
                         input_label: src.input_label.clone(),
                         event_handlers: src.event_handlers.clone(),
@@ -816,6 +820,7 @@ impl<'a> LayoutBox<'a> {
             children: Vec::new(),
             link_url: None,
             image_url: None,
+            text_leading: 0.0,
             alt_text: None,
             input_label: None,
             event_handlers: HashMap::new(),
@@ -2841,6 +2846,11 @@ impl<'a> LayoutBox<'a> {
 
         max_w = max_w.max(line_w);
 
+        // The collapsed inter-element space is reserved inside this box's width,
+        // but it sits *before* the glyphs. Paint trims the run before drawing, so
+        // it needs to be told how far in to start — otherwise the text after an
+        // inline element is drawn a space too far left and runs into it.
+        self.text_leading = if has_leading_space { space_w } else { 0.0 };
         self.dimensions.x = current_x + self.margin.left;
         self.dimensions.y = current_y + self.margin.top;
         self.dimensions.width = if no_wrap {

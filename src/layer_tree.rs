@@ -38,6 +38,8 @@ pub enum PaintCommand {
         font_size: f32,
         /// Line box height, so paint wraps at the same places layout measured.
         line_height: f32,
+        /// Space layout reserved before the first glyph of this run.
+        leading_space: f32,
         color: Color,
         clip: LayoutRect,
         /// `true` when `font-weight: bold` (or numeric >= 600)
@@ -790,6 +792,7 @@ impl LayerTreeBuilder {
                     text: apply_text_transform(&contents.borrow(), sv),
                     font_size,
                     line_height: crate::layout::resolved_line_height_px(layout.style_node),
+                    leading_space: layout.text_leading,
                     color,
                     clip,
                     bold,
@@ -825,6 +828,7 @@ impl LayerTreeBuilder {
                     text: marker.clone(),
                     font_size,
                     line_height: crate::layout::resolved_line_height_px(layout.style_node),
+                    leading_space: 0.0,
                     color,
                     clip,
                     bold: false,
@@ -865,6 +869,7 @@ impl LayerTreeBuilder {
                     text: label.clone(),
                     font_size,
                     line_height: crate::layout::resolved_line_height_px(layout.style_node),
+                    leading_space: 0.0,
                     color,
                     clip: d, // clip to the button bounds
                     bold: false,

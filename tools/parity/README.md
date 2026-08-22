@@ -68,3 +68,13 @@ code, and the rect collectors — in one change, with
 `test_button_coordinate_collection` and `test_border_box_min_size_includes_padding`
 updated to the chosen model. It is not a local edit; a half-migration renders
 worse than either model alone.
+
+## Known limitation: inline runs do not fragment across lines
+
+A text run is one box with one rect. When a run starts mid-line and wraps, the
+continuation is drawn from that same rect's left edge rather than from the start
+of the line box, so the second line of a paragraph containing inline elements is
+indented by however far into the line the run began (`probe-inline`).
+
+Fixing it means fragmenting an inline box into one rect per line it occupies,
+which the line-building code does not currently model.

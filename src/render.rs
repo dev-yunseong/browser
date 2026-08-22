@@ -397,13 +397,15 @@ fn execute_commands_on_tile(
                     draw_broken_image(pixmap, *r, alt, transform);
                 }
             }
-            PaintCommand::Text { rect, text, font_size, line_height, color, clip, bold, italic, text_decoration } => {
+            PaintCommand::Text { rect, text, font_size, line_height, leading_space, color, clip, bold, italic, text_decoration } => {
                 let mut adjusted_rect = *rect;
                 adjusted_rect.x += tx;
                 adjusted_rect.y += ty;
                 let mut adjusted_clip = *clip;
                 adjusted_clip.x += tx;
                 adjusted_clip.y += ty;
+                adjusted_rect.x += *leading_space;
+                adjusted_rect.width = (adjusted_rect.width - *leading_space).max(0.0);
                 render_text_raw(text.clone(), adjusted_rect, *font_size, *line_height, color, adjusted_clip, pixmap, *bold, *italic, *text_decoration);
             }
             PaintCommand::Shadow(r, s) => {
@@ -954,6 +956,16 @@ fn blend_glyph_pixel(pixmap: &mut Pixmap, x: u32, y: u32, coverage: f32, color: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serialises the tests that depend on the glyph cache's contents.
+    ///
+    /// The cache is process-global, so two such tests running at once clear each
+    /// other's entries and fail intermittently on whichever lost the race.
+    fn cache_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     use crate::layout::Rect as LayoutRect;
     use crate::css::Color;
 
@@ -977,6 +989,7 @@ mod tests {
     /// must be bit-for-bit identical to the first rasterization).
     #[test]
     fn test_glyph_cache_produces_identical_output() {
+        let _guard = cache_guard();
         clear_glyph_cache();
 
         let rect = full_rect(200.0, 40.0);
@@ -997,6 +1010,7 @@ mod tests {
     /// The glyph cache must be populated after the first render.
     #[test]
     fn test_glyph_cache_is_populated_after_render() {
+        let _guard = cache_guard();
         clear_glyph_cache();
 
         let rect = full_rect(200.0, 40.0);
@@ -1010,6 +1024,7 @@ mod tests {
     /// `clear_glyph_cache()` must empty the cache.
     #[test]
     fn test_clear_glyph_cache_empties_cache() {
+        let _guard = cache_guard();
         // Populate.
         let rect = full_rect(200.0, 40.0);
         let mut pixmap = white_pixmap(200, 40);
@@ -1024,6 +1039,7 @@ mod tests {
     /// Bold text rendered twice must match.
     #[test]
     fn test_bold_text_cache_identical() {
+        let _guard = cache_guard();
         clear_glyph_cache();
         let rect = full_rect(200.0, 40.0);
         let color = black();
@@ -1041,6 +1057,7 @@ mod tests {
     /// Italic text rendered twice must match.
     #[test]
     fn test_italic_text_cache_identical() {
+        let _guard = cache_guard();
         clear_glyph_cache();
         let rect = full_rect(200.0, 40.0);
         let color = black();
@@ -1061,6 +1078,7 @@ mod tests {
     /// that the text actually hits the pixmap).
     #[test]
     fn test_text_modifies_pixmap() {
+        let _guard = cache_guard();
         clear_glyph_cache();
         let rect = full_rect(200.0, 40.0);
         let mut pixmap = white_pixmap(200, 40);
@@ -1074,6 +1092,7 @@ mod tests {
     /// Empty and whitespace-only strings must not modify the pixmap at all.
     #[test]
     fn test_empty_text_does_not_modify_pixmap() {
+        let _guard = cache_guard();
         clear_glyph_cache();
         let rect = full_rect(200.0, 40.0);
 
@@ -1089,6 +1108,7 @@ mod tests {
     /// plain text (the decoration lines add extra pixels).
     #[test]
     fn test_underline_decoration_differs_from_plain() {
+        let _guard = cache_guard();
         clear_glyph_cache();
         let rect = full_rect(200.0, 40.0);
         let color = black();
@@ -1105,6 +1125,7 @@ mod tests {
     /// Different font sizes must be cached independently (i.e. produce different output).
     #[test]
     fn test_different_font_sizes_are_independent_cache_entries() {
+        let _guard = cache_guard();
         clear_glyph_cache();
         let rect = full_rect(200.0, 60.0);
         let color = black();
@@ -1143,6 +1164,7 @@ mod tests {
     /// check that `blend_glyph_pixel` uses the provided color, not a cached one).
     #[test]
     fn test_color_does_not_bleed_across_renders() {
+        let _guard = cache_guard();
         clear_glyph_cache();
         let rect = full_rect(200.0, 40.0);
 
@@ -1289,6 +1311,7 @@ mod tests {
     /// the clip must remain at their background value).
     #[test]
     fn test_clip_rect_limits_text_pixels() {
+        let _guard = cache_guard();
         clear_glyph_cache();
         let rect = LayoutRect { x: 0.0, y: 0.0, width: 200.0, height: 40.0 };
         // Clip to only the right half (x=100..200).
