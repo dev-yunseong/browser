@@ -148,9 +148,20 @@ fn composite_layer_to_surface(
     }
 
     let has_effect = layer.opacity < 1.0 || layer.transform != Matrix4x4::identity();
+    // A `filter: blur()` spreads its fill well outside the box it belongs to,
+    // so the surface this layer renders into has to have room for the falloff
+    // or the wash is cut off at its own edge — which, once the layer is also
+    // rotated, is nowhere near where the cut shows.
+    let pad = layer_blur_margin(layer);
+    let effect_rect = LayoutRect {
+        x: layer.bounds.x - pad,
+        y: layer.bounds.y - pad,
+        width: layer.bounds.width + pad * 2.0,
+        height: layer.bounds.height + pad * 2.0,
+    };
     let mut effect_pixmap = if has_effect {
-        let width = layer.bounds.width.max(1.0).ceil() as u32;
-        let height = layer.bounds.height.max(1.0).ceil() as u32;
+        let width = effect_rect.width.max(1.0).ceil() as u32;
+        let height = effect_rect.height.max(1.0).ceil() as u32;
         let mut pixmap = Pixmap::new(width, height).expect("Failed to allocate layer pixmap");
         pixmap.fill(tiny_skia::Color::TRANSPARENT);
         Some(pixmap)
@@ -161,19 +172,19 @@ fn composite_layer_to_surface(
     let (negative, zero, positive) = tree.categorize_children(layer_id);
 
     if let Some(ref mut pixmap) = effect_pixmap {
-        execute_commands_on_tile(&layer.background_commands, pixmap, layer.bounds, image_cache, base_url);
+        execute_commands_on_tile(&layer.background_commands, pixmap, effect_rect, image_cache, base_url);
 
         for &child_id in &negative {
-            composite_layer_to_surface(child_id, tree, pixmap, layer.bounds, image_cache, base_url);
+            composite_layer_to_surface(child_id, tree, pixmap, effect_rect, image_cache, base_url);
         }
 
-        execute_commands_on_tile(&layer.content_commands, pixmap, layer.bounds, image_cache, base_url);
+        execute_commands_on_tile(&layer.content_commands, pixmap, effect_rect, image_cache, base_url);
 
         for &child_id in &zero {
-            composite_layer_to_surface(child_id, tree, pixmap, layer.bounds, image_cache, base_url);
+            composite_layer_to_surface(child_id, tree, pixmap, effect_rect, image_cache, base_url);
         }
         for &child_id in &positive {
-            composite_layer_to_surface(child_id, tree, pixmap, layer.bounds, image_cache, base_url);
+            composite_layer_to_surface(child_id, tree, pixmap, effect_rect, image_cache, base_url);
         }
     } else {
         execute_commands_on_tile(&layer.background_commands, target, surface_rect, image_cache, base_url);
@@ -198,10 +209,36 @@ fn composite_layer_to_surface(
 
         let local_x = layer.bounds.x - surface_rect.x;
         let local_y = layer.bounds.y - surface_rect.y;
-        let transform = Transform::from_translate(local_x, local_y).pre_concat(layer.transform.to_skia());
+        // The matrix turns the box about its own centre, so it is composed
+        // against the box's position; the pixmap starts `pad` before that, so
+        // its own origin is shifted back by the same amount.
+        let transform = Transform::from_translate(local_x, local_y)
+            .pre_concat(layer.transform.to_skia())
+            .pre_concat(Transform::from_translate(-pad, -pad));
 
         target.draw_pixmap(0, 0, pixmap.as_ref(), &paint, transform, None);
     }
+}
+
+/// How far outside its own box a layer paints, because of a `filter: blur()` on
+/// something it draws.
+///
+/// Three standard deviations is where a Gaussian's visible falloff ends, which
+/// is the same margin `fill_background_shape` gives its own scratch pixmap.
+fn layer_blur_margin(layer: &crate::layer_tree::Layer) -> f32 {
+    let blur_of = |cmd: &PaintCommand| match cmd {
+        PaintCommand::Rect(_, _, _, blur)
+        | PaintCommand::LinearGradient { blur, .. }
+        | PaintCommand::RadialGradient { blur, .. } => *blur,
+        _ => 0.0,
+    };
+    layer
+        .background_commands
+        .iter()
+        .chain(layer.content_commands.iter())
+        .map(blur_of)
+        .fold(0.0_f32, f32::max)
+        * 3.0
 }
 
 /// Build a `Mask` (sized to the tile pixmap) for an overflow clip region.
@@ -295,8 +332,8 @@ fn execute_commands_on_tile(
                 }
             }
 
-            PaintCommand::RadialGradient { rect: r, stops, radius, blur } => {
-                if let Some(shader) = build_radial_gradient_shader(*r, stops) {
+            PaintCommand::RadialGradient { rect: r, stops, center, extent, radius, blur } => {
+                if let Some(shader) = build_radial_gradient_shader(*r, stops, *center, *extent) {
                     fill_background_shape(
                         pixmap, *r, *radius, *blur, shader, transform, active_mask!(),
                     );
@@ -1206,12 +1243,22 @@ fn build_linear_gradient_shader<'a>(
 fn build_radial_gradient_shader<'a>(
     r: LayoutRect,
     stops: &[CssColorStop],
+    center: Option<(crate::css::TranslateLength, crate::css::TranslateLength)>,
+    extent: crate::css::RadialExtent,
 ) -> Option<tiny_skia::Shader<'a>> {
     let skia_stops = css_stops_to_skia(stops);
     if skia_stops.len() < 2 { return None; }
 
-    let center = SkPoint::from_xy(r.x + r.width / 2.0, r.y + r.height / 2.0);
-    let radius = (r.width.min(r.height) / 2.0).max(1.0);
+    // `at 0 100%` puts the centre on a corner, and the extent then measures
+    // from there — which is a very different wash from one centred in the box
+    // and reaching only to its nearest side. A page puts a glow on a corner as
+    // often as in the middle.
+    let (cx, cy) = match center {
+        Some((x, y)) => (r.x + x.resolve(r.width), r.y + y.resolve(r.height)),
+        None => (r.x + r.width / 2.0, r.y + r.height / 2.0),
+    };
+    let radius = extent.radius(r, cx, cy);
+    let center = SkPoint::from_xy(cx, cy);
 
     RadialGradient::new(
         center,
@@ -1478,6 +1525,8 @@ mod tests {
             let cmds = vec![PaintCommand::RadialGradient {
                 rect,
                 stops: stops.clone(),
+                center: None,
+                extent: crate::css::RadialExtent::default(),
                 radius: CornerRadii::NONE,
                 blur,
             }];

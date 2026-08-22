@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Transform probe</title>
+<style>
+  body { margin: 0; background: #101018; font: 14px/1.4 sans-serif; color: #fff; height: 1100px; }
+  .w { position: absolute; width: 200px; height: 60px; background: #0cf; left: 100px; }
+  /* `transform-origin` defaults to the box's centre, so a rotated box turns in
+     place rather than swinging out around its top-left corner. */
+  .t1 { top: 40px; transform: translateY(-50%); }
+  .t2 { top: 160px; transform: rotate(-45deg); }
+  .t3 { top: 340px; transform: translateY(-70%) rotate(-45deg); }
+  .t4 { top: 520px; transform: translate(-50%, -50%); }
+  .t5 { top: 620px; transform: scale(1.5); background: #fa0; }
+  .t6 { top: 740px; transform: rotate(20deg) scale(0.75); background: #8f8; }
+  .none { top: 860px; background: #f6c; }
+  /* A gradient under a blur, rotated — the shape a page's decorative washes
+     take, and where getting the origin wrong is most visible. */
+  .glow { position: absolute; top: 950px; left: 200px; width: 300px; height: 120px;
+          background: radial-gradient(circle at 0 100%, #e6b7fe 10%, #5049c2 30%, rgba(87,78,255,0) 70%);
+          filter: blur(20px); transform: rotate(-45deg); }
+</style>
+</head>
+<body>
+  <div class="w t1"></div>
+  <div class="w t2"></div>
+  <div class="w t3"></div>
+  <div class="w t4"></div>
+  <div class="w t5"></div>
+  <div class="w t6"></div>
+  <div class="w none"></div>
+  <div class="glow"></div>
+</body>
+</html>

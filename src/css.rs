@@ -67,8 +67,42 @@ pub enum GradientValue {
     Radial {
         /// `true` = circle, `false` = ellipse (we render both as circle for simplicity).
         circle: bool,
+        /// The `at <x> <y>` centre. `None` is the box's own centre. A page puts
+        /// a wash's centre on a corner as often as in the middle, and the two
+        /// look nothing alike.
+        center: Option<(TranslateLength, TranslateLength)>,
+        /// How far the gradient reaches, which decides where its last stop
+        /// lands.
+        extent: RadialExtent,
         stops: Vec<CssColorStop>,
     },
+}
+
+/// The `<extent-keyword>` of a radial gradient: how far its 100% is from its
+/// centre.
+#[derive(Debug, Clone, Copy, PartialEq, Hash, Eq, Default)]
+pub enum RadialExtent {
+    ClosestSide,
+    ClosestCorner,
+    FarthestSide,
+    #[default]
+    FarthestCorner,
+}
+
+impl RadialExtent {
+    /// The radius this extent gives, for a centre at `(cx, cy)` inside `rect`.
+    pub fn radius(self, rect: crate::layout::Rect, cx: f32, cy: f32) -> f32 {
+        let dx = [(cx - rect.x).abs(), (rect.x + rect.width - cx).abs()];
+        let dy = [(cy - rect.y).abs(), (rect.y + rect.height - cy).abs()];
+        let corner = |x: f32, y: f32| (x * x + y * y).sqrt();
+        let r = match self {
+            RadialExtent::ClosestSide => dx[0].min(dx[1]).min(dy[0]).min(dy[1]),
+            RadialExtent::FarthestSide => dx[0].max(dx[1]).max(dy[0]).max(dy[1]),
+            RadialExtent::ClosestCorner => corner(dx[0].min(dx[1]), dy[0].min(dy[1])),
+            RadialExtent::FarthestCorner => corner(dx[0].max(dx[1]), dy[0].max(dy[1])),
+        };
+        r.max(1.0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2163,17 +2197,21 @@ pub fn parse_gradient(val: &str) -> Option<GradientValue> {
         let stops = auto_distribute_stops(stops);
         Some(GradientValue::Linear { direction, stops })
     } else {
-        // radial-gradient: first arg may be shape keyword.
+        // radial-gradient: the first argument may carry the shape, the extent
+        // and the centre, in any combination — `circle at 0 100%`,
+        // `farthest-side`, `ellipse closest-corner at 30% 40%`.
         let mut stop_start = 0;
         let first = args[0].trim().to_lowercase();
-        let circle = if first == "circle" || first.starts_with("circle ") {
+        let is_shape_arg = first.starts_with("circle")
+            || first.starts_with("ellipse")
+            || first.starts_with("closest")
+            || first.starts_with("farthest")
+            || first.starts_with("at ");
+        let (circle, center, extent) = if is_shape_arg {
             stop_start = 1;
-            true
-        } else if first == "ellipse" || first.starts_with("ellipse ") || first.starts_with("closest") || first.starts_with("farthest") {
-            stop_start = 1;
-            false
+            parse_radial_shape(&first)
         } else {
-            false
+            (false, None, RadialExtent::default())
         };
 
         let stops: Vec<CssColorStop> = args[stop_start..]
@@ -2184,8 +2222,59 @@ pub fn parse_gradient(val: &str) -> Option<GradientValue> {
         if stops.len() < 2 { return None; }
 
         let stops = auto_distribute_stops(stops);
-        Some(GradientValue::Radial { circle, stops })
+        Some(GradientValue::Radial { circle, center, extent, stops })
     }
+}
+
+/// Read a radial gradient's shape argument: `circle at 0 100%`,
+/// `ellipse farthest-side`, `at 30% 40%`.
+fn parse_radial_shape(
+    arg: &str,
+) -> (bool, Option<(TranslateLength, TranslateLength)>, RadialExtent) {
+    let (shape_part, at_part) = match arg.split_once(" at ") {
+        Some((s, a)) => (s, Some(a)),
+        None => (arg, None),
+    };
+    let mut circle = false;
+    let mut extent = RadialExtent::default();
+    for word in shape_part.split_whitespace() {
+        match word {
+            "circle" => circle = true,
+            "ellipse" => circle = false,
+            "closest-side" => extent = RadialExtent::ClosestSide,
+            "closest-corner" => extent = RadialExtent::ClosestCorner,
+            "farthest-side" => extent = RadialExtent::FarthestSide,
+            "farthest-corner" => extent = RadialExtent::FarthestCorner,
+            _ => {}
+        }
+    }
+    let center = at_part.and_then(|a| {
+        let parts: Vec<&str> = a.split_whitespace().collect();
+        let axis = |w: &str, horizontal: bool| -> Option<TranslateLength> {
+            match w {
+                "left" | "top" => Some(TranslateLength::Percent(OrderedFloat(0.0))),
+                "center" => Some(TranslateLength::Percent(OrderedFloat(50.0))),
+                "right" | "bottom" => Some(TranslateLength::Percent(OrderedFloat(100.0))),
+                _ => match parse_length(w) {
+                    Some(Value::Length(v, Unit::Percent)) => {
+                        Some(TranslateLength::Percent(OrderedFloat(v)))
+                    }
+                    Some(Value::Length(v, Unit::Px)) => Some(TranslateLength::Px(OrderedFloat(v))),
+                    _ => {
+                        let _ = horizontal;
+                        w.parse::<f32>().ok().map(|v| TranslateLength::Px(OrderedFloat(v)))
+                    }
+                },
+            }
+        };
+        match parts.as_slice() {
+            [x, y] => Some((axis(x, true)?, axis(y, false)?)),
+            // A single position sets the horizontal one and centres the other.
+            [x] => Some((axis(x, true)?, TranslateLength::Percent(OrderedFloat(50.0)))),
+            _ => None,
+        }
+    });
+    (circle, center, extent)
 }
 
 /// Assign evenly-spaced positions to any stops that don't have an explicit position.
@@ -2878,7 +2967,7 @@ mod tests {
     fn test_parse_radial_gradient_circle() {
         let v = parse_value("radial-gradient(circle, #fff, #000)");
         match v {
-            Value::Gradient(GradientValue::Radial { circle, stops }) => {
+            Value::Gradient(GradientValue::Radial { circle, stops, .. }) => {
                 assert!(circle);
                 assert_eq!(stops.len(), 2);
                 assert_eq!(stops[0].position, Some(0.0));
@@ -2914,6 +3003,57 @@ mod tests {
             }
             other => panic!("expected linear gradient, got {:?}", other),
         }
+    }
+
+    // ── Radial gradients ──────────────────────────────────────────────────────
+
+    /// `at 0 100%` puts the centre on a corner, and the extent then measures
+    /// from there. Dropping the position drew a small circle in the middle of a
+    /// box the page wanted filled from its bottom-left corner outwards.
+    #[test]
+    fn test_radial_gradient_reads_its_centre_and_extent() {
+        match parse_value("radial-gradient(circle at 0 100%, #fff 10%, #000 60%)") {
+            Value::Gradient(GradientValue::Radial { circle, center, extent, .. }) => {
+                assert!(circle);
+                assert_eq!(
+                    center,
+                    Some((
+                        TranslateLength::Px(OrderedFloat(0.0)),
+                        TranslateLength::Percent(OrderedFloat(100.0)),
+                    ))
+                );
+                assert_eq!(extent, RadialExtent::FarthestCorner);
+            }
+            other => panic!("expected a radial gradient, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_radial_gradient_extent_keywords() {
+        for (css, want) in [
+            ("radial-gradient(closest-side, #fff, #000)", RadialExtent::ClosestSide),
+            ("radial-gradient(farthest-side, #fff, #000)", RadialExtent::FarthestSide),
+            ("radial-gradient(ellipse closest-corner at 30% 40%, #fff, #000)", RadialExtent::ClosestCorner),
+            ("radial-gradient(#fff, #000)", RadialExtent::FarthestCorner),
+        ] {
+            match parse_value(css) {
+                Value::Gradient(GradientValue::Radial { extent, .. }) => assert_eq!(extent, want, "{css}"),
+                other => panic!("expected a radial gradient for {css}, got {other:?}"),
+            }
+        }
+    }
+
+    /// The extent decides where the last stop lands, and the four keywords give
+    /// four different radii from the same centre.
+    #[test]
+    fn test_radial_extent_radii() {
+        let rect = crate::layout::Rect { x: 0.0, y: 0.0, width: 300.0, height: 120.0 };
+        // Centre on the bottom-left corner, as `at 0 100%` puts it.
+        let (cx, cy) = (0.0, 120.0);
+        assert_eq!(RadialExtent::ClosestSide.radius(rect, cx, cy), 1.0);
+        assert_eq!(RadialExtent::FarthestSide.radius(rect, cx, cy), 300.0);
+        let far = RadialExtent::FarthestCorner.radius(rect, cx, cy);
+        assert!((far - (300.0f32 * 300.0 + 120.0 * 120.0).sqrt()).abs() < 0.01, "{far}");
     }
 
     // ── The `border` shorthand ────────────────────────────────────────────────

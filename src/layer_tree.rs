@@ -109,6 +109,10 @@ pub enum PaintCommand {
     RadialGradient {
         rect: LayoutRect,
         stops: Vec<CssColorStop>,
+        /// The `at <x> <y>` centre; `None` is the box's own centre.
+        center: Option<(crate::css::TranslateLength, crate::css::TranslateLength)>,
+        /// How far the gradient's last stop is from that centre.
+        extent: crate::css::RadialExtent,
         radius: CornerRadii,
         /// `filter: blur()` radius in pixels, 0 for none.
         blur: f32,
@@ -634,7 +638,16 @@ impl LayerTreeBuilder {
             };
             result = result.multiply(&m);
         }
-        result
+        // `transform-origin` defaults to the box's centre, so the whole list is
+        // applied about that point. Applying it about the top-left corner
+        // instead swings a rotated box out of its own place — the further from
+        // the corner, the further out — and a wash a page rotates ended up in
+        // a different part of the section from the one it was written for.
+        let cx = elem_width / 2.0;
+        let cy = elem_height / 2.0;
+        Matrix4x4::translate(cx, cy, 0.0)
+            .multiply(&result)
+            .multiply(&Matrix4x4::translate(-cx, -cy, 0.0))
     }
 
     /// Emit paint commands for a single `LayoutBox` (not its children) into `layer`.
@@ -643,14 +656,6 @@ impl LayerTreeBuilder {
     fn collect_paint_commands(layout: &LayoutBox, layer: &mut Layer, clip: LayoutRect, is_root_of_layer: bool) {
         // The border box, which is what a background and a border cover.
         let d = layout.paint_rect();
-        if let Ok(want) = std::env::var("BOX_DEBUG") {
-            if let markup5ever_rcdom::NodeData::Element { ref name, ref attrs, .. } = layout.style_node.node.data {
-                let cls = attrs.borrow().iter().find(|a| a.name.local.as_ref()=="class").map(|a| a.value.to_string()).unwrap_or_default();
-                if cls.contains(&want) {
-                    eprintln!("BOX <{}> .{} y={} h={} x={} w={}", name.local, &cls[..cls.len().min(46)], d.y.round(), d.height.round(), d.x.round(), d.width.round());
-                }
-            }
-        }
         let sv = &layout.style_node.specified_values;
 
         // A percentage radius is a fraction of the box, not a pixel count:
@@ -707,10 +712,12 @@ impl LayerTreeBuilder {
                     blur,
                 });
             }
-            Some(Value::Gradient(GradientValue::Radial { stops, .. })) => {
+            Some(Value::Gradient(GradientValue::Radial { stops, center, extent, .. })) => {
                 commands.push(PaintCommand::RadialGradient {
                     rect: d,
                     stops: stops.clone(),
+                    center: *center,
+                    extent: *extent,
                     radius,
                     blur,
                 });
@@ -730,10 +737,12 @@ impl LayerTreeBuilder {
                         blur,
                     });
                 }
-                Some(Value::Gradient(GradientValue::Radial { stops, .. })) => {
+                Some(Value::Gradient(GradientValue::Radial { stops, center, extent, .. })) => {
                     commands.push(PaintCommand::RadialGradient {
                         rect: d,
                         stops: stops.clone(),
+                        center: *center,
+                        extent: *extent,
                         radius,
                         blur,
                     });
