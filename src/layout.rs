@@ -503,6 +503,35 @@ fn outer_height(cb: &LayoutBox<'_>) -> f32 {
     }
 }
 
+/// The floor `flex-shrink` may not push a row item below.
+///
+/// CSS resolves `min-width: auto` on a flex item to its min-content width, so
+/// an item is never squeezed narrower than the longest word it contains. An
+/// author who wants that opts out by stating `min-width` themselves — usually
+/// `0`, which is why `minmax(0, 1fr)` and `min-width: 0` are such common
+/// idioms — and a scroll container opts out by its `overflow`.
+fn automatic_minimum_main_size(
+    sn: &StyledNode,
+    intrinsic_cache: &mut IntrinsicSizeCache,
+    vw: f32,
+    vh: f32,
+) -> f32 {
+    if sn.specified_values.contains_key(&crate::css::intern("min-width")) {
+        return 0.0;
+    }
+    let scrolls = matches!(
+        sn.specified_values.get(&crate::css::intern("overflow")),
+        Some(Value::Keyword(k)) if !matches!(k.as_ref(), "visible" | "clip")
+    ) || matches!(
+        sn.specified_values.get(&crate::css::intern("overflow-x")),
+        Some(Value::Keyword(k)) if !matches!(k.as_ref(), "visible" | "clip")
+    );
+    if scrolls {
+        return 0.0;
+    }
+    intrinsic_cache.min_content_width(sn, vw, vh)
+}
+
 fn border_box_width(cb: &LayoutBox<'_>) -> f32 {
     cb.dimensions.width + cb.padding.left + cb.padding.right + cb.border.left + cb.border.right
 }
@@ -1727,8 +1756,21 @@ impl<'a> LayoutBox<'a> {
                         let weight = raw_items[i].shrink * ms / total_shrink_weighted;
                         let reduction = weight * deficit;
                         if is_row {
+                            // CSS gives a flex item an *automatic minimum size*:
+                            // `min-width: auto` on a row item resolves to its
+                            // min-content width, so shrinking never squeezes a
+                            // box below the longest word it holds. Without that
+                            // floor a row of tags came out with each tag broken
+                            // across two lines, where the browser keeps every
+                            // one of them whole.
+                            let floor = automatic_minimum_main_size(
+                                raw_items[i].cb.style_node,
+                                intrinsic_cache,
+                                vw,
+                                vh,
+                            );
                             raw_items[i].cb.dimensions.width =
-                                (raw_items[i].cb.dimensions.width - reduction).max(0.0);
+                                (raw_items[i].cb.dimensions.width - reduction).max(floor);
                         } else {
                             raw_items[i].cb.dimensions.height =
                                 (raw_items[i].cb.dimensions.height - reduction).max(0.0);
@@ -6286,6 +6328,50 @@ mod tests {
             (bar.dimensions.height - (pill.dimensions.height + 16.0)).abs() < 1.5,
             "the bar is its padding plus the pill: bar={}, pill={}",
             bar.dimensions.height, pill.dimensions.height
+        );
+    }
+
+    /// CSS resolves `min-width: auto` on a row flex item to its min-content
+    /// width, so shrinking never squeezes a box below the longest word it
+    /// holds. Without that floor a row of tags came out with each tag broken
+    /// across two lines where the browser keeps every one of them whole.
+    #[test]
+    fn test_flex_item_does_not_shrink_below_its_longest_word() {
+        let html = r#"<div style="display:flex;width:120px">
+            <div id="a">Supercalifragilistic</div>
+            <div id="b">Expialidocious</div>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let a = find_element_by_id(&layout, "a").expect("item a");
+        let word = crate::font::fonts().measure(
+            "Supercalifragilistic",
+            16.0,
+            crate::font::FontStyle::regular(),
+            0.0,
+        );
+        assert!(
+            a.dimensions.width >= word - 1.0,
+            "the item keeps its longest word: width={}, word={word}",
+            a.dimensions.width
+        );
+    }
+
+    /// An author opts out of that floor by stating `min-width` — which is why
+    /// `min-width: 0` is such a common idiom on flex children.
+    #[test]
+    fn test_stated_min_width_opts_out_of_the_automatic_minimum() {
+        let html = r#"<div style="display:flex;width:120px">
+            <div id="a" style="min-width:0">Supercalifragilistic</div>
+            <div id="b" style="min-width:0">Expialidocious</div>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let a = find_element_by_id(&layout, "a").expect("item a");
+        assert!(
+            a.dimensions.width < 120.0,
+            "with min-width: 0 the item may shrink freely, got {}",
+            a.dimensions.width
         );
     }
 
