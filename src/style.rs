@@ -1286,6 +1286,12 @@ fn apply_default_styles(tag: &str, map: &mut HashMap<Arc<str>, Value>) {
             map.entry(intern("padding-left")).or_insert(Value::Length(6.0, crate::css::Unit::Px));
             map.entry(intern("padding-right")).or_insert(Value::Length(6.0, crate::css::Unit::Px));
             map.entry(intern("text-align")).or_insert(Value::Keyword(intern("center")));
+            // A form control does not inherit the page's text colour: the UA
+            // sheet gives it `ButtonText`, which is what keeps a default button
+            // readable on its own grey chrome. Letting it inherit painted a
+            // dark page's light text onto that grey and the label vanished.
+            map.entry(intern("color"))
+                .or_insert(Value::Color(crate::css::Color { r: 0, g: 0, b: 0, a: 255 }));
         }
         // <center> is a legacy presentational element — UA default maps it to a block
         // with text-align: center, matching browsers' built-in stylesheet.
@@ -1487,6 +1493,54 @@ fn selector_base_matches_element(sel: &Selector, node: &StyledNode) -> bool {
 /// `content_text` — the text to inject (may be empty for block-level decorators).
 /// `pseudo_decls` — the CSS declarations from the matching rule.
 /// `parent_values` — the parent element's computed style, used to inherit properties.
+/// Resolve the escapes in a CSS string.
+///
+/// An icon set writes its glyph as `content: "\f52a"` — a codepoint, not the
+/// four characters that spell it. Keeping the escape verbatim drew "f52a" next
+/// to every such icon, where a browser draws the glyph or, when the icon font
+/// never loaded, nothing at all.
+fn unescape_css_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let Some(&next) = chars.peek() else { break };
+        if !next.is_ascii_hexdigit() {
+            // `\"` and friends stand for the character itself; an escaped
+            // newline stands for nothing.
+            chars.next();
+            if next != '\n' {
+                out.push(next);
+            }
+            continue;
+        }
+        // Up to six hex digits, ended by a single optional space.
+        let mut hex = String::new();
+        while hex.len() < 6 {
+            match chars.peek() {
+                Some(&h) if h.is_ascii_hexdigit() => {
+                    hex.push(h);
+                    chars.next();
+                }
+                _ => break,
+            }
+        }
+        if chars.peek() == Some(&' ') {
+            chars.next();
+        }
+        match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+            Some(ch) => out.push(ch),
+            // An unpaired surrogate or an out-of-range value is the replacement
+            // character, per css-syntax-3.
+            None => out.push('\u{fffd}'),
+        }
+    }
+    out
+}
+
 /// Put a `background` shorthand that has only just resolved into the slot paint
 /// reads.
 ///
@@ -1645,13 +1699,14 @@ fn compute_pseudo_injections(
                     Value::Keyword(k) => {
                         // Strip wrapping quotes that the CSS parser preserves.
                         let s = k.as_ref();
-                        if (s.starts_with('"') && s.ends_with('"'))
+                        let inner = if (s.starts_with('"') && s.ends_with('"'))
                             || (s.starts_with('\'') && s.ends_with('\''))
                         {
-                            s[1..s.len()-1].to_string()
+                            &s[1..s.len() - 1]
                         } else {
-                            s.to_string()
-                        }
+                            s
+                        };
+                        unescape_css_string(inner)
                     }
                     _ => continue,
                 },
@@ -2261,6 +2316,28 @@ mod tests {
         assert_eq!(s.class, vec!["clearfix".to_string()]);
         assert_eq!(s.pseudo_element, Some("after".to_string()));
         assert!(s.pseudo_class.is_none());
+    }
+
+    /// An icon set writes its glyph as `content: "\\f52a"` — a codepoint, not the
+    /// four characters that spell it. Keeping the escape verbatim drew "f52a"
+    /// next to every such icon.
+    #[test]
+    fn test_content_escapes_are_resolved() {
+        let cases = [
+            ("\\f52a", "\u{f52a}"),
+            ("\\2192 ", "\u{2192}"),
+            ("\\2192  x", "\u{2192} x"),
+            ("a\\\"b", "a\"b"),
+            ("plain", "plain"),
+            ("\\", ""),
+        ];
+        for (source, want) in cases {
+            assert_eq!(
+                super::unescape_css_string(source),
+                want,
+                "{source:?} should unescape to {want:?}"
+            );
+        }
     }
 
     /// The character before `=` picks the attribute match. Reading every form

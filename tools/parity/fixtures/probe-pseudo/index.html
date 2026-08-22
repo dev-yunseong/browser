@@ -31,6 +31,12 @@
 
   /* A counter-ish marker: an empty inline generated box takes no room. */
   .empty::before { content: ""; }
+
+  /* An icon set writes its glyph as a codepoint, not as the characters that
+     spell it — and when its font never arrives, nothing is drawn for it. */
+  .icon::before { content: "\f52a"; margin-right: 6px; }
+  .esc::before { content: "\2192  "; color: #a371f7; }
+  .quotesc::before { content: "\"quoted\" "; color: #f0883e; }
 </style>
 </head>
 <body>
@@ -40,5 +46,8 @@
   <section><div class="card">a card with a generated accent stripe</div></section>
   <section><div class="off">content: none draws nothing</div></section>
   <section><span class="empty">an empty generated box takes no room</span></section>
+  <section><button class="icon">Search</button></section>
+  <section><span class="esc">an escaped arrow before this</span></section>
+  <section><span class="quotesc">an escaped quote before this</span></section>
 </body>
 </html>
