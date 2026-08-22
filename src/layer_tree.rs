@@ -611,6 +611,14 @@ impl LayerTreeBuilder {
     fn collect_paint_commands(layout: &LayoutBox, layer: &mut Layer, clip: LayoutRect, is_root_of_layer: bool) {
         // The border box, which is what a background and a border cover.
         let d = layout.paint_rect();
+        if let Ok(want) = std::env::var("BOX_DEBUG") {
+            if let markup5ever_rcdom::NodeData::Element { ref name, ref attrs, .. } = layout.style_node.node.data {
+                let cls = attrs.borrow().iter().find(|a| a.name.local.as_ref()=="class").map(|a| a.value.to_string()).unwrap_or_default();
+                if cls.contains(&want) {
+                    eprintln!("BOX <{}> .{} y={} h={} x={} w={}", name.local, &cls[..cls.len().min(46)], d.y.round(), d.height.round(), d.x.round(), d.width.round());
+                }
+            }
+        }
         let sv = &layout.style_node.specified_values;
 
         let radius = match sv.get(&crate::css::intern("border-radius")) {

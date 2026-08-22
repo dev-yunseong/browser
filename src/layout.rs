@@ -2054,6 +2054,15 @@ impl<'a> LayoutBox<'a> {
                 } else {
                     column_main
                 };
+                // A flex container may state an `aspect-ratio` instead of a
+                // height, which is how a media wrapper reserves its space when
+                // everything inside it is positioned. Without it the container
+                // collapsed to nothing and the section below it moved up.
+                if let Some(ratio) = read_aspect_ratio(self.style_node) {
+                    if height <= 0.0 && self.dimensions.width > 0.0 {
+                        self.dimensions.height = self.dimensions.width / ratio;
+                    }
+                }
             }
             self.dimensions.height = clamp_height(
                 self.style_node,
@@ -2505,7 +2514,12 @@ impl<'a> LayoutBox<'a> {
             let content_height = (child_y - self.dimensions.y
                 + self.padding.bottom + self.border.bottom).max(0.0);
             if self.dimensions.height <= 0.0 || height <= 0.0 {
-                self.dimensions.height = content_height;
+                self.dimensions.height = match read_aspect_ratio(self.style_node) {
+                    Some(ratio) if height <= 0.0 && self.dimensions.width > 0.0 => {
+                        self.dimensions.width / ratio
+                    }
+                    _ => content_height,
+                };
             }
             self.dimensions.height = clamp_height(
                 self.style_node,
@@ -2937,7 +2951,19 @@ impl<'a> LayoutBox<'a> {
 
         let content_height =
             (cursor_y - self.dimensions.y + self.padding.bottom + self.border.bottom).max(0.0);
-        let mut final_h = if height > 0.0 { height } else { content_height };
+        // `aspect-ratio` is not only for images: a media container, a card or a
+        // video wrapper states one and lets the height follow from the width.
+        // Applying it only to replaced elements left every such box the height
+        // of its content — zero, when the content inside it is positioned — and
+        // the whole section below it moved up.
+        let ratio_height = read_aspect_ratio(self.style_node)
+            .filter(|_| height <= 0.0 && self.dimensions.width > 0.0)
+            .map(|ratio| self.dimensions.width / ratio);
+        let mut final_h = match (height > 0.0, ratio_height) {
+            (true, _) => height,
+            (false, Some(h)) => h,
+            (false, None) => content_height,
+        };
         // A form control with no in-flow children still holds one line: its
         // value or its placeholder sits on it, and a browser sizes the control
         // from that line rather than collapsing it to its padding.
@@ -6677,6 +6703,34 @@ mod tests {
             "content below sits past the media, got y={}",
             after.dimensions.y
         );
+    }
+
+    /// `aspect-ratio` is not only for images: a media wrapper, a card or a
+    /// video container states one and lets its height follow from its width.
+    /// Applying it only to replaced elements left every such box the height of
+    /// its content — zero, when everything inside it is positioned — and the
+    /// whole section below it moved up.
+    #[test]
+    fn test_aspect_ratio_sizes_an_ordinary_box() {
+        for display in ["block", "flex", "grid"] {
+            let html = format!(
+                r#"<div style="width:800px"><div id="a" style="display:{display};width:100%;aspect-ratio:2/1"><div style="position:absolute">only positioned content</div></div><div id="after">after</div></div>"#
+            );
+            let (layout, _, _) = layout_from_html(&html, 800.0, 600.0);
+
+            let a = find_element_by_id(&layout, "a").expect("box");
+            assert!(
+                (a.dimensions.height - 400.0).abs() < 2.0,
+                "[{display}] 800 wide at 2:1 is 400 tall, got {}",
+                a.dimensions.height
+            );
+            let after = find_element_by_id(&layout, "after").expect("after");
+            assert!(
+                after.dimensions.y >= 398.0,
+                "[{display}] what follows sits below it, got y={}",
+                after.dimensions.y
+            );
+        }
     }
 
     /// `justify-content: center` must center flex children horizontally within
