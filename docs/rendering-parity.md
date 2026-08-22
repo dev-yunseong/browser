@@ -144,6 +144,8 @@ Ordered by how much of a page each one destroyed.
 | `filter` in a `style` attribute dropped | The inline-style parser had no case for it, so an inline blur never produced the longhand paint reads and the box came out sharp. |
 | Cascade layer order ranked below specificity | Layer order beats specificity outright: an unlayered rule wins over one in any layer however specific that one is. Re-ordering the source so unlayered rules came last only settled *ties*; github states its component rules inside `@layer primer-brand` and overrides them with plain page-level classes, so a four-class `:not()` selector kept its 24px margin over the unlayered rule's 16px and every pillar came out 8px too tall. |
 | A character no bundled face covers never looked at the system's fonts | A browser resolves a family it cannot satisfy through the system's own fonts, and the fallback for an uncovered codepoint is the same search. This engine went straight to the bundled NanumGothic, whose Hangul advance is 0.94em against the 1.00em of the Unifont Chromium picks here, so every Korean run on yunseong.dev came out 5.5% narrow — enough to keep a line the reference wraps. |
+| An atomic inline aligned to the line's top instead of its baseline | Everything on a line hangs from one baseline, and an empty `inline-block` — the twelve-pixel square an icon is — rests its bottom margin edge there. Top-aligning it put every icon beside a run of text three pixels too high. |
+| A block's bottom margin dropped before inline content | The margin is held back to collapse with the *next block's* top margin; inline content after it forms an anonymous block, which has none to collapse with, so the held margin is simply space before it. Held and never spent, it vanished. |
 | Flow advancing past the content box | A box that states a height and carries padding handed the next block a cursor its own padding too high, and every section below it climbed by that much. |
 
 
@@ -156,8 +158,8 @@ pixels:
 | fixture | layout | fold | page | height (chromium -> engine) |
 |---|---|---|---|---|
 | github.com | 1.37% | 2.89% | 1.60% | 10570 -> 10553 |
-| yunseong.dev | 1.43% | 3.18% | 3.05% | 4976 -> 4969 |
-| naver.com | 1.25% | 2.91% | 2.53% | 18658 -> 16384 |
+| yunseong.dev | 1.43% | 3.18% | 3.05% | 4976 -> 4976 |
+| naver.com | 1.25% | 2.91% | 2.52% | 18658 -> 16384 |
 
 github.com began this work at 9.14% layout, 13.84% fold and 780px too tall;
 yunseong.dev at 4.24% and 256px too short. github's page is now within a single
@@ -167,9 +169,8 @@ carried down the page; every section's own boxes are within a pixel or two.
 
 Every probe fixture sits at or below 1.7% on the layout metric, and
 `probe-grid`, `probe-transform` and `probe-aspect` are pixel-identical over the
-fold. `probe-has`, `probe-overlay` and `probe-grid` cover what this round found;
-`probe-has` still carries a difference of its own in how a lone atomic inline
-sits on its line.
+fold. `probe-has`, `probe-overlay`, `probe-layers` and `probe-grid` cover what this
+round found. yunseong.dev's page is now exactly Chromium's height.
 
 naver.com's number means little: its snapshot was captured without CSS (see
 below), so both renderers are drawing an unstyled page and the comparison only

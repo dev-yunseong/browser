@@ -788,6 +788,28 @@ fn strut_split(sn: &StyledNode) -> (f32, f32) {
     ((line_height - below).max(0.0), below)
 }
 
+/// How far below a line member's own top its baseline sits.
+///
+/// An atomic inline whose baseline is its own bottom edge — an empty
+/// `inline-block`, the twelve-pixel square an icon is — rests that edge on the
+/// line's baseline, so its whole margin box is above it. Everything else is
+/// itself a line box, and its baseline is its own strut's.
+fn member_ascent(cb: &LayoutBox<'_>) -> f32 {
+    let atomic = matches!(
+        cb.display,
+        DisplayType::InlineBlock
+            | DisplayType::Flex
+            | DisplayType::Grid
+            | DisplayType::Table
+            | DisplayType::Image
+            | DisplayType::Input
+    );
+    if atomic && hides_own_baseline(cb) {
+        return cb.margin.top + outer_height(cb) + cb.margin.bottom;
+    }
+    strut_split(cb.style_node).0
+}
+
 /// The height a line box has to be to hold `cb`, given the container's strut.
 ///
 /// An atomic inline whose baseline is its own bottom edge sits entirely above
@@ -3551,6 +3573,16 @@ impl<'a> LayoutBox<'a> {
                     };
                     let line_left = container_x + left_indent + align_offset;
                     let mut lx = line_left;
+                    // Everything on a line hangs from one baseline. An atomic
+                    // inline rests its bottom margin edge there, so a short one
+                    // sits *below* the line's top rather than flush with it —
+                    // which is where an icon beside a run of text goes, and
+                    // where this put it three pixels too high.
+                    let line_baseline = cur_line
+                        .members
+                        .iter()
+                        .map(member_ascent)
+                        .fold(0.0_f32, f32::max);
                     for mut m in cur_line.members.drain(..) {
                         // A text run's box spans the whole line box — its second
                         // and later lines start at the line's own left edge —
@@ -3561,7 +3593,8 @@ impl<'a> LayoutBox<'a> {
                         let is_text = matches!(m.style_node.node.data, NodeData::Text { .. });
                         let place_at = if is_text { line_left } else { lx };
                         let dx = place_at - (m.dimensions.x - m.margin.left);
-                        let dy = cursor_y - (m.dimensions.y - m.margin.top);
+                        let top = cursor_y + (line_baseline - member_ascent(&m)).max(0.0);
+                        let dy = top - (m.dimensions.y - m.margin.top);
                         offset_layout_box(&mut m, dx, dy);
                         max_child_x =
                             max_child_x.max(m.dimensions.x + outer_width(&m) + m.margin.right);
@@ -3790,6 +3823,17 @@ impl<'a> LayoutBox<'a> {
                         // Only reset prev_margin_bottom when a visible inline element is
                         // actually placed.  Empty/whitespace-only text nodes return None and
                         // must NOT interrupt adjacent-block margin collapsing.
+                        //
+                        // A block's bottom margin is held back to collapse with
+                        // the *next block's* top margin. Real inline content
+                        // after it forms an anonymous block, which has no margin
+                        // to collapse with, so the held margin is simply space
+                        // before it. Dropping it put an icon written between two
+                        // paragraphs flush against the one above it.
+                        if cur_line.members.is_empty() && prev_margin_bottom != 0.0 {
+                            cursor_y += prev_margin_bottom;
+                            line_start_y = cursor_y;
+                        }
                         prev_margin_bottom = 0.0;
                         // A text run's box spans the whole line box, so the
                         // part of it the line already holds — the indent its
@@ -8854,6 +8898,76 @@ mod tests {
         let first = find_element_by_id(&layout, "first").expect("first");
         let second = find_element_by_id(&layout, "second").expect("second");
         assert!(first.dimensions.x < second.dimensions.x);
+    }
+
+    /// Everything on a line hangs from one baseline. An atomic inline rests its
+    /// bottom margin edge there, so a short one sits *below* the line's top
+    /// rather than flush with it — which is where an icon beside a run of text
+    /// goes, and where top-aligning it put it three pixels too high.
+    #[test]
+    fn test_an_atomic_inline_rests_on_the_line_s_baseline() {
+        let css = ".flag { display: inline-block; width: 12px; height: 12px }";
+        let html = r#"<div style="width:800px;font-size:14px;line-height:21px">
+            <div id="line"><i class="flag" id="flag"></i> text beside it</div>
+        </div>"#;
+        let (layout, _, _) = layout_from_html_css(html, css, 800.0, 600.0);
+        let line = find_element_by_id(&layout, "line").expect("line");
+        let flag = find_element_by_id(&layout, "flag").expect("flag");
+        let drop = flag.dimensions.y - line.dimensions.y;
+        assert!(
+            drop > 1.0,
+            "a 12px box on a 21px line sits below its top, not flush with it; got {drop}",
+        );
+        assert!(
+            flag.dimensions.y + flag.dimensions.height
+                <= line.dimensions.y + line.dimensions.height + 0.5,
+            "and it stays inside the line box",
+        );
+    }
+
+    /// A block's bottom margin is held back to collapse with the next block's
+    /// top margin. Real inline content after it forms an anonymous block, which
+    /// has no margin to collapse with, so the held margin is space before it.
+    #[test]
+    fn test_a_block_s_bottom_margin_precedes_inline_content() {
+        let css = ".flag { display: inline-block; width: 12px; height: 12px }                   .box { margin-bottom: 8px }";
+        let html = r#"<div style="width:800px;font-size:14px;line-height:21px">
+            <div class="box" id="above">above</div>
+            <i class="flag" id="flag"></i>
+        </div>"#;
+        let (layout, _, _) = layout_from_html_css(html, css, 800.0, 600.0);
+        let above = find_element_by_id(&layout, "above").expect("above");
+        let flag = find_element_by_id(&layout, "flag").expect("flag");
+        let line_top = above.dimensions.y + above.dimensions.height + 8.0;
+        assert!(
+            flag.dimensions.y >= line_top - 0.5,
+            "the 8px margin is space before the anonymous block: line top {line_top}, flag at {}",
+            flag.dimensions.y,
+        );
+    }
+
+    /// Whitespace between two blocks is not inline content and must not
+    /// interrupt their margins collapsing.
+    #[test]
+    fn test_whitespace_between_blocks_does_not_break_collapsing() {
+        let html = r#"<div style="width:800px">
+            <p style="margin:16px 0;height:50px">A</p>
+            <p style="margin:16px 0;height:50px">B</p>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        fn blocks<'a>(b: &'a LayoutBox<'a>, out: &mut Vec<&'a LayoutBox<'a>>) {
+            for c in &b.children {
+                if matches!(c.style_node.node.data, NodeData::Element { ref name, .. } if name.local.as_ref() == "p") {
+                    out.push(c);
+                }
+                blocks(c, out);
+            }
+        }
+        let mut ps = Vec::new();
+        blocks(&layout, &mut ps);
+        assert_eq!(ps.len(), 2);
+        let gap = ps[1].dimensions.y - (ps[0].dimensions.y + ps[0].dimensions.height);
+        assert!((gap - 16.0).abs() < 0.5, "16px collapsed, not 32px; got {gap}");
     }
 
     /// CSS drops whitespace at the start and end of a block's inline content,
