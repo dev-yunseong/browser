@@ -73,6 +73,8 @@ impl IntrinsicSizeCache {
                             &apply_text_transform(&contents.borrow(), &node.specified_values),
                             font_size,
                             f32::INFINITY,
+                            resolved_font_style(node),
+                            resolved_letter_spacing_px(node),
                         ))
                     } else {
                         let disp = get_display_type(node);
@@ -213,7 +215,15 @@ impl IntrinsicSizeCache {
                             Some(
                                 trimmed
                                     .split_whitespace()
-                                    .map(|word| measure_text_width(word, font_size, f32::INFINITY))
+                                    .map(|word| {
+                                        measure_text_width(
+                                            word,
+                                            font_size,
+                                            f32::INFINITY,
+                                            resolved_font_style(node),
+                                            resolved_letter_spacing_px(node),
+                                        )
+                                    })
                                     .fold(0.0f32, f32::max),
                             )
                         }
@@ -274,20 +284,26 @@ impl IntrinsicSizeCache {
 /// Measure the width of `text` rendered at `font_size` px.
 /// When `wrap_width` is `f32::INFINITY`, no wrapping occurs (max-content).
 /// When finite, line-breaks at word boundaries (min-content: longest word).
-fn measure_text_width(text: &str, font_size: f32, wrap_width: f32) -> f32 {
+fn measure_text_width(
+    text: &str,
+    font_size: f32,
+    wrap_width: f32,
+    style: crate::font::FontStyle,
+    letter_spacing: f32,
+) -> f32 {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return 0.0;
     }
     let fonts = crate::font::fonts();
     let font_size = font_size.max(1.0);
-    let space_w = fonts.advance(' ', font_size);
+    let space_w = fonts.advance(' ', font_size, style) + letter_spacing;
 
     let mut max_w: f32 = 0.0;
     let mut line_w: f32 = 0.0;
 
     for word in trimmed.split_whitespace() {
-        let word_w = fonts.measure(word, font_size);
+        let word_w = fonts.measure(word, font_size, style, letter_spacing);
         if wrap_width.is_finite() && line_w + word_w > wrap_width && line_w > 0.0 {
             max_w = max_w.max(line_w);
             line_w = 0.0;
@@ -1776,7 +1792,17 @@ impl<'a> LayoutBox<'a> {
             }
 
             // Move items from raw_items into self.children.
-            for item in raw_items {
+            //
+            // Through the flex algorithm an item's `dimensions` hold its *content*
+            // box, because that is what flex-basis, grow and shrink operate on.
+            // Everything past this point — paint, hit testing, the parent's own
+            // sizing — reads `dimensions` as the border box, which is how every
+            // other layout path stores it. Converting here, once the algorithm is
+            // done, is what stops a padded flex item from painting its background
+            // short of its own text and letting the next item sit on top of it.
+            for mut item in raw_items {
+                item.cb.dimensions.width = border_box_width(&item.cb);
+                item.cb.dimensions.height = border_box_height(&item.cb);
                 self.children.push(item.cb);
             }
 
@@ -2847,7 +2873,9 @@ impl<'a> LayoutBox<'a> {
         };
         let fonts = crate::font::fonts();
         let line_height = resolved_line_height_px(self.style_node);
-        let space_w = fonts.advance(' ', font_size);
+        let font_style = resolved_font_style(self.style_node);
+        let letter_spacing = resolved_letter_spacing_px(self.style_node);
+        let space_w = fonts.advance(' ', font_size, font_style) + letter_spacing;
         let white_space = self
             .style_node
             .specified_values
@@ -2895,7 +2923,7 @@ impl<'a> LayoutBox<'a> {
         }
 
         for word in trimmed.split_whitespace() {
-            let word_w = fonts.measure(word, font_size);
+            let word_w = fonts.measure(word, font_size, font_style, letter_spacing);
 
             if no_wrap {
                 if line_w > 0.0 {
@@ -2915,7 +2943,7 @@ impl<'a> LayoutBox<'a> {
             // If a single word is LONGER than the entire container, we must break it char-by-char
             if container_width.is_finite() && word_w > container_width {
                 for c in word.chars() {
-                    let char_w = fonts.advance(c, font_size);
+                    let char_w = fonts.advance(c, font_size, font_style) + letter_spacing;
                     if line_w + char_w > container_width && line_w > 0.0 {
                         max_w = max_w.max(line_w);
                         line_w = 0.0;
@@ -3064,13 +3092,67 @@ fn resolved_font_size_px(sn: &StyledNode) -> f32 {
 /// comes from the font's vertical metrics, not a fixed multiplier — a guessed
 /// factor makes every block on a page the wrong height, and the error compounds
 /// down a long document.
+/// The face an element's text is set in.
+///
+/// Layout has to know this because a bold face is wider than the regular one at
+/// the same size: measuring every run with the regular face made bold headings
+/// and brand marks come out short, so the box behind them ended before the text
+/// did and whatever followed sat on top of it.
+pub fn resolved_font_style(sn: &StyledNode) -> crate::font::FontStyle {
+    let sv = &sn.specified_values;
+    let bold = match sv.get(&crate::css::intern("font-weight")) {
+        Some(Value::Keyword(k)) => match k.as_ref() {
+            "bold" | "bolder" => true,
+            other => other.parse::<f32>().is_ok_and(|w| w >= 600.0),
+        },
+        Some(Value::Number(v)) => *v >= 600.0,
+        Some(Value::Length(v, _)) => *v >= 600.0,
+        _ => false,
+    };
+    let italic = matches!(
+        sv.get(&crate::css::intern("font-style")),
+        Some(Value::Keyword(k)) if matches!(k.as_ref(), "italic" | "oblique")
+    );
+    // A stack is monospace when its *first* family is: `font-family: monospace`
+    // and `ui-monospace, SFMono-Regular, ..., monospace` both want a fixed
+    // pitch, while `system-ui, monospace` does not reach the fallback.
+    let monospace = match sv.get(&crate::css::intern("font-family")) {
+        Some(Value::Keyword(k)) => family_is_monospace(k.as_ref()),
+        Some(Value::RawCustomProp(s)) => family_is_monospace(s.as_ref()),
+        _ => false,
+    };
+    crate::font::FontStyle { bold, italic, monospace }
+}
+
+/// Whether a `font-family` stack asks for a fixed-pitch face.
+///
+/// Only the generic keyword is recognised by name; a stack that names real
+/// monospace faces is caught by the same keyword appearing at its end, which is
+/// how every such stack is written.
+fn family_is_monospace(stack: &str) -> bool {
+    stack
+        .split(',')
+        .map(|f| f.trim().trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase())
+        .any(|f| f == "monospace" || f == "ui-monospace" || f.ends_with(" mono") || f.ends_with("-mono"))
+}
+
+/// `letter-spacing` in pixels. `normal` is zero.
+pub fn resolved_letter_spacing_px(sn: &StyledNode) -> f32 {
+    match sn.specified_values.get(&crate::css::intern("letter-spacing")) {
+        Some(Value::Length(v, Unit::Px)) => *v,
+        Some(Value::Length(v, Unit::Em)) => resolved_font_size_px(sn) * *v,
+        Some(Value::Length(v, Unit::Percent)) => resolved_font_size_px(sn) * (*v / 100.0),
+        _ => 0.0,
+    }
+}
+
 pub fn resolved_line_height_px(sn: &StyledNode) -> f32 {
     let font_size = resolved_font_size_px(sn);
     match sn.specified_values.get(&crate::css::intern("line-height")) {
         Some(Value::Length(v, Unit::Px)) => (*v).max(0.0),
         Some(Value::Length(v, Unit::Percent)) => (font_size * (*v / 100.0)).max(0.0),
         Some(Value::Number(v)) => (font_size * *v).max(0.0),
-        _ => crate::font::fonts().normal_line_height(font_size),
+        _ => crate::font::fonts().normal_line_height(font_size, resolved_font_style(sn)),
     }
 }
 
@@ -4069,7 +4151,7 @@ mod tests {
         // the second leaves a blank one. Expressed in terms of the font's own
         // line height rather than a fixed number, so the assertion still means
         // "two lines" if the bundled face changes.
-        let line = crate::font::fonts().normal_line_height(16.0);
+        let line = crate::font::fonts().normal_line_height(16.0, crate::font::FontStyle::regular());
         assert!(
             second.dimensions.y >= first.dimensions.y + line * 2.0 - 1.0,
             "consecutive <br> should create a blank line of vertical space: \
@@ -5757,6 +5839,63 @@ mod tests {
             (h.margin.top - 13.4).abs() < 2.0,
             "h1 margin should be 0.67em of its own 20px size, got {}",
             h.margin.top
+        );
+    }
+
+    /// A bold run is measured with the bold face, which is wider than the
+    /// regular one at the same size. Measuring bold text with the regular face
+    /// made every heading and brand mark come out short, so the box behind it
+    /// ended before the text did.
+    #[test]
+    fn test_bold_text_measures_wider_than_regular() {
+        let fonts = crate::font::fonts();
+        let regular = fonts.measure("Yunseong", 16.0, crate::font::FontStyle::regular(), 0.0);
+        let bold = fonts.measure(
+            "Yunseong",
+            16.0,
+            crate::font::FontStyle { bold: true, italic: false, monospace: false },
+            0.0,
+        );
+        assert!(
+            bold > regular + 2.0,
+            "bold should be measurably wider: regular={regular}, bold={bold}"
+        );
+    }
+
+    /// `letter-spacing` changes how wide a run is, so it has to reach both the
+    /// measurement that decides line breaks and the box drawn behind the text.
+    #[test]
+    fn test_letter_spacing_widens_a_run() {
+        let html = r#"<div><span id="a">dev / archive</span><span id="b" style="letter-spacing:2px">dev / archive</span></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let a = find_element_by_id(&layout, "a").expect("span a");
+        let b = find_element_by_id(&layout, "b").expect("span b");
+        // 13 characters, 2px after each.
+        let delta = b.dimensions.width - a.dimensions.width;
+        assert!(
+            (delta - 26.0).abs() < 3.0,
+            "2px of letter-spacing over 13 characters should add about 26px, got {delta}"
+        );
+    }
+
+    /// A padded flex item's box has to include its own padding and border once
+    /// the flex algorithm is done, or its background stops short of its text and
+    /// the next item is drawn on top of it.
+    #[test]
+    fn test_flex_item_box_includes_its_padding_and_border() {
+        let html = r#"<div style="display:flex">
+            <span id="a">Yunseong</span>
+            <span id="b" style="border-left:1px solid #000;padding-left:10px">dev</span>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let b = find_element_by_id(&layout, "b").expect("span b");
+        let text = crate::font::fonts().measure("dev", 16.0, crate::font::FontStyle::regular(), 0.0);
+        assert!(
+            b.dimensions.width >= text + 10.0,
+            "item box should cover text plus its 11px of padding and border: width={}, text={text}",
+            b.dimensions.width
         );
     }
 

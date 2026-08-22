@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Flex item blockification probe</title>
+<style>
+  body { margin: 0; font: 16px/1.4 sans-serif; background: #fff; }
+  .row { display: flex; align-items: center; gap: 16px; background: #eef; margin-bottom: 12px; }
+  /* Inline children of a flex container become flex items: the gap applies,
+     and their own padding and borders take effect. */
+  .name { font-weight: 800; background: #fd0; }
+  .meta { border-left: 2px solid #000; padding-left: 12px; background: #cfc; }
+  .row img { width: 24px; height: 24px; background: #808; }
+  .col { display: flex; flex-direction: column; gap: 8px; background: #ffe; }
+  .col span { background: #cff; }
+  /* A flex item's own `display: inline` must not stop it being a block box. */
+  .inlineitem { display: flex; gap: 10px; background: #fee; }
+  .inlineitem > * { display: inline; background: #ccf; padding: 4px; }
+  /* Text directly inside a flex container is wrapped in an anonymous item. */
+  .anon { display: flex; gap: 10px; background: #efe; }
+  /* An inline element becomes a flex container when the page says so — a
+     brand link built as `<a display:flex>` is the common case. */
+  a.brand { align-items: center; display: flex; gap: 10px; background: #eef; text-decoration: none; color: #000; }
+  a.brand .bname { font-weight: 800; background: #fd0; }
+  a.brand .bmeta { border-left: 2px solid #000; padding-left: 10px; background: #cfc; }
+  /* The same brand as a real site ships it: a smaller, letter-spaced,
+     uppercased second item next to a bold first one, inside a wrapping
+     space-between bar. Both the spacing and the divider have to land. */
+  .bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; padding: 8px 16px; background: #f7f8f9; }
+  .bar .brand2 { align-items: center; display: flex; gap: 10px; margin-right: 24px; padding: 0; text-decoration: none; color: #111; white-space: nowrap; background: #eef; }
+  .bar .brand2 .n { font-size: 16px; font-weight: 800; letter-spacing: -0.04em; background: #fd0; }
+  .bar .brand2 .m { border-left: 1px solid #000; color: #666; font-size: 10px; font-weight: 500; letter-spacing: 0.08em; padding-left: 10px; text-transform: uppercase; background: #cfc; }
+  .bar button { border: 1px solid #333; background: #fff; padding: 6px 10px; }
+</style>
+</head>
+<body>
+  <div class="row"><span class="name">Yunseong</span><span class="meta">DEV / ARCHIVE</span></div>
+  <div class="row"><a class="name" href="#">link item</a><b class="meta">bold item</b></div>
+  <div class="col"><span>first</span><span>second</span></div>
+  <div class="inlineitem"><span>a</span><span>b</span><span>c</span></div>
+  <div class="anon">bare text<span>after</span></div>
+  <a class="brand" href="#"><span class="bname">Yunseong</span><span class="bmeta">DEV / ARCHIVE</span></a>
+  <div class="bar">
+    <a class="brand2" href="#"><span class="n">Yunseong</span><span class="m">dev / archive</span></a>
+    <button type="button">Menu</button>
+  </div>
+</body>
+</html>

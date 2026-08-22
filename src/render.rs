@@ -397,7 +397,7 @@ fn execute_commands_on_tile(
                     draw_broken_image(pixmap, *r, alt, transform);
                 }
             }
-            PaintCommand::Text { rect, text, font_size, line_height, leading_space, color, clip, bold, italic, text_decoration } => {
+            PaintCommand::Text { rect, text, font_size, line_height, leading_space, color, clip, style, letter_spacing, text_decoration } => {
                 let mut adjusted_rect = *rect;
                 adjusted_rect.x += tx;
                 adjusted_rect.y += ty;
@@ -406,7 +406,7 @@ fn execute_commands_on_tile(
                 adjusted_clip.y += ty;
                 adjusted_rect.x += *leading_space;
                 adjusted_rect.width = (adjusted_rect.width - *leading_space).max(0.0);
-                render_text_raw(text.clone(), adjusted_rect, *font_size, *line_height, color, adjusted_clip, pixmap, *bold, *italic, *text_decoration);
+                render_text_raw(text.clone(), adjusted_rect, *font_size, *line_height, color, adjusted_clip, pixmap, *style, *letter_spacing, *text_decoration);
             }
             PaintCommand::Shadow(r, s) => {
                 let blur = *s.blur;
@@ -612,7 +612,7 @@ fn draw_broken_image(pixmap: &mut Pixmap, r: LayoutRect, alt: &str, transform: T
             height: (r.height - 8.0).max(0.0),
         };
         let text_color = Color { r: 100, g: 100, b: 100, a: 255 };
-        render_text_raw(display_text, text_rect, 12.0, 14.0, &text_color, text_rect, pixmap, false, false, 0);
+        render_text_raw(display_text, text_rect, 12.0, 14.0, &text_color, text_rect, pixmap, crate::font::FontStyle::regular(), 0.0, 0);
     }
 }
 
@@ -661,17 +661,18 @@ fn render_text_raw(
     color: &Color,
     clip: LayoutRect,
     pixmap: &mut Pixmap,
-    bold: bool,
-    italic: bool,
+    style: crate::font::FontStyle,
+    letter_spacing: f32,
     text_decoration: u8,
 ) {
+    let italic = style.italic;
     let trimmed = text.trim();
     if trimmed.is_empty() { return; }
     let fonts = crate::font::fonts();
     let baseline_offset = font_size * 0.85;
     let mut current_y = rect.y + baseline_offset;
     let mut current_x = rect.x;
-    let space_w = fonts.advance(' ', font_size);
+    let space_w = fonts.advance(' ', font_size, style) + letter_spacing;
 
     // Shear coefficient for italic synthesis: shifts pixels ~12° (tan 12° ≈ 0.213)
     const ITALIC_SHEAR: f32 = 0.213;
@@ -690,9 +691,12 @@ fn render_text_raw(
         let mut word_w = 0.0;
         let mut glyphs = Vec::new();
         for c in word.chars() {
-            let (face, gid) = fonts.glyph(c);
-            let adv = fonts.advance(c, font_size);
-            glyphs.push((face, gid, adv));
+            let (face, gid) = fonts.glyph(c, style);
+            // A real bold face is bundled, so only the CJK fallback — which has
+            // no bold companion — still needs the strokes thickened by hand.
+            let synthetic_bold = style.bold && face == crate::font::FaceId::Fallback;
+            let adv = fonts.advance(c, font_size, style) + letter_spacing;
+            glyphs.push((face, gid, adv, synthetic_bold));
             word_w += adv;
         }
         if current_x + word_w > rect.x + rect.width + 1.0 && current_x > rect.x {
@@ -703,12 +707,12 @@ fn render_text_raw(
             line_start_x = current_x;
             line_end_x = current_x;
         }
-        for (face, gid, adv) in glyphs {
+        for (face, gid, adv, synthetic_bold) in glyphs {
             let key = GlyphKey {
                 face,
                 glyph_id: gid.0,
                 font_size_half_px,
-                bold,
+                bold: synthetic_bold,
                 italic: false, // Italic shear is applied at paint time; do not vary cache by italic
             };
 
@@ -738,7 +742,7 @@ fn render_text_raw(
                         let by_delta = bounds.min.y.floor() as i32;
 
                         // Bold: expand each sample to up to 4 pixel offsets.
-                        let bold_offsets: &[(i32, i32)] = if bold {
+                        let bold_offsets: &[(i32, i32)] = if synthetic_bold {
                             &[(0, 0), (1, 0), (-1, 0), (0, 1)]
                         } else {
                             &[(0, 0)]
@@ -1047,12 +1051,12 @@ mod tests {
         let color = black();
 
         let mut pixmap1 = white_pixmap(200, 40);
-        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut pixmap1, false, false, 0);
+        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut pixmap1, crate::font::FontStyle { bold: false, italic: false, monospace: false }, 0.0, 0);
 
         clear_glyph_cache();
 
         let mut pixmap2 = white_pixmap(200, 40);
-        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut pixmap2, false, false, 0);
+        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut pixmap2, crate::font::FontStyle { bold: false, italic: false, monospace: false }, 0.0, 0);
 
         assert_eq!(pixmap1.data(), pixmap2.data(),
             "cache and uncached renders must produce identical pixels");
@@ -1066,7 +1070,7 @@ mod tests {
 
         let rect = full_rect(200.0, 40.0);
         let mut pixmap = white_pixmap(200, 40);
-        render_text_raw("Abc".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, false, false, 0);
+        render_text_raw("Abc".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle { bold: false, italic: false, monospace: false }, 0.0, 0);
 
         let cache_size = GLYPH_CACHE.lock().unwrap().len();
         assert!(cache_size > 0, "glyph cache should be non-empty after rendering text; got {} entries", cache_size);
@@ -1079,7 +1083,7 @@ mod tests {
         // Populate.
         let rect = full_rect(200.0, 40.0);
         let mut pixmap = white_pixmap(200, 40);
-        render_text_raw("Test".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, false, false, 0);
+        render_text_raw("Test".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle { bold: false, italic: false, monospace: false }, 0.0, 0);
 
         clear_glyph_cache();
 
@@ -1096,11 +1100,11 @@ mod tests {
         let color = black();
 
         let mut p1 = white_pixmap(200, 40);
-        render_text_raw("Bold".to_string(), rect, 16.0, 19.2, &color, rect, &mut p1, true, false, 0);
+        render_text_raw("Bold".to_string(), rect, 16.0, 19.2, &color, rect, &mut p1, crate::font::FontStyle { bold: true, italic: false, monospace: false }, 0.0, 0);
 
         clear_glyph_cache();
         let mut p2 = white_pixmap(200, 40);
-        render_text_raw("Bold".to_string(), rect, 16.0, 19.2, &color, rect, &mut p2, true, false, 0);
+        render_text_raw("Bold".to_string(), rect, 16.0, 19.2, &color, rect, &mut p2, crate::font::FontStyle { bold: true, italic: false, monospace: false }, 0.0, 0);
 
         assert_eq!(p1.data(), p2.data(), "bold renders must be identical across cache miss and cache hit");
     }
@@ -1114,11 +1118,11 @@ mod tests {
         let color = black();
 
         let mut p1 = white_pixmap(200, 40);
-        render_text_raw("Italic".to_string(), rect, 16.0, 19.2, &color, rect, &mut p1, false, true, 0);
+        render_text_raw("Italic".to_string(), rect, 16.0, 19.2, &color, rect, &mut p1, crate::font::FontStyle { bold: false, italic: true, monospace: false }, 0.0, 0);
 
         clear_glyph_cache();
         let mut p2 = white_pixmap(200, 40);
-        render_text_raw("Italic".to_string(), rect, 16.0, 19.2, &color, rect, &mut p2, false, true, 0);
+        render_text_raw("Italic".to_string(), rect, 16.0, 19.2, &color, rect, &mut p2, crate::font::FontStyle { bold: false, italic: true, monospace: false }, 0.0, 0);
 
         assert_eq!(p1.data(), p2.data(), "italic renders must be identical across cache miss and cache hit");
     }
@@ -1135,7 +1139,7 @@ mod tests {
         let mut pixmap = white_pixmap(200, 40);
         let white_before = pixmap.data().to_vec();
 
-        render_text_raw("Hello world".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, false, false, 0);
+        render_text_raw("Hello world".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle { bold: false, italic: false, monospace: false }, 0.0, 0);
 
         assert_ne!(pixmap.data(), white_before.as_slice(), "text rendering must modify the pixmap");
     }
@@ -1150,7 +1154,7 @@ mod tests {
         for text in &["", "   ", "\t\n"] {
             let mut pixmap = white_pixmap(200, 40);
             let before = pixmap.data().to_vec();
-            render_text_raw(text.to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, false, false, 0);
+            render_text_raw(text.to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle { bold: false, italic: false, monospace: false }, 0.0, 0);
             assert_eq!(pixmap.data(), before.as_slice(), "empty/whitespace text must not modify pixmap");
         }
     }
@@ -1165,10 +1169,10 @@ mod tests {
         let color = black();
 
         let mut plain = white_pixmap(200, 40);
-        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut plain, false, false, 0);
+        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut plain, crate::font::FontStyle { bold: false, italic: false, monospace: false }, 0.0, 0);
 
         let mut underlined = white_pixmap(200, 40);
-        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut underlined, false, false, 0b001);
+        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut underlined, crate::font::FontStyle { bold: false, italic: false, monospace: false }, 0.0, 0b001);
 
         assert_ne!(plain.data(), underlined.data(), "underlined text must differ from plain text");
     }
@@ -1182,9 +1186,9 @@ mod tests {
         let color = black();
 
         let mut p12 = white_pixmap(200, 60);
-        render_text_raw("A".to_string(), rect, 12.0, 14.4, &color, rect, &mut p12, false, false, 0);
+        render_text_raw("A".to_string(), rect, 12.0, 14.4, &color, rect, &mut p12, crate::font::FontStyle { bold: false, italic: false, monospace: false }, 0.0, 0);
         let mut p24 = white_pixmap(200, 60);
-        render_text_raw("A".to_string(), rect, 24.0, 28.8, &color, rect, &mut p24, false, false, 0);
+        render_text_raw("A".to_string(), rect, 24.0, 28.8, &color, rect, &mut p24, crate::font::FontStyle { bold: false, italic: false, monospace: false }, 0.0, 0);
 
         // Primary assertion: different font sizes must produce different pixel output,
         // which proves the cache treats them as independent entries.
@@ -1220,10 +1224,10 @@ mod tests {
         let rect = full_rect(200.0, 40.0);
 
         let mut p_black = white_pixmap(200, 40);
-        render_text_raw("Hi".to_string(), rect, 16.0, 19.2, &black(), rect, &mut p_black, false, false, 0);
+        render_text_raw("Hi".to_string(), rect, 16.0, 19.2, &black(), rect, &mut p_black, crate::font::FontStyle { bold: false, italic: false, monospace: false }, 0.0, 0);
 
         let mut p_red = white_pixmap(200, 40);
-        render_text_raw("Hi".to_string(), rect, 16.0, 19.2, &red(), rect, &mut p_red, false, false, 0);
+        render_text_raw("Hi".to_string(), rect, 16.0, 19.2, &red(), rect, &mut p_red, crate::font::FontStyle { bold: false, italic: false, monospace: false }, 0.0, 0);
 
         assert_ne!(p_black.data(), p_red.data(), "black and red text must produce different pixel output");
     }
@@ -1371,10 +1375,10 @@ mod tests {
         let color = black();
 
         let mut p_right = white_pixmap(200, 40);
-        render_text_raw("Hello world text".to_string(), rect, 16.0, 19.2, &color, clip_right, &mut p_right, false, false, 0);
+        render_text_raw("Hello world text".to_string(), rect, 16.0, 19.2, &color, clip_right, &mut p_right, crate::font::FontStyle { bold: false, italic: false, monospace: false }, 0.0, 0);
 
         let mut p_full = white_pixmap(200, 40);
-        render_text_raw("Hello world text".to_string(), rect, 16.0, 19.2, &color, clip_full, &mut p_full, false, false, 0);
+        render_text_raw("Hello world text".to_string(), rect, 16.0, 19.2, &color, clip_full, &mut p_full, crate::font::FontStyle { bold: false, italic: false, monospace: false }, 0.0, 0);
 
         // The two renders must differ (full render has pixels in x=0..99 too).
         assert_ne!(p_right.data(), p_full.data(),

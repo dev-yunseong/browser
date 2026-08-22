@@ -42,10 +42,11 @@ pub enum PaintCommand {
         leading_space: f32,
         color: Color,
         clip: LayoutRect,
-        /// `true` when `font-weight: bold` (or numeric >= 600)
-        bold: bool,
-        /// `true` when `font-style: italic` or `oblique`
-        italic: bool,
+        /// Which face the run is set in — weight, slant and pitch together.
+        /// Layout measured with this face, so paint has to draw with it.
+        style: crate::font::FontStyle,
+        /// `letter-spacing` in pixels, added after every character.
+        letter_spacing: f32,
         /// Bitmask: bit 0 = underline, bit 1 = line-through, bit 2 = overline
         text_decoration: u8,
     },
@@ -805,11 +806,11 @@ impl LayerTreeBuilder {
                 Some(Value::Color(c)) => c.clone(),
                 _ => Color { r: 0, g: 0, b: 0, a: 255 },
             };
-            let bold = is_bold(sv);
-            let italic = match sv.get(&crate::css::intern("font-style")) {
-                Some(Value::Keyword(k)) => matches!(k.as_ref(), "italic" | "oblique"),
-                _ => false,
-            };
+            // Read the face and spacing from the same helpers layout measured
+            // with, so paint cannot drift from the widths that decided the
+            // line breaks.
+            let font_style = crate::layout::resolved_font_style(layout.style_node);
+            let letter_spacing = crate::layout::resolved_letter_spacing_px(layout.style_node);
             let text_decoration: u8 = match sv.get(&crate::css::intern("text-decoration")) {
                 Some(Value::Keyword(k)) => match k.as_ref() {
                     "underline"    => 0b001,
@@ -830,8 +831,8 @@ impl LayerTreeBuilder {
                     leading_space: layout.text_leading,
                     color,
                     clip,
-                    bold,
-                    italic,
+                    style: font_style,
+                    letter_spacing,
                     text_decoration,
                 });
             }
@@ -866,8 +867,8 @@ impl LayerTreeBuilder {
                     leading_space: 0.0,
                     color,
                     clip,
-                    bold: false,
-                    italic: false,
+                    style: crate::font::FontStyle::regular(),
+                    letter_spacing: 0.0,
                     text_decoration: 0,
                 });
             }
@@ -907,8 +908,8 @@ impl LayerTreeBuilder {
                     leading_space: 0.0,
                     color,
                     clip: d, // clip to the button bounds
-                    bold: false,
-                    italic: false,
+                    style: crate::font::FontStyle::regular(),
+                    letter_spacing: 0.0,
                     text_decoration: 0,
                 });
             }
@@ -941,8 +942,8 @@ impl LayerTreeBuilder {
                     leading_space: 0.0,
                     color,
                     clip: d,
-                    bold: false,
-                    italic: false,
+                    style: crate::font::FontStyle::regular(),
+                    letter_spacing: 0.0,
                     text_decoration: 0,
                 });
             }
