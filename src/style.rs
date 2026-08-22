@@ -1141,6 +1141,8 @@ fn build_final_tree(
                     }
                 }
 
+                promote_resolved_background(&mut specified_values);
+
                 let interned_map = store.intern(specified_values);
 
                 let children_handles: Vec<Handle> = handle.children.borrow().iter().cloned().collect();
@@ -1485,17 +1487,53 @@ fn selector_base_matches_element(sel: &Selector, node: &StyledNode) -> bool {
 /// `content_text` — the text to inject (may be empty for block-level decorators).
 /// `pseudo_decls` — the CSS declarations from the matching rule.
 /// `parent_values` — the parent element's computed style, used to inherit properties.
+/// Put a `background` shorthand that has only just resolved into the slot paint
+/// reads.
+///
+/// `background: var(--x)` leaves the shorthand holding the reference and the
+/// colour slot holding the reset the shorthand emits, because the substitution
+/// happens long after the shorthand was split. A colour slot that something
+/// else filled is left alone: the reset is transparent, so anything opaque
+/// there came from a later declaration.
+fn promote_resolved_background(map: &mut HashMap<Arc<str>, Value>) {
+    let colour_slot_is_reset = matches!(
+        map.get(&intern("background-color")),
+        None | Some(Value::Color(crate::css::Color { a: 0, .. }))
+    );
+    if !colour_slot_is_reset {
+        return;
+    }
+    match map.get(&intern("background")).cloned() {
+        Some(v @ Value::Color(_)) => {
+            map.insert(intern("background-color"), v);
+        }
+        Some(v @ Value::Gradient(_)) => {
+            map.entry(intern("background-image")).or_insert(v);
+        }
+        _ => {}
+    }
+}
+
 fn make_pseudo_styled_node(
     content_text: String,
     pseudo_decls: &[crate::css::Declaration],
     parent_values: &PropertyMap,
 ) -> StyledNode {
     use html5ever::tendril::StrTendril;
+    use html5ever::{ns, LocalName, QualName};
     use markup5ever_rcdom::Node;
 
-    // Create a real text node handle so that layout recognises it as a text run.
-    let text_handle = Node::new(NodeData::Text {
-        contents: std::cell::RefCell::new(StrTendril::from(content_text.as_str())),
+    // A generated box is an element, not a text run: `::before { content: "";
+    // display: block; width: 100%; height: 100% }` is how a page draws a circle
+    // behind an icon or a wash behind a card, and none of that survives being
+    // modelled as a text node — layout sizes a text node by its text, so an
+    // empty `content` came out nothing at all and a stated width and height were
+    // never read. The content, when there is any, becomes a text child of it.
+    let element_handle = Node::new(NodeData::Element {
+        name: QualName::new(None, ns!(html), LocalName::from("span")),
+        attrs: std::cell::RefCell::new(vec![]),
+        template_contents: std::cell::RefCell::new(None),
+        mathml_annotation_xml_integration_point: false,
     });
 
     // Build the property map: start with inheritable properties from parent, then
@@ -1516,16 +1554,52 @@ fn make_pseudo_styled_node(
         }
     }
 
+    // Custom properties inherit too, and a generated box is where a design
+    // system reaches for them — `::before { background: var(--bgColor) }` is how
+    // github draws the disc behind its play button. Without them the `var()`
+    // below resolves to nothing and the box paints no fill.
+    let mut custom_props: HashMap<Arc<str>, Value> = HashMap::new();
+    for (key, value) in parent_values.0.iter() {
+        if key.starts_with("--") {
+            custom_props.insert(key.clone(), value.clone());
+            map.insert(key.clone(), value.clone());
+        }
+    }
+    for decl in pseudo_decls {
+        if decl.name.starts_with("--") {
+            custom_props.insert(decl.name.clone(), decl.value.clone());
+        }
+    }
+
     // Apply pseudo-element declarations (skip `content` itself).
     for decl in pseudo_decls {
         if decl.name.as_ref() == "content" { continue; }
-        map.insert(decl.name.clone(), decl.value.clone());
+        let value = match &decl.value {
+            v @ Value::CssVar { .. } => resolve_var(v, &custom_props, 0).unwrap_or_else(|| v.clone()),
+            v => v.clone(),
+        };
+        map.insert(decl.name.clone(), value);
     }
 
+    promote_resolved_background(&mut map);
+    let values = PropertyMap(Arc::new(map));
+    let children = if content_text.is_empty() {
+        Vec::new()
+    } else {
+        let text_handle = Node::new(NodeData::Text {
+            contents: std::cell::RefCell::new(StrTendril::from(content_text.as_str())),
+        });
+        vec![StyledNode {
+            node: text_handle,
+            specified_values: values.clone(),
+            children: Vec::new(),
+        }]
+    };
+
     StyledNode {
-        node: text_handle,
-        specified_values: PropertyMap(Arc::new(map)),
-        children: Vec::new(),
+        node: element_handle,
+        specified_values: values,
+        children,
     }
 }
 
@@ -1995,17 +2069,22 @@ mod tests {
 
     /// Walk the styled tree and find the first child of `parent_tag` element that
     /// is a text node carrying the given text string.
+    /// Whether `parent_tag` has a child carrying `text`.
+    ///
+    /// A generated box is an element with the content as its own text child, so
+    /// the search goes one level deeper than the parent's own children.
     fn find_text_child(root: &StyledNode, parent_tag: &str, text: &str) -> bool {
         let node = match find_node(root, parent_tag) {
             Some(n) => n,
             None => return false,
         };
-        for child in &node.children {
-            if let markup5ever_rcdom::NodeData::Text { ref contents } = child.node.data {
-                if contents.borrow().as_ref() == text { return true; }
+        fn holds(node: &StyledNode, text: &str) -> bool {
+            if let markup5ever_rcdom::NodeData::Text { ref contents } = node.node.data {
+                return contents.borrow().as_ref() == text;
             }
+            node.children.iter().any(|c| holds(c, text))
         }
-        false
+        node.children.iter().any(|c| holds(c, text))
     }
 
     #[test]

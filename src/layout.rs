@@ -781,6 +781,24 @@ fn wrapped_text_extent(sn: &StyledNode, text: &str, available: f32) -> (f32, f32
     (widest.min(available.max(0.0)), lines as f32 * line_height)
 }
 
+/// The containing block an absolutely positioned child resolves against: its
+/// ancestor's *padding* box, per CSS 2.2 §10.1.
+///
+/// Reading the content box instead left a `position: absolute; inset: 0`
+/// overlay short by the padding it is meant to cover — the accent stripe down
+/// the side of a padded card came out the height of its text rather than of the
+/// card.
+fn padding_box_of(cb: &LayoutBox<'_>) -> Rect {
+    let border_w = outer_width(cb);
+    let border_h = outer_height(cb);
+    Rect {
+        x: cb.dimensions.x + cb.border.left,
+        y: cb.dimensions.y + cb.border.top,
+        width: (border_w - cb.border.left - cb.border.right).max(0.0),
+        height: (border_h - cb.border.top - cb.border.bottom).max(0.0),
+    }
+}
+
 fn ratio_border_box_height(
     border_box: bool,
     padding: &EdgeSizes,
@@ -2737,22 +2755,7 @@ impl<'a> LayoutBox<'a> {
             // ── Layout absolutely/fixedly positioned children inside flex container ──
             // Same logic as the block layout path: position after container size is known.
             if !flex_positioned_entries.is_empty() {
-                let final_self_cb = Rect {
-                    x: self.dimensions.x + self.padding.left + self.border.left,
-                    y: self.dimensions.y + self.padding.top + self.border.top,
-                    width: (self.dimensions.width
-                        - self.padding.left
-                        - self.padding.right
-                        - self.border.left
-                        - self.border.right)
-                        .max(0.0),
-                    height: (self.dimensions.height
-                        - self.padding.top
-                        - self.padding.bottom
-                        - self.border.top
-                        - self.border.bottom)
-                        .max(0.0),
-                };
+                let final_self_cb = padding_box_of(&self);
 
                 for pos_node in flex_positioned_entries {
                     let child_pos_type = get_position_type(pos_node);
@@ -3808,22 +3811,7 @@ impl<'a> LayoutBox<'a> {
         // Now that self has its final dimensions, we can resolve absolute offsets against it.
         if !positioned_entries.is_empty() {
             // The final content-box of self (after height is known).
-            let final_self_cb = Rect {
-                x: self.dimensions.x + self.padding.left + self.border.left,
-                y: self.dimensions.y + self.padding.top + self.border.top,
-                width: (self.dimensions.width
-                    - self.padding.left
-                    - self.padding.right
-                    - self.border.left
-                    - self.border.right)
-                    .max(0.0),
-                height: (self.dimensions.height
-                    - self.padding.top
-                    - self.padding.bottom
-                    - self.border.top
-                    - self.border.bottom)
-                    .max(0.0),
-            };
+            let final_self_cb = padding_box_of(&self);
 
             // Every insertion shifts the ones after it, and the entries are in
             // document order, so the offset is just how many have gone in.
@@ -8529,6 +8517,66 @@ mod tests {
             (r.dimensions.width - 240.0).abs() < 1.0,
             "120 tall at 2:1 is 240 wide, got {}",
             r.dimensions.width
+        );
+    }
+
+    /// A generated box is a box, not a text run. `content: ""` with a stated
+    /// size is how a page draws a disc behind an icon or a stripe down the side
+    /// of a card, and none of that survives being modelled as a text node.
+    #[test]
+    fn test_a_generated_box_is_sized_by_its_own_properties() {
+        let css = r#"
+            .disc { --bg: #ffffff2e; position: relative; width: 44px; height: 44px }
+            .disc::before { content: ""; background: var(--bg); width: 100%; height: 100%; position: absolute }
+            .card { --accent: #3fb950; padding: 12px; position: relative }
+            .card::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: var(--accent) }
+            .rule::after { content: ""; display: block; height: 4px; width: 120px; background: #a371f7 }
+        "#;
+        let html = r#"<div style="width:400px">
+            <div class="disc" id="disc"></div>
+            <div class="card" id="card">a line of text</div>
+            <h3 class="rule" id="rule">a heading</h3>
+        </div>"#;
+        let (layout, _, _) = layout_from_html_css(html, css, 800.0, 600.0);
+
+        // The disc's generated box fills it, and carries the colour the custom
+        // property names.
+        let disc = find_element_by_id(&layout, "disc").expect("disc");
+        let before = disc.children.first().expect("a generated child");
+        assert!(
+            (outer_width(before) - 44.0).abs() < 0.5 && (outer_height(before) - 44.0).abs() < 0.5,
+            "the generated box is 44x44, got {}x{}",
+            outer_width(before),
+            outer_height(before)
+        );
+        assert!(
+            matches!(
+                before.style_node.specified_values.get(&crate::css::intern("background-color")),
+                Some(Value::Color(c)) if c.a > 0
+            ),
+            "and takes the colour its `var()` names"
+        );
+
+        // `top: 0; bottom: 0` stretches against the *padding* box, so a stripe
+        // down a padded card is as tall as the card, not as its text.
+        let card = find_element_by_id(&layout, "card").expect("card");
+        let stripe = card.children.first().expect("a generated child");
+        assert!(
+            (outer_height(stripe) - outer_height(card)).abs() < 0.5,
+            "the stripe covers the card's {} px, got {}",
+            outer_height(card),
+            outer_height(stripe)
+        );
+
+        // A generated box in flow takes its own size and pushes the box it
+        // belongs to.
+        let rule = find_element_by_id(&layout, "rule").expect("rule");
+        let after = rule.children.last().expect("a generated child");
+        assert!(
+            (outer_height(after) - 4.0).abs() < 0.5 && (outer_width(after) - 120.0).abs() < 0.5,
+            "the rule is 120x4, got {}x{}",
+            outer_width(after),
+            outer_height(after)
         );
     }
 
