@@ -44,6 +44,18 @@ a regression points at a mechanism rather than at "github.com looks wrong":
 | `smoke` | block/inline flow, flex row, borders, radii |
 | `probe-hiding` | every idiom real sites use to hide content |
 | `probe-sizing` | grid track sizing, flex basis, percentage widths |
+| `probe-spacing` | margins and paddings from `var()` and `calc()`, grid and flex gaps |
+| `probe-vars` | custom properties: fallbacks, arithmetic, theming by attribute |
+| `probe-fixed` | `position: fixed`/`absolute`/`sticky`, out-of-flow heroes |
+| `probe-gradient` | linear and radial gradients, stops outside the box |
+| `probe-image` | intrinsic sizing, `object-fit`, data URIs |
+| `probe-inline` | inline runs, reserved inter-element space, wrapping |
+| `probe-overflow` | `overflow` clipping, `clip-path`, scroll containers |
+| `probe-controls` | buttons, inputs and anchors styled as controls |
+| `probe-flexitems` | inline children of a flex container, an inline flex container |
+| `probe-navbar` | a real site's brand bar, markup and stylesheet taken verbatim |
+| `probe-generics` | which face `sans-serif`, `serif` and `monospace` resolve to |
+| `probe-webfont` | `@font-face` in woff2, woff and truetype, and family fallback |
 
 ## Known limitation: two box models in one engine
 
@@ -68,13 +80,34 @@ code, the flex re-layout pass that re-runs an item at its flexed main size, and
 the rect collectors — in one change, with `test_button_coordinate_collection`
 and `test_border_box_min_size_includes_padding` updated to the chosen model.
 
-This has been attempted once, migrating the width computation and painting
-together and leaving the flex paths alone. Every test still passed and nearly
-every fixture got worse: flex cards came out 30px too wide because the re-layout
-pass feeds an item's flexed width back in as a containing-block width, and the
-padding is then taken off a second time. The tests do not cover the interaction;
-only the pixel diff caught it. A half-migration renders worse than either model
-alone, so the next attempt needs the flex paths in the same change.
+This has been attempted twice, and both attempts are worth knowing about.
+
+The first migrated the width computation and painting together and left the flex
+paths alone. Every test still passed and nearly every fixture got worse: flex
+cards came out 30px too wide because the re-layout pass feeds an item's flexed
+width back in as a containing-block width, and the padding is then taken off a
+second time. The tests do not cover that interaction; only the pixel diff caught
+it.
+
+The second tried the smallest possible version: stop taking padding off a
+*shrink-to-fit* width under `border-box`, on the grounds that `max-content`
+already counts it, so the painted box would cover the label. That does fix the
+clipped button — and immediately breaks `min-width`. The bounds are compared
+against `width` in the content-box space the rest of the function assumes, so a
+`min-width: 85px` box came out 85px of *content* plus its padding, 24px too wide,
+and a floated header cluster overflowed the viewport. Mapping the bounds into the
+other space fixes that pair and breaks the next one along.
+
+Both attempts say the same thing: the meaning of `dimensions` cannot be changed
+for one path at a time. The next attempt needs the width computation, the
+min/max bounds, the flex re-layout pass and paint in a single change, with
+`test_button_coordinate_collection` and `test_border_box_min_size_includes_padding`
+rewritten to the chosen model.
+
+A flex item is the one path that has been migrated, and only because its
+conversion could be done in one place: through the flex algorithm `dimensions`
+holds the content box, which is what flex-basis and grow operate on, and it is
+converted to the border box once, after the algorithm finishes.
 
 ## Known limitation: inline runs do not fragment across lines
 

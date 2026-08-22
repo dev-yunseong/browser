@@ -54,18 +54,40 @@ Ordered by how much of a page each one destroyed.
 | `min-height` / `max-height` applied only in block layout | A navbar sized by `min-height` collapsed to its content and everything below it moved up. |
 | Hairlines drawn at fractional offsets | A 1px `#161718` rule spread across two rows and came out `#656667`. On a design built from hairlines that is most of its visible structure. |
 | `display: flex` parsed as a length | Introduced while adding `ch`/`ex`: the parser matched a unit suffix without checking that a number preceded it, and `flex` ends in `ex`. Caught by the probes the same day. |
+| Custom property names lowercased | Property names are case-insensitive; custom ones are not. Every `var()` naming a mixed-case token — `--borderColor-default`, which is how a design system names all of them — looked up a property nothing had defined, so a whole palette resolved to nothing. |
+| Selector lists split on every comma | `:has(p, div, pre)` carries commas of its own, so one narrow selector became several wide ones. A fragment as broad as `div` matched every division on the page and drew GitHub's focus ring around 639 elements. |
+| Leading `var()` in a border shorthand read as the colour | The width then defaulted to `medium`, so `border-top: var(--borderWidth-thin) solid #fff9` came out as a 3px rule in the element's text colour — white, on a dark surface. |
+| `#rgba` hex colours unparsed | A translucent tint fell back to the property's initial value. |
+| Bold text measured with the regular face | A bold face is wider at the same size, so headings and brand marks measured short and the box behind them ended before the text did — the next item was then drawn on top of the last word. |
+| `letter-spacing` ignored | Applied by neither measurement nor paint, so a tracked heading was the wrong width and broke in the wrong place. |
+| Two of three generic families bound to the wrong face | The bundled `sans-serif` was right only by accident — the file named `DejaVuSans.ttf` was in fact Liberation Sans — while `serif` fell back to sans and the bold sans was 17% too wide. |
+| `@font-face` discarded | A page designed around its own face was measured with a bundled one, so every line broke somewhere else. WOFF and WOFF2 are what every real site ships, so an engine that reads only bare TTF loads none of them. |
+| Flex container one `gap` too tall | The trailing gap was only removed for multi-line containers, so every single-line flex row was one gap too tall — and a page built from stacked flex rows accumulated the error all the way down. |
+| Shrink-wrapped flex item narrowed by its own margin | Max-content is a content width and knows nothing of margins, but the block sizing path subtracts them from whatever it is handed. An item with a side margin came out that much narrower than its content, and its children were shrunk to fit. |
+| `align-items` ignored on a column flex container | Items were measured at the container's full width, so `center` had nothing to centre. |
+| Gradient stops clamped to the box | `#fff 117%` means the gradient never reaches white inside the box; clamping made it reach white at the bottom edge, so a hero faded a whole shade too early. |
+| UA block margins stated in pixels | `p`, `ul`, `h1`-`h6` take `em` margins in the spec's sheet, so they track the page's font size. Fixed pixels pinned a page's rhythm to a 16px body, and `h3`-`h6` had no margins at all. |
+| Grid `auto` tracks sized from free space | `auto` and `fr` drew from the same pool, so on `auto 1fr` the auto track swallowed the row and the column beside it came out empty. |
+
+## Where it stands
+
+Ten of the thirteen probe fixtures are now under 1% of a 16px block-mean diff,
+and two of them are pixel-identical over the first fold. The three that are not
+are listed below with what holds them back.
 
 ## What still limits parity
 
-- **Web fonts are not loaded.** `@font-face` is skipped, so a page designed
-  around a specific face is measured with a bundled one. Advance widths differ,
-  so lines break in different places and page heights differ by around a fifth.
-  This is the largest remaining source of drift on a text-heavy page.
 - **Canvas, video and script-driven content do not render.** github.com's
   landing page is largely a WebGL canvas and a video, so a large share of its
   remaining difference is content this engine does not draw at all rather than
   draws wrongly.
-- **Two box models coexist** — see `tools/parity/README.md`. Shrink-to-fit
-  controls come out narrower than their labels.
+- **Two box models coexist** — see `tools/parity/README.md` for the two failed
+  migrations and what each one hit. The visible cost is a shrink-to-fit control
+  coming out narrower than its own label (`probe-controls`).
 - **Inline runs do not fragment across lines**, so a wrapped run's continuation
-  is indented to wherever the run began.
+  is indented to wherever the run began (`probe-inline`).
+- **A snapshot can only be as good as its capture.** `capture.mjs` now inlines
+  fonts as well as stylesheets and images, but a snapshot taken before that
+  still points at a CDN, and a page rendered against a fallback face is a
+  difference in the snapshot rather than in either renderer. Re-capture before
+  reading a font-heavy page's numbers.
