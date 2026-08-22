@@ -5,17 +5,22 @@
 //! matching what is drawn, so both go through this module.
 //!
 //! Faces are bundled rather than discovered from the system, so a page renders
-//! the same way wherever this runs. DejaVu Sans is the primary because it is the
-//! default `sans-serif` on the Linux systems this renders against, so Latin text
-//! picks up the same advance widths a browser would use; its bold and monospace
-//! companions are bundled for the same reason. NanumGothic covers the CJK ranges
-//! DejaVu has no glyphs for.
+//! the same way wherever this runs. Which faces are bundled is not a matter of
+//! taste: they are the ones a browser resolves the CSS generic families to on
+//! the Linux systems this renders against — Liberation Sans for `sans-serif`,
+//! Liberation Serif for `serif`, DejaVu Sans Mono for `monospace` — established
+//! by measuring the same string in both. A face with different advance widths
+//! breaks lines in different places, so the wrong choice makes a page the wrong
+//! length however correct the layout code is. NanumGothic covers the CJK ranges
+//! none of them have glyphs for.
 
 use ab_glyph::{Font, FontRef, GlyphId, PxScale};
 use std::sync::{OnceLock, RwLock};
 
-const SANS: &[u8] = include_bytes!("../assets/fonts/DejaVuSans.ttf");
-const SANS_BOLD: &[u8] = include_bytes!("../assets/fonts/DejaVuSans-Bold.ttf");
+const SANS: &[u8] = include_bytes!("../assets/fonts/LiberationSans-Regular.ttf");
+const SANS_BOLD: &[u8] = include_bytes!("../assets/fonts/LiberationSans-Bold.ttf");
+const SERIF: &[u8] = include_bytes!("../assets/fonts/LiberationSerif-Regular.ttf");
+const SERIF_BOLD: &[u8] = include_bytes!("../assets/fonts/LiberationSerif-Bold.ttf");
 const MONO: &[u8] = include_bytes!("../assets/fonts/DejaVuSansMono.ttf");
 const MONO_BOLD: &[u8] = include_bytes!("../assets/fonts/DejaVuSansMono-Bold.ttf");
 const FALLBACK: &[u8] = include_bytes!("../assets/fonts/NanumGothic.ttf");
@@ -28,6 +33,8 @@ const FALLBACK: &[u8] = include_bytes!("../assets/fonts/NanumGothic.ttf");
 pub enum FaceId {
     Sans,
     SansBold,
+    Serif,
+    SerifBold,
     Mono,
     MonoBold,
     Fallback,
@@ -44,6 +51,7 @@ pub struct FontStyle {
     pub bold: bool,
     pub italic: bool,
     pub monospace: bool,
+    pub serif: bool,
     /// A registered web-font family, if the element's `font-family` names one.
     /// `None` means the bundled faces.
     pub web_family: Option<u16>,
@@ -51,17 +59,19 @@ pub struct FontStyle {
 
 impl FontStyle {
     pub const fn regular() -> Self {
-        FontStyle { bold: false, italic: false, monospace: false, web_family: None }
+        FontStyle { bold: false, italic: false, monospace: false, serif: false, web_family: None }
     }
 
     /// The bundled face this style asks for, before any fallback for missing
     /// glyphs. Web faces are consulted first, in `FontSet::glyph`.
     pub fn face(self) -> FaceId {
-        match (self.monospace, self.bold) {
-            (true, true) => FaceId::MonoBold,
-            (true, false) => FaceId::Mono,
-            (false, true) => FaceId::SansBold,
-            (false, false) => FaceId::Sans,
+        match (self.monospace, self.serif, self.bold) {
+            (true, _, true) => FaceId::MonoBold,
+            (true, _, false) => FaceId::Mono,
+            (false, true, true) => FaceId::SerifBold,
+            (false, true, false) => FaceId::Serif,
+            (false, false, true) => FaceId::SansBold,
+            (false, false, false) => FaceId::Sans,
         }
     }
 }
@@ -164,6 +174,8 @@ fn faces_for(family: u16, bold: bool, italic: bool) -> Vec<(u32, &'static WebFac
 pub struct FontSet {
     sans: FontRef<'static>,
     sans_bold: FontRef<'static>,
+    serif: FontRef<'static>,
+    serif_bold: FontRef<'static>,
     mono: FontRef<'static>,
     mono_bold: FontRef<'static>,
     fallback: FontRef<'static>,
@@ -174,6 +186,8 @@ impl FontSet {
         match id {
             FaceId::Sans => &self.sans,
             FaceId::SansBold => &self.sans_bold,
+            FaceId::Serif => &self.serif,
+            FaceId::SerifBold => &self.serif_bold,
             FaceId::Mono => &self.mono,
             FaceId::MonoBold => &self.mono_bold,
             FaceId::Fallback => &self.fallback,
@@ -285,6 +299,8 @@ pub fn fonts() -> &'static FontSet {
     FONTS.get_or_init(|| FontSet {
         sans: FontRef::try_from_slice(SANS).expect("bundled sans font should parse"),
         sans_bold: FontRef::try_from_slice(SANS_BOLD).expect("bundled bold font should parse"),
+        serif: FontRef::try_from_slice(SERIF).expect("bundled serif font should parse"),
+        serif_bold: FontRef::try_from_slice(SERIF_BOLD).expect("bundled serif bold font should parse"),
         mono: FontRef::try_from_slice(MONO).expect("bundled mono font should parse"),
         mono_bold: FontRef::try_from_slice(MONO_BOLD).expect("bundled mono bold font should parse"),
         fallback: FontRef::try_from_slice(FALLBACK).expect("bundled fallback font should parse"),

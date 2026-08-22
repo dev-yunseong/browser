@@ -1403,10 +1403,24 @@ impl<'a> LayoutBox<'a> {
                             _ => None,
                         }
                     });
+                // In a column container the cross axis is horizontal, so an
+                // `align-items` other than `stretch` shrink-wraps the item
+                // instead of filling the line. Measuring it at the full width
+                // regardless made every item exactly as wide as its container,
+                // which left `center` nothing to centre.
+                let child_align = child_node
+                    .specified_values
+                    .get(&crate::css::intern("align-self"))
+                    .and_then(|v| if let Value::Keyword(k) = v { Some(&**k) } else { None })
+                    .unwrap_or(align_items);
+                let column_shrink_wraps = !is_row && child_align != "stretch";
                 let measure_width =
                     if let Some(basis) = flex_basis {
                         basis.min(inner_width).max(0.0)
-                    } else if is_row && is_block_level_for(child_node, child_display) && !child_has_explicit_width {
+                    } else if (is_row || column_shrink_wraps)
+                        && is_block_level_for(child_node, child_display)
+                        && !child_has_explicit_width
+                    {
                         // Shrink-wrap: use max-content so block items don't fill the flex
                         // container. The block sizing path subtracts the item's own margins
                         // from whatever container width it is handed, so they have to be
@@ -1719,11 +1733,19 @@ impl<'a> LayoutBox<'a> {
                     _ => (0.0, 0.0), // flex-start
                 };
 
-                // Cross-axis size of this line (max of all items' cross sizes).
-                let line_cross: f32 = line_indices
+                // Cross-axis size of this line: the tallest (or widest) item in
+                // it. A single-line column container is the exception — its
+                // cross axis is horizontal and the container's own width is
+                // definite, so that width is the line. Taking the widest item
+                // instead left `align-items: center` nothing to centre against,
+                // since the widest item filled the line by definition.
+                let mut line_cross: f32 = line_indices
                     .iter()
                     .map(|&i| cross_size(&raw_items[i].cb))
                     .fold(0.0_f32, f32::max);
+                if !is_row && lines.len() == 1 {
+                    line_cross = line_cross.max(inner_width);
+                }
 
                 // Place each item.
                 for (idx_in_line, &i) in line_indices.iter().enumerate() {
@@ -3119,15 +3141,17 @@ pub fn resolved_font_style(sn: &StyledNode) -> crate::font::FontStyle {
         sv.get(&crate::css::intern("font-style")),
         Some(Value::Keyword(k)) if matches!(k.as_ref(), "italic" | "oblique")
     );
-    // A stack is monospace when its *first* family is: `font-family: monospace`
-    // and `ui-monospace, SFMono-Regular, ..., monospace` both want a fixed
-    // pitch, while `system-ui, monospace` does not reach the fallback.
-    let monospace = match sv.get(&crate::css::intern("font-family")) {
-        Some(Value::Keyword(k)) => family_is_monospace(k.as_ref()),
-        Some(Value::RawCustomProp(s)) => family_is_monospace(s.as_ref()),
-        _ => false,
+    // Which generic the stack asks for. `ui-monospace, SFMono-Regular, ...,
+    // monospace` wants a fixed pitch; `Georgia, serif` wants a serif. A stack
+    // that names neither gets the sans-serif default, as a browser does.
+    let stack = match sv.get(&crate::css::intern("font-family")) {
+        Some(Value::Keyword(k)) => Some(k.to_string()),
+        Some(Value::RawCustomProp(s)) => Some(s.to_string()),
+        _ => None,
     };
-    crate::font::FontStyle { bold, italic, monospace, web_family: web_family_for(sv) }
+    let monospace = stack.as_deref().is_some_and(family_is_monospace);
+    let serif = !monospace && stack.as_deref().is_some_and(family_is_serif);
+    crate::font::FontStyle { bold, italic, monospace, serif, web_family: web_family_for(sv) }
 }
 
 /// The registered web-font family an element's `font-family` stack selects.
@@ -3160,6 +3184,17 @@ fn family_is_monospace(stack: &str) -> bool {
         .split(',')
         .map(|f| f.trim().trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase())
         .any(|f| f == "monospace" || f == "ui-monospace" || f.ends_with(" mono") || f.ends_with("-mono"))
+}
+
+/// Whether a `font-family` stack asks for a serif face.
+///
+/// Only the generic keyword is matched: a stack naming real serif faces ends in
+/// that keyword, which is how such a stack is written.
+fn family_is_serif(stack: &str) -> bool {
+    stack
+        .split(',')
+        .map(|f| f.trim().trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase())
+        .any(|f| f == "serif" || f == "ui-serif")
 }
 
 /// `letter-spacing` in pixels. `normal` is zero.
@@ -5879,7 +5914,7 @@ mod tests {
         let bold = fonts.measure(
             "Yunseong",
             16.0,
-            crate::font::FontStyle { bold: true, italic: false, monospace: false, web_family: None },
+            crate::font::FontStyle { bold: true, italic: false, monospace: false, serif: false, web_family: None },
             0.0,
         );
         assert!(
@@ -5957,6 +5992,46 @@ mod tests {
             brand.dimensions.width >= a.dimensions.width,
             "the brand must be at least as wide as its first child: {} vs {}",
             brand.dimensions.width, a.dimensions.width
+        );
+    }
+
+    /// In a column flex container the cross axis is horizontal, so
+    /// `align-items: center` centres each item across the container's width.
+    /// Measuring items at the full width regardless made every one of them as
+    /// wide as its container, which left `center` nothing to centre.
+    #[test]
+    fn test_column_flex_align_items_center_centres_items() {
+        let html = r#"<div id="col" style="display:flex;flex-direction:column;align-items:center;width:800px">
+            <h2 id="h">ABSOLUTE hero heading</h2>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let h = find_element_by_id(&layout, "h").expect("h2");
+        assert!(
+            h.dimensions.width < 700.0,
+            "the item shrink-wraps rather than filling the column: width={}",
+            h.dimensions.width
+        );
+        let centre = h.dimensions.x + h.dimensions.width / 2.0;
+        assert!(
+            (centre - 400.0).abs() < 4.0,
+            "the item should sit at the middle of the 800px column, centre={centre}"
+        );
+    }
+
+    /// `align-items: stretch` — the default — still fills the column.
+    #[test]
+    fn test_column_flex_stretch_still_fills_the_container() {
+        let html = r#"<div id="col" style="display:flex;flex-direction:column;width:800px">
+            <div id="a">stretched</div>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let a = find_element_by_id(&layout, "a").expect("child");
+        assert!(
+            a.dimensions.width > 700.0,
+            "a stretched item fills the column: width={}",
+            a.dimensions.width
         );
     }
 

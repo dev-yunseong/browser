@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Generic family probe</title>
+<style>
+  /* Which face a browser resolves `sans-serif`, `serif` and `monospace` to is
+     not a detail: a face with different advance widths breaks lines in
+     different places, so the whole page comes out a different length. Each box
+     is sized by its text, so a wrong face shows up as a wrong width. */
+  body { margin: 0; font-size: 16px; background: #fff; }
+  p { margin: 0 0 6px; }
+  .fit { display: inline-block; background: #dfe; }
+  .sans { font-family: sans-serif; }
+  .serif { font-family: serif; }
+  .mono { font-family: monospace; }
+  .b { font-weight: 700; }
+  .big { font-size: 48px; }
+  /* A named stack falls back to the generic at its end. */
+  .stack-serif { font-family: Georgia, "Times New Roman", serif; }
+  .stack-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  /* Wrapping is decided by advance widths. */
+  .measure { width: 300px; background: #eef; }
+</style>
+</head>
+<body>
+  <p><span class="fit sans">Handgloves sans</span></p>
+  <p><span class="fit sans b">Handgloves sans bold</span></p>
+  <p><span class="fit serif">Handgloves serif</span></p>
+  <p><span class="fit serif b">Handgloves serif bold</span></p>
+  <p><span class="fit mono">Handgloves mono</span></p>
+  <p><span class="fit mono b">Handgloves mono bold</span></p>
+  <p><span class="fit stack-serif">Named serif stack</span></p>
+  <p><span class="fit stack-mono">Named mono stack</span></p>
+  <p><span class="fit sans big b">FIXED hero heading</span></p>
+  <p class="measure sans">The quick brown fox jumps over the lazy dog and the line breaks land where this face says.</p>
+  <p class="measure serif">The quick brown fox jumps over the lazy dog and the line breaks land where this face says.</p>
+  <p class="measure mono">The quick brown fox jumps over the lazy dog and the line breaks land where this face says.</p>
+</body>
+</html>

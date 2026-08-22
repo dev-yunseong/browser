@@ -864,10 +864,11 @@ fn css_stops_to_skia(stops: &[CssColorStop]) -> Vec<GradientStop> {
     }
 
     let last = stops.len() - 1;
-    let mut positions: Vec<Option<f32>> = stops
-        .iter()
-        .map(|s| s.position.map(|p| p.clamp(0.0, 1.0)))
-        .collect();
+    // Positions are kept as written, out of range included. `#fff 117%` means
+    // the gradient never reaches white inside the box; clamping the stop to
+    // 100% — as this did — made it reach white at the bottom edge instead, so
+    // a hero faded out a whole shade too early.
+    let mut positions: Vec<Option<f32>> = stops.iter().map(|s| s.position).collect();
     positions[0].get_or_insert(0.0);
     positions[last].get_or_insert(1.0);
 
@@ -891,19 +892,81 @@ fn css_stops_to_skia(stops: &[CssColorStop]) -> Vec<GradientStop> {
         i = after + 1;
     }
 
-    let mut previous = 0.0f32;
-    stops
+    // A stop may not sit before the one in front of it.
+    let mut previous = f32::NEG_INFINITY;
+    let resolved: Vec<(f32, crate::css::Color)> = stops
         .iter()
         .zip(positions)
         .map(|(s, pos)| {
             let pos = pos.unwrap_or(previous).max(previous);
             previous = pos;
-            GradientStop::new(
-                pos,
-                tiny_skia::Color::from_rgba8(s.color.r, s.color.g, s.color.b, s.color.a),
-            )
+            (pos, s.color.clone())
+        })
+        .collect();
+
+    // tiny-skia only takes stops inside [0, 1], so a run that starts before 0
+    // or ends past 1 is clipped to the box: the colour at the boundary is the
+    // interpolation of the two stops that straddle it.
+    clip_stops_to_unit(&resolved)
+        .into_iter()
+        .map(|(pos, c)| {
+            GradientStop::new(pos, tiny_skia::Color::from_rgba8(c.r, c.g, c.b, c.a))
         })
         .collect()
+}
+
+/// Sample the colour of a gradient run at `t`, in sRGB.
+fn lerp_color(a: &crate::css::Color, b: &crate::css::Color, t: f32) -> crate::css::Color {
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round().clamp(0.0, 255.0) as u8;
+    crate::css::Color {
+        r: mix(a.r, b.r),
+        g: mix(a.g, b.g),
+        b: mix(a.b, b.b),
+        a: mix(a.a, b.a),
+    }
+}
+
+/// Restrict a resolved stop list to the `[0, 1]` the shader can express.
+///
+/// Kept separate from the tiny-skia conversion so the clipping itself can be
+/// checked: a `GradientStop` exposes neither its position nor its colour.
+fn clip_stops_to_unit(resolved: &[(f32, crate::css::Color)]) -> Vec<(f32, crate::css::Color)> {
+    if resolved.len() < 2 {
+        return resolved
+            .iter()
+            .map(|(p, c)| (p.clamp(0.0, 1.0), c.clone()))
+            .collect();
+    }
+
+    let mut clipped: Vec<(f32, crate::css::Color)> = Vec::with_capacity(resolved.len() + 2);
+    for w in resolved.windows(2) {
+        let (p0, c0) = (w[0].0, &w[0].1);
+        let (p1, c1) = (w[1].0, &w[1].1);
+        if (0.0..=1.0).contains(&p0) {
+            clipped.push((p0, c0.clone()));
+        }
+        // The colour where this segment crosses the edge of the box.
+        for edge in [0.0f32, 1.0f32] {
+            if p0 < edge && p1 > edge {
+                let t = (edge - p0) / (p1 - p0);
+                clipped.push((edge, lerp_color(c0, c1, t)));
+            }
+        }
+    }
+    let (plast, clast) = resolved.last().expect("checked len >= 2");
+    if (0.0..=1.0).contains(plast) {
+        clipped.push((*plast, clast.clone()));
+    }
+
+    if clipped.len() < 2 {
+        // Every stop fell outside the box: paint the run's own end colours.
+        return vec![
+            (0.0, resolved[0].1.clone()),
+            (1.0, resolved[resolved.len() - 1].1.clone()),
+        ];
+    }
+    clipped.sort_by(|a, b| a.0.total_cmp(&b.0));
+    clipped
 }
 
 /// Build a tiny-skia `Shader` for a CSS `linear-gradient()`.
@@ -1024,6 +1087,80 @@ mod tests {
     use crate::layout::Rect as LayoutRect;
     use crate::css::Color;
 
+    fn stop(pos: Option<f32>, r: u8, g: u8, b: u8) -> CssColorStop {
+        CssColorStop { color: Color { r, g, b, a: 255 }, position: pos }
+    }
+
+    /// Resolve a CSS stop list the way paint does, without the shader.
+    fn resolved(stops: &[CssColorStop]) -> Vec<(f32, Color)> {
+        let mut positions: Vec<Option<f32>> = stops.iter().map(|s| s.position).collect();
+        let last = positions.len() - 1;
+        positions[0].get_or_insert(0.0);
+        positions[last].get_or_insert(1.0);
+        let mut i = 0;
+        while i < positions.len() {
+            if positions[i].is_some() { i += 1; continue; }
+            let before = i - 1;
+            let mut after = i;
+            while positions[after].is_none() { after += 1; }
+            let (a, b) = (positions[before].unwrap_or(0.0), positions[after].unwrap_or(1.0));
+            let steps = (after - before) as f32;
+            for (n, slot) in positions[i..after].iter_mut().enumerate() {
+                *slot = Some(a + (b - a) * ((n + 1) as f32 / steps));
+            }
+            i = after + 1;
+        }
+        let pairs: Vec<(f32, Color)> = stops
+            .iter()
+            .zip(positions)
+            .map(|(s, p)| (p.unwrap_or(0.0), s.color.clone()))
+            .collect();
+        clip_stops_to_unit(&pairs)
+    }
+
+    /// `#fff 117%` means the gradient never reaches white inside the box.
+    /// Clamping the stop to 100% made it reach white at the bottom edge, so a
+    /// hero faded out a whole shade too early.
+    #[test]
+    fn test_gradient_stop_past_the_box_is_clipped_not_clamped() {
+        let out = resolved(&[stop(Some(0.0), 0, 0, 0), stop(Some(1.17), 255, 255, 255)]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].0, 1.0);
+        // At the bottom edge the run is 1/1.17 of the way to white.
+        let expected = (255.0f32 / 1.17).round() as u8;
+        assert!(
+            out[1].1.r.abs_diff(expected) <= 2,
+            "the far edge should be part way to white ({expected}), got {}",
+            out[1].1.r
+        );
+    }
+
+    /// A stop before the start of the box is clipped the same way.
+    #[test]
+    fn test_gradient_stop_before_the_box_is_clipped() {
+        let out = resolved(&[stop(Some(-1.0), 0, 0, 0), stop(Some(1.0), 255, 255, 255)]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0, 0.0);
+        assert!(
+            out[0].1.r.abs_diff(128) <= 2,
+            "half the run lies above the box, so it starts mid-grey, got {}",
+            out[0].1.r
+        );
+    }
+
+    /// Ordinary stops are untouched, and an unpositioned one lands halfway.
+    #[test]
+    fn test_gradient_stops_inside_the_box_are_unchanged() {
+        let out = resolved(&[
+            stop(Some(0.0), 255, 0, 0),
+            stop(None, 0, 255, 0),
+            stop(Some(1.0), 0, 0, 255),
+        ]);
+        assert_eq!(out.len(), 3);
+        assert!((out[1].0 - 0.5).abs() < 0.01);
+        assert_eq!(out[1].1.g, 255);
+    }
+
     /// Helper: allocate a small opaque white pixmap.
     fn white_pixmap(w: u32, h: u32) -> Pixmap {
         let mut p = Pixmap::new(w, h).unwrap();
@@ -1051,12 +1188,12 @@ mod tests {
         let color = black();
 
         let mut pixmap1 = white_pixmap(200, 40);
-        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut pixmap1, crate::font::FontStyle { bold: false, italic: false, monospace: false, web_family: None }, 0.0, 0);
+        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut pixmap1, crate::font::FontStyle { bold: false, italic: false, monospace: false, serif: false, web_family: None }, 0.0, 0);
 
         clear_glyph_cache();
 
         let mut pixmap2 = white_pixmap(200, 40);
-        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut pixmap2, crate::font::FontStyle { bold: false, italic: false, monospace: false, web_family: None }, 0.0, 0);
+        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut pixmap2, crate::font::FontStyle { bold: false, italic: false, monospace: false, serif: false, web_family: None }, 0.0, 0);
 
         assert_eq!(pixmap1.data(), pixmap2.data(),
             "cache and uncached renders must produce identical pixels");
@@ -1070,7 +1207,7 @@ mod tests {
 
         let rect = full_rect(200.0, 40.0);
         let mut pixmap = white_pixmap(200, 40);
-        render_text_raw("Abc".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle { bold: false, italic: false, monospace: false, web_family: None }, 0.0, 0);
+        render_text_raw("Abc".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle { bold: false, italic: false, monospace: false, serif: false, web_family: None }, 0.0, 0);
 
         let cache_size = GLYPH_CACHE.lock().unwrap().len();
         assert!(cache_size > 0, "glyph cache should be non-empty after rendering text; got {} entries", cache_size);
@@ -1083,7 +1220,7 @@ mod tests {
         // Populate.
         let rect = full_rect(200.0, 40.0);
         let mut pixmap = white_pixmap(200, 40);
-        render_text_raw("Test".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle { bold: false, italic: false, monospace: false, web_family: None }, 0.0, 0);
+        render_text_raw("Test".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle { bold: false, italic: false, monospace: false, serif: false, web_family: None }, 0.0, 0);
 
         clear_glyph_cache();
 
@@ -1100,11 +1237,11 @@ mod tests {
         let color = black();
 
         let mut p1 = white_pixmap(200, 40);
-        render_text_raw("Bold".to_string(), rect, 16.0, 19.2, &color, rect, &mut p1, crate::font::FontStyle { bold: true, italic: false, monospace: false, web_family: None }, 0.0, 0);
+        render_text_raw("Bold".to_string(), rect, 16.0, 19.2, &color, rect, &mut p1, crate::font::FontStyle { bold: true, italic: false, monospace: false, serif: false, web_family: None }, 0.0, 0);
 
         clear_glyph_cache();
         let mut p2 = white_pixmap(200, 40);
-        render_text_raw("Bold".to_string(), rect, 16.0, 19.2, &color, rect, &mut p2, crate::font::FontStyle { bold: true, italic: false, monospace: false, web_family: None }, 0.0, 0);
+        render_text_raw("Bold".to_string(), rect, 16.0, 19.2, &color, rect, &mut p2, crate::font::FontStyle { bold: true, italic: false, monospace: false, serif: false, web_family: None }, 0.0, 0);
 
         assert_eq!(p1.data(), p2.data(), "bold renders must be identical across cache miss and cache hit");
     }
@@ -1118,11 +1255,11 @@ mod tests {
         let color = black();
 
         let mut p1 = white_pixmap(200, 40);
-        render_text_raw("Italic".to_string(), rect, 16.0, 19.2, &color, rect, &mut p1, crate::font::FontStyle { bold: false, italic: true, monospace: false, web_family: None }, 0.0, 0);
+        render_text_raw("Italic".to_string(), rect, 16.0, 19.2, &color, rect, &mut p1, crate::font::FontStyle { bold: false, italic: true, monospace: false, serif: false, web_family: None }, 0.0, 0);
 
         clear_glyph_cache();
         let mut p2 = white_pixmap(200, 40);
-        render_text_raw("Italic".to_string(), rect, 16.0, 19.2, &color, rect, &mut p2, crate::font::FontStyle { bold: false, italic: true, monospace: false, web_family: None }, 0.0, 0);
+        render_text_raw("Italic".to_string(), rect, 16.0, 19.2, &color, rect, &mut p2, crate::font::FontStyle { bold: false, italic: true, monospace: false, serif: false, web_family: None }, 0.0, 0);
 
         assert_eq!(p1.data(), p2.data(), "italic renders must be identical across cache miss and cache hit");
     }
@@ -1139,7 +1276,7 @@ mod tests {
         let mut pixmap = white_pixmap(200, 40);
         let white_before = pixmap.data().to_vec();
 
-        render_text_raw("Hello world".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle { bold: false, italic: false, monospace: false, web_family: None }, 0.0, 0);
+        render_text_raw("Hello world".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle { bold: false, italic: false, monospace: false, serif: false, web_family: None }, 0.0, 0);
 
         assert_ne!(pixmap.data(), white_before.as_slice(), "text rendering must modify the pixmap");
     }
@@ -1154,7 +1291,7 @@ mod tests {
         for text in &["", "   ", "\t\n"] {
             let mut pixmap = white_pixmap(200, 40);
             let before = pixmap.data().to_vec();
-            render_text_raw(text.to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle { bold: false, italic: false, monospace: false, web_family: None }, 0.0, 0);
+            render_text_raw(text.to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle { bold: false, italic: false, monospace: false, serif: false, web_family: None }, 0.0, 0);
             assert_eq!(pixmap.data(), before.as_slice(), "empty/whitespace text must not modify pixmap");
         }
     }
@@ -1169,10 +1306,10 @@ mod tests {
         let color = black();
 
         let mut plain = white_pixmap(200, 40);
-        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut plain, crate::font::FontStyle { bold: false, italic: false, monospace: false, web_family: None }, 0.0, 0);
+        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut plain, crate::font::FontStyle { bold: false, italic: false, monospace: false, serif: false, web_family: None }, 0.0, 0);
 
         let mut underlined = white_pixmap(200, 40);
-        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut underlined, crate::font::FontStyle { bold: false, italic: false, monospace: false, web_family: None }, 0.0, 0b001);
+        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut underlined, crate::font::FontStyle { bold: false, italic: false, monospace: false, serif: false, web_family: None }, 0.0, 0b001);
 
         assert_ne!(plain.data(), underlined.data(), "underlined text must differ from plain text");
     }
@@ -1186,9 +1323,9 @@ mod tests {
         let color = black();
 
         let mut p12 = white_pixmap(200, 60);
-        render_text_raw("A".to_string(), rect, 12.0, 14.4, &color, rect, &mut p12, crate::font::FontStyle { bold: false, italic: false, monospace: false, web_family: None }, 0.0, 0);
+        render_text_raw("A".to_string(), rect, 12.0, 14.4, &color, rect, &mut p12, crate::font::FontStyle { bold: false, italic: false, monospace: false, serif: false, web_family: None }, 0.0, 0);
         let mut p24 = white_pixmap(200, 60);
-        render_text_raw("A".to_string(), rect, 24.0, 28.8, &color, rect, &mut p24, crate::font::FontStyle { bold: false, italic: false, monospace: false, web_family: None }, 0.0, 0);
+        render_text_raw("A".to_string(), rect, 24.0, 28.8, &color, rect, &mut p24, crate::font::FontStyle { bold: false, italic: false, monospace: false, serif: false, web_family: None }, 0.0, 0);
 
         // Primary assertion: different font sizes must produce different pixel output,
         // which proves the cache treats them as independent entries.
@@ -1224,10 +1361,10 @@ mod tests {
         let rect = full_rect(200.0, 40.0);
 
         let mut p_black = white_pixmap(200, 40);
-        render_text_raw("Hi".to_string(), rect, 16.0, 19.2, &black(), rect, &mut p_black, crate::font::FontStyle { bold: false, italic: false, monospace: false, web_family: None }, 0.0, 0);
+        render_text_raw("Hi".to_string(), rect, 16.0, 19.2, &black(), rect, &mut p_black, crate::font::FontStyle { bold: false, italic: false, monospace: false, serif: false, web_family: None }, 0.0, 0);
 
         let mut p_red = white_pixmap(200, 40);
-        render_text_raw("Hi".to_string(), rect, 16.0, 19.2, &red(), rect, &mut p_red, crate::font::FontStyle { bold: false, italic: false, monospace: false, web_family: None }, 0.0, 0);
+        render_text_raw("Hi".to_string(), rect, 16.0, 19.2, &red(), rect, &mut p_red, crate::font::FontStyle { bold: false, italic: false, monospace: false, serif: false, web_family: None }, 0.0, 0);
 
         assert_ne!(p_black.data(), p_red.data(), "black and red text must produce different pixel output");
     }
@@ -1375,10 +1512,10 @@ mod tests {
         let color = black();
 
         let mut p_right = white_pixmap(200, 40);
-        render_text_raw("Hello world text".to_string(), rect, 16.0, 19.2, &color, clip_right, &mut p_right, crate::font::FontStyle { bold: false, italic: false, monospace: false, web_family: None }, 0.0, 0);
+        render_text_raw("Hello world text".to_string(), rect, 16.0, 19.2, &color, clip_right, &mut p_right, crate::font::FontStyle { bold: false, italic: false, monospace: false, serif: false, web_family: None }, 0.0, 0);
 
         let mut p_full = white_pixmap(200, 40);
-        render_text_raw("Hello world text".to_string(), rect, 16.0, 19.2, &color, clip_full, &mut p_full, crate::font::FontStyle { bold: false, italic: false, monospace: false, web_family: None }, 0.0, 0);
+        render_text_raw("Hello world text".to_string(), rect, 16.0, 19.2, &color, clip_full, &mut p_full, crate::font::FontStyle { bold: false, italic: false, monospace: false, serif: false, web_family: None }, 0.0, 0);
 
         // The two renders must differ (full render has pixels in x=0..99 too).
         assert_ne!(p_right.data(), p_full.data(),
