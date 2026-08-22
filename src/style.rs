@@ -408,6 +408,47 @@ fn apply_attribute_styles_arena(node: &NodeDataSend, map: &mut HashMap<Arc<str>,
                 if k == "height" { if let Ok(val) = v.trim_end_matches("px").parse::<f32>() { map.insert(intern("height"), Value::Length(val, crate::css::Unit::Px)); } }
             }
         }
+        // An inline `<svg>` is a replaced element and takes up space whether or
+        // not anything can draw it. Its size comes from its `width`/`height`
+        // attributes, and its proportions from `viewBox`; with neither width nor
+        // height stated the SVG spec's own defaults are `100%`, which is why a
+        // logo with only a `viewBox` fills its container and takes a square of
+        // height with it. Sizing it at nothing left a page hundreds of pixels
+        // short of the browser's.
+        "svg" => {
+            let mut ratio = None;
+            for (k, v) in &node.attrs {
+                match k.as_str() {
+                    "width" | "height" => {
+                        if let Some(len) = parse_legacy_length_attr(v) {
+                            map.entry(intern(k)).or_insert(len);
+                        }
+                    }
+                    "viewbox" | "viewBox" => {
+                        let nums: Vec<f32> = v
+                            .split(|c: char| c == ',' || c.is_whitespace())
+                            .filter(|p| !p.is_empty())
+                            .filter_map(|p| p.parse::<f32>().ok())
+                            .collect();
+                        if let [_, _, w, h] = nums.as_slice() {
+                            if *w > 0.0 && *h > 0.0 {
+                                ratio = Some(*w / *h);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(r) = ratio {
+                map.entry(intern("aspect-ratio")).or_insert(Value::Number(r));
+            }
+            // The spec's default for both is `100%`; the ratio then supplies
+            // whichever one is not stated.
+            if !map.contains_key(&intern("width")) && !map.contains_key(&intern("height")) {
+                map.entry(intern("width"))
+                    .or_insert(Value::Length(100.0, crate::css::Unit::Percent));
+            }
+        }
         "font" => {
             for (k, v) in &node.attrs {
                 if k == "color" { if let Some(c) = parse_color(v) { map.insert(intern("color"), Value::Color(c)); } }

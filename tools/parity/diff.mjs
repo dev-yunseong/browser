@@ -228,9 +228,11 @@ function fixtureUrl(name) {
 }
 
 /**
- * A snapshot with no CSS renders as an unstyled page in *both* engines, so a
- * diff against it agrees closely while measuring nothing. Report that rather
- * than a flattering number.
+ * A snapshot with no CSS renders as an unstyled page in *both* engines, so its
+ * number says nothing about how well the engine applies a stylesheet. It still
+ * measures everything else the page exercises — the DOM, inline styles, images,
+ * and text layout in the page's own language — so the row is reported with that
+ * caveat attached rather than dropped.
  */
 async function stylesheetBytes(name) {
   const capture = path.join(CAPTURES, `${name}.html`);
@@ -242,9 +244,6 @@ async function stylesheetBytes(name) {
 async function compare(name, browser) {
   const url = fixtureUrl(name);
   const cssBytes = await stylesheetBytes(name);
-  if (cssBytes === 0) {
-    return { name, unstyled: true };
-  }
   const reference = await renderChromium(browser, url);
   const engine = await renderEngine(url);
 
@@ -268,6 +267,7 @@ async function compare(name, browser) {
 
   return {
     name,
+    unstyled: cssBytes === 0,
     referenceHeight: reference.height,
     engineHeight: engine.height,
     page: mismatched / (WIDTH * height),
@@ -314,14 +314,11 @@ for (const r of results) {
     console.log(`${r.name.padEnd(15)} ERROR  ${r.error}`);
     continue;
   }
-  if (r.unstyled) {
-    console.log(`${r.name.padEnd(15)} SKIPPED — snapshot has no CSS, so it cannot measure rendering`);
-    continue;
-  }
   const drift = r.engineHeight - r.referenceHeight;
   console.log(
     `${r.name.padEnd(15)} ${pct(r.layout).padStart(7)}  ${pct(r.fold).padStart(8)}  ${pct(r.page).padStart(8)}   ` +
-      `${r.referenceHeight} -> ${r.engineHeight} (${drift >= 0 ? '+' : ''}${drift})`,
+      `${r.referenceHeight} -> ${r.engineHeight} (${drift >= 0 ? '+' : ''}${drift})` +
+      (r.unstyled ? '   [no stylesheet in snapshot: DOM, inline styles and images only]' : ''),
   );
 }
 console.log(`\nRasters in ${OUT}`);

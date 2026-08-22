@@ -3552,7 +3552,10 @@ fn get_display_type(sn: &StyledNode) -> DisplayType {
             "th" | "td" => DisplayType::TableCell,
             "thead" | "tbody" | "tfoot" | "caption" => DisplayType::Block,
             "input" | "button" | "select" | "textarea" => DisplayType::Input,
-            "img" => DisplayType::Image,
+            // An inline `<svg>` is a replaced element: it reserves a box from
+            // its own width, height and `viewBox` whether or not anything can
+            // draw its contents.
+            "img" | "svg" => DisplayType::Image,
             _ => DisplayType::Inline,
         }
     } else {
@@ -3622,10 +3625,12 @@ fn should_skip(child: &StyledNode) -> bool {
         ) {
             return true;
         }
-        if t == "svg" {
-            // This engine does not rasterize SVG content yet.
-            // Skipping the subtree avoids malformed icon blobs and keeps the
-            // surrounding layout box size driven by CSS width/height.
+        // An `<svg>` is a replaced element and keeps its box — its size comes
+        // from its `width`/`height` attributes and its `viewBox`, and a page
+        // that draws its logo as inline SVG loses that whole box otherwise. Its
+        // *contents* are a different language and are not laid out as HTML:
+        // anything else in the SVG namespace is skipped, subtree and all.
+        if name.ns.as_ref() == "http://www.w3.org/2000/svg" && t != "svg" {
             return true;
         }
         // <input type="hidden"> never renders, regardless of CSS.
@@ -6598,6 +6603,43 @@ mod tests {
             f.dimensions.height < 25.0,
             "the field keeps its own ~13px font, got height {}",
             f.dimensions.height
+        );
+    }
+
+    /// An inline `<svg>` is a replaced element and keeps its box whether or not
+    /// anything can draw it. Its size comes from its `width`/`height`
+    /// attributes; with neither stated the SVG spec's defaults are `100%`, and
+    /// the `viewBox` supplies the proportions — which is how a logo with only a
+    /// `viewBox` fills its container and takes a square of height with it.
+    #[test]
+    fn test_inline_svg_reserves_a_box_from_its_viewbox() {
+        let html = r#"<div style="width:400px"><svg id="s" viewBox="0 0 24 24"><path d="M0 0h24v24H0z"/></svg></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let s = find_element_by_id(&layout, "s").expect("svg");
+        assert!(
+            (s.dimensions.width - 400.0).abs() < 1.0 && (s.dimensions.height - 400.0).abs() < 1.0,
+            "a 1:1 viewBox with no stated size fills the container and squares off: {}x{}",
+            s.dimensions.width, s.dimensions.height
+        );
+    }
+
+    /// Stated `width` and `height` attributes win, and the contents of the SVG
+    /// are not laid out as HTML.
+    #[test]
+    fn test_inline_svg_takes_its_stated_size_and_lays_out_no_children() {
+        let html = r#"<div style="width:400px"><svg id="s" viewBox="0 0 16 16" width="32" height="32"><text>not html</text></svg></div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let s = find_element_by_id(&layout, "s").expect("svg");
+        assert!(
+            (s.dimensions.width - 32.0).abs() < 1.0 && (s.dimensions.height - 32.0).abs() < 1.0,
+            "the attributes win: {}x{}",
+            s.dimensions.width, s.dimensions.height
+        );
+        assert!(
+            s.children.is_empty(),
+            "SVG contents are a different language and are not laid out as HTML"
         );
     }
 
