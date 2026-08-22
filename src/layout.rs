@@ -1594,18 +1594,22 @@ impl<'a> LayoutBox<'a> {
             raw_items.sort_by_key(|item| item.order);
 
             // ── Helper: compute main/cross size of a laid-out box ─────────────
+            // An item's outer size on each axis. `margin_box_*` adds padding and
+            // border unconditionally, which double counts them for the common
+            // auto-sized item whose `dimensions` already covers them — a padded
+            // pill then made its row that much taller than the browser draws it.
             let main_size = |cb: &LayoutBox<'_>| -> f32 {
                 if is_row {
-                    margin_box_width(cb)
+                    outer_width(cb) + cb.margin.left + cb.margin.right
                 } else {
-                    margin_box_height(cb)
+                    outer_height(cb) + cb.margin.top + cb.margin.bottom
                 }
             };
             let cross_size = |cb: &LayoutBox<'_>| -> f32 {
                 if is_row {
-                    margin_box_height(cb)
+                    outer_height(cb) + cb.margin.top + cb.margin.bottom
                 } else {
-                    margin_box_width(cb)
+                    outer_width(cb) + cb.margin.left + cb.margin.right
                 }
             };
 
@@ -1874,17 +1878,13 @@ impl<'a> LayoutBox<'a> {
                     let dy = y - item.cb.dimensions.y;
                     offset_layout_box(&mut item.cb, dx, dy);
 
-                    main_cursor += if is_row {
-                        margin_box_width(&item.cb)
-                    } else {
-                        margin_box_height(&item.cb)
-                    };
+                    main_cursor += main_size(&item.cb);
 
                     max_child_x = max_child_x.max(
-                        item.cb.dimensions.x + border_box_width(&item.cb) + item.cb.margin.right,
+                        item.cb.dimensions.x + outer_width(&item.cb) + item.cb.margin.right,
                     );
                     child_y = child_y.max(
-                        item.cb.dimensions.y + border_box_height(&item.cb) + item.cb.margin.bottom,
+                        item.cb.dimensions.y + outer_height(&item.cb) + item.cb.margin.bottom,
                     );
                 }
 
@@ -1901,8 +1901,8 @@ impl<'a> LayoutBox<'a> {
             // done, is what stops a padded flex item from painting its background
             // short of its own text and letting the next item sit on top of it.
             for mut item in raw_items {
-                item.cb.dimensions.width = border_box_width(&item.cb);
-                item.cb.dimensions.height = border_box_height(&item.cb);
+                item.cb.dimensions.width = outer_width(&item.cb);
+                item.cb.dimensions.height = outer_height(&item.cb);
                 self.children.push(item.cb);
             }
 
@@ -1920,9 +1920,11 @@ impl<'a> LayoutBox<'a> {
             // For column containers, derive the main-axis (height) from the actual child
             // positions rather than main_container_size (which is near-zero when height is auto).
             // Include padding.bottom + border.bottom, consistent with block layout (line ~1197).
+            // A column container's height is measured from its own top edge, not
+            // from its content edge: measuring from the content edge counts the
+            // bottom padding but drops the top one.
             let column_main = if !is_row {
-                let content_top = self.dimensions.y + self.padding.top + self.border.top;
-                (child_y - content_top + self.padding.bottom + self.border.bottom).max(0.0)
+                (child_y - self.dimensions.y + self.padding.bottom + self.border.bottom).max(0.0)
             } else {
                 0.0
             };
@@ -1939,7 +1941,18 @@ impl<'a> LayoutBox<'a> {
                 };
             }
             if self.dimensions.height <= 0.0 || height <= 0.0 {
-                self.dimensions.height = if is_row { total_cross } else { column_main };
+                // `total_cross` is the sum of the line heights, which is the
+                // content box; a row container's own padding and border sit
+                // outside it and have to be added back.
+                self.dimensions.height = if is_row {
+                    total_cross
+                        + self.padding.top
+                        + self.padding.bottom
+                        + self.border.top
+                        + self.border.bottom
+                } else {
+                    column_main
+                };
             }
             self.dimensions.height = clamp_height(
                 self.style_node,
@@ -2380,7 +2393,15 @@ impl<'a> LayoutBox<'a> {
             }
 
             // Finalize grid container height.
-            let content_height = (child_y - content_top
+            //
+            // Measured from the container's own top edge, not from its content
+            // edge: subtracting `content_top` counts the bottom padding but
+            // silently drops the top one, so a padded grid came out exactly its
+            // `padding-top` short. On a page that lays each entry out as a
+            // padded grid — which is how a project list is built — that is a
+            // whole `padding-top` lost per entry, and the page ends hundreds of
+            // pixels short.
+            let content_height = (child_y - self.dimensions.y
                 + self.padding.bottom + self.border.bottom).max(0.0);
             if self.dimensions.height <= 0.0 || height <= 0.0 {
                 self.dimensions.height = content_height;
@@ -6215,6 +6236,56 @@ mod tests {
             b.dimensions.height < 32.0,
             "the button keeps its own line height, not 3x the font size: height={}",
             b.dimensions.height
+        );
+    }
+
+    /// A grid or flex container's height is measured from its own top edge.
+    /// Measuring from the content edge counted the bottom padding but silently
+    /// dropped the top one, so every padded container came out exactly its
+    /// `padding-top` short — and a page built from padded entries ended
+    /// hundreds of pixels short.
+    #[test]
+    fn test_container_height_includes_both_paddings() {
+        for style in [
+            "display:grid;grid-template-columns:38px 1fr;padding:20px 0",
+            "display:flex;padding:20px 0",
+            "display:flex;flex-direction:column;padding:20px 0",
+        ] {
+            let html = format!(
+                r#"<div id="f" style="{style}"><div id="a" style="height:30px">a</div></div>"#
+            );
+            let (layout, _, _) = layout_from_html(&html, 800.0, 600.0);
+            let f = find_element_by_id(&layout, "f").expect("container");
+            let a = find_element_by_id(&layout, "a").expect("item");
+            assert!(
+                (a.dimensions.y - 20.0).abs() < 1.0,
+                "[{style}] the item sits below the top padding, got y={}",
+                a.dimensions.y
+            );
+            assert!(
+                (f.dimensions.height - 70.0).abs() < 1.5,
+                "[{style}] 20 + 30 + 20 = 70, got {}",
+                f.dimensions.height
+            );
+        }
+    }
+
+    /// A flex line reserves an item's outer size. For the common auto-sized item
+    /// `dimensions` already covers padding and border, so adding them again made
+    /// a row holding a padded pill that much taller than the browser draws it.
+    #[test]
+    fn test_flex_line_counts_a_padded_item_once() {
+        let html = r#"<div id="bar" style="display:flex;justify-content:flex-end;padding:8px">
+            <a id="pill" style="display:inline-flex;padding:8px 16px;border:1px solid #000">Sign in</a>
+        </div>"#;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+
+        let bar = find_element_by_id(&layout, "bar").expect("bar");
+        let pill = find_element_by_id(&layout, "pill").expect("pill");
+        assert!(
+            (bar.dimensions.height - (pill.dimensions.height + 16.0)).abs() < 1.5,
+            "the bar is its padding plus the pill: bar={}, pill={}",
+            bar.dimensions.height, pill.dimensions.height
         );
     }
 
