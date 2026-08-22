@@ -227,8 +227,24 @@ function fixtureUrl(name) {
   return `http://127.0.0.1:${SERVE_PORT}/${rel}`;
 }
 
+/**
+ * A snapshot with no CSS renders as an unstyled page in *both* engines, so a
+ * diff against it agrees closely while measuring nothing. Report that rather
+ * than a flattering number.
+ */
+async function stylesheetBytes(name) {
+  const capture = path.join(CAPTURES, `${name}.html`);
+  if (!existsSync(capture)) return null;
+  const html = await readFile(capture, 'utf8');
+  return [...html.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/g)].reduce((n, m) => n + m[1].length, 0);
+}
+
 async function compare(name, browser) {
   const url = fixtureUrl(name);
+  const cssBytes = await stylesheetBytes(name);
+  if (cssBytes === 0) {
+    return { name, unstyled: true };
+  }
   const reference = await renderChromium(browser, url);
   const engine = await renderEngine(url);
 
@@ -296,6 +312,10 @@ console.log('-'.repeat(78));
 for (const r of results) {
   if (r.error) {
     console.log(`${r.name.padEnd(15)} ERROR  ${r.error}`);
+    continue;
+  }
+  if (r.unstyled) {
+    console.log(`${r.name.padEnd(15)} SKIPPED — snapshot has no CSS, so it cannot measure rendering`);
     continue;
   }
   const drift = r.engineHeight - r.referenceHeight;
