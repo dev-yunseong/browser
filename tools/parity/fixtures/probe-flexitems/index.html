@@ -11,6 +11,12 @@
   .row img { width: 24px; height: 24px; background: #808; }
   .col { display: flex; flex-direction: column; gap: 8px; background: #ffe; }
   .col span { background: #cff; }
+  /* The `place-*` shorthands set both axes at once. github centres the link
+     under its customer stories with `place-content: center`. */
+  .pc { display: flex; place-content: center; width: 400px; padding: 0 24px; background: #eef; }
+  .pc2 { display: flex; place-content: center flex-end; width: 400px; background: #efe; }
+  .pi { display: flex; place-items: center; height: 60px; width: 400px; background: #fef; }
+  .pi > span { background: #ffd; }
   /* A flex item's own `display: inline` must not stop it being a block box. */
   .inlineitem { display: flex; gap: 10px; background: #fee; }
   .inlineitem > * { display: inline; background: #ccf; padding: 4px; }
@@ -42,5 +48,11 @@
     <a class="brand2" href="#"><span class="n">Yunseong</span><span class="m">dev / archive</span></a>
     <button type="button">Menu</button>
   </div>
+  <section>
+    <b>place-content and place-items</b>
+    <div class="pc"><a href="#">Explore customer stories</a></div>
+    <div class="pc2"><a href="#">two values, block then inline</a></div>
+    <div class="pi"><span>centred on both axes</span></div>
+  </section>
 </body>
 </html>

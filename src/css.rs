@@ -886,6 +886,15 @@ pub fn parse_css(source: &str) -> Stylesheet {
                 "filter" | "-webkit-filter" => {
                     expand_filter(&val_raw, important, &mut declarations);
                 }
+                // The `place-*` shorthands: one value sets both axes, two set
+                // the block axis then the inline one.
+                //
+                // github centres the link under its customer stories with
+                // `place-content: center`, and reading only `justify-content`
+                // left it hard against the section's left padding.
+                shorthand @ ("place-content" | "place-items" | "place-self") => {
+                    expand_place_shorthand(shorthand, &val_raw, important, &mut declarations);
+                }
                 // inset shorthand: "inset: <top> [<right> [<bottom> [<left>]]]"
                 // Same quad syntax as margin/padding, maps to top/right/bottom/left.
                 "inset" => {
@@ -1557,6 +1566,40 @@ fn physical_pair_for(key: &str) -> Option<(&'static str, &'static str)> {
 /// A corner whose two radii differ is kept as the pair, since no single `Value`
 /// can hold both; `layer_tree` splits it again when it resolves them against the
 /// box.
+/// Split a `place-*` shorthand into its block-axis and inline-axis longhands.
+///
+/// One value sets both; two set the block axis first. The keywords themselves
+/// pass through untouched, since `align-*` and `justify-*` take the same ones.
+pub fn expand_place_shorthand(
+    name: &str,
+    val_raw: &str,
+    important: bool,
+    declarations: &mut Vec<Declaration>,
+) {
+    let (block, inline) = match name {
+        "place-content" => ("align-content", "justify-content"),
+        "place-items" => ("align-items", "justify-items"),
+        "place-self" => ("align-self", "justify-self"),
+        _ => return,
+    };
+    let parts: Vec<&str> = val_raw.split_whitespace().collect();
+    let (a, j) = match parts.as_slice() {
+        [one] => (*one, *one),
+        [first, second, ..] => (*first, *second),
+        [] => return,
+    };
+    declarations.push(Declaration {
+        name: intern(block),
+        value: parse_value(a),
+        important,
+    });
+    declarations.push(Declaration {
+        name: intern(inline),
+        value: parse_value(j),
+        important,
+    });
+}
+
 /// Split `filter: blur(Npx)` out into the `filter-blur` longhand paint reads.
 ///
 /// Shared with the `style` attribute parser: a `filter` written there was
@@ -3095,6 +3138,33 @@ fn named_color(s: &str) -> Option<Color> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The `place-*` shorthands set both axes at once. github centres the link
+    /// under its customer stories with `place-content: center`, and reading only
+    /// `justify-content` left it hard against the section's left padding.
+    #[test]
+    fn a_place_shorthand_sets_both_axes() {
+        let sheet = parse_css(".xpc { place-content: center } .xpi { place-items: start end } .xps { place-self: stretch }");
+        let value = |sel: &str, prop: &str| {
+            sheet
+                .all_rules()
+                .into_iter()
+                .find(|r| r.selectors.iter().any(|s| format!("{s:?}").contains(sel)))
+                .and_then(|r| {
+                    r.declarations
+                        .iter()
+                        .find(|d| &*d.name == prop)
+                        .map(|d| format!("{:?}", d.value))
+                })
+        };
+        assert_eq!(value("xpc", "align-content").as_deref(), Some("Keyword(\"center\")"));
+        assert_eq!(value("xpc", "justify-content").as_deref(), Some("Keyword(\"center\")"));
+        // Two values name the block axis first, then the inline one.
+        assert_eq!(value("xpi", "align-items").as_deref(), Some("Keyword(\"start\")"));
+        assert_eq!(value("xpi", "justify-items").as_deref(), Some("Keyword(\"end\")"));
+        assert_eq!(value("xps", "align-self").as_deref(), Some("Keyword(\"stretch\")"));
+        assert_eq!(value("xps", "justify-self").as_deref(), Some("Keyword(\"stretch\")"));
+    }
     /// A layer's place in the cascade is its whole path, compared one level at
     /// a time — `base.inner` sits at `base`'s place among the top-level layers
     /// and only then at its own place among `base`'s sub-layers. A layer's own

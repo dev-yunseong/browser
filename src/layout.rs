@@ -5751,7 +5751,7 @@ mod tests {
         None
     }
 
-    fn find_element_by_id<'a>(layout: &'a LayoutBox<'a>, id: &str) -> Option<&'a LayoutBox<'a>> {
+    pub(super) fn find_element_by_id<'a>(layout: &'a LayoutBox<'a>, id: &str) -> Option<&'a LayoutBox<'a>> {
         if let NodeData::Element { ref attrs, .. } = layout.style_node.node.data {
             for attr in attrs.borrow().iter() {
                 if attr.name.local.to_string() == "id" && attr.value.to_string() == id {
@@ -5770,7 +5770,7 @@ mod tests {
     /// Convenience test helper: parse HTML into a LayoutBox tree.
     /// Leaks DOM/stylesheet/style-tree so `LayoutBox<'static>` is valid for the
     /// lifetime of the test. The leak is acceptable in unit tests.
-    fn layout_from_html(html: &str, width: f32, height: f32) -> (LayoutBox<'static>, f32, f32) {
+    pub(super) fn layout_from_html(html: &str, width: f32, height: f32) -> (LayoutBox<'static>, f32, f32) {
         let dom = Box::leak(Box::new(dom::parse_html(html)));
         let ss = Box::leak(Box::new(css::parse_css("")));
         let style_tree = Box::leak(Box::new(style::build_style_tree(
@@ -10416,6 +10416,7 @@ mod tests {
 pub fn debug_display_type(sn: &StyledNode) -> DisplayType {
     get_display_type(sn)
 }
+
 
 
 
