@@ -470,9 +470,23 @@ impl FontSet {
     ///
     /// The faces have different units-per-em, so a shared `PxScale` would draw
     /// one of them at the wrong size.
+    /// The `PxScale` that draws `font_size`-pixel glyphs from `face_id`.
+    ///
+    /// `ab_glyph` measures a `PxScale` against the face's *height* — its ascent
+    /// less its descent — not against the em square, so handing it the font size
+    /// draws every glyph at `units_per_em / height` of its proper size. On
+    /// Liberation Sans that is 2048/2288, so a 16px capital came out 10px tall
+    /// where a browser draws it 11: text was spaced correctly and *shaped* a
+    /// tenth too small, all the way down every page.
     pub fn scale(&self, face_id: FaceId, font_size: f32) -> PxScale {
-        let _ = self.face(face_id);
-        PxScale::from(font_size)
+        let face = self.face(face_id);
+        let units = face.units_per_em().unwrap_or(1000.0);
+        let height = face.height_unscaled();
+        if units > 0.0 && height > 0.0 {
+            PxScale::from(font_size * height / units)
+        } else {
+            PxScale::from(font_size)
+        }
     }
 }
 
@@ -495,6 +509,63 @@ pub fn fonts() -> &'static FontSet {
 
 #[cfg(test)]
 mod tests {
+
+    /// A glyph has to be rasterised at the size it was measured at.
+    ///
+    /// `ab_glyph` measures a `PxScale` against the face's *height* — its ascent
+    /// less its descent — not against the em square, so handing it the font size
+    /// draws every glyph at `units_per_em / height` of its proper size. On
+    /// Liberation Sans that is 2048/2288: a 16px capital came out 10px tall
+    /// where a browser draws it 11, and every page was set in text spaced
+    /// correctly and shaped a tenth too small.
+    #[test]
+    fn a_glyph_is_rasterised_at_the_size_it_was_measured_at() {
+        use ab_glyph::Font;
+        let f = fonts();
+        for size in [16.0_f32, 24.0, 40.0] {
+            let face = f.face(FaceId::Sans);
+            let units = face.units_per_em().expect("the face states its em square");
+            let gid = face.glyph_id('H');
+            let outlined = face
+                .outline_glyph(gid.with_scale_and_position(
+                    f.scale(FaceId::Sans, size),
+                    ab_glyph::point(0.0, 0.0),
+                ))
+                .expect("H must outline");
+            let drawn = outlined.px_bounds().height();
+            // The face's own cap height, scaled by the em square as CSS asks.
+            let cap = face
+                .outline(gid)
+                .expect("H must have an outline")
+                .bounds
+                .height()
+                .abs()
+                * (size / units);
+            // `px_bounds` is the whole pixels the ink touches, so it is up to a
+            // pixel taller than the outline itself.
+            assert!(
+                drawn >= cap && drawn <= cap + 1.5,
+                "{size}px capital must rasterise {cap:.2}px tall, got {drawn:.2}"
+            );
+        }
+    }
+
+    /// The advance and the ink have to agree about the size, or text is spaced
+    /// for one size and drawn at another.
+    #[test]
+    fn the_scale_matches_the_advance_the_same_size_measures() {
+        use ab_glyph::{Font, ScaleFont};
+        let f = fonts();
+        let face = f.face(FaceId::Sans);
+        let scaled = face.as_scaled(f.scale(FaceId::Sans, 16.0));
+        let gid = face.glyph_id('H');
+        assert!(
+            (scaled.h_advance(gid) - f.advance('H', 16.0, FontStyle::regular())).abs() < 0.01,
+            "the rasteriser's advance must be the one layout measured: {} vs {}",
+            scaled.h_advance(gid),
+            f.advance('H', 16.0, FontStyle::regular())
+        );
+    }
     use super::*;
 
     /// A character none of the bundled faces cover is answered by whichever
@@ -545,3 +616,4 @@ mod tests {
         );
     }
 }
+

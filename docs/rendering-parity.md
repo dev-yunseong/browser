@@ -160,6 +160,7 @@ Ordered by how much of a page each one destroyed.
 | `text-decoration-color` ignored | The line was drawn in the text's colour whatever the page said. yunseong.dev underlines its project headings — links — in a near-white `--hairline`, and every one of them came out as a hard black rule under the heading. The colour travels down with the line, since the text node carrying the glyphs is where the line is drawn. |
 | A replaced element stopped being replaced when the page gave it a `display` | The keyword decides how a box flows, not whether the element still draws its contents. It was honoured for `<img>` and nowhere else, so github's button icons — `display: flex` on an `<svg>` — became empty flex containers and shrank to nothing: the chevron beside "English" in its footer disappeared. |
 | `scaleX()` and `scaleY()` dropped | The transform parser knew `scale()` and nothing narrower, so a one-axis scale was a no-op. That is how a hover underline is animated in from nothing — the box is laid out at its full width and held at `scaleX(0)` — and every link in github's footer carried a stub of its hover rule underneath it. |
+| Every glyph rasterised a tenth too small | `ab_glyph` measures a `PxScale` against the face's *height* — its ascent less its descent — not against the em square, so handing it the font size draws glyphs at `units_per_em / height` of their proper size. On Liberation Sans that is 2048/2288: a 16px capital came out 10px tall where a browser draws it 11. Advances were measured correctly all along, so every page was set in text spaced right and shaped a tenth small — which is what the coverage curve had been quietly making up for. github's fold-pixel diff fell from 2.42% to 1.10% and yunseong.dev's from 2.36% to 1.60%. |
 | `transform-origin` ignored | Every transform was applied about the box's centre. A page that states an origin means it: the same underline is pinned at `0 0` so it grows from its left edge. The keywords, the percentages and the one-value form are all read now, and `probe-transform` stays pixel-identical with a scale about each corner and a rotation about an edge added to it. |
 | An auto width never read off the height and the ratio | The mirror rule, height from width, was there; this one was not, so a replaced box with `width: auto`, a stated height and proportions of its own fell back to a 100px placeholder. `width: auto` also has to count *as* auto — it is written down but states nothing. github's icons say it outright. |
 | A replaced flex item shrunk past its own size | CSS floors a flex item at its content-based minimum, and for a box with a ratio and a definite height that is the height carried through the ratio — the transferred size suggestion. The floor was skipped for anything with a scroll-container `overflow`, which an `<svg>` clipping its own contents is not. github writes `overflow: hidden` on the logos in its customer marquee, and all twelve shrank to nothing wide: the whole band came out empty. |
@@ -178,9 +179,9 @@ pixels:
 
 | fixture | layout | fold | page | height (chromium -> engine) |
 |---|---|---|---|---|
-| github.com | 0.80% | 2.42% | 1.56% | 10570 -> 10553 |
-| yunseong.dev | 0.78% | 2.36% | 2.60% | 4976 -> 4976 |
-| naver.com | 1.22% | 3.02% | 2.49% | 18658 -> 16384 |
+| github.com | 0.46% | 1.10% | 1.48% | 10570 -> 10553 |
+| yunseong.dev | 0.48% | 1.60% | 2.30% | 4976 -> 4976 |
+| naver.com | 1.16% | 3.02% | 2.50% | 18658 -> 16384 |
 
 github.com began this work at 9.14% layout, 13.84% fold and 780px too tall;
 yunseong.dev at 4.24% and 256px too short. github's page is now within a single
@@ -206,13 +207,12 @@ exercises the UA stylesheet.
   only three text leaves differ in width by 4px or more, and across yunseong.dev
   only two — and both renderers position glyphs at quarter-pixel phases. What
   differs is that FreeType hints stems onto the pixel grid and this rasteriser
-  does not. The text-coverage curve was re-fitted by sweeping its exponent
-  against the reference's own ink: 1/2.4 is where the layout metric bottoms out
-  on every fixture and both sites and the page metric has not yet begun to rise.
-  It brings the ink to within 3.5% of the reference's, from 6-10% short, and
-  `probe-baseline`'s to within half a percent. `probe-webfont` and naver.com
-  prefer a slightly lighter curve — 0.07 and 0.03 points respectively — which is
-  the cost of one exponent for every face.
+  does not. Once the glyphs were being rasterised at their proper size, the
+  text-coverage curve was re-fitted by sweeping its exponent against the
+  reference's own ink: 1/1.2 is where the layout metric bottoms out on every
+  fixture and both sites. Most of what the old 1/2.4 curve was making up for was
+  that the glyphs were a tenth too small; with that fixed the curve is nearly
+  linear, which is what it should always have been.
 - **Canvas, video and script-driven content do not render.** github.com's
   landing page is largely a WebGL canvas and a video, so a share of its
   remaining difference is content this engine does not draw at all.

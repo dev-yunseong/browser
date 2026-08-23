@@ -1567,17 +1567,18 @@ fn build_radial_gradient_shader<'a>(
 /// How much a glyph's partial coverage is darkened before it is blended.
 ///
 /// The reference renderer runs glyph coverage through a contrast curve before
-/// compositing, which is why the same face at the same size carries visibly more
-/// ink there than a straight linear blend produces. The exponent is fitted by
-/// sweeping it against the reference's own ink on five text-heavy fixtures and
-/// on both sites: 1/2.4 is where the layout metric bottoms out on every one of
-/// them and the page metric has not yet begun to rise. It brings the ink to
-/// within 3.5% of the reference's — from 6-10% short — and `probe-baseline`'s
-/// to within half a percent. It is an approximation of the reference's curve,
-/// not a derivation of it, and what is left is glyph *shape*: FreeType hints
-/// stems onto the pixel grid and this rasteriser does not, which no coverage
-/// curve can make up.
-const TEXT_COVERAGE_GAMMA: f32 = 1.0 / 2.4;
+/// compositing, which is why the same face at the same size carries slightly
+/// more ink there than a straight linear blend produces. The exponent is fitted
+/// by sweeping it against the reference's own ink on five text-heavy fixtures
+/// and on both sites, and re-fitted once the glyphs were being rasterised at
+/// their proper size: 1/1.2 is where the layout metric bottoms out on every one
+/// of them. Most of what a 1/2.4 curve was making up for was that the glyphs
+/// were a tenth too small — see `FontSet::scale` — and with that fixed the
+/// curve is nearly linear, which is what it should always have been. It is an
+/// approximation of the reference's curve, not a derivation of it, and what is
+/// left is glyph *shape*: FreeType hints stems onto the pixel grid and this
+/// rasteriser does not, which no coverage curve can make up.
+const TEXT_COVERAGE_GAMMA: f32 = 1.0 / 1.2;
 
 /// Rasterise an inline `<svg>` subtree into `rect`.
 ///
