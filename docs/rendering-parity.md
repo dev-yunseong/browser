@@ -164,6 +164,7 @@ Ordered by how much of a page each one destroyed.
 | An auto width never read off the height and the ratio | The mirror rule, height from width, was there; this one was not, so a replaced box with `width: auto`, a stated height and proportions of its own fell back to a 100px placeholder. `width: auto` also has to count *as* auto — it is written down but states nothing. github's icons say it outright. |
 | A replaced flex item shrunk past its own size | CSS floors a flex item at its content-based minimum, and for a box with a ratio and a definite height that is the height carried through the ratio — the transferred size suggestion. The floor was skipped for anything with a scroll-container `overflow`, which an `<svg>` clipping its own contents is not. github writes `overflow: hidden` on the logos in its customer marquee, and all twelve shrank to nothing wide: the whole band came out empty. |
 | An inline `<svg>` handed over with the fill from the file | `fill` and `stroke` are presentation attributes, so any rule outranks them — which is how an icon set states one colour in the markup and is recoloured by the page. The subtree was serialised untouched, so github's customer logos drew in the element's own text colour, white, rather than the muted grey the page states. Each element's cascaded paint is written onto it now. |
+| The other SVG presentation properties left behind with it | `stroke-dasharray`, `stroke-dashoffset`, `stroke-width`, the opacities and the caps reach the file the same way `fill` does. github hides the stem of its expanding link arrow with a dash the length of the stem, offset by the same, and slides it in on hover; without them the stem was drawn and every "Explore …" link ended in a full arrow where the reference has only a chevron. |
 | A decoration shorthand matched whole | `text-decoration: underline dotted` and `underline 1px` state the line, its style and its colour in one value. Matching the whole string against `underline` drew no line at all under anything written that way. |
 | A decoration drawn at a guessed thickness and offset | A browser takes both from the face and snaps them to whole pixels, so the line is solid rather than spread over two rows at half strength. Measured against Chromium at 12, 16, 20, 32 and 48px: 0.085em thick rounded, never under a pixel, 0.057em below the baseline. A fixed 0.07em hung a whole thickness below the baseline was a pixel low at every size and a third too thin from 20px up. |
 | An unfetchable image framed whatever its size came from | A browser marks out the space a page *told* it to reserve, and leaves a box it sized itself blank. Framing every one drew a hairline right across the page around a block-level image whose width came from the layout. |
@@ -177,7 +178,7 @@ pixels:
 
 | fixture | layout | fold | page | height (chromium -> engine) |
 |---|---|---|---|---|
-| github.com | 0.80% | 2.42% | 1.57% | 10570 -> 10553 |
+| github.com | 0.80% | 2.42% | 1.56% | 10570 -> 10553 |
 | yunseong.dev | 0.78% | 2.36% | 2.60% | 4976 -> 4976 |
 | naver.com | 1.22% | 3.02% | 2.49% | 18658 -> 16384 |
 

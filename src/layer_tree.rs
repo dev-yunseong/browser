@@ -794,6 +794,36 @@ impl LayerTreeBuilder {
             }
         }
 
+        /// The other SVG presentation properties a stylesheet reaches for, as
+        /// they would be written in the file.
+        ///
+        /// github hides the stem of its expanding link arrow with
+        /// `stroke-dasharray: 10; stroke-dashoffset: 10` and slides it in on
+        /// hover; dropping those drew the stem, so every "Explore …" link ended
+        /// in a full arrow where the reference has only a chevron.
+        const PRESENTATION: [&str; 8] = [
+            "opacity",
+            "fill-opacity",
+            "fill-rule",
+            "stroke-opacity",
+            "stroke-width",
+            "stroke-dasharray",
+            "stroke-dashoffset",
+            "stroke-linecap",
+        ];
+
+        fn presentation_value(sn: &crate::style::StyledNode, prop: &str) -> Option<String> {
+            match sn.specified_values.get(&crate::css::intern(prop)) {
+                Some(Value::Keyword(k)) => Some(k.to_string()),
+                Some(Value::Number(n)) => Some(format!("{n}")),
+                // SVG measures in user units, which is what a `px` length is
+                // once it reaches the file.
+                Some(Value::Length(v, crate::css::Unit::Px)) => Some(format!("{v}")),
+                Some(Value::Length(v, crate::css::Unit::Percent)) => Some(format!("{v}%")),
+                _ => None,
+            }
+        }
+
         fn escape(text: &str) -> String {
             text.replace('&', "&amp;")
                 .replace('<', "&lt;")
@@ -809,15 +839,24 @@ impl LayerTreeBuilder {
                     ..
                 } => {
                     let tag = name.local.to_string();
-                    let fill = paint_of(sn, "fill", current);
-                    let stroke = paint_of(sn, "stroke", current);
+                    let mut stated: Vec<(&str, String)> = Vec::new();
+                    if let Some(v) = paint_of(sn, "fill", current) {
+                        stated.push(("fill", v));
+                    }
+                    if let Some(v) = paint_of(sn, "stroke", current) {
+                        stated.push(("stroke", v));
+                    }
+                    for prop in PRESENTATION {
+                        if let Some(v) = presentation_value(sn, prop) {
+                            stated.push((prop, v));
+                        }
+                    }
                     out.push('<');
                     out.push_str(&tag);
                     for attr in attrs.borrow().iter() {
                         let key = attr.name.local.to_string();
                         // The cascade's value replaces the markup's own.
-                        if (key == "fill" && fill.is_some()) || (key == "stroke" && stroke.is_some())
-                        {
+                        if stated.iter().any(|(p, _)| *p == key) {
                             continue;
                         }
                         out.push(' ');
@@ -826,11 +865,8 @@ impl LayerTreeBuilder {
                         out.push_str(&escape(&attr.value.to_string()));
                         out.push('"');
                     }
-                    if let Some(f) = fill {
-                        out.push_str(&format!(" fill=\"{f}\""));
-                    }
-                    if let Some(st) = stroke {
-                        out.push_str(&format!(" stroke=\"{st}\""));
+                    for (prop, value) in &stated {
+                        out.push_str(&format!(" {prop}=\"{value}\""));
                     }
                     out.push('>');
                     for child in &sn.children {
@@ -2681,6 +2717,24 @@ mod tests {
             source.contains(r#"fill="currentColor""#),
             "the file's own paint survives: {source}"
         );
+    }
+
+    /// A stylesheet also states the other SVG presentation properties, and they
+    /// have to reach the file the same way. github hides the stem of its
+    /// expanding link arrow with `stroke-dasharray: 10; stroke-dashoffset: 10`
+    /// and slides it in on hover; dropping those drew the stem, so every
+    /// "Explore ..." link ended in a full arrow where the reference has only a
+    /// chevron.
+    #[test]
+    fn test_a_cascaded_stroke_dash_reaches_the_file() {
+        let tree = build_tree_from_html(
+            r#"<svg id="s" width="16" height="16" viewBox="0 0 16 16"><path class="stem" stroke="currentColor" d="M1.75 8H11"></path></svg>"#,
+            ".stem { stroke-dasharray: 10; stroke-dashoffset: 10px; stroke-width: 1.5px }",
+        );
+        let source = svg_source(&tree).expect("the svg must be painted");
+        assert!(source.contains(r#"stroke-dasharray="10""#), "dasharray: {source}");
+        assert!(source.contains(r#"stroke-dashoffset="10""#), "dashoffset: {source}");
+        assert!(source.contains(r#"stroke-width="1.5""#), "width: {source}");
     }
 
     /// `viewBox` keeps its capital B — usvg will not read it otherwise, and the

@@ -21,6 +21,12 @@
      width with a stated height takes its width from the two. */
   .icon { width: auto; height: 24px; display: flex; overflow: hidden; }
   .bar { display: flex; gap: 12px; align-items: center; background: #101018; padding: 8px; }
+  /* A stylesheet states the other presentation properties too: github hides
+     the stem of its expanding link arrow with a dash the length of the stem,
+     offset by the same, and slides it in on hover. */
+  .arrow .stem { stroke-dasharray: 10; stroke-dashoffset: 10; }
+  .arrow .shown { stroke-dasharray: 10; stroke-dashoffset: 0; }
+  .arrow svg { color: #0969da; }
 </style>
 </head>
 <body>
@@ -50,6 +56,12 @@
       <svg class="icon" width="270" height="40" viewBox="0 0 270 40" fill="none"><path fill="currentColor" d="M0 8h270v24H0z"/></svg>
       <svg class="icon" width="180" height="40" viewBox="0 0 180 40" fill="none"><path fill="currentColor" d="M0 8h180v24H0z"/></svg>
       <svg class="icon" width="120" height="40" viewBox="0 0 120 40" fill="none"><path fill="currentColor" d="M0 8h120v24H0z"/></svg>
+    </div>
+  </section>
+  <section class="arrow"><b>a dash the length of the stroke hides it</b>
+    <div>
+      <svg viewBox="0 0 16 16" width="32" height="32" fill="none"><path fill="currentColor" d="M6.2 4.3L10.5 8L6.2 11.7L7.3 12.8L11.5 8.5L7.3 3.2z"/><path class="stem" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M1.75 8H11"/></svg>
+      <svg viewBox="0 0 16 16" width="32" height="32" fill="none"><path fill="currentColor" d="M6.2 4.3L10.5 8L6.2 11.7L7.3 12.8L11.5 8.5L7.3 3.2z"/><path class="shown" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M1.75 8H11"/></svg>
     </div>
   </section>
 </body>
