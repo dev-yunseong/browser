@@ -229,6 +229,13 @@ exercises the UA stylesheet.
 - **`text-align: justify` is not stretched.** The inter-word spaces keep their
   natural width, so a justified paragraph reads as left-aligned; `probe-align`
   records the difference.
+- **A line box holding an atomic inline is a pixel short.** CSS puts the strut's
+  descent below the baseline — `descent + (line-height - ascent - descent) / 2`,
+  which is what this engine computes. Chromium rounds the face's ascent and
+  descent to whole pixels first, through FreeType's hinted metrics, and comes out
+  0.3-0.7px lower. Measured at nine size and line-height combinations: 16px/1.4
+  gives 6.39 there against 5.65 here. It costs a pixel on every line that holds an
+  image or an icon, which is most of github's remaining 17px.
 - **`justify-items` other than `stretch` is not modelled** — a grid item always
   fills its cell on the inline axis.
 - **Two box models coexist.** `dimensions` holds the content box on an axis a
