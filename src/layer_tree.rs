@@ -491,7 +491,12 @@ impl LayerTreeBuilder {
                 // `compute_transform_matrix` states the matrix about the box's
                 // own origin — the same one the painter uses — so it is moved
                 // into page space before it composes with the ancestors'.
-                let m = Self::compute_transform_matrix(ops, b.dimensions.width, b.dimensions.height);
+                let m = Self::compute_transform_matrix_about(
+                    ops,
+                    b.dimensions.width,
+                    b.dimensions.height,
+                    Self::transform_origin(b, b.dimensions.width, b.dimensions.height),
+                );
                 let local = tiny_skia::Transform::from_translate(b.dimensions.x, b.dimensions.y)
                     .pre_concat(m.to_skia())
                     .pre_translate(-b.dimensions.x, -b.dimensions.y);
@@ -1028,7 +1033,12 @@ impl LayerTreeBuilder {
         if let Some(Value::Transform(ops)) = sv.get(&crate::css::intern("transform")) {
             let w = layout.dimensions.width;
             let h = layout.dimensions.height;
-            matrix = Self::compute_transform_matrix(ops, w, h);
+            matrix = Self::compute_transform_matrix_about(
+                ops,
+                w,
+                h,
+                Self::transform_origin(layout, w, h),
+            );
             triggers.push(CompositingTrigger::Transform(matrix));
         }
 
@@ -1124,7 +1134,96 @@ impl LayerTreeBuilder {
         }
     }
 
+    /// Where a transform is applied from, in the box's own coordinates.
+    ///
+    /// `transform-origin` defaults to the box's centre. A page that states
+    /// another point means it: an underline animated in with `scaleX()` is
+    /// pinned at `0 0` so it grows from the left rather than out of its middle.
+    fn transform_origin(layout: &LayoutBox, width: f32, height: f32) -> (f32, f32) {
+        let raw = match layout
+            .style_node
+            .specified_values
+            .get(&crate::css::intern("transform-origin"))
+        {
+            Some(Value::Keyword(k)) => k.to_string(),
+            Some(Value::Length(v, unit)) => format!("{v}{}", if *unit == crate::css::Unit::Percent { "%" } else { "px" }),
+            _ => return (width / 2.0, height / 2.0),
+        };
+
+        let axis = |word: &str, extent: f32, vertical: bool| -> Option<f32> {
+            match word {
+                "left" if !vertical => Some(0.0),
+                "right" if !vertical => Some(extent),
+                "top" if vertical => Some(0.0),
+                "bottom" if vertical => Some(extent),
+                "center" => Some(extent / 2.0),
+                _ => {
+                    if let Some(pct) = word.strip_suffix('%') {
+                        pct.parse::<f32>().ok().map(|p| extent * p / 100.0)
+                    } else {
+                        word.trim_end_matches("px").parse::<f32>().ok()
+                    }
+                }
+            }
+        };
+
+        let words: Vec<&str> = raw.split_whitespace().collect();
+        // A single value sets the horizontal origin and centres the vertical
+        // one; `top`/`bottom` alone are the other way round.
+        let (x, y) = match words.as_slice() {
+            [one] => {
+                if matches!(*one, "top" | "bottom") {
+                    (Some(width / 2.0), axis(one, height, true))
+                } else {
+                    (axis(one, width, false), Some(height / 2.0))
+                }
+            }
+            [a, b, ..] => {
+                // The pair may be written either way round when both are
+                // keywords: `top left` means the same as `left top`.
+                if matches!(*a, "top" | "bottom") || matches!(*b, "left" | "right") {
+                    (axis(b, width, false), axis(a, height, true))
+                } else {
+                    (axis(a, width, false), axis(b, height, true))
+                }
+            }
+            [] => (None, None),
+        };
+        (x.unwrap_or(width / 2.0), y.unwrap_or(height / 2.0))
+    }
+
+    fn compute_transform_matrix_about(
+        ops: &[TransformOp],
+        elem_width: f32,
+        elem_height: f32,
+        origin: (f32, f32),
+    ) -> Matrix4x4 {
+        let m = Self::compute_transform_matrix_raw(ops, elem_width, elem_height);
+        Matrix4x4::translate(origin.0, origin.1, 0.0)
+            .multiply(&m)
+            .multiply(&Matrix4x4::translate(-origin.0, -origin.1, 0.0))
+    }
+
     fn compute_transform_matrix(ops: &[TransformOp], elem_width: f32, elem_height: f32) -> Matrix4x4 {
+        // `transform-origin` defaults to the box's centre, so the whole list is
+        // applied about that point. Applying it about the top-left corner
+        // instead swings a rotated box out of its own place — the further from
+        // the corner, the further out — and a wash a page rotates ended up in
+        // a different part of the section from the one it was written for.
+        Self::compute_transform_matrix_about(
+            ops,
+            elem_width,
+            elem_height,
+            (elem_width / 2.0, elem_height / 2.0),
+        )
+    }
+
+    /// The transform list itself, applied from the box's own corner.
+    fn compute_transform_matrix_raw(
+        ops: &[TransformOp],
+        elem_width: f32,
+        elem_height: f32,
+    ) -> Matrix4x4 {
         let mut result = Matrix4x4::identity();
         for op in ops {
             let m = match op {
@@ -1137,16 +1236,7 @@ impl LayerTreeBuilder {
             };
             result = result.multiply(&m);
         }
-        // `transform-origin` defaults to the box's centre, so the whole list is
-        // applied about that point. Applying it about the top-left corner
-        // instead swings a rotated box out of its own place — the further from
-        // the corner, the further out — and a wash a page rotates ended up in
-        // a different part of the section from the one it was written for.
-        let cx = elem_width / 2.0;
-        let cy = elem_height / 2.0;
-        Matrix4x4::translate(cx, cy, 0.0)
-            .multiply(&result)
-            .multiply(&Matrix4x4::translate(-cx, -cy, 0.0))
+        result
     }
 
     /// Emit paint commands for a single `LayoutBox` (not its children) into `layer`.
@@ -1942,6 +2032,108 @@ mod tests {
             "translate(10px, 20px) should produce tx=10, got {}", tx);
         assert!((ty - 20.0).abs() < 0.5,
             "translate(10px, 20px) should produce ty=20, got {}", ty);
+    }
+
+    /// The matrix a box's transform composes to.
+    fn transform_matrix_of(html: &str) -> Matrix4x4 {
+        let tree = build_tree_from_html(html, "");
+        tree.layers
+            .iter()
+            .find(|l| l.triggers.iter().any(|t| matches!(t, CompositingTrigger::Transform(_))))
+            .expect("the transform must make a layer")
+            .transform
+    }
+
+    /// `transform-origin` says where a transform is applied from. A page that
+    /// states one means it: an underline animated in with `scaleX()` is pinned
+    /// at `0 0` so it grows from its left edge rather than out of its middle.
+    #[test]
+    fn test_a_stated_transform_origin_is_where_the_scale_is_applied_from() {
+        // Scaling a 100px box by a half about its left edge leaves the left
+        // edge where it was: the matrix carries no translation.
+        let m = transform_matrix_of(
+            r#"<div style="width:100px; height:50px; transform-origin:0 0; transform:scaleX(0.5);">C</div>"#,
+        );
+        assert_eq!(m.0[0], 0.5);
+        assert_eq!(m.0[3], 0.0, "the left edge stays put");
+
+        // About the centre it moves in by a quarter of the width.
+        let centred = transform_matrix_of(
+            r#"<div style="width:100px; height:50px; transform:scaleX(0.5);">C</div>"#,
+        );
+        assert_eq!(centred.0[0], 0.5);
+        assert!(
+            (centred.0[3] - 25.0).abs() < 0.01,
+            "the centre pulls it in by a quarter, got {}",
+            centred.0[3]
+        );
+    }
+
+    /// The keywords name the same points as the lengths, in either order.
+    #[test]
+    fn test_transform_origin_keywords_name_the_box_s_own_corners() {
+        for origin in ["right bottom", "bottom right", "100% 100%"] {
+            let m = transform_matrix_of(&format!(
+                r#"<div style="width:100px; height:50px; transform-origin:{origin}; transform:scale(0.5);">C</div>"#
+            ));
+            assert!(
+                (m.0[3] - 50.0).abs() < 0.01 && (m.0[7] - 25.0).abs() < 0.01,
+                "{origin} must pin the bottom-right corner, got {} {}",
+                m.0[3],
+                m.0[7]
+            );
+        }
+    }
+
+    /// One value sets the horizontal origin and centres the vertical one —
+    /// except `top` and `bottom`, which are the other way round.
+    #[test]
+    fn test_a_single_transform_origin_value_centres_the_other_axis() {
+        let m = transform_matrix_of(
+            r#"<div style="width:100px; height:50px; transform-origin:left; transform:scale(0.5);">C</div>"#,
+        );
+        assert_eq!(m.0[3], 0.0, "pinned at the left");
+        assert!((m.0[7] - 12.5).abs() < 0.01, "and centred down, got {}", m.0[7]);
+
+        let top = transform_matrix_of(
+            r#"<div style="width:100px; height:50px; transform-origin:top; transform:scale(0.5);">C</div>"#,
+        );
+        assert!((top.0[3] - 25.0).abs() < 0.01, "centred across, got {}", top.0[3]);
+        assert_eq!(top.0[7], 0.0, "and pinned at the top");
+    }
+
+    /// A one-axis scale is how a hover underline is animated in from nothing:
+    /// the box is laid out at its full width and held at `scaleX(0)` until the
+    /// link is hovered. Dropping the function left the box drawn, so every link
+    /// in github's footer carried a stub of its hover rule underneath it.
+    #[test]
+    fn test_scale_x_collapses_the_box_it_is_on() {
+        let tree = build_tree_from_html(
+            r#"<div style="width:100px; height:50px; transform:scaleX(0);">Content</div>"#,
+            "",
+        );
+        let layer = tree
+            .layers
+            .iter()
+            .find(|l| l.triggers.iter().any(|t| matches!(t, CompositingTrigger::Transform(_))))
+            .expect("the transform must make a layer");
+        assert_eq!(layer.transform.0[0], 0.0, "nothing across");
+        assert_eq!(layer.transform.0[5], 1.0, "and untouched down");
+    }
+
+    #[test]
+    fn test_scale_y_touches_only_the_down_axis() {
+        let tree = build_tree_from_html(
+            r#"<div style="width:100px; height:50px; transform:scaleY(0.5);">Content</div>"#,
+            "",
+        );
+        let layer = tree
+            .layers
+            .iter()
+            .find(|l| l.triggers.iter().any(|t| matches!(t, CompositingTrigger::Transform(_))))
+            .expect("the transform must make a layer");
+        assert_eq!(layer.transform.0[0], 1.0, "untouched across");
+        assert_eq!(layer.transform.0[5], 0.5, "and halved down");
     }
 
     #[test]
@@ -2788,5 +2980,6 @@ mod scrollable_overflow_tests {
         );
     }
 }
+
 
 

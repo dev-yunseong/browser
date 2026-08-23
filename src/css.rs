@@ -4025,6 +4025,19 @@ fn parse_transform_list(val: &str) -> Vec<TransformOp> {
                     let y = args.get(1).and_then(|s| s.parse::<f32>().ok()).unwrap_or(x);
                     ops.push(TransformOp::Scale(OrderedFloat(x), OrderedFloat(y)));
                 }
+                // A one-axis scale is how an underline is animated in from
+                // nothing: the box is laid out at its full width and held at
+                // `scaleX(0)` until the link is hovered. Dropping the function
+                // left it drawn, so every link in github's footer carried a
+                // stub of its hover rule underneath it.
+                "scalex" => {
+                    let x = args.get(0).and_then(|s| s.parse::<f32>().ok()).unwrap_or(1.0);
+                    ops.push(TransformOp::Scale(OrderedFloat(x), OrderedFloat(1.0)));
+                }
+                "scaley" => {
+                    let y = args.get(0).and_then(|s| s.parse::<f32>().ok()).unwrap_or(1.0);
+                    ops.push(TransformOp::Scale(OrderedFloat(1.0), OrderedFloat(y)));
+                }
                 "rotate" => {
                     let mut rad = 0.0;
                     if let Some(arg) = args.get(0) {

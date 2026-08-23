@@ -15,6 +15,19 @@
   .none { top: 860px; background: #f6c; }
   /* A gradient under a blur, rotated — the shape a page's decorative washes
      take, and where getting the origin wrong is most visible. */
+  .rule { position: absolute; left: 100px; width: 300px; height: 6px; background: #6cf;
+          transform-origin: 0 0; }
+  .r0    { top: 1000px; transform: scaleX(0); }
+  .rhalf { top: 1020px; transform: scaleX(0.5); }
+  .rfull { top: 1040px; transform: scaleX(1); }
+  .ry    { top: 1060px; transform: scaleY(0.5); }
+  /* `transform-origin` says where the transform is applied from; the default
+     is the box's own centre. */
+  .o { position: absolute; left: 500px; width: 200px; height: 20px; background: #fa0; }
+  .o1 { top: 1000px; transform: scale(0.5); }
+  .o2 { top: 1030px; transform-origin: 0 0; transform: scale(0.5); }
+  .o3 { top: 1060px; transform-origin: right bottom; transform: scale(0.5); }
+  .o4 { top: 1090px; transform-origin: left; transform: rotate(20deg); }
   .glow { position: absolute; top: 950px; left: 200px; width: 300px; height: 120px;
           background: radial-gradient(circle at 0 100%, #e6b7fe 10%, #5049c2 30%, rgba(87,78,255,0) 70%);
           filter: blur(20px); transform: rotate(-45deg); }
@@ -29,5 +42,17 @@
   <div class="w t6"></div>
   <div class="w none"></div>
   <div class="glow"></div>
+
+  <!-- A one-axis scale is how a hover underline is animated in from nothing:
+       the box is laid out at its full width and held at `scaleX(0)` until the
+       link is hovered. -->
+  <div class="rule r0"></div>
+  <div class="rule rhalf"></div>
+  <div class="rule rfull"></div>
+  <div class="rule ry"></div>
+  <div class="o o1"></div>
+  <div class="o o2"></div>
+  <div class="o o3"></div>
+  <div class="o o4"></div>
 </body>
 </html>
