@@ -185,15 +185,17 @@ pixels:
 | naver.com | 1.16% | 3.02% | 2.50% | 18658 -> 16384 |
 
 github.com began this work at 9.14% layout, 13.84% fold and 780px too tall;
-yunseong.dev at 4.24% and 256px too short. github's page is now within a single
-pixel of Chromium's height, and only about a sixtieth of its pixels differ at
-all. Its remaining vertical drift is around 16px, gained in one section and
-carried down the page; every section's own boxes are within a pixel or two.
+yunseong.dev at 4.24% and 256px too short. Both are now within half a percent
+on the layout metric and about a hundredth of the page's pixels differ over the
+fold. github's remaining vertical drift is 17px, gained a few pixels at a time
+down the page; every section's own boxes are within a pixel or two, and
+yunseong.dev's page is exactly Chromium's height.
 
-Every probe fixture sits at or below 1.7% on the layout metric; `probe-grid`
-and `probe-aspect` are pixel-identical over the fold, and `probe-transform` is
-now pixel-identical over the whole page. `probe-has`, `probe-overlay`, `probe-layers` and `probe-grid` cover what this
-round found. yunseong.dev's page is now exactly Chromium's height.
+Every probe fixture sits at or below 1.7% on the layout metric, most of them
+below 0.4%; `probe-grid` and `probe-aspect` are pixel-identical over the fold,
+and `probe-transform` is pixel-identical over the whole page with a scale and a
+rotation about each of its corners in it. `probe-align`, `probe-wrap`,
+`probe-svg` and `probe-transform` cover what this round found.
 
 naver.com's number means little: its snapshot was captured without CSS (see
 below), so both renderers are drawing an unstyled page and the comparison only
