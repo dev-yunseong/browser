@@ -27,6 +27,11 @@
   .arrow .stem { stroke-dasharray: 10; stroke-dashoffset: 10; }
   .arrow .shown { stroke-dasharray: 10; stroke-dashoffset: 0; }
   .arrow svg { color: #0969da; }
+  /* A shrink-wrapping box around a ratio-sized icon takes the icon's own
+     width, not the replaced-element placeholder. */
+  .pill { display: inline-flex; align-items: center; gap: 8px; background: #eef;
+          border: 1px solid #99f; border-radius: 6px; padding: 6px 10px; }
+  .pill svg { width: auto; height: 16px; display: flex; }
 </style>
 </head>
 <body>
@@ -63,6 +68,9 @@
       <svg viewBox="0 0 16 16" width="32" height="32" fill="none"><path fill="currentColor" d="M6.2 4.3L10.5 8L6.2 11.7L7.3 12.8L11.5 8.5L7.3 3.2z"/><path class="stem" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M1.75 8H11"/></svg>
       <svg viewBox="0 0 16 16" width="32" height="32" fill="none"><path fill="currentColor" d="M6.2 4.3L10.5 8L6.2 11.7L7.3 12.8L11.5 8.5L7.3 3.2z"/><path class="shown" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M1.75 8H11"/></svg>
     </div>
+  </section>
+  <section><b>a box shrinks to the icon it holds</b>
+    <div><span class="pill"><svg width="16" height="16" viewBox="0 0 16 16" fill="#0969da"><circle cx="8" cy="8" r="7"/></svg>English<svg width="16" height="16" viewBox="0 0 16 16" fill="#0969da"><path d="M3 6l5 5 5-5z"/></svg></span></div>
   </section>
 </body>
 </html>

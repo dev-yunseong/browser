@@ -86,7 +86,7 @@ impl IntrinsicSizeCache {
                         let disp = get_display_type(node);
                         if disp == DisplayType::Image {
                             let w = read_px_direct(node, "width");
-                            Some(if w > 0.0 { w } else { 100.0 })
+                            Some(if w > 0.0 { w } else { replaced_width_from_ratio(node) })
                         } else if should_skip(node) {
                             Some(0.0)
                         } else if let Some(Value::Length(v, Unit::Px)) =
@@ -283,7 +283,7 @@ impl IntrinsicSizeCache {
                         let disp = get_display_type(node);
                         if disp == DisplayType::Image {
                             let w = read_px_direct(node, "width");
-                            Some(if w > 0.0 { w } else { 100.0 })
+                            Some(if w > 0.0 { w } else { replaced_width_from_ratio(node) })
                         } else if should_skip(node) {
                             Some(0.0)
                         } else if let Some(Value::Length(v, Unit::Px)) =
@@ -596,6 +596,25 @@ fn greedy_lines(widths: &[f32], space_w: f32, first_indent: f32, avail: f32) -> 
         words_on_line += 1;
     }
     lines
+}
+
+/// What a replaced box with an auto width contributes to its parent's intrinsic
+/// size.
+///
+/// Its own proportions and its stated height settle it — the same rule layout
+/// applies once the box is placed. Falling straight to the 100px placeholder
+/// made the box around github's footer chevron six times as wide as the 16px
+/// icon inside it, and the language button with it.
+fn replaced_width_from_ratio(sn: &StyledNode) -> f32 {
+    const REPLACED_PLACEHOLDER_WIDTH: f32 = 100.0;
+    let height = read_px_direct(sn, "height");
+    if height <= 0.0 {
+        return REPLACED_PLACEHOLDER_WIDTH;
+    }
+    match read_aspect_ratio(sn) {
+        Some(ratio) if ratio > 0.0 => height * ratio,
+        _ => REPLACED_PLACEHOLDER_WIDTH,
+    }
 }
 
 fn measure_text_width(
@@ -7563,6 +7582,35 @@ mod tests {
         let img = find_element_by_id(&layout, "a").expect("img");
         assert_eq!(outer_width(img), 0.0, "nothing to show is no width");
         assert_eq!(outer_height(img), 0.0, "and a height on its own is no box");
+    }
+
+    /// A shrink-wrapping box around a replaced element with an auto width takes
+    /// that element's own proportions, not the placeholder. github's footer
+    /// button holds a 16px chevron in a `display: flex` span, and reading 100px
+    /// for it made the span — and the button around it — 84px too wide.
+    #[test]
+    fn test_a_box_around_a_ratio_sized_icon_shrinks_to_the_icon() {
+        let html = r##"<div style="width: 400px"><span id="a" style="display: inline-flex; background: #eee"><svg width="16" height="16" viewBox="0 0 16 16" style="width: auto; height: 16px"><path d="M1 1"/></svg></span></div>"##;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let span = find_element_by_id(&layout, "a").expect("span");
+        assert!(
+            (outer_width(span) - 16.0).abs() < 0.5,
+            "the span is as wide as the icon, got {}",
+            outer_width(span)
+        );
+    }
+
+    /// With nothing to go on it is still the placeholder.
+    #[test]
+    fn test_a_box_around_an_unsized_image_keeps_the_placeholder() {
+        let html = r##"<div style="width: 400px"><span id="a" style="display: inline-flex"><img src="x.png" alt="something"></span></div>"##;
+        let (layout, _, _) = layout_from_html(html, 800.0, 600.0);
+        let span = find_element_by_id(&layout, "a").expect("span");
+        assert!(
+            outer_width(span) > 20.0,
+            "nothing states its size, so the placeholder stands, got {}",
+            outer_width(span)
+        );
     }
 
     /// Only an ordinary inline `<img>` collapses. A page that gave the image a
