@@ -175,9 +175,9 @@ pixels:
 
 | fixture | layout | fold | page | height (chromium -> engine) |
 |---|---|---|---|---|
-| github.com | 0.82% | 2.43% | 1.52% | 10570 -> 10553 |
-| yunseong.dev | 0.87% | 2.36% | 2.62% | 4976 -> 4976 |
-| naver.com | 1.19% | 3.02% | 2.51% | 18658 -> 16384 |
+| github.com | 0.80% | 2.42% | 1.57% | 10570 -> 10553 |
+| yunseong.dev | 0.78% | 2.36% | 2.60% | 4976 -> 4976 |
+| naver.com | 1.22% | 3.02% | 2.49% | 18658 -> 16384 |
 
 github.com began this work at 9.14% layout, 13.84% fold and 780px too tall;
 yunseong.dev at 4.24% and 256px too short. github's page is now within a single
@@ -203,8 +203,13 @@ exercises the UA stylesheet.
   only three text leaves differ in width by 4px or more, and across yunseong.dev
   only two — and both renderers position glyphs at quarter-pixel phases. What
   differs is that FreeType hints stems onto the pixel grid and this rasteriser
-  does not. The text-coverage curve now brings the ink to within 4-10% of the
-  reference's, from 6-13% short.
+  does not. The text-coverage curve was re-fitted by sweeping its exponent
+  against the reference's own ink: 1/2.4 is where the layout metric bottoms out
+  on every fixture and both sites and the page metric has not yet begun to rise.
+  It brings the ink to within 3.5% of the reference's, from 6-10% short, and
+  `probe-baseline`'s to within half a percent. `probe-webfont` and naver.com
+  prefer a slightly lighter curve — 0.07 and 0.03 points respectively — which is
+  the cost of one exponent for every face.
 - **Canvas, video and script-driven content do not render.** github.com's
   landing page is largely a WebGL canvas and a video, so a share of its
   remaining difference is content this engine does not draw at all.
