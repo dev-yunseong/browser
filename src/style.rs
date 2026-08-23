@@ -1030,6 +1030,13 @@ fn build_final_tree(
                         "word-break",
                         "overflow-wrap",
                         "direction",
+                        // `text-wrap` and its longhands inherit, which is what
+                        // lets a design system state `text-wrap: pretty` once on
+                        // a component and have every run inside it break that
+                        // way — github writes it exactly like that.
+                        "text-wrap",
+                        "text-wrap-style",
+                        "text-wrap-mode",
                     ];
                     for prop in inheritable {
                         let prop_arc = intern(prop);
@@ -1744,6 +1751,7 @@ fn make_pseudo_styled_node(
         "font-style", "line-height", "text-align", "white-space",
         "visibility", "text-indent", "letter-spacing", "word-spacing",
         "text-transform", "word-break", "overflow-wrap", "direction",
+        "text-wrap", "text-wrap-style", "text-wrap-mode",
     ];
     for prop in &inheritable {
         let key = intern(prop);

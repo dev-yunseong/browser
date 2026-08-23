@@ -453,6 +453,151 @@ fn collapsed_space_width(node: &StyledNode, raw: &str, font_size: f32) -> f32 {
 /// wrap a button's label that fits its own box exactly.
 const LINE_FIT_EPSILON: f32 = 1.0 / 64.0;
 
+/// How a run's lines are chosen — CSS `text-wrap-style`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WrapStyle {
+    /// Greedy: every line takes as many words as fit.
+    Auto,
+    /// Greedy, but a last line left holding a single word pulls one down from
+    /// the line above it.
+    Pretty,
+    /// The same number of lines, made as even as the words allow.
+    Balance,
+}
+
+/// `text-wrap-style`, from either the longhand or the `text-wrap` shorthand.
+pub fn resolved_wrap_style(sn: &StyledNode) -> WrapStyle {
+    for prop in ["text-wrap-style", "text-wrap"] {
+        if let Some(Value::Keyword(k)) = sn.specified_values.get(&crate::css::intern(prop)) {
+            // The shorthand states a mode and a style in either order, so both
+            // words are looked at: `text-wrap: wrap pretty`.
+            for word in k.split_whitespace() {
+                match word {
+                    "pretty" => return WrapStyle::Pretty,
+                    "balance" => return WrapStyle::Balance,
+                    _ => {}
+                }
+            }
+        }
+    }
+    WrapStyle::Auto
+}
+
+/// Chromium balances a run only while it is short enough to be worth it, and
+/// stops at six lines. Beyond that the cost of the search outweighs the look,
+/// and a browser falls back to the greedy break.
+const BALANCE_LINE_LIMIT: usize = 6;
+
+/// Where a run of words breaks into lines, as the index of the first word on
+/// each line.
+///
+/// `widths` are the words' own advances, `space_w` the space between two of
+/// them, `first_indent` what an inline sibling already took on the first line,
+/// and `avail` the width the run is laid into.
+///
+/// The greedy answer is the CSS default and what every other value is measured
+/// against; `text-wrap-style` then adjusts it.
+pub(crate) fn break_lines(
+    widths: &[f32],
+    space_w: f32,
+    first_indent: f32,
+    avail: f32,
+    style: WrapStyle,
+) -> Vec<usize> {
+    let greedy = greedy_lines(widths, space_w, first_indent, avail);
+    if widths.len() < 2 || greedy.len() < 2 || !avail.is_finite() {
+        return greedy;
+    }
+    match style {
+        WrapStyle::Auto => greedy,
+        WrapStyle::Pretty => {
+            // A last line holding one word is the orphan `pretty` exists to
+            // avoid: the line above gives up its own last word, as long as the
+            // two of them still fit together. github writes it on every body
+            // run, and the greedy break left "onboarding" alone under a full
+            // line on its customer stories.
+            let last_start = greedy[greedy.len() - 1];
+            if last_start + 1 != widths.len() {
+                return greedy;
+            }
+            let prev_start = greedy[greedy.len() - 2];
+            if last_start - prev_start < 2 {
+                // The line above is a single word too; moving it down only
+                // moves the orphan up.
+                return greedy;
+            }
+            let pulled = line_width(widths, space_w, last_start - 1, widths.len());
+            if pulled > avail + LINE_FIT_EPSILON {
+                return greedy;
+            }
+            let mut out = greedy;
+            let n = out.len();
+            out[n - 1] = last_start - 1;
+            out
+        }
+        WrapStyle::Balance => {
+            if greedy.len() > BALANCE_LINE_LIMIT {
+                return greedy;
+            }
+            // The evenest break is the narrowest width the run still fits in
+            // without taking another line, so the answer is the smallest such
+            // width — found by bisection, since fitting is monotone in it.
+            let widest_word = widths.iter().fold(0.0_f32, |m, w| m.max(*w));
+            let mut lo = widest_word.max(first_indent);
+            let mut hi = avail;
+            for _ in 0..24 {
+                let mid = 0.5 * (lo + hi);
+                if greedy_lines(widths, space_w, first_indent, mid).len() <= greedy.len() {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            let balanced = greedy_lines(widths, space_w, first_indent, hi);
+            if balanced.len() == greedy.len() {
+                balanced
+            } else {
+                greedy
+            }
+        }
+    }
+}
+
+/// The width of `widths[from..to]` set on one line, spaces included.
+fn line_width(widths: &[f32], space_w: f32, from: usize, to: usize) -> f32 {
+    let mut w = 0.0;
+    for (i, word) in widths[from..to].iter().enumerate() {
+        if i > 0 {
+            w += space_w;
+        }
+        w += word;
+    }
+    w
+}
+
+/// The greedy break: every line takes as many words as fit.
+fn greedy_lines(widths: &[f32], space_w: f32, first_indent: f32, avail: f32) -> Vec<usize> {
+    let mut lines = vec![0usize];
+    let mut line_w = first_indent;
+    let mut words_on_line = 0usize;
+    for (i, word_w) in widths.iter().enumerate() {
+        // The space that goes before this word has to fit too — the same test
+        // `layout_text` makes, so both agree about where the lines break.
+        let needed = if words_on_line > 0 { space_w + word_w } else { *word_w };
+        if avail.is_finite() && line_w + needed > avail + LINE_FIT_EPSILON && words_on_line > 0 {
+            lines.push(i);
+            line_w = 0.0;
+            words_on_line = 0;
+        }
+        if words_on_line > 0 {
+            line_w += space_w;
+        }
+        line_w += word_w;
+        words_on_line += 1;
+    }
+    lines
+}
+
 fn measure_text_width(
     text: &str,
     font_size: f32,
@@ -1408,6 +1553,10 @@ pub struct LayoutBox<'a> {
     /// field's own colour; a GUI that overlays a real text widget draws its own
     /// background over this, so the raster and the widget cannot double up.
     pub input_value: Option<String>,
+    /// The width this run was laid into, kept so paint can break its lines
+    /// exactly where layout did. The box itself is only as wide as the widest
+    /// line, which is not enough to re-run `text-wrap-style` against.
+    pub wrap_width: f32,
     pub event_handlers: HashMap<String, String>,
     pub display: DisplayType,
     pub z_index: i32,
@@ -1486,6 +1635,7 @@ impl<'a> Clone for LayoutBox<'a> {
                         input_label: src.input_label.clone(),
                         input_placeholder: src.input_placeholder.clone(),
                         input_value: src.input_value.clone(),
+                        wrap_width: src.wrap_width,
                         event_handlers: src.event_handlers.clone(),
                         display: src.display,
                         z_index: src.z_index,
@@ -1681,6 +1831,7 @@ impl<'a> LayoutBox<'a> {
             input_label: None,
             input_placeholder: None,
             input_value: None,
+            wrap_width: f32::INFINITY,
             event_handlers: HashMap::new(),
             display,
             z_index,
@@ -4188,6 +4339,17 @@ impl<'a> LayoutBox<'a> {
         let first_line_indent = (current_x - container_start_x).max(0.0)
             + if has_leading_space { space_w } else { 0.0 };
 
+        // `text-wrap-style` adjusts the greedy break, so the run's own word
+        // advances are kept while it is measured — but only when a style asks
+        // for them, since every ordinary run takes the greedy answer as it is.
+        let wrap_style = resolved_wrap_style(self.style_node);
+        let restyle_lines = wrap_style != WrapStyle::Auto
+            && !no_wrap
+            && !preserve_newlines
+            && container_width.is_finite();
+        let mut word_widths: Vec<f32> = Vec::new();
+        let mut any_word_overlong = false;
+
         let mut lines_count = 1;
         // The indent is part of the first line's width; a break resets it,
         // since the next line starts at the container's own edge.
@@ -4215,6 +4377,12 @@ impl<'a> LayoutBox<'a> {
             }
             for word in segment.split_whitespace() {
                 let word_w = fonts.measure(word, font_size, font_style, letter_spacing);
+                if restyle_lines {
+                    word_widths.push(word_w);
+                    // A word wider than its container is broken between its own
+                    // characters, which is not something a wrap style rearranges.
+                    any_word_overlong |= word_w > container_width;
+                }
 
                 if no_wrap {
                     if line_w > 0.0 {
@@ -4272,6 +4440,36 @@ impl<'a> LayoutBox<'a> {
         }
 
         max_w = max_w.max(line_w);
+
+        // Re-break under the run's own `text-wrap-style`. The greedy pass above
+        // settled the default and told this one whether the run is the kind a
+        // style applies to at all.
+        if restyle_lines && !any_word_overlong && word_widths.len() > 1 {
+            let starts = break_lines(
+                &word_widths,
+                space_w,
+                first_line_indent,
+                container_width,
+                wrap_style,
+            );
+            lines_count = starts.len();
+            max_w = 0.0;
+            for (i, start) in starts.iter().enumerate() {
+                let end = starts.get(i + 1).copied().unwrap_or(word_widths.len());
+                let mut w = line_width(&word_widths, space_w, *start, end);
+                if i == 0 {
+                    w += first_line_indent;
+                }
+                if i + 1 == starts.len() && has_trailing_space {
+                    w += space_w;
+                }
+                max_w = max_w.max(w);
+            }
+        }
+
+        // Paint has to break the run in the same places, and the box it is
+        // given is only as wide as the widest line — not the room the run had.
+        self.wrap_width = if no_wrap { f32::INFINITY } else { container_width };
 
         // The box spans the whole line box, because that is where its second
         // and later lines live; the first line starts `text_leading` in, which
@@ -7370,6 +7568,127 @@ mod tests {
         );
     }
 
+    // ── Line breaking: `text-wrap-style` ─────────────────────────────────
+
+    /// Word advances from the run's cumulative prefix widths, which is how the
+    /// figures below were measured out of Chromium.
+    fn words_from_prefixes(prefixes: &[f32], space_w: f32) -> Vec<f32> {
+        let mut out = Vec::new();
+        let mut prev = 0.0;
+        for (i, p) in prefixes.iter().enumerate() {
+            out.push(p - prev - if i > 0 { space_w } else { 0.0 });
+            prev = *p;
+        }
+        out
+    }
+
+    /// The widths of the lines a break produces.
+    fn line_widths(widths: &[f32], space_w: f32, starts: &[usize]) -> Vec<f32> {
+        let mut out = Vec::new();
+        for (i, start) in starts.iter().enumerate() {
+            let end = starts.get(i + 1).copied().unwrap_or(widths.len());
+            out.push(super::line_width(widths, space_w, *start, end));
+        }
+        out
+    }
+
+    /// github's customer-story heading, measured out of Chromium at 20px in a
+    /// 552px column. Greedy leaves "onboarding" alone on the last line; `pretty`
+    /// pulls "automates" down to keep it company.
+    #[test]
+    fn test_pretty_pulls_a_word_down_to_a_lonely_last_line() {
+        let space_w = 5.56;
+        let widths = words_from_prefixes(&[140.0, 259.0, 325.0, 374.0, 412.0, 511.0, 617.0], space_w);
+        let greedy = break_lines(&widths, space_w, 0.0, 552.0, WrapStyle::Auto);
+        assert_eq!(greedy, vec![0, 6], "greedy fills the first line to 511");
+
+        let pretty = break_lines(&widths, space_w, 0.0, 552.0, WrapStyle::Pretty);
+        assert_eq!(pretty, vec![0, 5], "pretty breaks a word earlier");
+        let lines = line_widths(&widths, space_w, &pretty);
+        assert!(
+            (lines[0] - 412.0).abs() < 1.0 && (lines[1] - 199.0).abs() < 1.5,
+            "and lands on Chromium's 412 / 199, got {lines:?}"
+        );
+    }
+
+    /// A last line that already holds two words is left alone: `pretty` is about
+    /// the orphan, not about evening the lines out.
+    #[test]
+    fn test_pretty_leaves_a_last_line_that_is_not_an_orphan() {
+        let space_w = 4.45;
+        // "Write, test, and fix code quickly with GitHub Copilot, from simple
+        //  boilerplate to complex features." at 16px in 602px.
+        let widths = words_from_prefixes(
+            &[41.0, 76.0, 107.0, 128.0, 167.0, 220.0, 253.0, 307.0, 366.0, 403.0, 453.0, 531.0, 549.0, 613.0, 680.0],
+            space_w,
+        );
+        let greedy = break_lines(&widths, space_w, 0.0, 602.0, WrapStyle::Auto);
+        let pretty = break_lines(&widths, space_w, 0.0, 602.0, WrapStyle::Pretty);
+        assert_eq!(greedy, pretty, "two words on the last line is not an orphan");
+    }
+
+    /// github's security heading at 40px in 640px: greedy runs the first line to
+    /// 594 and leaves 327 under it, and `balance` evens the two out.
+    #[test]
+    fn test_balance_evens_the_lines_out() {
+        let space_w = 11.1;
+        let widths = words_from_prefixes(&[122.0, 325.0, 474.0, 594.0, 705.0, 836.0, 932.0], space_w);
+        let greedy = break_lines(&widths, space_w, 0.0, 640.0, WrapStyle::Auto);
+        assert_eq!(greedy, vec![0, 4]);
+
+        let balanced = break_lines(&widths, space_w, 0.0, 640.0, WrapStyle::Balance);
+        assert_eq!(balanced, vec![0, 3], "the break moves one word earlier");
+        let lines = line_widths(&widths, space_w, &balanced);
+        assert!(
+            (lines[0] - 474.0).abs() < 1.0 && (lines[1] - 447.0).abs() < 1.5,
+            "onto Chromium's 474 / 447, got {lines:?}"
+        );
+    }
+
+    /// Balancing never costs a line — that is the whole constraint on it.
+    #[test]
+    fn test_balance_keeps_the_line_count() {
+        let space_w = 11.1;
+        let widths = words_from_prefixes(&[124.0, 249.0, 331.0, 451.0, 496.0, 571.0, 654.0, 696.0, 771.0, 931.0], space_w);
+        let greedy = break_lines(&widths, space_w, 0.0, 640.0, WrapStyle::Auto);
+        let balanced = break_lines(&widths, space_w, 0.0, 640.0, WrapStyle::Balance);
+        assert_eq!(greedy.len(), balanced.len(), "the same two lines");
+        assert_eq!(balanced, vec![0, 4]);
+        let lines = line_widths(&widths, space_w, &balanced);
+        assert!(
+            (lines[0] - 451.0).abs() < 1.0 && (lines[1] - 468.0).abs() < 1.5,
+            "Chromium's 451 / 468, got {lines:?}"
+        );
+    }
+
+    /// A run that fits on one line is not something either style touches.
+    #[test]
+    fn test_a_single_line_run_is_left_alone_by_every_style() {
+        let widths = vec![40.0, 30.0, 50.0];
+        for style in [WrapStyle::Auto, WrapStyle::Pretty, WrapStyle::Balance] {
+            assert_eq!(
+                break_lines(&widths, 4.0, 0.0, 800.0, style),
+                vec![0],
+                "{style:?} must leave a run that fits alone"
+            );
+        }
+    }
+
+    /// The orphan stands when pulling the word down would overflow the line.
+    #[test]
+    fn test_pretty_gives_up_when_the_pulled_word_will_not_fit() {
+        let space_w = 5.0;
+        // The orphan is wide enough that the word above cannot join it.
+        let widths = vec![90.0, 90.0, 150.0];
+        let greedy = break_lines(&widths, space_w, 0.0, 190.0, WrapStyle::Auto);
+        assert_eq!(greedy, vec![0, 2], "two fit, the third wraps");
+        assert_eq!(
+            break_lines(&widths, space_w, 0.0, 190.0, WrapStyle::Pretty),
+            greedy,
+            "the pair below would be 245 wide, so the orphan stands"
+        );
+    }
+
     #[test]
     fn test_image_no_dimensions_gets_default() {
         // Nothing stated, nothing decoded and nothing to say in its place: the
@@ -9998,3 +10317,4 @@ mod tests {
 pub fn debug_display_type(sn: &StyledNode) -> DisplayType {
     get_display_type(sn)
 }
+

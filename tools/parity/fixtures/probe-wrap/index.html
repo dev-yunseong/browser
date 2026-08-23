@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Line breaking probe</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 20px/1.4 sans-serif; background: #fff; color: #111; }
+  section { border-bottom: 2px solid #333; padding: 10px; }
+  h2 { font-size: 13px; margin: 0 0 6px; color: #666; font-weight: 600; }
+  .col { width: 552px; background: #eef; }
+  .narrow { width: 352px; background: #efe; font-size: 32px; line-height: 1.25; }
+  .wide { width: 640px; background: #fef; font-size: 40px; line-height: 1.1; }
+  .tiny { width: 274px; background: #ffd; font-size: 18px; }
+  .p { text-wrap: pretty; }
+  .b { text-wrap: balance; }
+  /* The style inherits, which is how a design system states it once on a
+     component and has every run inside break that way. */
+  .inherits { text-wrap: pretty; }
+  .inherits p { margin: 0; }
+</style>
+</head>
+<body>
+  <section>
+    <h2>greedy leaves one word alone on the last line</h2>
+    <div class="col">Mercedes-Benz standardizes source code and automates onboarding</div>
+  </section>
+
+  <section>
+    <h2>pretty pulls a word down to keep it company</h2>
+    <div class="col p">Mercedes-Benz standardizes source code and automates onboarding</div>
+  </section>
+
+  <section>
+    <h2>balance evens the two lines out instead</h2>
+    <div class="col b">Mercedes-Benz standardizes source code and automates onboarding</div>
+  </section>
+
+  <section>
+    <h2>a last line that already holds two words is left alone</h2>
+    <div class="col p">Write, test, and fix code quickly with GitHub Copilot, from simple boilerplate to complex features.</div>
+  </section>
+
+  <section>
+    <h2>pretty at a larger size in a narrow column</h2>
+    <div class="narrow">8.3M secret leaks stopped</div>
+    <div class="narrow p">8.3M secret leaks stopped</div>
+  </section>
+
+  <section>
+    <h2>balance across a wide heading</h2>
+    <div class="wide">Built-in application security where found means fixed</div>
+    <div class="wide b">Built-in application security where found means fixed</div>
+  </section>
+
+  <section>
+    <h2>a short run pretty barely changes</h2>
+    <div class="tiny">Explore GitHub Advanced Security</div>
+    <div class="tiny p">Explore GitHub Advanced Security</div>
+  </section>
+
+  <section class="inherits">
+    <h2>the style inherits to the runs inside</h2>
+    <div class="col"><p>Mercedes-Benz standardizes source code and automates onboarding</p></div>
+  </section>
+
+  <section>
+    <h2>three lines balanced</h2>
+    <div class="tiny b">Organize everything from high-level roadmaps to everyday tasks and beyond</div>
+  </section>
+</body>
+</html>

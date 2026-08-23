@@ -157,6 +157,11 @@ pub enum PaintCommand {
         /// Where each of the run's lines sits inside the box. Layout places the
         /// box by its widest line; the rest are settled against that here.
         text_align: TextAlign,
+        /// `text-wrap-style`, and the width layout laid the run into. Paint has
+        /// to break the lines in the same places, and the box is only as wide as
+        /// the widest line — not the room the run actually had.
+        wrap_style: crate::layout::WrapStyle,
+        wrap_width: f32,
     },
     /// Outer box-shadow
     Shadow(LayoutRect, BoxShadow),
@@ -1357,6 +1362,8 @@ impl LayerTreeBuilder {
                         Some(Value::Keyword(k)) => TextAlign::from_keyword(k),
                         _ => TextAlign::Start,
                     },
+                    wrap_style: crate::layout::resolved_wrap_style(layout.style_node),
+                    wrap_width: layout.wrap_width,
                 });
             }
         }
@@ -1396,8 +1403,11 @@ impl LayerTreeBuilder {
                     preserve_newlines: false,
                     // A marker, a control's label, its value and its
                     // placeholder are each one line in a box this places, so
-                    // there is nothing to settle them against.
+                    // there is nothing to settle them against and nothing to
+                    // re-break.
                     text_align: TextAlign::Start,
+                    wrap_style: crate::layout::WrapStyle::Auto,
+                    wrap_width: f32::INFINITY,
                 });
             }
         }
@@ -1442,8 +1452,11 @@ impl LayerTreeBuilder {
                     preserve_newlines: false,
                     // A marker, a control's label, its value and its
                     // placeholder are each one line in a box this places, so
-                    // there is nothing to settle them against.
+                    // there is nothing to settle them against and nothing to
+                    // re-break.
                     text_align: TextAlign::Start,
+                    wrap_style: crate::layout::WrapStyle::Auto,
+                    wrap_width: f32::INFINITY,
                 });
             }
         }
@@ -1483,6 +1496,8 @@ impl LayerTreeBuilder {
                 text_decoration: 0,
                 preserve_newlines: false,
                 text_align: TextAlign::Start,
+                wrap_style: crate::layout::WrapStyle::Auto,
+                wrap_width: f32::INFINITY,
             });
         }
 
@@ -1551,8 +1566,11 @@ impl LayerTreeBuilder {
                     preserve_newlines: false,
                     // A marker, a control's label, its value and its
                     // placeholder are each one line in a box this places, so
-                    // there is nothing to settle them against.
+                    // there is nothing to settle them against and nothing to
+                    // re-break.
                     text_align: TextAlign::Start,
+                    wrap_style: crate::layout::WrapStyle::Auto,
+                    wrap_width: f32::INFINITY,
                 });
             }
         }

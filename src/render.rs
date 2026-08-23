@@ -550,14 +550,14 @@ fn execute_commands_on_tile(
                     draw_broken_image(pixmap, *r, alt, alt_color, *alt_font_size, *alt_line_height, transform, *framed);
                 }
             }
-            PaintCommand::Text { rect, text, font_size, line_height, leading_space, color, clip, style, letter_spacing, text_decoration, preserve_newlines, text_align } => {
+            PaintCommand::Text { rect, text, font_size, line_height, leading_space, color, clip, style, letter_spacing, text_decoration, preserve_newlines, text_align, wrap_style, wrap_width } => {
                 let mut adjusted_rect = *rect;
                 adjusted_rect.x += tx;
                 adjusted_rect.y += ty;
                 let mut adjusted_clip = *clip;
                 adjusted_clip.x += tx;
                 adjusted_clip.y += ty;
-                render_text_raw(text.clone(), adjusted_rect, *font_size, *line_height, color, adjusted_clip, pixmap, *style, *letter_spacing, *text_decoration, *preserve_newlines, *leading_space, *text_align);
+                render_text_raw(text.clone(), adjusted_rect, *font_size, *line_height, color, adjusted_clip, pixmap, *style, *letter_spacing, *text_decoration, *preserve_newlines, *leading_space, *text_align, *wrap_style, *wrap_width);
             }
             PaintCommand::Svg { rect, source, current_color } => {
                 let mut r = *rect;
@@ -920,8 +920,10 @@ fn draw_broken_image(
         false,
         inset,
         // A broken image's `alt` runs from the box's left edge, as a browser
-        // draws it.
+        // draws it, and wraps greedily inside the box it was given.
         crate::layer_tree::TextAlign::Start,
+        crate::layout::WrapStyle::Auto,
+        text_rect.width,
     );
 }
 
@@ -1003,6 +1005,11 @@ fn render_text_raw(
     // Where each line sits inside the box, which layout placed by the widest
     // of them.
     text_align: crate::layer_tree::TextAlign,
+    // How the run's lines were chosen, and the width they were chosen against.
+    // The box is only as wide as the widest line, so re-breaking against it
+    // would not reproduce a `balance` or `pretty` run's own lines.
+    wrap_style: crate::layout::WrapStyle,
+    wrap_width: f32,
 ) {
     let italic = style.italic;
     let trimmed = text.trim();
@@ -1036,6 +1043,7 @@ fn render_text_raw(
 
     /// One word, resolved to the glyphs that draw it: each carries the kerning
     /// that precedes it and the advance that follows.
+    #[derive(Clone)]
     struct Word {
         glyphs: Vec<(crate::font::FaceId, ab_glyph::GlyphId, f32, f32, bool)>,
         width: f32,
@@ -1056,18 +1064,19 @@ fn render_text_raw(
     // arrived started each line at the box's left edge, so a centred paragraph
     // had its first line centred by the box and every later one left-aligned
     // against that line.
+    //
+    // The break itself comes from the same function layout used, against the
+    // same width, so `balance` and `pretty` draw the lines layout measured.
+    // A run laid into an unbounded width still has to break somewhere, and the
+    // box it was given is that width.
+    let avail = if wrap_width.is_finite() && wrap_width > 0.0 {
+        wrap_width
+    } else {
+        rect.width
+    };
     let mut lines: Vec<Line> = Vec::new();
-    let mut line = Line { words: Vec::new(), left: rect.x + first_line_indent, width: 0.0 };
-    let mut cursor = line.left;
     for (segment_index, segment) in segments.into_iter().enumerate() {
-        if segment_index > 0 {
-            let finished = std::mem::replace(
-                &mut line,
-                Line { words: Vec::new(), left: rect.x, width: 0.0 },
-            );
-            lines.push(finished);
-            cursor = line.left;
-        }
+        let mut words: Vec<Word> = Vec::new();
         for word in segment.split_whitespace() {
             let mut width = 0.0;
             let mut glyphs = Vec::new();
@@ -1087,21 +1096,37 @@ fn render_text_raw(
                 width += kern + adv;
                 prev_glyph = Some((face, gid));
             }
-            if cursor + width > rect.x + rect.width + 1.0 && cursor > rect.x {
-                let finished = std::mem::replace(
-                    &mut line,
-                    Line { words: Vec::new(), left: rect.x, width: 0.0 },
-                );
-                lines.push(finished);
-                cursor = line.left;
+            words.push(Word { glyphs, width });
+        }
+        if words.is_empty() {
+            continue;
+        }
+        // Only the run's very first line carries what an inline sibling to its
+        // left already took.
+        let indent = if segment_index == 0 && lines.is_empty() {
+            first_line_indent
+        } else {
+            0.0
+        };
+        let widths: Vec<f32> = words.iter().map(|w| w.width).collect();
+        let starts = crate::layout::break_lines(&widths, space_w, indent, avail, wrap_style);
+        for (i, start) in starts.iter().enumerate() {
+            let end = starts.get(i + 1).copied().unwrap_or(words.len());
+            let left = rect.x + if i == 0 { indent } else { 0.0 };
+            let mut width = 0.0;
+            for (k, w) in words[*start..end].iter().enumerate() {
+                if k > 0 {
+                    width += space_w;
+                }
+                width += w.width;
             }
-            line.width = cursor + width - line.left;
-            line.words.push(Word { glyphs, width });
-            cursor += width + space_w;
+            lines.push(Line {
+                words: words[*start..end].to_vec(),
+                left,
+                width,
+            });
         }
     }
-    lines.push(line);
-    lines.retain(|l| !l.words.is_empty());
 
     // The lines are aligned within the widest of them, which is the width
     // layout gave the box and already placed where the alignment asks for.
@@ -1687,11 +1712,11 @@ mod tests {
         let at = |x: f32| LayoutRect { x, y: 2.0, width: 78.0, height: 26.0 };
         render_text_raw(
             "iiii".to_string(), at(4.0), 16.0, 19.2, &color, at(0.0), &mut whole,
-            crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start,
+            crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY,
         );
         render_text_raw(
             "iiii".to_string(), at(4.5), 16.0, 19.2, &color, at(0.0), &mut half,
-            crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start,
+            crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY,
         );
         assert_ne!(
             whole.data(), half.data(),
@@ -1979,6 +2004,8 @@ mod tests {
             false,
             0.0,
             align,
+            crate::layout::WrapStyle::Auto,
+            120.0,
         );
         pixmap
     }
@@ -2042,6 +2069,8 @@ mod tests {
                 false,
                 0.0,
                 align,
+                crate::layout::WrapStyle::Auto,
+                180.0,
             );
             ink_span(&pixmap, 0, 30).expect("the run must draw")
         };
@@ -2065,12 +2094,12 @@ mod tests {
         let color = black();
 
         let mut pixmap1 = white_pixmap(200, 40);
-        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut pixmap1, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
+        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut pixmap1, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
 
         clear_glyph_cache();
 
         let mut pixmap2 = white_pixmap(200, 40);
-        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut pixmap2, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
+        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut pixmap2, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
 
         assert_eq!(pixmap1.data(), pixmap2.data(),
             "cache and uncached renders must produce identical pixels");
@@ -2084,7 +2113,7 @@ mod tests {
 
         let rect = full_rect(200.0, 40.0);
         let mut pixmap = white_pixmap(200, 40);
-        render_text_raw("Abc".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
+        render_text_raw("Abc".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
 
         let cache_size = GLYPH_CACHE.lock().unwrap().len();
         assert!(cache_size > 0, "glyph cache should be non-empty after rendering text; got {} entries", cache_size);
@@ -2097,7 +2126,7 @@ mod tests {
         // Populate.
         let rect = full_rect(200.0, 40.0);
         let mut pixmap = white_pixmap(200, 40);
-        render_text_raw("Test".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
+        render_text_raw("Test".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
 
         clear_glyph_cache();
 
@@ -2114,11 +2143,11 @@ mod tests {
         let color = black();
 
         let mut p1 = white_pixmap(200, 40);
-        render_text_raw("Bold".to_string(), rect, 16.0, 19.2, &color, rect, &mut p1, crate::font::FontStyle { bold: true, ..crate::font::FontStyle::regular() }, 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
+        render_text_raw("Bold".to_string(), rect, 16.0, 19.2, &color, rect, &mut p1, crate::font::FontStyle { bold: true, ..crate::font::FontStyle::regular() }, 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
 
         clear_glyph_cache();
         let mut p2 = white_pixmap(200, 40);
-        render_text_raw("Bold".to_string(), rect, 16.0, 19.2, &color, rect, &mut p2, crate::font::FontStyle { bold: true, ..crate::font::FontStyle::regular() }, 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
+        render_text_raw("Bold".to_string(), rect, 16.0, 19.2, &color, rect, &mut p2, crate::font::FontStyle { bold: true, ..crate::font::FontStyle::regular() }, 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
 
         assert_eq!(p1.data(), p2.data(), "bold renders must be identical across cache miss and cache hit");
     }
@@ -2132,11 +2161,11 @@ mod tests {
         let color = black();
 
         let mut p1 = white_pixmap(200, 40);
-        render_text_raw("Italic".to_string(), rect, 16.0, 19.2, &color, rect, &mut p1, crate::font::FontStyle { italic: true, ..crate::font::FontStyle::regular() }, 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
+        render_text_raw("Italic".to_string(), rect, 16.0, 19.2, &color, rect, &mut p1, crate::font::FontStyle { italic: true, ..crate::font::FontStyle::regular() }, 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
 
         clear_glyph_cache();
         let mut p2 = white_pixmap(200, 40);
-        render_text_raw("Italic".to_string(), rect, 16.0, 19.2, &color, rect, &mut p2, crate::font::FontStyle { italic: true, ..crate::font::FontStyle::regular() }, 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
+        render_text_raw("Italic".to_string(), rect, 16.0, 19.2, &color, rect, &mut p2, crate::font::FontStyle { italic: true, ..crate::font::FontStyle::regular() }, 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
 
         assert_eq!(p1.data(), p2.data(), "italic renders must be identical across cache miss and cache hit");
     }
@@ -2153,7 +2182,7 @@ mod tests {
         let mut pixmap = white_pixmap(200, 40);
         let white_before = pixmap.data().to_vec();
 
-        render_text_raw("Hello world".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
+        render_text_raw("Hello world".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
 
         assert_ne!(pixmap.data(), white_before.as_slice(), "text rendering must modify the pixmap");
     }
@@ -2168,7 +2197,7 @@ mod tests {
         for text in &["", "   ", "\t\n"] {
             let mut pixmap = white_pixmap(200, 40);
             let before = pixmap.data().to_vec();
-            render_text_raw(text.to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
+            render_text_raw(text.to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
             assert_eq!(pixmap.data(), before.as_slice(), "empty/whitespace text must not modify pixmap");
         }
     }
@@ -2183,10 +2212,10 @@ mod tests {
         let color = black();
 
         let mut plain = white_pixmap(200, 40);
-        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut plain, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
+        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut plain, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
 
         let mut underlined = white_pixmap(200, 40);
-        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut underlined, crate::font::FontStyle::regular(), 0.0, 0b001, false, 0.0, crate::layer_tree::TextAlign::Start);
+        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut underlined, crate::font::FontStyle::regular(), 0.0, 0b001, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
 
         assert_ne!(plain.data(), underlined.data(), "underlined text must differ from plain text");
     }
@@ -2200,9 +2229,9 @@ mod tests {
         let color = black();
 
         let mut p12 = white_pixmap(200, 60);
-        render_text_raw("A".to_string(), rect, 12.0, 14.4, &color, rect, &mut p12, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
+        render_text_raw("A".to_string(), rect, 12.0, 14.4, &color, rect, &mut p12, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
         let mut p24 = white_pixmap(200, 60);
-        render_text_raw("A".to_string(), rect, 24.0, 28.8, &color, rect, &mut p24, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
+        render_text_raw("A".to_string(), rect, 24.0, 28.8, &color, rect, &mut p24, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
 
         // Primary assertion: different font sizes must produce different pixel output,
         // which proves the cache treats them as independent entries.
@@ -2238,10 +2267,10 @@ mod tests {
         let rect = full_rect(200.0, 40.0);
 
         let mut p_black = white_pixmap(200, 40);
-        render_text_raw("Hi".to_string(), rect, 16.0, 19.2, &black(), rect, &mut p_black, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
+        render_text_raw("Hi".to_string(), rect, 16.0, 19.2, &black(), rect, &mut p_black, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
 
         let mut p_red = white_pixmap(200, 40);
-        render_text_raw("Hi".to_string(), rect, 16.0, 19.2, &red(), rect, &mut p_red, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
+        render_text_raw("Hi".to_string(), rect, 16.0, 19.2, &red(), rect, &mut p_red, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
 
         assert_ne!(p_black.data(), p_red.data(), "black and red text must produce different pixel output");
     }
@@ -2494,10 +2523,10 @@ mod tests {
         let color = black();
 
         let mut p_right = white_pixmap(200, 40);
-        render_text_raw("Hello world text".to_string(), rect, 16.0, 19.2, &color, clip_right, &mut p_right, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
+        render_text_raw("Hello world text".to_string(), rect, 16.0, 19.2, &color, clip_right, &mut p_right, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
 
         let mut p_full = white_pixmap(200, 40);
-        render_text_raw("Hello world text".to_string(), rect, 16.0, 19.2, &color, clip_full, &mut p_full, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start);
+        render_text_raw("Hello world text".to_string(), rect, 16.0, 19.2, &color, clip_full, &mut p_full, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
 
         // The two renders must differ (full render has pixels in x=0..99 too).
         assert_ne!(p_right.data(), p_full.data(),
