@@ -150,6 +150,9 @@ pub enum PaintCommand {
         letter_spacing: f32,
         /// Bitmask: bit 0 = underline, bit 1 = line-through, bit 2 = overline
         text_decoration: u8,
+        /// `text-decoration-color`, which is the text's own colour unless the
+        /// page states another.
+        decoration_color: Color,
         /// Whether the source's own newlines are line breaks, as `pre-line`
         /// and friends make them. Layout counted its lines that way, so paint
         /// has to draw them that way.
@@ -1330,14 +1333,27 @@ impl LayerTreeBuilder {
             // line breaks.
             let font_style = crate::layout::resolved_font_style(layout.style_node);
             let letter_spacing = crate::layout::resolved_letter_spacing_px(layout.style_node);
+            // The shorthand states the line, its style and its colour in one
+            // value — `underline dotted`, `underline 1px` — so every word is
+            // looked at rather than the whole string matched. Matching it whole
+            // drew no line at all under anything written that way.
             let text_decoration: u8 = match sv.get(&crate::css::intern("text-decoration")) {
-                Some(Value::Keyword(k)) => match k.as_ref() {
-                    "underline"    => 0b001,
-                    "line-through" => 0b010,
-                    "overline"     => 0b100,
-                    _              => 0,
-                },
+                Some(Value::Keyword(k)) => k.split_whitespace().fold(0u8, |bits, word| {
+                    bits | match word {
+                        "underline" => 0b001,
+                        "line-through" => 0b010,
+                        "overline" => 0b100,
+                        _ => 0,
+                    }
+                }),
                 _ => 0,
+            };
+            // The line takes the text's colour unless the page gave it one.
+            // yunseong.dev underlines its project headings in a hairline grey;
+            // drawn in the ink colour they came out as hard rules.
+            let decoration_color = match sv.get(&crate::css::intern("text-decoration-color")) {
+                Some(Value::Color(c)) => c.clone(),
+                _ => color.clone(),
             };
             // `font-size: 0` is a hiding idiom (and the way inline-block gaps are
             // collapsed); there is no glyph to draw at zero pixels.
@@ -1364,6 +1380,7 @@ impl LayerTreeBuilder {
                     },
                     wrap_style: crate::layout::resolved_wrap_style(layout.style_node),
                     wrap_width: layout.wrap_width,
+                    decoration_color,
                 });
             }
         }
@@ -1403,11 +1420,12 @@ impl LayerTreeBuilder {
                     preserve_newlines: false,
                     // A marker, a control's label, its value and its
                     // placeholder are each one line in a box this places, so
-                    // there is nothing to settle them against and nothing to
-                    // re-break.
+                    // there is nothing to settle them against, nothing to
+                    // re-break, and no line to colour.
                     text_align: TextAlign::Start,
                     wrap_style: crate::layout::WrapStyle::Auto,
                     wrap_width: f32::INFINITY,
+                    decoration_color: Color { r: 0, g: 0, b: 0, a: 255 },
                 });
             }
         }
@@ -1452,11 +1470,12 @@ impl LayerTreeBuilder {
                     preserve_newlines: false,
                     // A marker, a control's label, its value and its
                     // placeholder are each one line in a box this places, so
-                    // there is nothing to settle them against and nothing to
-                    // re-break.
+                    // there is nothing to settle them against, nothing to
+                    // re-break, and no line to colour.
                     text_align: TextAlign::Start,
                     wrap_style: crate::layout::WrapStyle::Auto,
                     wrap_width: f32::INFINITY,
+                    decoration_color: Color { r: 0, g: 0, b: 0, a: 255 },
                 });
             }
         }
@@ -1498,6 +1517,8 @@ impl LayerTreeBuilder {
                 text_align: TextAlign::Start,
                 wrap_style: crate::layout::WrapStyle::Auto,
                 wrap_width: f32::INFINITY,
+                // A field draws no line under its value.
+                decoration_color: Color { r: 0, g: 0, b: 0, a: 255 },
             });
         }
 
@@ -1566,11 +1587,12 @@ impl LayerTreeBuilder {
                     preserve_newlines: false,
                     // A marker, a control's label, its value and its
                     // placeholder are each one line in a box this places, so
-                    // there is nothing to settle them against and nothing to
-                    // re-break.
+                    // there is nothing to settle them against, nothing to
+                    // re-break, and no line to colour.
                     text_align: TextAlign::Start,
                     wrap_style: crate::layout::WrapStyle::Auto,
                     wrap_width: f32::INFINITY,
+                    decoration_color: Color { r: 0, g: 0, b: 0, a: 255 },
                 });
             }
         }
@@ -1628,7 +1650,7 @@ mod tests {
         Rect { x: 0.0, y: 0.0, width: 800.0, height: 600.0 }
     }
 
-    fn build_tree_from_html(html: &str, extra_css: &str) -> LayerTree {
+    pub(super) fn build_tree_from_html(html: &str, extra_css: &str) -> LayerTree {
         let dom = dom::parse_html(html);
         let stylesheet = css::parse_css(extra_css);
         let style_tree = style::build_style_tree(&dom.document, &stylesheet, None, &HashMap::new(), None, None, None);
@@ -2256,6 +2278,86 @@ mod tests {
         assert!(label_cmd.is_some(), "input[type=button] must emit a Text paint command with 'Click me'");
     }
 
+    /// The colour of a decoration line, and the bits saying which lines to draw.
+    fn decoration_of(tree: &LayerTree, needle: &str) -> Option<(u8, Color)> {
+        for layer in &tree.layers {
+            for cmd in layer
+                .background_commands
+                .iter()
+                .chain(layer.content_commands.iter())
+            {
+                if let PaintCommand::Text {
+                    text,
+                    text_decoration,
+                    decoration_color,
+                    ..
+                } = cmd
+                {
+                    if text.contains(needle) {
+                        return Some((*text_decoration, decoration_color.clone()));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// A page that underlines in a hairline grey means that grey. Drawing the
+    /// line in the text colour turned yunseong.dev's project headings — which
+    /// are links underlined in a near-white `--hairline` — into hard rules.
+    #[test]
+    fn test_an_underline_takes_the_colour_the_page_gave_it() {
+        let tree = build_tree_from_html(
+            r##"<a href="#" id="a">Adiabatic Quantum Computing</a>"##,
+            "#a { color: #161718; text-decoration: underline; text-decoration-color: #e3e5e7 }",
+        );
+        let (bits, color) = decoration_of(&tree, "Adiabatic").expect("the run must be painted");
+        assert_eq!(bits & 0b001, 0b001, "it is underlined");
+        assert_eq!(
+            (color.r, color.g, color.b),
+            (0xe3, 0xe5, 0xe7),
+            "in the colour the page stated, not the ink colour"
+        );
+    }
+
+    /// With no colour of its own the line takes the text's, which is what CSS
+    /// says `currentColor` resolves to.
+    #[test]
+    fn test_an_underline_with_no_colour_of_its_own_takes_the_text_s() {
+        let tree = build_tree_from_html(
+            r##"<a href="#" id="a">Adiabatic Quantum Computing</a>"##,
+            "#a { color: #cc0000; text-decoration: underline }",
+        );
+        let (_, color) = decoration_of(&tree, "Adiabatic").expect("the run must be painted");
+        assert_eq!((color.r, color.g, color.b), (0xcc, 0x00, 0x00));
+    }
+
+    /// The shorthand states the line, its style and its colour in one value, so
+    /// every word is looked at. Matching the whole string drew no line at all
+    /// under anything written as `underline dotted`.
+    #[test]
+    fn test_a_multi_word_decoration_shorthand_still_draws_its_line() {
+        let tree = build_tree_from_html(
+            r##"<p id="a">spelled oddly</p>"##,
+            "#a { text-decoration: underline dotted }",
+        );
+        let (bits, _) = decoration_of(&tree, "spelled").expect("the run must be painted");
+        assert_eq!(bits & 0b001, 0b001, "the underline survives the extra words");
+    }
+
+    /// The colour travels down with the line: the text node carrying the glyphs
+    /// is where the line is actually drawn.
+    #[test]
+    fn test_a_decoration_colour_reaches_a_nested_run() {
+        let tree = build_tree_from_html(
+            r##"<a href="#" id="a"><span>nested</span></a>"##,
+            "#a { text-decoration: underline; text-decoration-color: #00ff00 }",
+        );
+        let (bits, color) = decoration_of(&tree, "nested").expect("the run must be painted");
+        assert_eq!(bits & 0b001, 0b001);
+        assert_eq!((color.r, color.g, color.b), (0x00, 0xff, 0x00));
+    }
+
     /// `<input type="submit">` without a value attribute must default to "Submit".
     #[test]
     fn test_input_submit_default_label() {
@@ -2541,3 +2643,5 @@ mod scrollable_overflow_tests {
         );
     }
 }
+
+

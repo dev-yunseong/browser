@@ -1067,6 +1067,14 @@ fn build_final_tree(
                         if let Some(v) = p.get(&decoration) {
                             specified_values.entry(decoration).or_insert_with(|| v.clone());
                         }
+                        // The line's own colour travels with it. A site that
+                        // underlines its headings in a hairline grey draws a
+                        // line you can barely see; taking the text colour drew
+                        // a hard rule under every one of them.
+                        let deco_color = intern("text-decoration-color");
+                        if let Some(v) = p.get(&deco_color) {
+                            specified_values.entry(deco_color).or_insert_with(|| v.clone());
+                        }
                     }
                 }
 

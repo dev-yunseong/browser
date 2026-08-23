@@ -157,6 +157,9 @@ Ordered by how much of a page each one destroyed.
 | Only a run's *first* line placed by `text-align` | Every line of a run is placed by its own width. Layout centres the box, which is as wide as the run's widest line, and paint then drew each line from the box's left edge — so a centred paragraph had its first line centred and every later one hanging off that line's left edge. github's customer-story headings are two centred lines each, and the second one sat left of where it belongs on all of them. Paint now breaks the whole run into lines before it draws, and settles each one against the widest. |
 | A source that never arrived given a 100px placeholder | An ordinary inline `<img>` whose bytes never came and whose `alt` is empty is not rendered at all — a stated height does not hold its row open. Only an image the page gave a display of its own keeps a box, and there the stated height holds while an auto width shrinks to nothing (or fills the line, block-level). github's customer band is `inline-block` SVG logos 42px tall; the placeholder drew a framed 100px box across a band the reference leaves blank. |
 | `text-wrap: balance` and `pretty` broken greedily | Both change where a run's lines break, and github writes them on every heading and body run — 16 of its 133 styled runs break somewhere else because of it. Measured out of Chromium on eight of them: `pretty` pulls a word down onto a last line that would hold only one ("onboarding" alone under a full line on the customer stories), and `balance` re-breaks to the evenest split that still costs no extra line. The break now comes from one function that layout and paint both call, against the width layout used — the box is only as wide as the widest line, which is not enough to re-run either style against. |
+| `text-decoration-color` ignored | The line was drawn in the text's colour whatever the page said. yunseong.dev underlines its project headings — links — in a near-white `--hairline`, and every one of them came out as a hard black rule under the heading. The colour travels down with the line, since the text node carrying the glyphs is where the line is drawn. |
+| A decoration shorthand matched whole | `text-decoration: underline dotted` and `underline 1px` state the line, its style and its colour in one value. Matching the whole string against `underline` drew no line at all under anything written that way. |
+| A decoration drawn at a guessed thickness and offset | A browser takes both from the face and snaps them to whole pixels, so the line is solid rather than spread over two rows at half strength. Measured against Chromium at 12, 16, 20, 32 and 48px: 0.085em thick rounded, never under a pixel, 0.057em below the baseline. A fixed 0.07em hung a whole thickness below the baseline was a pixel low at every size and a third too thin from 20px up. |
 | An unfetchable image framed whatever its size came from | A browser marks out the space a page *told* it to reserve, and leaves a box it sized itself blank. Framing every one drew a hairline right across the page around a block-level image whose width came from the layout. |
 
 
@@ -169,8 +172,8 @@ pixels:
 | fixture | layout | fold | page | height (chromium -> engine) |
 |---|---|---|---|---|
 | github.com | 0.82% | 2.43% | 1.52% | 10570 -> 10553 |
-| yunseong.dev | 1.02% | 2.55% | 2.67% | 4976 -> 4976 |
-| naver.com | 1.21% | 3.10% | 2.68% | 18658 -> 16384 |
+| yunseong.dev | 0.87% | 2.36% | 2.62% | 4976 -> 4976 |
+| naver.com | 1.19% | 3.02% | 2.51% | 18658 -> 16384 |
 
 github.com began this work at 9.14% layout, 13.84% fold and 780px too tall;
 yunseong.dev at 4.24% and 256px too short. github's page is now within a single

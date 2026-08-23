@@ -22,6 +22,13 @@
   .indent .lead { font-weight: 600; background: #ffd; }
   .prefix { width: 300px; background: #fd0; display: inline-block; }
   .after { width: 500px; background: #efe; margin-top: 12px; }
+  /* A decoration takes the colour the page gave it, not the text's. A site
+     that underlines its headings in a hairline grey means a line you can
+     barely see. */
+  .deco a { color: #161718; text-decoration: underline; text-decoration-color: #e3e5e7; }
+  .deco .loud { text-decoration: underline; text-decoration-color: #cc0000; }
+  .deco .dotted { text-decoration: underline dotted; }
+  .deco .plain { color: #0a58ca; text-decoration: underline; }
 </style>
 </head>
 <body>
@@ -50,6 +57,19 @@
     <p style="text-decoration: underline">a paragraph that underlines <em>everything inside it</em></p>
     <p style="text-decoration: underline">and it stops at <span style="display: inline-block; background: #eef">an atomic inline</span> here</p>
     <p style="text-decoration: line-through">struck through, <span>span included</span></p>
+  </section>
+  <section class="deco">
+    <b>a decoration takes the colour the page gave it</b>
+    <div><a href="#">Adiabatic Quantum Computing Conference</a></div>
+    <div><span class="loud">a line the page painted red</span></div>
+    <div><span class="dotted">a shorthand with a style after it</span></div>
+    <div><span class="plain">no colour of its own, so the text's</span></div>
+    <!-- A browser snaps the line to whole pixels and takes its thickness from
+         the face, so it comes out solid at every size rather than spread
+         across two rows. -->
+    <div style="font-size: 12px"><span class="loud">twelve pixels</span></div>
+    <div style="font-size: 20px"><span class="loud">twenty pixels</span></div>
+    <div style="font-size: 32px"><span class="loud">thirty-two</span></div>
   </section>
 </body>
 </html>

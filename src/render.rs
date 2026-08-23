@@ -550,14 +550,14 @@ fn execute_commands_on_tile(
                     draw_broken_image(pixmap, *r, alt, alt_color, *alt_font_size, *alt_line_height, transform, *framed);
                 }
             }
-            PaintCommand::Text { rect, text, font_size, line_height, leading_space, color, clip, style, letter_spacing, text_decoration, preserve_newlines, text_align, wrap_style, wrap_width } => {
+            PaintCommand::Text { rect, text, font_size, line_height, leading_space, color, clip, style, letter_spacing, text_decoration, preserve_newlines, text_align, wrap_style, wrap_width, decoration_color } => {
                 let mut adjusted_rect = *rect;
                 adjusted_rect.x += tx;
                 adjusted_rect.y += ty;
                 let mut adjusted_clip = *clip;
                 adjusted_clip.x += tx;
                 adjusted_clip.y += ty;
-                render_text_raw(text.clone(), adjusted_rect, *font_size, *line_height, color, adjusted_clip, pixmap, *style, *letter_spacing, *text_decoration, *preserve_newlines, *leading_space, *text_align, *wrap_style, *wrap_width);
+                render_text_raw(text.clone(), adjusted_rect, *font_size, *line_height, color, adjusted_clip, pixmap, *style, *letter_spacing, *text_decoration, *preserve_newlines, *leading_space, *text_align, *wrap_style, *wrap_width, decoration_color);
             }
             PaintCommand::Svg { rect, source, current_color } => {
                 let mut r = *rect;
@@ -924,6 +924,7 @@ fn draw_broken_image(
         crate::layer_tree::TextAlign::Start,
         crate::layout::WrapStyle::Auto,
         text_rect.width,
+        color,
     );
 }
 
@@ -1010,6 +1011,9 @@ fn render_text_raw(
     // would not reproduce a `balance` or `pretty` run's own lines.
     wrap_style: crate::layout::WrapStyle,
     wrap_width: f32,
+    // The colour of the underline, line-through or overline. A page that
+    // underlines in a hairline grey means that grey, not its text colour.
+    decoration_color: &Color,
 ) {
     let italic = style.italic;
     let trimmed = text.trim();
@@ -1259,17 +1263,30 @@ fn render_text_raw(
 
     // Draw text decorations.
     if text_decoration != 0 {
-        let line_thickness = (font_size * 0.07).max(1.0);
+        // A browser takes the line's thickness and its distance below the
+        // baseline from the face's own metrics and then snaps both to whole
+        // pixels, so the line comes out solid rather than spread across two
+        // rows at half strength. Measured against Chromium at 12, 16, 20, 32
+        // and 48px, that is a thickness of 0.085em rounded, never less than a
+        // pixel — a fixed 0.07em drew every line from 20px up a third too thin.
+        let line_thickness = (font_size * 0.085).round().max(1.0);
         let mut paint = Paint::default();
-        paint.set_color_rgba8(color.r, color.g, color.b, color.a);
+        paint.set_color_rgba8(
+            decoration_color.r,
+            decoration_color.g,
+            decoration_color.b,
+            decoration_color.a,
+        );
 
         for (seg_start_x, seg_end_x, baseline_y) in decoration_lines {
             let seg_w = (seg_end_x - seg_start_x).max(0.0);
             if seg_w < 1.0 { continue; }
 
-            // Underline: slightly below the baseline.
+            // Underline: just below the baseline, at the same five sizes'
+            // measured 0.057em. Hanging it a whole thickness below put it a
+            // pixel low at every size.
             if text_decoration & 0b001 != 0 {
-                let uy = baseline_y + line_thickness;
+                let uy = (baseline_y + font_size * 0.057).round();
                 if let Some(r) = tiny_skia::Rect::from_xywh(seg_start_x, uy, seg_w, line_thickness) {
                     pixmap.fill_rect(r, &paint, Transform::identity(), None);
                 }
@@ -1277,7 +1294,7 @@ fn render_text_raw(
 
             // Line-through: at mid-height of the em square (≈ 40% up from baseline).
             if text_decoration & 0b010 != 0 {
-                let ly = baseline_y - font_size * 0.30;
+                let ly = (baseline_y - font_size * 0.30).round();
                 if let Some(r) = tiny_skia::Rect::from_xywh(seg_start_x, ly, seg_w, line_thickness) {
                     pixmap.fill_rect(r, &paint, Transform::identity(), None);
                 }
@@ -1285,7 +1302,7 @@ fn render_text_raw(
 
             // Overline: above the em square top.
             if text_decoration & 0b100 != 0 {
-                let oy = baseline_y - font_size * 0.85;
+                let oy = (baseline_y - font_size * 0.85).round();
                 if let Some(r) = tiny_skia::Rect::from_xywh(seg_start_x, oy, seg_w, line_thickness) {
                     pixmap.fill_rect(r, &paint, Transform::identity(), None);
                 }
@@ -1712,11 +1729,11 @@ mod tests {
         let at = |x: f32| LayoutRect { x, y: 2.0, width: 78.0, height: 26.0 };
         render_text_raw(
             "iiii".to_string(), at(4.0), 16.0, 19.2, &color, at(0.0), &mut whole,
-            crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY,
+            crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY, &black(),
         );
         render_text_raw(
             "iiii".to_string(), at(4.5), 16.0, 19.2, &color, at(0.0), &mut half,
-            crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY,
+            crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY, &black(),
         );
         assert_ne!(
             whole.data(), half.data(),
@@ -1870,6 +1887,68 @@ mod tests {
         );
     }
 
+    /// The rows an underline covers, and how solidly.
+    fn underline_rows(p: &Pixmap) -> Vec<(u32, f32)> {
+        let mut out = Vec::new();
+        for y in 0..p.height() {
+            let (mut n, mut sum) = (0u32, 0.0f32);
+            for x in 0..p.width() {
+                let i = ((y * p.width() + x) * 4) as usize;
+                // Red ink on white: the line is drawn in a colour of its own.
+                let (r, g) = (p.data()[i] as f32, p.data()[i + 1] as f32);
+                if r - g > 40.0 {
+                    n += 1;
+                    sum += (255.0 - g) / 255.0;
+                }
+            }
+            if n > 20 {
+                out.push((y, sum / n as f32));
+            }
+        }
+        out
+    }
+
+    /// A browser snaps a decoration to whole pixels, so the line comes out
+    /// solid rather than spread across two rows at half strength. Measured
+    /// against Chromium at five sizes: 0.085em thick, rounded, never under a
+    /// pixel, sitting 0.057em below the baseline.
+    #[test]
+    fn test_an_underline_is_a_solid_row_of_whole_pixels() {
+        for (font_size, rows) in [(12.0_f32, 1usize), (16.0, 1), (20.0, 2), (32.0, 3), (48.0, 4)] {
+            let mut pixmap = white_pixmap(200, 120);
+            render_text_raw(
+                "Hxxxxxxxx".to_string(),
+                LayoutRect { x: 0.0, y: 10.0, width: 190.0, height: 60.0 },
+                font_size,
+                font_size,
+                &black(),
+                full_rect(200.0, 120.0),
+                &mut pixmap,
+                crate::font::FontStyle::regular(),
+                0.0,
+                0b001,
+                false,
+                0.0,
+                crate::layer_tree::TextAlign::Start,
+                crate::layout::WrapStyle::Auto,
+                190.0,
+                &red(),
+            );
+            let drawn = underline_rows(&pixmap);
+            assert_eq!(
+                drawn.len(),
+                rows,
+                "{font_size}px must underline in {rows} whole rows, got {drawn:?}"
+            );
+            for (y, coverage) in &drawn {
+                assert!(
+                    *coverage > 0.99,
+                    "{font_size}px row {y} must be solid, got {coverage}"
+                );
+            }
+        }
+    }
+
     /// A browser frames an image it could not fetch only for a box the page
     /// sized on both axes. A block-level one whose width came from the layout is
     /// left blank — framing it drew a hairline right across the page.
@@ -2006,6 +2085,7 @@ mod tests {
             align,
             crate::layout::WrapStyle::Auto,
             120.0,
+            &black(),
         );
         pixmap
     }
@@ -2071,6 +2151,7 @@ mod tests {
                 align,
                 crate::layout::WrapStyle::Auto,
                 180.0,
+                &black(),
             );
             ink_span(&pixmap, 0, 30).expect("the run must draw")
         };
@@ -2094,12 +2175,12 @@ mod tests {
         let color = black();
 
         let mut pixmap1 = white_pixmap(200, 40);
-        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut pixmap1, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
+        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut pixmap1, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY, &black());
 
         clear_glyph_cache();
 
         let mut pixmap2 = white_pixmap(200, 40);
-        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut pixmap2, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
+        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut pixmap2, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY, &black());
 
         assert_eq!(pixmap1.data(), pixmap2.data(),
             "cache and uncached renders must produce identical pixels");
@@ -2113,7 +2194,7 @@ mod tests {
 
         let rect = full_rect(200.0, 40.0);
         let mut pixmap = white_pixmap(200, 40);
-        render_text_raw("Abc".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
+        render_text_raw("Abc".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY, &black());
 
         let cache_size = GLYPH_CACHE.lock().unwrap().len();
         assert!(cache_size > 0, "glyph cache should be non-empty after rendering text; got {} entries", cache_size);
@@ -2126,7 +2207,7 @@ mod tests {
         // Populate.
         let rect = full_rect(200.0, 40.0);
         let mut pixmap = white_pixmap(200, 40);
-        render_text_raw("Test".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
+        render_text_raw("Test".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY, &black());
 
         clear_glyph_cache();
 
@@ -2143,11 +2224,11 @@ mod tests {
         let color = black();
 
         let mut p1 = white_pixmap(200, 40);
-        render_text_raw("Bold".to_string(), rect, 16.0, 19.2, &color, rect, &mut p1, crate::font::FontStyle { bold: true, ..crate::font::FontStyle::regular() }, 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
+        render_text_raw("Bold".to_string(), rect, 16.0, 19.2, &color, rect, &mut p1, crate::font::FontStyle { bold: true, ..crate::font::FontStyle::regular() }, 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY, &black());
 
         clear_glyph_cache();
         let mut p2 = white_pixmap(200, 40);
-        render_text_raw("Bold".to_string(), rect, 16.0, 19.2, &color, rect, &mut p2, crate::font::FontStyle { bold: true, ..crate::font::FontStyle::regular() }, 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
+        render_text_raw("Bold".to_string(), rect, 16.0, 19.2, &color, rect, &mut p2, crate::font::FontStyle { bold: true, ..crate::font::FontStyle::regular() }, 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY, &black());
 
         assert_eq!(p1.data(), p2.data(), "bold renders must be identical across cache miss and cache hit");
     }
@@ -2161,11 +2242,11 @@ mod tests {
         let color = black();
 
         let mut p1 = white_pixmap(200, 40);
-        render_text_raw("Italic".to_string(), rect, 16.0, 19.2, &color, rect, &mut p1, crate::font::FontStyle { italic: true, ..crate::font::FontStyle::regular() }, 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
+        render_text_raw("Italic".to_string(), rect, 16.0, 19.2, &color, rect, &mut p1, crate::font::FontStyle { italic: true, ..crate::font::FontStyle::regular() }, 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY, &black());
 
         clear_glyph_cache();
         let mut p2 = white_pixmap(200, 40);
-        render_text_raw("Italic".to_string(), rect, 16.0, 19.2, &color, rect, &mut p2, crate::font::FontStyle { italic: true, ..crate::font::FontStyle::regular() }, 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
+        render_text_raw("Italic".to_string(), rect, 16.0, 19.2, &color, rect, &mut p2, crate::font::FontStyle { italic: true, ..crate::font::FontStyle::regular() }, 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY, &black());
 
         assert_eq!(p1.data(), p2.data(), "italic renders must be identical across cache miss and cache hit");
     }
@@ -2182,7 +2263,7 @@ mod tests {
         let mut pixmap = white_pixmap(200, 40);
         let white_before = pixmap.data().to_vec();
 
-        render_text_raw("Hello world".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
+        render_text_raw("Hello world".to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY, &black());
 
         assert_ne!(pixmap.data(), white_before.as_slice(), "text rendering must modify the pixmap");
     }
@@ -2197,7 +2278,7 @@ mod tests {
         for text in &["", "   ", "\t\n"] {
             let mut pixmap = white_pixmap(200, 40);
             let before = pixmap.data().to_vec();
-            render_text_raw(text.to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
+            render_text_raw(text.to_string(), rect, 16.0, 19.2, &black(), rect, &mut pixmap, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY, &black());
             assert_eq!(pixmap.data(), before.as_slice(), "empty/whitespace text must not modify pixmap");
         }
     }
@@ -2212,10 +2293,10 @@ mod tests {
         let color = black();
 
         let mut plain = white_pixmap(200, 40);
-        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut plain, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
+        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut plain, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY, &black());
 
         let mut underlined = white_pixmap(200, 40);
-        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut underlined, crate::font::FontStyle::regular(), 0.0, 0b001, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
+        render_text_raw("Hello".to_string(), rect, 16.0, 19.2, &color, rect, &mut underlined, crate::font::FontStyle::regular(), 0.0, 0b001, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY, &black());
 
         assert_ne!(plain.data(), underlined.data(), "underlined text must differ from plain text");
     }
@@ -2229,9 +2310,9 @@ mod tests {
         let color = black();
 
         let mut p12 = white_pixmap(200, 60);
-        render_text_raw("A".to_string(), rect, 12.0, 14.4, &color, rect, &mut p12, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
+        render_text_raw("A".to_string(), rect, 12.0, 14.4, &color, rect, &mut p12, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY, &black());
         let mut p24 = white_pixmap(200, 60);
-        render_text_raw("A".to_string(), rect, 24.0, 28.8, &color, rect, &mut p24, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
+        render_text_raw("A".to_string(), rect, 24.0, 28.8, &color, rect, &mut p24, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY, &black());
 
         // Primary assertion: different font sizes must produce different pixel output,
         // which proves the cache treats them as independent entries.
@@ -2267,10 +2348,10 @@ mod tests {
         let rect = full_rect(200.0, 40.0);
 
         let mut p_black = white_pixmap(200, 40);
-        render_text_raw("Hi".to_string(), rect, 16.0, 19.2, &black(), rect, &mut p_black, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
+        render_text_raw("Hi".to_string(), rect, 16.0, 19.2, &black(), rect, &mut p_black, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY, &black());
 
         let mut p_red = white_pixmap(200, 40);
-        render_text_raw("Hi".to_string(), rect, 16.0, 19.2, &red(), rect, &mut p_red, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
+        render_text_raw("Hi".to_string(), rect, 16.0, 19.2, &red(), rect, &mut p_red, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY, &black());
 
         assert_ne!(p_black.data(), p_red.data(), "black and red text must produce different pixel output");
     }
@@ -2523,10 +2604,10 @@ mod tests {
         let color = black();
 
         let mut p_right = white_pixmap(200, 40);
-        render_text_raw("Hello world text".to_string(), rect, 16.0, 19.2, &color, clip_right, &mut p_right, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
+        render_text_raw("Hello world text".to_string(), rect, 16.0, 19.2, &color, clip_right, &mut p_right, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY, &black());
 
         let mut p_full = white_pixmap(200, 40);
-        render_text_raw("Hello world text".to_string(), rect, 16.0, 19.2, &color, clip_full, &mut p_full, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY);
+        render_text_raw("Hello world text".to_string(), rect, 16.0, 19.2, &color, clip_full, &mut p_full, crate::font::FontStyle::regular(), 0.0, 0, false, 0.0, crate::layer_tree::TextAlign::Start, crate::layout::WrapStyle::Auto, f32::INFINITY, &black());
 
         // The two renders must differ (full render has pixels in x=0..99 too).
         assert_ne!(p_right.data(), p_full.data(),
