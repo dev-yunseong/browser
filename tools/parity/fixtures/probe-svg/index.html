@@ -12,6 +12,15 @@
   /* No width or height: the SVG spec's defaults are 100%, and the viewBox
      supplies the proportions. */
   .box { width: 120px; }
+  /* `fill` is a presentation attribute, so a rule outranks the value the file
+     carries — which is how an icon set states one colour in the markup and is
+     recoloured by the page. */
+  .muted svg, .muted path, .muted rect { fill: #a4aea6; }
+  .muted { color: #ffffff; }
+  /* A replaced element keeps its own box whatever `display` says, and an auto
+     width with a stated height takes its width from the two. */
+  .icon { width: auto; height: 24px; display: flex; overflow: hidden; }
+  .bar { display: flex; gap: 12px; align-items: center; background: #101018; padding: 8px; }
 </style>
 </head>
 <body>
@@ -32,6 +41,16 @@
   </section>
   <section><b>malformed source draws nothing</b><br>
     <svg viewBox="0 0 16 16" width="32" height="32"><path d="not a path"</svg>
+  </section>
+  <section class="muted"><b>a rule outranks the fill in the file</b><br>
+    <svg viewBox="0 0 16 16" width="32" height="32" fill="none"><path fill="currentColor" d="M1 1h14v14H1z"/></svg>
+  </section>
+  <section><b>auto width, stated height, shrinking in a flex row</b>
+    <div class="bar muted">
+      <svg class="icon" width="270" height="40" viewBox="0 0 270 40" fill="none"><path fill="currentColor" d="M0 8h270v24H0z"/></svg>
+      <svg class="icon" width="180" height="40" viewBox="0 0 180 40" fill="none"><path fill="currentColor" d="M0 8h180v24H0z"/></svg>
+      <svg class="icon" width="120" height="40" viewBox="0 0 120 40" fill="none"><path fill="currentColor" d="M0 8h120v24H0z"/></svg>
+    </div>
   </section>
 </body>
 </html>

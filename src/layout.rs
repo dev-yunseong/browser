@@ -1273,6 +1273,25 @@ fn automatic_minimum_main_size(
     if sn.specified_values.contains_key(&crate::css::intern("min-width")) {
         return 0.0;
     }
+    // A box with proportions of its own and a definite height carries that
+    // height through the ratio — CSS calls it the transferred size suggestion,
+    // and for a replaced element it is the whole content-based minimum: there
+    // is no text inside to measure. It comes before the scroll-container
+    // exception below, because an `<svg>` clipping its own contents is not a
+    // scrollport for CSS boxes. github writes `overflow: hidden` on the logos in
+    // its customer marquee, and reading that as "no minimum" shrank all twelve
+    // of them to nothing wide and left the whole band empty.
+    if let Some(ratio) = read_aspect_ratio(sn) {
+        if ratio > 0.0 {
+            if let Some(Value::Length(h, Unit::Px)) =
+                sn.specified_values.get(&crate::css::intern("height"))
+            {
+                if *h > 0.0 {
+                    return *h * ratio;
+                }
+            }
+        }
+    }
     let scrolls = matches!(
         sn.specified_values.get(&crate::css::intern("overflow")),
         Some(Value::Keyword(k)) if !matches!(k.as_ref(), "visible" | "clip")
@@ -2250,6 +2269,29 @@ impl<'a> LayoutBox<'a> {
                 let final_x = self.dimensions.x + outer_width(&self) + self.margin.right;
                 let final_y = self.dimensions.y + outer_height(&self) + self.margin.bottom;
                 return (Some(self), final_x, final_y);
+            }
+            // A replaced element with a stated height, an auto width and
+            // proportions of its own takes its width from the two — the mirror
+            // of the height rule just below, and what CSS 10.3.2 says for a
+            // replaced box. github's button icons are `width: auto; height:
+            // 16px` around a 16x16 `viewBox`, and the 100px placeholder blew the
+            // chevron beside "English" in its footer out to six times its size.
+            //
+            // `width: auto` is written down but states nothing, so it counts as
+            // auto here the same as no width at all — those icons say it
+            // outright.
+            let width_is_auto = auto_width
+                || matches!(
+                    self.style_node.specified_values.get(&crate::css::intern("width")),
+                    Some(Value::Keyword(k)) if &**k == "auto"
+                );
+            if width_is_auto && height > 0.0 {
+                if let Some(ratio) = read_aspect_ratio(self.style_node) {
+                    if ratio > 0.0 {
+                        self.dimensions.width = height * ratio;
+                        self.content_box_width = false;
+                    }
+                }
             }
             // width is already set by the shrink-wrap / explicit-CSS path above.
             // If no CSS width was specified, the shrink-wrap path returns a value from
@@ -4975,14 +5017,23 @@ fn get_display_type(sn: &StyledNode) -> DisplayType {
     } else {
         false
     };
-    // An image is a replaced element: `display` decides how its box participates
-    // in flow, not whether it still draws an image. `display: block` on an <img>
-    // is how nearly every stylesheet removes the inline baseline gap under a
-    // picture, and treating that as "become a plain block" stopped the image
-    // being painted at all and left the box with no intrinsic height.
+    // A replaced element keeps its own box whatever `display` the page states:
+    // the keyword decides how the box participates in flow, not whether the
+    // element still draws its contents. `display: block` on an <img> is how
+    // nearly every stylesheet removes the inline baseline gap under a picture,
+    // and treating that as "become a plain block" stopped the image being
+    // painted at all and left the box with no intrinsic height.
+    //
+    // An inline `<svg>` is the same: github's buttons put `display: flex` on
+    // their icons, and laying one out as an empty flex container shrank it to
+    // nothing — the chevron beside "English" in its footer disappeared.
     let is_image = matches!(
         sn.node.data,
-        NodeData::Element { ref name, .. } if name.local.as_ref() == "img"
+        NodeData::Element { ref name, .. }
+            if matches!(
+                name.local.as_ref(),
+                "img" | "svg" | "canvas" | "video" | "iframe" | "embed" | "object"
+            )
     );
     if let Some(Value::Keyword(d)) = sn.specified_values.get(&crate::css::intern("display")) {
         match &**d {
@@ -10317,4 +10368,6 @@ mod tests {
 pub fn debug_display_type(sn: &StyledNode) -> DisplayType {
     get_display_type(sn)
 }
+
+
 

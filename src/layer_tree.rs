@@ -762,6 +762,87 @@ impl LayerTreeBuilder {
         })
     }
 
+    /// Serialize an inline `<svg>` subtree with each element's cascaded `fill`
+    /// and `stroke` written onto it.
+    ///
+    /// Both are presentation attributes, so any rule outranks the value the file
+    /// carries — and an icon set meant to be recoloured from CSS says
+    /// `fill="currentColor"` on every shape it draws. Handing the markup over
+    /// untouched drew github's customer logos in the element's own text colour,
+    /// which is white, rather than the muted grey the page states for them.
+    fn serialize_svg(styled: &crate::style::StyledNode, current_color: &Color) -> String {
+        fn paint_of(
+            sn: &crate::style::StyledNode,
+            prop: &str,
+            current: &Color,
+        ) -> Option<String> {
+            let hex = |c: &Color| format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b);
+            match sn.specified_values.get(&crate::css::intern(prop)) {
+                Some(Value::Color(c)) => Some(hex(c)),
+                Some(Value::Keyword(k)) if k.eq_ignore_ascii_case("currentcolor") => {
+                    Some(hex(current))
+                }
+                Some(Value::Keyword(k)) if k.eq_ignore_ascii_case("none") => {
+                    Some("none".to_string())
+                }
+                _ => None,
+            }
+        }
+
+        fn escape(text: &str) -> String {
+            text.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('"', "&quot;")
+        }
+
+        fn walk(sn: &crate::style::StyledNode, current: &Color, out: &mut String) {
+            match sn.node.data {
+                NodeData::Element {
+                    ref name,
+                    ref attrs,
+                    ..
+                } => {
+                    let tag = name.local.to_string();
+                    let fill = paint_of(sn, "fill", current);
+                    let stroke = paint_of(sn, "stroke", current);
+                    out.push('<');
+                    out.push_str(&tag);
+                    for attr in attrs.borrow().iter() {
+                        let key = attr.name.local.to_string();
+                        // The cascade's value replaces the markup's own.
+                        if (key == "fill" && fill.is_some()) || (key == "stroke" && stroke.is_some())
+                        {
+                            continue;
+                        }
+                        out.push(' ');
+                        out.push_str(&key);
+                        out.push_str("=\"");
+                        out.push_str(&escape(&attr.value.to_string()));
+                        out.push('"');
+                    }
+                    if let Some(f) = fill {
+                        out.push_str(&format!(" fill=\"{f}\""));
+                    }
+                    if let Some(st) = stroke {
+                        out.push_str(&format!(" stroke=\"{st}\""));
+                    }
+                    out.push('>');
+                    for child in &sn.children {
+                        walk(child, current, out);
+                    }
+                    out.push_str(&format!("</{tag}>"));
+                }
+                NodeData::Text { ref contents } => out.push_str(&escape(&contents.borrow())),
+                _ => {}
+            }
+        }
+
+        let mut out = String::new();
+        walk(styled, current_color, &mut out);
+        out
+    }
+
     fn has_overflow_hidden(layout: &LayoutBox) -> bool {
         let sv = &layout.style_node.specified_values;
         for prop in ["overflow", "overflow-x", "overflow-y"] {
@@ -1275,7 +1356,7 @@ impl LayerTreeBuilder {
                 };
                 commands.push(PaintCommand::Svg {
                     rect: d,
-                    source: crate::js::serialize_outer_html(&layout.style_node.node),
+                    source: Self::serialize_svg(layout.style_node, &current_color),
                     current_color,
                 });
             }
@@ -2356,6 +2437,70 @@ mod tests {
         let (bits, color) = decoration_of(&tree, "nested").expect("the run must be painted");
         assert_eq!(bits & 0b001, 0b001);
         assert_eq!((color.r, color.g, color.b), (0x00, 0xff, 0x00));
+    }
+
+    /// The markup an inline `<svg>` is handed to the rasteriser as.
+    fn svg_source(tree: &LayerTree) -> Option<String> {
+        for layer in &tree.layers {
+            for cmd in layer
+                .background_commands
+                .iter()
+                .chain(layer.content_commands.iter())
+            {
+                if let PaintCommand::Svg { source, .. } = cmd {
+                    return Some(source.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// `fill` is a presentation attribute, so a rule outranks the value the file
+    /// carries. An icon set meant to be recoloured says `fill="currentColor"` on
+    /// every shape, and github's customer logos came out in the element's own
+    /// text colour — white — instead of the muted grey the page states.
+    #[test]
+    fn test_a_cascaded_fill_replaces_the_one_in_the_markup() {
+        let tree = build_tree_from_html(
+            r#"<div class="bar"><svg id="s" width="20" height="20" viewBox="0 0 20 20" fill="none"><path fill="currentColor" d="M1 1"/></svg></div>"#,
+            ".bar svg, .bar path { fill: #a4aea6 } .bar { color: #ffffff }",
+        );
+        let source = svg_source(&tree).expect("the svg must be painted");
+        assert!(
+            source.contains(r##"fill="#a4aea6""##),
+            "the cascade's fill is written on: {source}"
+        );
+        assert!(
+            !source.contains("currentColor"),
+            "and the markup's own is gone: {source}"
+        );
+    }
+
+    /// A file that states nothing the cascade overrides is handed over as it is,
+    /// `currentColor` and all — paint resolves that against the element's colour.
+    #[test]
+    fn test_an_svg_the_cascade_says_nothing_about_keeps_its_own_paint() {
+        let tree = build_tree_from_html(
+            r#"<svg id="s" width="20" height="20" viewBox="0 0 20 20"><path fill="currentColor" d="M1 1"/></svg>"#,
+            "",
+        );
+        let source = svg_source(&tree).expect("the svg must be painted");
+        assert!(
+            source.contains(r#"fill="currentColor""#),
+            "the file's own paint survives: {source}"
+        );
+    }
+
+    /// `viewBox` keeps its capital B — usvg will not read it otherwise, and the
+    /// icon comes out unscaled.
+    #[test]
+    fn test_serializing_an_svg_keeps_its_view_box() {
+        let tree = build_tree_from_html(
+            r#"<svg id="s" width="20" height="20" viewBox="0 0 40 40"><path d="M1 1"/></svg>"#,
+            "",
+        );
+        let source = svg_source(&tree).expect("the svg must be painted");
+        assert!(source.contains(r#"viewBox="0 0 40 40""#), "kept: {source}");
     }
 
     /// `<input type="submit">` without a value attribute must default to "Submit".
