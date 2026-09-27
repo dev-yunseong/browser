@@ -17,6 +17,8 @@ path = "src/bin/browser_cli.rs"
 
 [dependencies]
 ab_glyph = "0.2.32"
+ttf-parser = "0.25"
+memmap2 = "0.9"
 v8 = "147"
 # ICU data for V8 Intl/toLocale* (v8 147 uses ICU 77); without it locale
 # formatting throws or aborts the process.

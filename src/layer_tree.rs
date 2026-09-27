@@ -56,6 +56,14 @@ pub enum PaintCommand {
         italic: bool,
         /// Bitmask: bit 0 = underline, bit 1 = line-through, bit 2 = overline
         text_decoration: u8,
+        /// Raw CSS `font-family` value (resolved by `crate::fonts`).
+        font_family: std::sync::Arc<str>,
+        /// CSS `font-weight` (1..=1000).
+        font_weight: u16,
+        /// Used line box height in px.
+        line_height: f32,
+        /// CSS `letter-spacing` in px, added after every character.
+        letter_spacing: f32,
     },
     /// Outer box-shadow
     /// Rect, shadow parameters, and the element's border-radius (so the shadow
@@ -749,11 +757,8 @@ impl LayerTreeBuilder {
                 Some(Value::Color(c)) => c.clone(),
                 _ => Color { r: 0, g: 0, b: 0, a: 255 },
             };
-            let bold = match sv.get(&crate::css::intern("font-weight")) {
-                Some(Value::Keyword(k)) => matches!(k.as_ref(), "bold" | "bolder"),
-                Some(Value::Length(v, _)) => *v >= 600.0,
-                _ => false,
-            };
+            let font_weight = crate::fonts::parse_weight(sv.get(&crate::css::intern("font-weight")));
+            let bold = font_weight >= 600;
             let italic = match sv.get(&crate::css::intern("font-style")) {
                 Some(Value::Keyword(k)) => matches!(k.as_ref(), "italic" | "oblique"),
                 _ => false,
@@ -777,6 +782,16 @@ impl LayerTreeBuilder {
                 bold,
                 italic,
                 text_decoration,
+                font_family: text_font_family(sv),
+                font_weight,
+                // Line fragments are the glyph content area (ascent + descent), so
+                // their own height puts the baseline at rect.y + ascent.
+                line_height: if layout.text_fragment.is_some() {
+                    d.height
+                } else {
+                    crate::fonts::line_height_px(sv, font_size)
+                },
+                letter_spacing: crate::fonts::letter_spacing_px(sv, font_size),
             });
         }
 
@@ -795,11 +810,12 @@ impl LayerTreeBuilder {
                 // Place marker ~20px to the left of the content box left edge.
                 // The padding-left (~40px) leaves enough room for the marker.
                 let marker_x = (d.x - 20.0).max(0.0);
+                let line_height = crate::fonts::line_height_px(sv, font_size);
                 let marker_rect = crate::layout::Rect {
                     x: marker_x,
                     y: d.y,
                     width: 20.0,
-                    height: font_size,
+                    height: line_height,
                 };
                 commands.push(PaintCommand::Text {
                     rect: marker_rect,
@@ -810,6 +826,10 @@ impl LayerTreeBuilder {
                     bold: false,
                     italic: false,
                     text_decoration: 0,
+                    font_family: text_font_family(sv),
+                    font_weight: 400,
+                    line_height,
+                    letter_spacing: 0.0,
                 });
             }
         }
@@ -828,17 +848,14 @@ impl LayerTreeBuilder {
                     Some(Value::Color(c)) => c.clone(),
                     _ => Color { r: 0, g: 0, b: 0, a: 255 },
                 };
-                // Center the text vertically by offsetting the rect so the baseline
-                // lands near the mid-point.  The text renderer places the baseline at
-                // rect.y + font_size * 0.85, so shift rect.y so that baseline falls
-                // at d.y + d.height / 2.0.
-                // baseline = rect_y + font_size * 0.85  =>  rect_y = mid - font_size * 0.85
+                // Center one `line-height: normal` line box vertically in the button.
+                let line_height = crate::fonts::chain_for(sv).metrics(font_size).normal_line_height();
                 let mid_y = d.y + d.height / 2.0;
                 let text_rect = crate::layout::Rect {
                     x: d.x + layout.padding.left,
-                    y: mid_y - font_size * 0.85,
+                    y: mid_y - line_height / 2.0,
                     width: (d.width - layout.padding.left - layout.padding.right).max(0.0),
-                    height: font_size,
+                    height: line_height,
                 };
                 commands.push(PaintCommand::Text {
                     rect: text_rect,
@@ -849,6 +866,10 @@ impl LayerTreeBuilder {
                     bold: false,
                     italic: false,
                     text_decoration: 0,
+                    font_family: text_font_family(sv),
+                    font_weight: crate::fonts::parse_weight(sv.get(&crate::css::intern("font-weight"))),
+                    line_height,
+                    letter_spacing: crate::fonts::letter_spacing_px(sv, font_size),
                 });
             }
         }
@@ -892,6 +913,14 @@ impl LayerTreeBuilder {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// Raw CSS `font-family` of a node (`serif` when unset, the initial value).
+fn text_font_family(sv: &std::collections::HashMap<std::sync::Arc<str>, Value>) -> std::sync::Arc<str> {
+    match sv.get(&crate::css::intern("font-family")) {
+        Some(Value::Keyword(k)) => k.clone(),
+        _ => crate::css::intern("serif"),
+    }
+}
 
 #[cfg(test)]
 mod tests {

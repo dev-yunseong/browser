@@ -17,51 +17,13 @@
 
 use crate::css::{Unit, Value};
 use crate::style::StyledNode;
-use ab_glyph::{Font, FontRef};
 use markup5ever_rcdom::NodeData;
 use std::collections::HashMap;
-use std::sync::OnceLock;
 extern crate stacker;
 
-const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/NanumGothic.ttf");
-
-fn font() -> &'static FontRef<'static> {
-    static FONT: OnceLock<FontRef<'static>> = OnceLock::new();
-    FONT.get_or_init(|| FontRef::try_from_slice(FONT_DATA).expect("embedded font"))
-}
-
-/// Font metrics of the embedded font as fractions of the font size.
-#[derive(Clone, Copy)]
-struct FontMetrics {
-    ascent: f32,
-    descent: f32,
-}
-
-fn font_metrics() -> FontMetrics {
-    static M: OnceLock<FontMetrics> = OnceLock::new();
-    *M.get_or_init(|| {
-        let f = font();
-        let upem = f.units_per_em().unwrap_or(1000.0);
-        let ascent = f.ascent_unscaled() / upem;
-        let descent = -f.descent_unscaled() / upem;
-        if ascent > 0.0 && descent >= 0.0 {
-            FontMetrics { ascent, descent }
-        } else {
-            FontMetrics { ascent: 0.85, descent: 0.15 }
-        }
-    })
-}
-
-/// `line-height: normal` as a multiple of the font size (ascent + descent + line gap
-/// of the embedded font).
-fn normal_line_height_factor() -> f32 {
-    static N: OnceLock<f32> = OnceLock::new();
-    *N.get_or_init(|| {
-        let f = font();
-        let upem = f.units_per_em().unwrap_or(1000.0);
-        let h = (f.ascent_unscaled() - f.descent_unscaled() + f.line_gap_unscaled()) / upem;
-        if h > 0.5 { h } else { 1.2 }
-    })
+/// Rounded ascent / descent of the node's primary font in px (shared with the painter).
+fn font_metrics(sn: &StyledNode, fs: f32) -> crate::fonts::LineMetrics {
+    crate::fonts::chain_for(&sn.specified_values).metrics(fs)
 }
 
 /// Snap a coordinate to 1/64 px (the precision browsers lay out with).
@@ -69,47 +31,31 @@ fn snap(v: f32) -> f32 {
     (v * 64.0).round() / 64.0
 }
 
-thread_local! {
-    static ADVANCE_CACHE: std::cell::RefCell<HashMap<char, f32>> = std::cell::RefCell::new(HashMap::new());
+/// Horizontal advance of `c` in px for the node's font (same as the painter).
+fn char_advance(sn: &StyledNode, c: char, font_size: f32) -> f32 {
+    crate::fonts::chain_for(&sn.specified_values).advance(c, font_size)
 }
 
-/// Horizontal advance of `c` at a 1px font size (same formula as the painter).
-fn char_advance_em(c: char) -> f32 {
-    ADVANCE_CACHE.with(|cache| {
-        if let Some(v) = cache.borrow().get(&c) {
-            return *v;
-        }
-        let f = font();
-        let upem = f.units_per_em().unwrap_or(1000.0);
-        let v = f.h_advance_unscaled(f.glyph_id(c)) / upem;
-        cache.borrow_mut().insert(c, v);
-        v
-    })
-}
-
-/// Width of `text` at `font_size` with `letter_spacing` added after every character.
-fn text_width(text: &str, font_size: f32, letter_spacing: f32) -> f32 {
-    let mut w = 0.0;
-    for c in text.chars() {
-        w += char_advance_em(c) * font_size + letter_spacing;
-    }
-    w
+/// Width of `text` at `font_size` in the node's font with `letter_spacing`
+/// added after every character (same as the painter).
+fn text_width(sn: &StyledNode, text: &str, font_size: f32, letter_spacing: f32) -> f32 {
+    crate::fonts::chain_for(&sn.specified_values).measure_spaced(text, font_size, letter_spacing)
 }
 
 /// Measure the width of `text` rendered at `font_size` px.
 /// When `wrap_width` is `f32::INFINITY`, no wrapping occurs (max-content).
 /// When finite, line-breaks at word boundaries and reports the widest line.
 #[allow(dead_code)]
-fn measure_text_width(text: &str, font_size: f32, wrap_width: f32) -> f32 {
+fn measure_text_width(sn: &StyledNode, text: &str, font_size: f32, wrap_width: f32) -> f32 {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return 0.0;
     }
-    let space_w = char_advance_em(' ') * font_size;
+    let space_w = char_advance(sn, ' ', font_size);
     let mut max_w: f32 = 0.0;
     let mut line_w: f32 = 0.0;
     for word in trimmed.split_whitespace() {
-        let word_w = text_width(word, font_size, 0.0);
+        let word_w = text_width(sn, word, font_size, 0.0);
         if wrap_width.is_finite() && line_w + word_w > wrap_width && line_w > 0.0 {
             max_w = max_w.max(line_w);
             line_w = 0.0;
@@ -469,7 +415,7 @@ fn line_height(sn: &StyledNode) -> f32 {
         Some(Value::Length(v, Unit::Px)) => v.max(0.0),
         Some(Value::Length(v, Unit::Percent)) => fs * v / 100.0,
         Some(Value::Number(n)) => fs * n,
-        _ => fs * normal_line_height_factor(),
+        _ => font_metrics(sn, fs).normal_line_height(),
     }
 }
 
@@ -2034,13 +1980,13 @@ fn make_pieces<'a>(items: &[Item<'a>]) -> Vec<Piece<'a>> {
                 let anywhere = matches!(skw(node, "overflow-wrap").or_else(|| skw(node, "word-wrap")), Some("break-word" | "anywhere"))
                     || word_break == "break-word";
                 let text = apply_text_transform(&text_of(node), node);
-                let space_w = char_advance_em(' ') * fs + ls;
+                let space_w = char_advance(node, ' ', fs) + ls;
                 let mut word = String::new();
                 let flush = |word: &mut String, pieces: &mut Vec<Piece<'a>>, break_next: &mut bool| {
                     if word.is_empty() {
                         return;
                     }
-                    let w = text_width(word, fs, ls);
+                    let w = text_width(node, word, fs, ls);
                     pieces.push(Piece {
                         kind: PieceKind::Text(node, std::mem::take(word)),
                         width: w,
@@ -2092,7 +2038,7 @@ fn make_pieces<'a>(items: &[Item<'a>]) -> Vec<Piece<'a>> {
                         let bb = bb && (pieces.last().map_or(true, |p| !matches!(p.kind, PieceKind::Open(_))) || break_next || ws.wrap);
                         pieces.push(Piece {
                             kind: PieceKind::Text(node, c.to_string()),
-                            width: char_advance_em(c) * fs + ls,
+                            width: char_advance(node, c, fs) + ls,
                             break_before: bb && ws.wrap,
                             collapsible: false,
                             break_anywhere: anywhere,
@@ -2263,8 +2209,8 @@ struct InlineMetrics {
 
 fn inline_metrics(sn: &StyledNode) -> InlineMetrics {
     let fs = font_size(sn);
-    let m = font_metrics();
-    InlineMetrics { ascent: m.ascent * fs, descent: m.descent * fs, line_height: line_height(sn), x_height: fs * 0.5 }
+    let m = font_metrics(sn, fs);
+    InlineMetrics { ascent: m.ascent, descent: m.descent, line_height: line_height(sn), x_height: fs * 0.5 }
 }
 
 impl InlineMetrics {
@@ -2441,7 +2387,7 @@ fn layout_inline_run_clamped<'a>(
                 }
                 if !fits && p.break_anywhere {
                     if let PieceKind::Text(node, text) = p.kind.clone() {
-                        let (a, b) = split_text_to_fit(&text, avail_now - width, font_size(node), letter_spacing(node), !has_content);
+                        let (a, b) = split_text_to_fit(node, &text, avail_now - width, font_size(node), letter_spacing(node), !has_content);
                         if !b.is_empty() {
                             if a.is_empty() {
                                 end = j;
@@ -2449,8 +2395,8 @@ fn layout_inline_run_clamped<'a>(
                             }
                             let fs = font_size(node);
                             let ls = letter_spacing(node);
-                            let wa = text_width(&a, fs, ls);
-                            let wb = text_width(&b, fs, ls);
+                            let wa = text_width(node, &a, fs, ls);
+                            let wb = text_width(node, &b, fs, ls);
                             let bb = pieces[j].break_before;
                             pieces[j] = Piece { kind: PieceKind::Text(node, a), width: wa, break_before: bb, collapsible: false, break_anywhere: true };
                             pieces.insert(j + 1, Piece { kind: PieceKind::Text(node, b), width: wb, break_before: true, collapsible: false, break_anywhere: true });
@@ -2534,11 +2480,11 @@ fn layout_inline_run_clamped<'a>(
 
 /// Split `text` so that the first part fits in `room` px. With `take_one`, at
 /// least one character is kept in the first part.
-fn split_text_to_fit(text: &str, room: f32, fs: f32, ls: f32, take_one: bool) -> (String, String) {
+fn split_text_to_fit(sn: &StyledNode, text: &str, room: f32, fs: f32, ls: f32, take_one: bool) -> (String, String) {
     let mut acc = 0.0;
     let mut split = text.len();
     for (ci, c) in text.char_indices() {
-        let cw = char_advance_em(c) * fs + ls;
+        let cw = char_advance(sn, c, fs) + ls;
         if acc + cw > room + 0.01 && !(take_one && ci == 0) {
             split = ci;
             break;
@@ -2758,7 +2704,7 @@ fn build_line<'a>(
             // The painter wraps words that overflow the rect and ignores
             // letter-spacing; make sure the rect is wide enough for its own
             // measurement so a line fragment is never re-wrapped.
-            let painter_w = text_width(t.trim(), font_size(b.style_node), 0.0);
+            let painter_w = text_width(b.style_node, t.trim(), font_size(b.style_node), letter_spacing(b.style_node));
             if painter_w > b.dimensions.width {
                 b.dimensions.width = painter_w;
             }
@@ -2895,7 +2841,7 @@ fn truncate_with_ellipsis(line: &mut Vec<Piece>, avail: f32, always: bool) {
         }
     }
     let Some(enode) = ellipsis_node else { return };
-    let ew = text_width("\u{2026}", font_size(enode), letter_spacing(enode));
+    let ew = text_width(enode, "\u{2026}", font_size(enode), letter_spacing(enode));
     let limit = (avail - ew).max(0.0);
     let total: f32 = line.iter().map(|p| p.width).sum();
     if !always && total <= avail + 0.01 {
@@ -2919,7 +2865,7 @@ fn truncate_with_ellipsis(line: &mut Vec<Piece>, avail: f32, always: bool) {
                 if let Some(pos) = line.iter().rposition(|p| matches!(p.kind, PieceKind::Text(..))) {
                     if let PieceKind::Text(n, ref mut t) = line[pos].kind {
                         t.push('\u{2026}');
-                        line[pos].width += text_width("\u{2026}", font_size(n), letter_spacing(n));
+                        line[pos].width += text_width(n, "\u{2026}", font_size(n), letter_spacing(n));
                     }
                 }
             }
@@ -2935,7 +2881,7 @@ fn truncate_with_ellipsis(line: &mut Vec<Piece>, avail: f32, always: bool) {
         let mut acc = x;
         let mut kept = String::new();
         for c in text.chars() {
-            let cw = char_advance_em(c) * fs + ls;
+            let cw = char_advance(n, c, fs) + ls;
             if acc + cw > limit + 0.01 {
                 break;
             }
@@ -2943,7 +2889,7 @@ fn truncate_with_ellipsis(line: &mut Vec<Piece>, avail: f32, always: bool) {
             kept.push(c);
         }
         kept.push('\u{2026}');
-        let w = text_width(&kept, fs, ls);
+        let w = text_width(n, &kept, fs, ls);
         new_line.push(Piece { kind: PieceKind::Text(n, kept), width: w, break_before: false, collapsible: false, break_anywhere: false });
         appended = true;
     }
@@ -4929,7 +4875,8 @@ mod tests {
         // The text box is the glyph content area: the line starts at y=24 and the
         // content area sits half the leading below it.
         let fs = 16.0;
-        let half_leading = (fs * normal_line_height_factor() - fs * (font_metrics().ascent + font_metrics().descent)) / 2.0;
+        let m = font_metrics(text.style_node, fs);
+        let half_leading = (m.normal_line_height() - (m.ascent + m.descent)) / 2.0;
         assert!((text.dimensions.y - (24.0 + half_leading)).abs() < 0.05, "text y {}", text.dimensions.y);
         assert!(text.dimensions.width > 0.0);
         assert!(text.dimensions.height > 0.0);
@@ -5281,7 +5228,7 @@ mod tests {
         let second = find_element_by_id(&layout, "second").expect("second span");
 
         assert!(
-            second.dimensions.y >= first.dimensions.y + 40.0,
+            second.dimensions.y >= first.dimensions.y + 32.0,
             "consecutive <br> should create a blank line of vertical space: first.y={}, second.y={}",
             first.dimensions.y,
             second.dimensions.y
@@ -7470,7 +7417,7 @@ mod tests {
             600.0,
         );
         let s = by_id(&root, "s");
-        let text_w = text_width("abc", 16.0, 0.0);
+        let text_w = text_width(s.style_node, "abc", 16.0, 0.0);
         assert!((s.dimensions.width - (text_w + 10.0)).abs() < 0.5, "got {}", s.dimensions.width);
     }
 
@@ -7483,7 +7430,7 @@ mod tests {
             600.0,
         );
         let a = by_id(&root, "a");
-        let min_word = text_width("unbreakableword", 16.0, 0.0);
+        let min_word = text_width(a.style_node, "unbreakableword", 16.0, 0.0);
         assert!(a.dimensions.width >= min_word - 0.5, "item {} shrank below its min-content {}", a.dimensions.width, min_word);
     }
 
@@ -7586,7 +7533,7 @@ mod tests {
             600.0,
         );
         let s = by_id(&root, "s");
-        assert!(s.dimensions.width >= 30.0 + text_width("x", 16.0, 0.0) - 0.5);
+        assert!(s.dimensions.width >= 30.0 + text_width(s.style_node, "x", 16.0, 0.0) - 0.5);
     }
 
     #[test]
