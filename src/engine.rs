@@ -1435,11 +1435,6 @@ impl BrowserEngine {
         // made by page scripts so :focus styles match the live document.
         let js_focused_id = self.js_runtime.get_focused_node_id();
         let focused_id = focused_id.or(js_focused_id.as_deref());
-        if let Ok(path) = std::env::var("BROWSER_DEBUG_DUMP_HTML") {
-            if !path.is_empty() {
-                let _ = std::fs::write(path, &body);
-            }
-        }
 
         let mut css_cache = self.css_cache.clone();
         let result = process_html_with_scroll(
@@ -1715,8 +1710,8 @@ impl BrowserEngine {
         tiny_skia::Pixmap::from_vec(bytes, tiny_skia::IntSize::from_wh(page.width, vh)?)
     }
 
-    /// Return the raw HTML source of the last loaded page.
-    /// Full DOM serialization is deferred to a follow-up issue.
+    /// The serialized live DOM the last render laid out (the fetched HTML
+    /// until page script has run).
     pub fn dom_tree(&self) -> String {
         self.last_page
             .as_ref()

@@ -3274,8 +3274,14 @@ fn storage_clear_cb(
 }
 /// `BROWSER_DEBUG_FETCH=1` logs every script-initiated fetch/XHR with its
 /// status to stderr, which is how failed page API calls are diagnosed.
+/// The variable is read once per process.
 fn debug_fetch_enabled() -> bool {
-    std::env::var("BROWSER_DEBUG_FETCH").map(|v| !v.is_empty() && v != "0").unwrap_or(false)
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BROWSER_DEBUG_FETCH")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
 }
 
 fn fetch_cb(
@@ -3378,12 +3384,11 @@ fn fetch_cb(
                         let response_url = response.url().to_string();
                         let status = response.status().as_u16();
                         let status_text = response.status().canonical_reason().unwrap_or("").to_string();
+                        let acao = response.headers().get("access-control-allow-origin").and_then(|h| h.to_str().ok());
                         if debug_fetch_enabled() {
-                            let acao = response.headers().get("access-control-allow-origin").and_then(|h| h.to_str().ok());
                             eprintln!("[FETCH] {} {} -> {} (cross_origin={}, acao={:?})", method, target_url, status, is_cross_origin, acao);
                         }
                         if is_cross_origin && !bypass_cors {
-                            let acao = response.headers().get("access-control-allow-origin").and_then(|h| h.to_str().ok());
                             let allowed = match acao { Some("*") => true, Some(val) if val == origin_str => true, _ => false };
                             if !allowed {
                                 let _ = sender_clone.send(Box::new(move || {

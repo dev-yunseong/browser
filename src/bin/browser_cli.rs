@@ -12,6 +12,7 @@
 //!   browser-cli js <script>              # Evaluate JavaScript and print result
 //!   browser-cli style [<selector>]       # Print computed CSS styles
 //!   browser-cli layout                   # Print the layout tree
+//!   browser-cli dom [<file>]             # Print or save the rendered DOM as HTML
 //!   browser-cli logs                     # Print browser console entries
 //!   browser-cli tick [count]             # Advance daemon JS tasks
 //!   browser-cli --port 7071 <command>    # Custom daemon port
@@ -302,6 +303,16 @@ impl DaemonClient {
         serde_json::to_string_pretty(&v).map_err(|e| CliError::Parse(e.to_string()))
     }
 
+    /// GET /dom — the serialized live DOM the last render laid out.
+    fn get_dom(&self) -> Result<String, CliError> {
+        let resp = self
+            .client
+            .get(format!("{}/dom", self.base_url))
+            .send()
+            .map_err(Self::check_error)?;
+        resp.text().map_err(|e| CliError::Http(e.to_string()))
+    }
+
     /// GET /layout — returns the plain-text layout tree.
     fn get_layout(&self) -> Result<String, CliError> {
         let resp = self
@@ -567,6 +578,8 @@ enum Command {
         selector: Option<String>,
     },
     Layout,
+    /// Print the rendered DOM, or save it to the given file.
+    Dom(Option<String>),
     Logs,
     Tick(u32),
     Help,
@@ -675,6 +688,11 @@ fn parse_command(line: &str) -> Command {
             },
         },
         "layout" => Command::Layout,
+        "dom" => Command::Dom(if rest.is_empty() {
+            None
+        } else {
+            Some(rest.to_string())
+        }),
         "logs" | "console-log" | "console-logs" => Command::Logs,
         "tick" => {
             let count = if rest.is_empty() {
@@ -711,6 +729,7 @@ fn print_help() {
         "  style [<selector>]      Print computed CSS styles (optionally filtered by selector)"
     );
     println!("  layout                  Print the current layout tree");
+    println!("  dom [<file>]            Print the DOM the last render used as HTML, or save it");
     println!("  logs                    Print browser console entries");
     println!("  tick [count]            Advance daemon JS tasks and re-render if needed");
     println!("  help                    Show this help");
@@ -798,6 +817,16 @@ fn dispatch_command(cmd: Command, state: &mut CliState) -> bool {
         },
         Command::Style { selector } => match state.client.get_style(selector.as_deref()) {
             Ok(text) => println!("{}", text),
+            Err(e) => eprintln!("Error: {}", e),
+        },
+        Command::Dom(path) => match state.client.get_dom() {
+            Ok(html) => match path {
+                None => println!("{}", html),
+                Some(path) => match std::fs::write(&path, html) {
+                    Ok(()) => println!("DOM saved to {}", path),
+                    Err(e) => eprintln!("Error: {}", CliError::Io(e.to_string())),
+                },
+            },
             Err(e) => eprintln!("Error: {}", e),
         },
         Command::Layout => match state.client.get_layout() {
@@ -1026,6 +1055,15 @@ mod tests {
     #[test]
     fn test_parse_command_submit() {
         assert_eq!(parse_command("submit"), Command::Submit);
+    }
+
+    #[test]
+    fn test_parse_command_dom() {
+        assert_eq!(parse_command("dom"), Command::Dom(None));
+        assert_eq!(
+            parse_command("dom /tmp/page.html"),
+            Command::Dom(Some("/tmp/page.html".to_string()))
+        );
     }
 
     #[test]
