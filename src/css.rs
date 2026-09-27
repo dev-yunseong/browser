@@ -1054,8 +1054,10 @@ pub fn parse_declaration(name: &str, raw: &str, important: bool, out: &mut Vec<D
                 .into_iter()
                 .filter_map(|layer| parse_box_shadow(layer.trim()))
                 .collect();
-            if let Some(first) = layers.first() {
-                push_decl(out, name, Value::BoxShadow(first.clone()), important);
+            match layers.first() {
+                Some(first) => push_decl(out, name, Value::BoxShadow(first.clone()), important),
+                // `none` must also replace an earlier single-layer value.
+                None => push_decl(out, name, Value::Keyword(intern("none")), important),
             }
             push_decl(out, "box-shadow-layers", Value::BoxShadowList(layers), important);
         }
@@ -2675,18 +2677,19 @@ mod tests {
         assert!(has_shadow, "box-shadow property must produce Value::BoxShadow");
     }
 
-    /// `box-shadow: none` in a stylesheet must produce NO `Value::BoxShadow` declaration.
+    /// `box-shadow: none` produces no `Value::BoxShadow`, but still declares
+    /// `box-shadow` so it overrides an earlier shadow in the cascade.
     #[test]
-    fn test_css_box_shadow_none_produces_no_declaration() {
+    fn test_css_box_shadow_none_overrides_without_shadow_value() {
         let ss = parse_css("div { box-shadow: none; }");
         let rule = match &ss.items[0] {
             RuleOrAtRule::Rule(r) => r,
             _ => panic!("expected rule"),
         };
-        let has_shadow = rule.declarations.iter().any(|d| {
-            d.name.as_ref() == "box-shadow"
-        });
-        assert!(!has_shadow, "box-shadow: none must not produce a box-shadow declaration");
+        assert!(!rule.declarations.iter().any(|d| matches!(d.value, Value::BoxShadow(_))));
+        assert!(rule.declarations.iter().any(|d| {
+            d.name.as_ref() == "box-shadow" && matches!(&d.value, Value::Keyword(k) if k.as_ref() == "none")
+        }));
     }
 
     #[test]

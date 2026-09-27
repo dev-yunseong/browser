@@ -2940,7 +2940,18 @@ fn build_line<'a>(
     };
     let mut pending_text: Option<(LayoutBox<'a>, String)> = None;
     let flush_text = |pending_text: &mut Option<(LayoutBox<'a>, String)>, frag_stack: &mut Vec<LayoutBox<'a>>, out: &mut Vec<LayoutBox<'a>>| {
-        if let Some((mut b, t)) = pending_text.take() {
+        if let Some((mut b, mut t)) = pending_text.take() {
+            // A fragment that starts with a space (e.g. " more" after an inline
+            // element) starts its glyphs after that space: move the space out of
+            // the fragment so the rect begins at the first glyph.
+            let body = t.trim_start();
+            if body.len() != t.len() && !body.is_empty() {
+                let lead = &t[..t.len() - body.len()];
+                let lead_w = text_width(b.style_node, lead, font_size(b.style_node), letter_spacing(b.style_node));
+                b.dimensions.x += lead_w;
+                b.dimensions.width = (b.dimensions.width - lead_w).max(0.0);
+                t = body.to_string();
+            }
             // The painter wraps words that overflow the rect and ignores
             // letter-spacing; make sure the rect is wide enough for its own
             // measurement so a line fragment is never re-wrapped.
