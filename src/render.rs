@@ -149,7 +149,7 @@ fn composite_layer_to_surface(
     // An effect layer paints into its own surface covering everything the
     // layer and its descendants draw (overflowing children included), not
     // just its border box.
-    let effect_rect = if has_effect { layer_paint_extent(tree, layer_id, has_transform) } else { layer.bounds };
+    let effect_rect = if has_effect { layer_paint_extent(tree, layer_id, has_transform, surface_rect) } else { layer.bounds };
     let mut effect_pixmap = if has_effect {
         let width = effect_rect.width.max(1.0).ceil() as u32;
         let height = effect_rect.height.max(1.0).ceil() as u32;
@@ -228,14 +228,18 @@ fn composite_layer_to_surface(
     }
 }
 
-/// Largest effect-layer surface side, in px; bigger extents are cropped
-/// around the layer's border box.
+/// Largest effect-layer surface area (in px²), used only as a last-resort
+/// cap for a rotated or scaled layer whose inverse-mapped visible rect is
+/// still huge (e.g. a near-zero scale).
 const MAX_EFFECT_SURFACE_SIDE: f32 = 8192.0;
 
 /// Union of the rects painted by `layer_id` and its descendant layers (page
 /// coordinates, ignoring descendant transforms), including the border box.
-/// Ancestor clips of the layer bound the result.
-fn layer_paint_extent(tree: &LayerTree, layer_id: usize, transformed: bool) -> LayoutRect {
+/// Ancestor clips of the layer bound the result, and so does `surface_rect`
+/// (the visible rect of the surface this layer is about to be composited
+/// onto) — nothing painted outside of what that surface shows can ever
+/// become visible, however tall the painted content is.
+fn layer_paint_extent(tree: &LayerTree, layer_id: usize, transformed: bool, surface_rect: LayoutRect) -> LayoutRect {
     let layer = &tree.layers[layer_id];
     let (mut x0, mut y0) = (layer.bounds.x, layer.bounds.y);
     let (mut x1, mut y1) = (layer.bounds.x + layer.bounds.width, layer.bounds.y + layer.bounds.height);
@@ -281,16 +285,80 @@ fn layer_paint_extent(tree: &LayerTree, layer_id: usize, transformed: bool) -> L
         x1 = x1.min(c.rect.x + c.rect.width);
         y1 = y1.min(c.rect.y + c.rect.height);
     }
+
+    // Nothing outside `surface_rect` (mapped back through the inverse of
+    // this layer's own transform) is visible once composited, so it never
+    // needs to be painted. For an opacity-only layer the transform is the
+    // identity and this is exactly `surface_rect`; for a translate it is a
+    // plain offset; for a rotate/scale it is the general inverse, when one
+    // exists.
+    if let Some(visible) = visible_source_rect(layer.transform, layer.bounds, surface_rect) {
+        x0 = x0.max(visible.x);
+        y0 = y0.max(visible.y);
+        x1 = x1.min(visible.x + visible.width);
+        y1 = y1.min(visible.y + visible.height);
+    }
+
     let b = layer.bounds;
-    let half = MAX_EFFECT_SURFACE_SIDE / 2.0;
-    x0 = x0.max(b.x + b.width / 2.0 - half).floor();
-    y0 = y0.max(b.y + b.height / 2.0 - half).floor();
-    x1 = x1.min(b.x + b.width / 2.0 + half);
-    y1 = y1.min(b.y + b.height / 2.0 + half);
     if x1 <= x0 || y1 <= y0 {
         return LayoutRect { x: b.x, y: b.y, width: 1.0, height: 1.0 };
     }
-    LayoutRect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }
+
+    // Last-resort cap: even after clamping to what the target surface can
+    // show, a rotated or scaled layer's inverse-mapped visible rect can
+    // still be enormous. Shrink it (centered on the border box) so the
+    // surface pixmap we are about to allocate stays a reasonable size.
+    let area = (x1 - x0) as f64 * (y1 - y0) as f64;
+    let max_area = (MAX_EFFECT_SURFACE_SIDE as f64) * (MAX_EFFECT_SURFACE_SIDE as f64);
+    if area > max_area {
+        let cx = b.x + b.width / 2.0;
+        let cy = b.y + b.height / 2.0;
+        let scale = (max_area / area).sqrt() as f32;
+        let half_w = (x1 - x0) * scale / 2.0;
+        let half_h = (y1 - y0) * scale / 2.0;
+        x0 = x0.max(cx - half_w);
+        y0 = y0.max(cy - half_h);
+        x1 = x1.min(cx + half_w);
+        y1 = y1.min(cy + half_h);
+        if x1 <= x0 || y1 <= y0 {
+            return LayoutRect { x: b.x, y: b.y, width: 1.0, height: 1.0 };
+        }
+    }
+
+    let x0 = x0.floor();
+    let y0 = y0.floor();
+    LayoutRect { x: x0, y: y0, width: (x1 - x0).max(1.0), height: (y1 - y0).max(1.0) }
+}
+
+/// The region of `bounds`-relative paint-command space that maps into
+/// `surface_rect` under `transform`, applied about the border box's
+/// top-left corner the way `composite_layer_to_surface` composites the
+/// effect surface onto its target. Returns `None` when `transform` cannot
+/// be inverted (a degenerate scale), in which case the caller does not crop
+/// by visibility and falls back to the total-area cap alone.
+fn visible_source_rect(transform: Matrix4x4, bounds: LayoutRect, surface_rect: LayoutRect) -> Option<LayoutRect> {
+    let inv = transform.to_skia().invert()?;
+    let corners = [
+        (surface_rect.x, surface_rect.y),
+        (surface_rect.x + surface_rect.width, surface_rect.y),
+        (surface_rect.x, surface_rect.y + surface_rect.height),
+        (surface_rect.x + surface_rect.width, surface_rect.y + surface_rect.height),
+    ];
+    let (mut x0, mut y0) = (f32::INFINITY, f32::INFINITY);
+    let (mut x1, mut y1) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for (cx, cy) in corners {
+        let mut pt = SkPoint::from_xy(cx - bounds.x, cy - bounds.y);
+        inv.map_point(&mut pt);
+        let (px, py) = (pt.x + bounds.x, pt.y + bounds.y);
+        if !px.is_finite() || !py.is_finite() {
+            return None;
+        }
+        x0 = x0.min(px);
+        y0 = y0.min(py);
+        x1 = x1.max(px);
+        y1 = y1.max(py);
+    }
+    Some(LayoutRect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 })
 }
 
 /// Build a `Mask` (sized to the tile pixmap) for an overflow clip region.
@@ -334,6 +402,11 @@ fn build_clip_mask(
     Some(m)
 }
 
+/// Test-only entry point: unclipped variant of `execute_commands_with_clips`.
+/// Not used outside `mod tests` — every non-test call site goes through a
+/// layer's `ancestor_clips`, so this is `#[cfg(test)]` rather than a second
+/// production entry point to the same logic.
+#[cfg(test)]
 fn execute_commands_on_tile(
     commands: &[PaintCommand],
     pixmap: &mut Pixmap,
@@ -2588,5 +2661,28 @@ mod tests {
         render_layout_tree(&layout.unwrap(), &mut p, &HashMap::new(), &url::Url::parse("https://e.com/").unwrap());
         assert_eq!(px(&p, 5, 5), [0, 255, 0, 255], "second row moved into the clip");
         assert_eq!(px(&p, 5, 15), [255, 255, 255, 255], "nothing painted below the clip");
+    }
+
+    /// Regression test: an opacity layer wrapping content spread across a
+    /// tall (12000px) page must paint its full extent, not just a window
+    /// cropped to a fixed distance around its border box. Both a square
+    /// near the top (y=100) and one near the bottom (y=11900) must show the
+    /// half-transparent child color.
+    #[test]
+    fn test_opacity_layer_on_tall_page_paints_full_extent() {
+        let html = r#"<html><body style="margin:0"><div style="position:relative;width:10px;height:1px;opacity:0.5">
+            <div style="position:absolute;left:0;top:100px;width:10px;height:10px;background:#000"></div>
+            <div style="position:absolute;left:0;top:11900px;width:10px;height:10px;background:#000"></div>
+        </div></body></html>"#;
+        let dom = crate::dom::parse_html(html);
+        let sheet = crate::css::parse_css("");
+        let styled = crate::style::build_style_tree(&dom.document, &sheet, None, &HashMap::new(), None, None, None);
+        let (layout, _, _) = crate::layout::build_layout_tree(&styled, 0.0, 0.0, 0.0, 40.0, 40.0, 12000.0);
+        let mut p = white_pixmap(40, 12000);
+        render_layout_tree(&layout.unwrap(), &mut p, &HashMap::new(), &url::Url::parse("https://e.com/").unwrap());
+        let top = px(&p, 5, 105);
+        let bottom = px(&p, 5, 11905);
+        assert!(top[0] > 100 && top[0] < 160, "top square should be half-transparent black, got {top:?}");
+        assert!(bottom[0] > 100 && bottom[0] < 160, "bottom square should be half-transparent black, got {bottom:?}");
     }
 }
