@@ -240,6 +240,9 @@ pub enum DisplayType {
 
 // ── Public entry points ───────────────────────────────────────────────────────
 
+/// `current_x` is accepted for call-site compatibility (historically the
+/// starting inline-layout cursor) but is not used: layout always starts a
+/// fresh block-formatting context at `container_start_x`.
 pub fn build_layout_tree<'a>(
     style_node: &'a StyledNode,
     container_start_x: f32,
@@ -249,7 +252,8 @@ pub fn build_layout_tree<'a>(
     vw: f32,
     vh: f32,
 ) -> (Option<LayoutBox<'a>>, f32, f32) {
-    build_layout_tree_with_cb(style_node, container_start_x, current_x, current_y, container_width, vw, vh, None)
+    let _ = current_x;
+    build_layout_tree_with_cb(style_node, container_start_x, current_y, container_width, vw, vh, None)
 }
 
 /// Variant that takes the initial containing block for absolutely positioned
@@ -257,7 +261,6 @@ pub fn build_layout_tree<'a>(
 pub fn build_layout_tree_with_cb<'a>(
     style_node: &'a StyledNode,
     container_start_x: f32,
-    _current_x: f32,
     current_y: f32,
     container_width: f32,
     vw: f32,
@@ -978,19 +981,20 @@ impl<'a> LayoutBox<'a> {
 }
 
 /// Iterative subtree translation (avoids stack overflows on deep trees).
+///
+/// Uses a stack of `&mut LayoutBox` rather than recursion: each entry is a
+/// disjoint mutable borrow taken from its parent's `children` vector via
+/// `iter_mut`, so the whole traversal is safe — no raw pointers needed.
 pub fn offset_layout_box(layout: &mut LayoutBox, dx: f32, dy: f32) {
     if dx == 0.0 && dy == 0.0 {
         return;
     }
-    let mut stack: Vec<*mut LayoutBox> = vec![layout as *mut LayoutBox];
-    while let Some(ptr) = stack.pop() {
-        // SAFETY: Each pointer comes from a uniquely-owned LayoutBox node; no two
-        // entries on the stack alias the same allocation.
-        let node = unsafe { &mut *ptr };
+    let mut stack: Vec<&mut LayoutBox> = vec![layout];
+    while let Some(node) = stack.pop() {
         node.dimensions.x += dx;
         node.dimensions.y += dy;
         for child in &mut node.children {
-            stack.push(child as *mut LayoutBox);
+            stack.push(child);
         }
     }
 }
@@ -4270,35 +4274,41 @@ fn make_abs_placeholder<'a>(sn: &'a StyledNode, x: f32, y: f32, ctx: &mut Ctx) -
 /// Replace pending placeholders in `root`'s subtree whose containing block is
 /// `cb_rect` (absolute boxes; fixed boxes only when `is_viewport`).
 fn resolve_pending_abs(root: &mut LayoutBox, cb_rect: Rect, is_viewport: bool, ctx: &mut Ctx) {
-    let mut stack: Vec<*mut LayoutBox> = vec![root as *mut LayoutBox];
-    while let Some(ptr) = stack.pop() {
+    if ctx.pending_abs == 0 {
+        return;
+    }
+    resolve_pending_abs_node(root, cb_rect, is_viewport, ctx);
+}
+
+/// Recursive helper for `resolve_pending_abs`. Recursion (rather than a raw-
+/// pointer stack) is safe here because each call only ever holds one `&mut
+/// LayoutBox` at a time, borrowed from the parent's `children` vector by
+/// index; layout trees are bounded by DOM nesting depth, so this does not
+/// risk a stack overflow in practice.
+fn resolve_pending_abs_node(node: &mut LayoutBox, cb_rect: Rect, is_viewport: bool, ctx: &mut Ctx) {
+    for k in 0..node.children.len() {
         if ctx.pending_abs == 0 {
-            break;
+            return;
         }
-        // SAFETY: each pointer refers to a distinct node of the tree owned by `root`;
-        // children vectors are only modified for the node currently being visited.
-        let node = unsafe { &mut *ptr };
-        for k in 0..node.children.len() {
+        if node.children[k].abs_placeholder {
             let child = &node.children[k];
-            if child.abs_placeholder {
-                let is_fixed = child.position == PositionType::Fixed;
-                if is_fixed && !is_viewport {
-                    continue;
-                }
-                let sn = child.style_node;
-                let (sx, sy) = (child.dimensions.x, child.dimensions.y);
-                let cbr = if is_fixed { Rect { x: 0.0, y: 0.0, width: ctx.vw, height: ctx.vh } } else { cb_rect };
-                ctx.pending_abs = ctx.pending_abs.saturating_sub(1);
-                if let Some(b) = layout_abs(sn, sx, sy, cbr, ctx) {
-                    node.children[k] = b;
-                } else {
-                    let mut empty = LayoutBox::new(sn);
-                    empty.dimensions = Rect { x: sx, y: sy, width: 0.0, height: 0.0 };
-                    node.children[k] = empty;
-                }
-            } else {
-                stack.push(&mut node.children[k] as *mut LayoutBox);
+            let is_fixed = child.position == PositionType::Fixed;
+            if is_fixed && !is_viewport {
+                continue;
             }
+            let sn = child.style_node;
+            let (sx, sy) = (child.dimensions.x, child.dimensions.y);
+            let cbr = if is_fixed { Rect { x: 0.0, y: 0.0, width: ctx.vw, height: ctx.vh } } else { cb_rect };
+            ctx.pending_abs = ctx.pending_abs.saturating_sub(1);
+            if let Some(b) = layout_abs(sn, sx, sy, cbr, ctx) {
+                node.children[k] = b;
+            } else {
+                let mut empty = LayoutBox::new(sn);
+                empty.dimensions = Rect { x: sx, y: sy, width: 0.0, height: 0.0 };
+                node.children[k] = empty;
+            }
+        } else {
+            resolve_pending_abs_node(&mut node.children[k], cb_rect, is_viewport, ctx);
         }
     }
 }
