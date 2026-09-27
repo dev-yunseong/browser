@@ -1,4 +1,4 @@
-use crate::css::{Stylesheet, Value, Selector, parse_value, parse_color, Combinator, intern, SelectorKey};
+use crate::css::{Stylesheet, Value, Selector, parse_color, Combinator, intern, SelectorKey, PseudoClass, Unit};
 
 use markup5ever_rcdom::{Handle, NodeData};
 use std::collections::{HashMap, HashSet};
@@ -45,14 +45,34 @@ impl StyleStore {
     }
 }
 
+/// Which box a selector styles: the element itself or one of its generated boxes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PseudoTarget {
+    None,
+    Before,
+    After,
+    Placeholder,
+}
+
+/// Cascaded declarations of an element and of its `::before`, `::after` and
+/// `::placeholder` pseudo-elements.
+type Cascaded = (
+    HashMap<Arc<str>, Value>,
+    Option<HashMap<Arc<str>, Value>>,
+    Option<HashMap<Arc<str>, Value>>,
+    Option<HashMap<Arc<str>, Value>>,
+);
+
 /// An entry in the selector index pointing to a specific selector within a rule.
 #[derive(Clone)]
 struct IndexEntry {
     specificity: (usize, usize, usize),
     rule_idx: usize,
     sel_idx: usize,
-    /// True when the selector has an ancestor part (needs DOM context for full match).
+    /// True when the match result depends on more than tag/id/classes (ancestors,
+    /// attributes, structural pseudo-classes), so it cannot be cached per signature.
     is_complex: bool,
+    target: PseudoTarget,
 }
 
 /// Pre-built index that buckets selectors by their key feature for O(1) candidate lookup.
@@ -65,22 +85,33 @@ struct SelectorIndex {
 }
 
 impl SelectorIndex {
-    fn build(stylesheet: &Stylesheet) -> Self {
+    fn build(rules: &[&crate::css::Rule]) -> Self {
         let mut by_id: HashMap<String, Vec<IndexEntry>> = HashMap::new();
         let mut by_class: HashMap<String, Vec<IndexEntry>> = HashMap::new();
         let mut by_tag: HashMap<String, Vec<IndexEntry>> = HashMap::new();
         let mut universal: Vec<IndexEntry> = Vec::new();
 
-        for (rule_idx, rule) in stylesheet.all_rules().iter().enumerate() {
+        for (rule_idx, rule) in rules.iter().enumerate() {
             for (sel_idx, sel) in rule.selectors.iter().enumerate() {
+                if sel.never_matches {
+                    continue;
+                }
+                let target = match sel.pseudo_element.as_deref() {
+                    None => PseudoTarget::None,
+                    Some("before") => PseudoTarget::Before,
+                    Some("after") => PseudoTarget::After,
+                    Some("placeholder") => PseudoTarget::Placeholder,
+                    Some(_) => continue,
+                };
                 let entry = IndexEntry {
                     specificity: sel.specificity(),
                     rule_idx,
                     sel_idx,
-                    // Mark as complex if it has an ancestor combinator OR attribute constraints.
-                    // Attribute selectors depend on per-node attribute values, which are not
-                    // captured in the ElementSignature, so they must bypass the signature cache.
-                    is_complex: sel.ancestor.is_some() || !sel.attributes.is_empty(),
+                    is_complex: sel.ancestor.is_some()
+                        || !sel.attributes.is_empty()
+                        || !sel.attr_ops.is_empty()
+                        || !sel.pseudos.is_empty(),
+                    target,
                 };
                 match sel.key_feature() {
                     SelectorKey::Id(id)    => by_id.entry(id).or_default().push(entry),
@@ -131,6 +162,7 @@ impl ElementSignature {
     fn from_node(node: &NodeDataSend) -> Self {
         let mut classes = node.classes.clone();
         classes.sort_unstable();
+        classes.dedup();
         ElementSignature { tag: node.tag.clone(), id: node.id.clone(), classes }
     }
 }
@@ -148,6 +180,8 @@ pub struct NodeDataSend {
     pub classes: Vec<String>,
     pub attrs: Vec<(String, String)>,
     pub is_element: bool,
+    /// Text node with at least one character (used by `:empty`).
+    pub has_text: bool,
     pub parent_idx: Option<usize>,
     pub children_idx: Vec<usize>,
 }
@@ -173,21 +207,28 @@ fn flatten_dom(root: &Handle, arena: &mut Vec<NodeDataSend>, root_parent_idx: Op
         let mut classes = Vec::new();
         let mut attrs_vec = Vec::new();
         let mut is_element = false;
+        let mut has_text = false;
 
-        if let NodeData::Element { ref name, ref attrs, .. } = handle.data {
-            is_element = true;
-            tag = name.local.to_string();
-            for attr in attrs.borrow().iter() {
-                let k = attr.name.local.to_string();
-                let v = attr.value.to_string();
-                if k == "id" { id = Some(v.clone()); }
-                if k == "class" { classes = v.split_whitespace().map(|s| s.to_string()).collect(); }
-                attrs_vec.push((k, v));
+        match handle.data {
+            NodeData::Element { ref name, ref attrs, .. } => {
+                is_element = true;
+                tag = name.local.to_string();
+                for attr in attrs.borrow().iter() {
+                    let k = attr.name.local.to_string();
+                    let v = attr.value.to_string();
+                    if k == "id" { id = Some(v.clone()); }
+                    if k == "class" { classes = v.split_whitespace().map(|s| s.to_string()).collect(); }
+                    attrs_vec.push((k, v));
+                }
             }
+            NodeData::Text { ref contents } => {
+                has_text = !contents.borrow().is_empty();
+            }
+            _ => {}
         }
 
         arena.push(NodeDataSend {
-            tag, id, classes, attrs: attrs_vec, is_element, parent_idx, children_idx: Vec::new()
+            tag, id, classes, attrs: attrs_vec, is_element, has_text, parent_idx, children_idx: Vec::new()
         });
 
         // Push children in REVERSE order so the first child is popped first,
@@ -212,14 +253,93 @@ fn flatten_dom(root: &Handle, arena: &mut Vec<NodeDataSend>, root_parent_idx: Op
     start_idx
 }
 
-fn matches_selector_arena(selector: &Selector, idx: usize, arena: &[NodeDataSend], hovered_id: Option<&str>, focused_id: Option<&str>) -> bool {
+struct MatchCtx<'a> {
+    arena: &'a [NodeDataSend],
+    hovered_id: Option<&'a str>,
+    focused_id: Option<&'a str>,
+}
+
+fn attr_value<'a>(node: &'a NodeDataSend, name: &str) -> Option<&'a str> {
+    node.attrs.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+}
+
+/// Element siblings of `idx` (including itself), in document order.
+fn element_siblings(idx: usize, arena: &[NodeDataSend]) -> Vec<usize> {
+    match arena[idx].parent_idx {
+        Some(p) => arena[p].children_idx.iter().copied().filter(|&c| arena[c].is_element).collect(),
+        None => vec![idx],
+    }
+}
+
+fn pseudo_matches(pc: &PseudoClass, idx: usize, ctx: &MatchCtx) -> bool {
+    let arena = ctx.arena;
     let node = &arena[idx];
-    
-    let has_constraint = selector.tag.is_some() || selector.id.is_some() || !selector.class.is_empty() || !selector.attributes.is_empty() || selector.pseudo_class.is_some();
-    if !has_constraint { return false; }
+    match pc {
+        PseudoClass::Not(list) => !list.iter().any(|s| matches_selector_arena(s, idx, ctx)),
+        PseudoClass::Is(list) | PseudoClass::Where(list) => list.iter().any(|s| matches_selector_arena(s, idx, ctx)),
+        PseudoClass::FirstChild => element_siblings(idx, arena).first() == Some(&idx),
+        PseudoClass::LastChild => element_siblings(idx, arena).last() == Some(&idx),
+        PseudoClass::OnlyChild => element_siblings(idx, arena).len() == 1,
+        PseudoClass::NthChild(a, b, of) | PseudoClass::NthLastChild(a, b, of) => {
+            let mut sibs = element_siblings(idx, arena);
+            if let Some(list) = of {
+                if !list.iter().any(|s| matches_selector_arena(s, idx, ctx)) {
+                    return false;
+                }
+                sibs.retain(|&s| list.iter().any(|sel| matches_selector_arena(sel, s, ctx)));
+            }
+            if matches!(pc, PseudoClass::NthLastChild(..)) {
+                sibs.reverse();
+            }
+            match sibs.iter().position(|&s| s == idx) {
+                Some(pos) => crate::css::nth_matches(*a, *b, pos as i32 + 1),
+                None => false,
+            }
+        }
+        PseudoClass::FirstOfType | PseudoClass::LastOfType | PseudoClass::OnlyOfType
+        | PseudoClass::NthOfType(..) | PseudoClass::NthLastOfType(..) => {
+            let mut sibs: Vec<usize> = element_siblings(idx, arena).into_iter().filter(|&s| arena[s].tag == node.tag).collect();
+            match pc {
+                PseudoClass::FirstOfType => sibs.first() == Some(&idx),
+                PseudoClass::LastOfType => sibs.last() == Some(&idx),
+                PseudoClass::OnlyOfType => sibs.len() == 1,
+                PseudoClass::NthOfType(a, b) => sibs.iter().position(|&s| s == idx).map_or(false, |p| crate::css::nth_matches(*a, *b, p as i32 + 1)),
+                PseudoClass::NthLastOfType(a, b) => {
+                    sibs.reverse();
+                    sibs.iter().position(|&s| s == idx).map_or(false, |p| crate::css::nth_matches(*a, *b, p as i32 + 1))
+                }
+                _ => false,
+            }
+        }
+        PseudoClass::Empty => node.children_idx.iter().all(|&c| !arena[c].is_element && !arena[c].has_text),
+        PseudoClass::Root => node.tag == "html",
+        PseudoClass::Hover => node.id.is_some() && node.id.as_deref() == ctx.hovered_id,
+        PseudoClass::Focus => node.id.is_some() && node.id.as_deref() == ctx.focused_id,
+        PseudoClass::Link => matches!(node.tag.as_str(), "a" | "area") && attr_value(node, "href").is_some(),
+        PseudoClass::Checked => {
+            (node.tag == "input" && attr_value(node, "checked").is_some())
+                || (node.tag == "option" && attr_value(node, "selected").is_some())
+        }
+        PseudoClass::Disabled | PseudoClass::Enabled => {
+            let is_control = matches!(node.tag.as_str(), "input" | "button" | "select" | "textarea" | "option" | "optgroup" | "fieldset");
+            let disabled = is_control && attr_value(node, "disabled").is_some();
+            if matches!(pc, PseudoClass::Disabled) { disabled } else { is_control && !disabled }
+        }
+        PseudoClass::Never(_) => false,
+    }
+}
+
+/// Match the subject compound of `selector` (ignoring any pseudo-element) and
+/// its combinator chain against arena node `idx`.
+fn matches_selector_arena(selector: &Selector, idx: usize, ctx: &MatchCtx) -> bool {
+    let arena = ctx.arena;
+    let node = &arena[idx];
+    if !node.is_element || selector.never_matches || !selector.has_constraint() {
+        return false;
+    }
 
     if let Some(ref s_tag) = selector.tag {
-        if &node.tag != s_tag { return false; }
+        if !node.tag.eq_ignore_ascii_case(s_tag) { return false; }
     }
     if let Some(ref s_id) = selector.id {
         if node.id.as_deref() != Some(s_id) { return false; }
@@ -227,27 +347,36 @@ fn matches_selector_arena(selector: &Selector, idx: usize, arena: &[NodeDataSend
     for s_class in &selector.class {
         if !node.classes.contains(s_class) { return false; }
     }
-    if let Some(ref pseudo) = selector.pseudo_class {
-        if pseudo == "hover" {
-            if Some(node.id.as_deref()) != Some(hovered_id) || node.id.is_none() { return false; }
-        } else if pseudo == "focus" {
-            if Some(node.id.as_deref()) != Some(focused_id) || node.id.is_none() { return false; }
-        } else if pseudo == "root" {
-            // :root matches the root element of the document — the <html> element.
-            if node.tag != "html" { return false; }
-        } else { return false; }
-    }
     for attr_sel in &selector.attributes {
-        let mut matched = false;
-        for (k, v) in &node.attrs {
-            if k == &attr_sel.name {
-                match &attr_sel.value {
-                    crate::css::AttributeMatch::Exists => { matched = true; break; }
-                    crate::css::AttributeMatch::Equals(val) => { if v == val { matched = true; break; } }
+        let matched = node.attrs.iter().any(|(k, v)| {
+            k == &attr_sel.name
+                && match &attr_sel.value {
+                    crate::css::AttributeMatch::Exists => true,
+                    crate::css::AttributeMatch::Equals(val) => v == val,
                 }
-            }
-        }
+        });
         if !matched { return false; }
+    }
+    for op in &selector.attr_ops {
+        match attr_value(node, &op.name) {
+            Some(v) if op.matches_value(v) => {}
+            _ => return false,
+        }
+    }
+    if selector.pseudos.is_empty() {
+        if let Some(ref pseudo) = selector.pseudo_class {
+            // Hand-built selectors (tests) may carry only the legacy string form.
+            let ok = match pseudo.as_str() {
+                "hover" => node.id.is_some() && node.id.as_deref() == ctx.hovered_id,
+                "focus" => node.id.is_some() && node.id.as_deref() == ctx.focused_id,
+                "root" => node.tag == "html",
+                _ => false,
+            };
+            if !ok { return false; }
+        }
+    }
+    for pc in &selector.pseudos {
+        if !pseudo_matches(pc, idx, ctx) { return false; }
     }
 
     if let Some(ref ancestor_sel) = selector.ancestor {
@@ -255,61 +384,54 @@ fn matches_selector_arena(selector: &Selector, idx: usize, arena: &[NodeDataSend
         match combinator {
             Combinator::Descendant => {
                 let mut current = node.parent_idx;
-                let mut matched = false;
                 while let Some(p_idx) = current {
-                    if matches_selector_arena(ancestor_sel, p_idx, arena, hovered_id, focused_id) {
-                        matched = true; break;
+                    if matches_selector_arena(ancestor_sel, p_idx, ctx) {
+                        return true;
                     }
                     current = arena[p_idx].parent_idx;
                 }
-                if !matched { return false; }
+                return false;
             }
             Combinator::Child => {
-                if let Some(p_idx) = node.parent_idx {
-                    if !matches_selector_arena(ancestor_sel, p_idx, arena, hovered_id, focused_id) { return false; }
-                } else { return false; }
+                return match node.parent_idx {
+                    Some(p_idx) => matches_selector_arena(ancestor_sel, p_idx, ctx),
+                    None => false,
+                };
             }
             Combinator::NextSibling => {
-                if let Some(p_idx) = node.parent_idx {
-                    let p_node = &arena[p_idx];
-                    let mut found = false;
-                    for &sib_idx in p_node.children_idx.iter().rev() {
-                        if sib_idx >= idx { continue; }
-                        if arena[sib_idx].is_element {
-                            if matches_selector_arena(ancestor_sel, sib_idx, arena, hovered_id, focused_id) { found = true; }
-                            break;
-                        }
-                    }
-                    if !found { return false; }
-                } else { return false; }
+                let sibs = element_siblings(idx, arena);
+                let pos = sibs.iter().position(|&s| s == idx).unwrap_or(0);
+                return pos > 0 && matches_selector_arena(ancestor_sel, sibs[pos - 1], ctx);
             }
             Combinator::SubsequentSibling => {
-                if let Some(p_idx) = node.parent_idx {
-                    let p_node = &arena[p_idx];
-                    let mut matched = false;
-                    for &sib_idx in &p_node.children_idx {
-                        if sib_idx >= idx { break; }
-                        if arena[sib_idx].is_element {
-                            if matches_selector_arena(ancestor_sel, sib_idx, arena, hovered_id, focused_id) {
-                                matched = true; break;
-                            }
-                        }
-                    }
-                    if !matched { return false; }
-                } else { return false; }
+                let sibs = element_siblings(idx, arena);
+                for &s in &sibs {
+                    if s == idx { break; }
+                    if matches_selector_arena(ancestor_sel, s, ctx) { return true; }
+                }
+                return false;
             }
         }
     }
     true
 }
 
+/// Presentational hints from HTML attributes. They sit below every author rule.
 fn apply_attribute_styles_arena(node: &NodeDataSend, map: &mut HashMap<Arc<str>, Value>) {
+    if attr_value(node, "hidden").is_some() {
+        map.insert(intern("display"), Value::Keyword(intern("none")));
+    }
     match node.tag.as_str() {
-        "table" | "td" | "th" => {
+        "table" | "td" | "th" | "col" | "tr" => {
             for (k, v) in &node.attrs {
                 if k == "width" {
                     if let Some(width) = parse_legacy_length_attr(v) {
                         map.insert(intern("width"), width);
+                    }
+                }
+                if k == "height" {
+                    if let Some(h) = parse_legacy_length_attr(v) {
+                        map.insert(intern("height"), h);
                     }
                 }
                 if k == "align" {
@@ -318,12 +440,17 @@ fn apply_attribute_styles_arena(node: &NodeDataSend, map: &mut HashMap<Arc<str>,
                         map.insert(intern("text-align"), Value::Keyword(intern(&align)));
                     }
                 }
+                if k == "bgcolor" {
+                    if let Some(c) = parse_color(v) {
+                        map.insert(intern("background-color"), Value::Color(c));
+                    }
+                }
             }
         }
-        "img" => {
+        "img" | "svg" | "video" | "canvas" | "iframe" | "embed" | "object" => {
             for (k, v) in &node.attrs {
-                if k == "width" { if let Ok(val) = v.trim_end_matches("px").parse::<f32>() { map.insert(intern("width"), Value::Length(val, crate::css::Unit::Px)); } }
-                if k == "height" { if let Ok(val) = v.trim_end_matches("px").parse::<f32>() { map.insert(intern("height"), Value::Length(val, crate::css::Unit::Px)); } }
+                if k == "width" { if let Some(val) = parse_legacy_length_attr(v) { map.insert(intern("width"), val); } }
+                if k == "height" { if let Some(val) = parse_legacy_length_attr(v) { map.insert(intern("height"), val); } }
             }
         }
         "font" => {
@@ -356,6 +483,62 @@ impl PropertyMap {
     }
 }
 
+/// Apply one cascaded declaration to a declared-value map.
+///
+/// A shorthand whose value still contains `var()` is stored unexpanded; it
+/// removes longhands set by earlier declarations so that, once expanded at
+/// computed-value time, it only fills longhands that no *later* declaration set.
+fn apply_declaration(map: &mut HashMap<Arc<str>, Value>, name: &Arc<str>, value: &Value) {
+    if matches!(value, Value::RawCustomProp(_)) && !name.starts_with("--") {
+        for lh in crate::css::shorthand_longhands(name) {
+            map.remove(*lh);
+        }
+    }
+    map.insert(name.clone(), value.clone());
+}
+
+fn collect_matches(
+    node: &NodeDataSend,
+    idx: usize,
+    sel_index: &SelectorIndex,
+    sig_cache: &HashMap<ElementSignature, Vec<(usize, usize, (usize, usize, usize))>>,
+    all_rules: &[&crate::css::Rule],
+    ctx: &MatchCtx,
+    target: PseudoTarget,
+) -> Vec<((usize, usize, usize), usize)> {
+    // (specificity, rule_idx) with the best specificity per rule.
+    let mut rule_matches: Vec<((usize, usize, usize), usize)> = Vec::new();
+    let mut push = |spec: (usize, usize, usize), rule_idx: usize| {
+        if let Some(existing) = rule_matches.iter_mut().find(|(_, r)| *r == rule_idx) {
+            if spec > existing.0 { existing.0 = spec; }
+        } else {
+            rule_matches.push((spec, rule_idx));
+        }
+    };
+    if target == PseudoTarget::None {
+        if let Some(simple) = sig_cache.get(&ElementSignature::from_node(node)) {
+            for &(rule_idx, _, spec) in simple {
+                push(spec, rule_idx);
+            }
+        }
+    }
+    for entry in sel_index.candidates(node) {
+        if entry.target != target {
+            continue;
+        }
+        if target == PseudoTarget::None && !entry.is_complex {
+            continue; // handled by the signature cache
+        }
+        let sel = &all_rules[entry.rule_idx].selectors[entry.sel_idx];
+        if matches_selector_arena(sel, idx, ctx) {
+            push(entry.specificity, entry.rule_idx);
+        }
+    }
+    // Cascade order: specificity, then source order.
+    rule_matches.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    rule_matches
+}
+
 /// Build a style tree, applying CSS rules, inline styles, and JS overrides.
 pub fn build_style_tree(
     root: &Handle,
@@ -369,37 +552,32 @@ pub fn build_style_tree(
     let mut arena = Vec::new();
     flatten_dom(root, &mut arena, None);
 
-    // Pre-build selector index: O(M) — done once before the parallel phase.
-    let sel_index = SelectorIndex::build(stylesheet);
     // Snapshot all_rules into a Vec so we can index into it by rule_idx.
     let all_rules: Vec<&crate::css::Rule> = stylesheet.all_rules();
+    // Pre-build selector index: O(M) — done once before the parallel phase.
+    let sel_index = SelectorIndex::build(&all_rules);
+    let keyframes = stylesheet.keyframes();
 
-    // Pre-build element signature cache for simple (no-combinator) selectors.
-    // Maps ElementSignature -> Vec<(specificity, rule_idx)>.
-    // Computed sequentially once; read-only inside par_iter (HashMap is Sync when V is Sync).
-    let mut sig_cache: HashMap<ElementSignature, Vec<(( usize, usize, usize), usize)>> = HashMap::new();
+    let ctx = MatchCtx { arena: &arena, hovered_id, focused_id };
+
+    // Pre-build element signature cache for simple (position-independent) selectors.
+    let mut sig_cache: HashMap<ElementSignature, Vec<(usize, usize, (usize, usize, usize))>> = HashMap::new();
     for (idx, node) in arena.iter().enumerate() {
         if !node.is_element { continue; }
         let sig = ElementSignature::from_node(node);
         if sig_cache.contains_key(&sig) { continue; }
-        // Gather simple-selector matches for this signature.
-        // "Simple" means no ancestor combinator — result is position-independent.
-        let candidates = sel_index.candidates(node);
-        let mut rule_best: HashMap<usize, (usize, usize, usize)> = HashMap::new();
-        for entry in &candidates {
-            if entry.is_complex { continue; } // skip; needs full DOM context
+        let mut matched = Vec::new();
+        for entry in sel_index.candidates(node) {
+            if entry.is_complex || entry.target != PseudoTarget::None { continue; }
             let sel = &all_rules[entry.rule_idx].selectors[entry.sel_idx];
-            if matches_selector_arena(sel, idx, &arena, hovered_id, focused_id) {
-                let e = rule_best.entry(entry.rule_idx).or_insert((0, 0, 0));
-                if entry.specificity > *e { *e = entry.specificity; }
+            if matches_selector_arena(sel, idx, &ctx) {
+                matched.push((entry.rule_idx, entry.sel_idx, entry.specificity));
             }
         }
-        let mut matched: Vec<((usize, usize, usize), usize)> = rule_best.into_iter().map(|(ridx, spec)| (spec, ridx)).collect();
-        matched.sort_by_key(|&(spec, _)| spec);
         sig_cache.insert(sig, matched);
     }
 
-    // Phase 1: Parallel CSS Matching (index-accelerated, O(N × bucket_size))
+    // Phase 1: Parallel CSS Matching + cascade (index-accelerated).
     //
     // Memory bound: cap at 4 threads so peak RSS stays bounded on large pages.
     // Static pool avoids recreating threads on every render call.
@@ -411,88 +589,179 @@ pub fn build_style_tree(
             .expect("CSS thread pool init failed")
     });
 
-    let mut raw_styles: Vec<HashMap<Arc<str>, Value>> = pool.install(|| {
+    let mut raw_styles: Vec<Cascaded> = pool.install(|| {
         arena.par_iter().enumerate().map(|(idx, node)| {
-        if !node.is_element { return HashMap::new(); }
+        if !node.is_element { return (HashMap::new(), None, None, None); }
         let mut map = HashMap::new();
-        apply_default_styles(&node.tag, &mut map);
+        apply_default_styles(&node.tag, node, &mut map);
+        apply_attribute_styles_arena(node, &mut map);
 
-        // --- Collect matching rules ---
-        // Use a Vec to track (rule_idx, max_specificity) without HashMap allocation.
-        let mut rule_matches: Vec<(usize, (usize, usize, usize))> = Vec::new();
-
-        // 1. Simple-selector matches via the signature cache (no DOM traversal needed).
-        // sig_cache is already deduped by rule_idx — extend directly, no find needed.
-        let sig = ElementSignature::from_node(node);
-        if let Some(simple_matches) = sig_cache.get(&sig) {
-            rule_matches.extend(simple_matches.iter().map(|&(spec, rule_idx)| (rule_idx, spec)));
-        }
-
-        // 2. Complex-selector matches via the index (need full DOM context for ancestor checks)
-        let candidates = sel_index.candidates(node);
-        for entry in &candidates {
-            if !entry.is_complex { continue; }
-            let sel = &all_rules[entry.rule_idx].selectors[entry.sel_idx];
-            if matches_selector_arena(sel, idx, &arena, hovered_id, focused_id) {
-                if let Some(existing) = rule_matches.iter_mut().find(|(ridx, _)| *ridx == entry.rule_idx) {
-                    if entry.specificity > existing.1 { existing.1 = entry.specificity; }
-                } else {
-                    rule_matches.push((entry.rule_idx, entry.specificity));
-                }
-            }
-        }
-
-        // Sort by specificity (ascending) so higher specificity overwrites lower
-        rule_matches.sort_by_key(|&(_, spec)| spec);
+        let rule_matches = collect_matches(node, idx, &sel_index, &sig_cache, &all_rules, &ctx, PseudoTarget::None);
 
         // Apply matched rules; defer important declarations.
-        // Only allocate `important` if needed (most nodes have no !important rules).
         let mut important: Vec<(Arc<str>, Value)> = Vec::new();
-        let mut inline_important: Vec<(Arc<str>, Value)> = Vec::new();
-        for (rule_idx, _) in &rule_matches {
+        for (_, rule_idx) in &rule_matches {
             for decl in &all_rules[*rule_idx].declarations {
-                if !decl.important { map.insert(decl.name.clone(), decl.value.clone()); }
+                if !decl.important { apply_declaration(&mut map, &decl.name, &decl.value); }
                 else { important.push((decl.name.clone(), decl.value.clone())); }
             }
         }
 
-        apply_attribute_styles_arena(node, &mut map);
-
-        if let Some(v) = node.attrs.iter().find(|(k, _)| k == "style").map(|(_, v)| v) {
-            let mut inline_map = Vec::new();
-            parse_inline_style_into_vec(v, &mut inline_map);
-            for decl in inline_map {
-                if !decl.important { map.insert(decl.name, decl.value); }
+        let mut inline_important: Vec<(Arc<str>, Value)> = Vec::new();
+        if let Some(v) = attr_value(node, "style") {
+            for decl in crate::css::parse_declaration_block(v) {
+                if !decl.important { apply_declaration(&mut map, &decl.name, &decl.value); }
                 else { inline_important.push((decl.name, decl.value)); }
             }
         }
 
-        for (k, v) in important { map.insert(k, v); }
-        for (k, v) in inline_important { map.insert(k, v); }
+        let important_names: HashSet<Arc<str>> =
+            important.iter().chain(inline_important.iter()).map(|(k, _)| k.clone()).collect();
+        for (k, v) in important { apply_declaration(&mut map, &k, &v); }
+        for (k, v) in inline_important { apply_declaration(&mut map, &k, &v); }
 
         if let Some(ref id) = node.id {
             if let Some(overrides) = js_overrides.get(id) {
-                for (k, v) in overrides { map.insert(intern(k), parse_value(v)); }
+                for (k, v) in overrides {
+                    let mut decls = Vec::new();
+                    let (val, _) = crate::css::strip_important(v);
+                    crate::css::parse_declaration(&k.to_ascii_lowercase(), val, false, &mut decls);
+                    for d in decls { apply_declaration(&mut map, &d.name, &d.value); }
+                }
             }
         }
-        map
+
+        // Animations sit above normal declarations and below !important ones.
+        if !keyframes.is_empty() {
+            for d in animation_declarations(&map, &keyframes) {
+                if !important_names.contains(&d.name) {
+                    apply_declaration(&mut map, &d.name, &d.value);
+                }
+            }
+        }
+
+        let pseudo = |target: PseudoTarget| -> Option<HashMap<Arc<str>, Value>> {
+            let matches = collect_matches(node, idx, &sel_index, &sig_cache, &all_rules, &ctx, target);
+            if matches.is_empty() { return None; }
+            let mut pmap = HashMap::new();
+            let mut imp = Vec::new();
+            for (_, rule_idx) in &matches {
+                for decl in &all_rules[*rule_idx].declarations {
+                    if !decl.important { apply_declaration(&mut pmap, &decl.name, &decl.value); }
+                    else { imp.push((decl.name.clone(), decl.value.clone())); }
+                }
+            }
+            for (k, v) in imp { apply_declaration(&mut pmap, &k, &v); }
+            Some(pmap)
+        };
+        let placeholder = if placeholder_text(node, &arena).is_some() {
+            // UA style (Chromium html.css); author rules override it.
+            let mut pmap = pseudo(PseudoTarget::Placeholder).unwrap_or_default();
+            for (k, v) in [
+                ("color", Value::Color(crate::css::Color { r: 0x75, g: 0x75, b: 0x75, a: 255 })),
+                ("display", Value::Keyword(intern("block"))),
+                ("white-space", Value::Keyword(intern("pre"))),
+                ("overflow-x", Value::Keyword(intern("hidden"))),
+                ("overflow-y", Value::Keyword(intern("hidden"))),
+            ] {
+                pmap.entry(intern(k)).or_insert(v);
+            }
+            Some(pmap)
+        } else {
+            None
+        };
+        (map, pseudo(PseudoTarget::Before), pseudo(PseudoTarget::After), placeholder)
     }).collect()
     });
 
-    // Phase 2: Sequential Inheritance & Deduplication
+    // Phase 2: Sequential Inheritance & computed values & pseudo-elements.
     let mut store = StyleStore::default();
     let mut arena_idx = 0;
-    let mut tree = build_final_tree(root, &mut arena_idx, &mut raw_styles, parent_style, &mut store);
+    build_final_tree(root, &mut arena_idx, &mut raw_styles, &arena, parent_style, &mut store)
+}
 
-    // Phase 3: Inject ::before / ::after pseudo-element children.
-    // For each element node in the tree, find CSS rules whose selectors have a
-    // matching pseudo_element ("before" or "after").  When a matching rule provides
-    // a `content` property that is not "none" or "normal", inject a synthetic text
-    // StyledNode as the first (before) or last (after) child of the element.
-    let all_rules: Vec<&crate::css::Rule> = stylesheet.all_rules();
-    inject_pseudo_elements(&mut tree, &all_rules);
-
-    tree
+/// Declarations that running CSS animations contribute when the page is
+/// rendered as a still frame. Every animation is treated as having run to
+/// completion: a finite animation keeps its end keyframe when
+/// `animation-fill-mode` is `forwards`/`both`; a paused one shows its start
+/// keyframe (during its delay only with `backwards`/`both`). Infinite
+/// animations and ones without a fill keep the base style. Only keyframes at
+/// the exact end offset contribute (no interpolation).
+fn animation_declarations(
+    map: &HashMap<Arc<str>, Value>,
+    keyframes: &HashMap<&str, &[crate::css::Keyframe]>,
+) -> Vec<crate::css::Declaration> {
+    let list = |name: &str| -> Vec<String> {
+        map.get(name)
+            .map(value_to_css_text)
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    let names: Vec<String> = map
+        .get("animation-name")
+        .map(value_to_css_text)
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+        .collect();
+    if names.iter().all(|n| n.is_empty() || n == "none") {
+        return Vec::new();
+    }
+    let counts = list("animation-iteration-count");
+    let directions = list("animation-direction");
+    let fills = list("animation-fill-mode");
+    let states = list("animation-play-state");
+    let delays = list("animation-delay");
+    let pick = |l: &Vec<String>, i: usize, d: &str| -> String {
+        if l.is_empty() { d.to_string() } else { l[i % l.len()].clone() }
+    };
+    let seconds = |t: &str| -> f32 {
+        if let Some(ms) = t.strip_suffix("ms") { ms.parse::<f32>().map(|v| v / 1000.0).unwrap_or(0.0) }
+        else { t.trim_end_matches('s').parse::<f32>().unwrap_or(0.0) }
+    };
+    let mut out = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        let Some(frames) = keyframes.get(name.as_str()) else { continue };
+        let fill = pick(&fills, i, "none");
+        let fills_forwards = matches!(fill.as_str(), "forwards" | "both");
+        let fills_backwards = matches!(fill.as_str(), "backwards" | "both");
+        let direction = pick(&directions, i, "normal");
+        let reversed_iteration = |iteration: u32| match direction.as_str() {
+            "reverse" => true,
+            "alternate" => iteration % 2 == 1,
+            "alternate-reverse" => iteration % 2 == 0,
+            _ => false,
+        };
+        let offset = if pick(&states, i, "running") == "paused" {
+            if !fills_backwards && seconds(&pick(&delays, i, "0s")) > 0.0 {
+                continue;
+            }
+            if reversed_iteration(0) { 1.0 } else { 0.0 }
+        } else {
+            let count = pick(&counts, i, "1");
+            let Ok(count) = count.parse::<f32>() else { continue }; // infinite
+            if !fills_forwards || count < 0.0 {
+                continue;
+            }
+            let (iteration, progress) = if count == 0.0 {
+                (0, 0.0)
+            } else if count.fract() == 0.0 {
+                (count as u32 - 1, 1.0)
+            } else {
+                (count.floor() as u32, count.fract())
+            };
+            if reversed_iteration(iteration) { 1.0 - progress } else { progress }
+        };
+        for frame in frames.iter() {
+            if frame.offsets.iter().any(|o| (o - offset).abs() < 1e-4) {
+                out.extend(frame.declarations.iter().cloned());
+            }
+        }
+    }
+    out
 }
 
 /// Returns the CSS initial value for a given property name, or `None` if not defined here.
@@ -514,6 +783,9 @@ fn initial_value(prop: &str) -> Option<Value> {
         "opacity"          => Some(Value::Number(1.0)),
         "border-width"     => Some(Value::Length(0.0, Unit::Px)),
         "border-style"     => Some(Value::Keyword(intern("none"))),
+        "white-space"      => Some(Value::Keyword(intern("normal"))),
+        "position"         => Some(Value::Keyword(intern("static"))),
+        "float"            => Some(Value::Keyword(intern("none"))),
         "margin-top" | "margin-right" | "margin-bottom" | "margin-left" |
         "padding-top" | "padding-right" | "padding-bottom" | "padding-left" =>
             Some(Value::Length(0.0, Unit::Px)),
@@ -521,9 +793,140 @@ fn initial_value(prop: &str) -> Option<Value> {
     }
 }
 
+/// Properties inherited by default (CSS 2.1 + commonly used modern ones).
+const INHERITED_PROPERTIES: &[&str] = &[
+    "color",
+    "font-size",
+    "font-family",
+    "font-weight",
+    "font-style",
+    "font-variant",
+    "line-height",
+    "letter-spacing",
+    "word-spacing",
+    "text-align",
+    "text-indent",
+    "text-transform",
+    "text-shadow",
+    "white-space",
+    "word-break",
+    "overflow-wrap",
+    "word-wrap",
+    "visibility",
+    "cursor",
+    "list-style-type",
+    "list-style-position",
+    "direction",
+    "quotes",
+    "border-collapse",
+    "border-spacing",
+    "caption-side",
+    "empty-cells",
+    "hyphens",
+    "tab-size",
+    "text-align-last",
+    "writing-mode",
+    "pointer-events",
+    "-webkit-text-fill-color",
+    "-webkit-font-smoothing",
+    "text-rendering",
+];
+
+fn is_inherited(prop: &str) -> bool {
+    INHERITED_PROPERTIES.contains(&prop)
+}
+
+/// Reserved key under which an element's custom properties are stored.
+pub const CUSTOM_PROPS_KEY: &str = "--";
+
 /// Maximum recursion depth for `var()` resolution, to prevent infinite loops from
 /// cyclic custom property references (e.g. `--a: var(--b); --b: var(--a)`).
 const VAR_RESOLVE_MAX_DEPTH: u32 = 32;
+
+/// Substitute every `var(--name[, fallback])` in `text` using `custom`.
+/// Returns `None` when a referenced property is missing and has no fallback
+/// (the declaration is then invalid at computed-value time).
+fn substitute_vars(text: &str, custom: &HashMap<Arc<str>, Value>, depth: u32) -> Option<String> {
+    if depth > VAR_RESOLVE_MAX_DEPTH {
+        return None;
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find("var(") {
+        // Make sure "var(" is not the tail of another identifier.
+        let prev_ok = pos == 0 || !rest[..pos].chars().last().map_or(false, |c| c.is_alphanumeric() || c == '-' || c == '_');
+        out.push_str(&rest[..pos]);
+        if !prev_ok {
+            out.push_str("var(");
+            rest = &rest[pos + 4..];
+            continue;
+        }
+        let args_start = pos + 4;
+        // find matching paren
+        let bytes = rest.as_bytes();
+        let mut depth_p = 1;
+        let mut j = args_start;
+        while j < bytes.len() {
+            match bytes[j] {
+                b'(' => depth_p += 1,
+                b')' => {
+                    depth_p -= 1;
+                    if depth_p == 0 { break; }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        let args = &rest[args_start..j.min(rest.len())];
+        let (name, fallback) = match crate::css::split_top_level(args, b',').as_slice() {
+            [n] => (n.trim().to_string(), None),
+            [n, ..] => {
+                let comma = args.find(',').unwrap_or(args.len());
+                (n.trim().to_string(), Some(args[comma + 1..].to_string()))
+            }
+            [] => (String::new(), None),
+        };
+        let replacement = match custom.get(name.as_str()) {
+            Some(Value::RawCustomProp(raw)) if !raw.trim().is_empty() || fallback.is_none() => {
+                substitute_vars(raw, custom, depth + 1)
+            }
+            Some(other) if !matches!(other, Value::RawCustomProp(_)) => Some(value_to_css_text(other)),
+            _ => match fallback {
+                Some(fb) => substitute_vars(fb.trim(), custom, depth + 1),
+                None => None,
+            },
+        }?;
+        out.push_str(&replacement);
+        rest = if j < rest.len() { &rest[j + 1..] } else { "" };
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// Best-effort serialization of a parsed value back to CSS text.
+fn value_to_css_text(v: &Value) -> String {
+    match v {
+        Value::Keyword(k) => k.to_string(),
+        Value::Length(n, u) => {
+            let unit = match u {
+                Unit::Px => "px",
+                Unit::Percent => "%",
+                Unit::Em => "em",
+                Unit::Rem => "rem",
+                Unit::Vw => "vw",
+                Unit::Vh => "vh",
+                Unit::Vmin => "vmin",
+                Unit::Vmax => "vmax",
+                Unit::Fr => "fr",
+            };
+            format!("{}{}", n, unit)
+        }
+        Value::Number(n) => format!("{}", n),
+        Value::Color(c) => format!("rgba({},{},{},{})", c.r, c.g, c.b, c.a as f32 / 255.0),
+        Value::RawCustomProp(s) => s.to_string(),
+        _ => String::new(),
+    }
+}
 
 /// Resolve `Value::CssVar` references using the provided custom properties map.
 /// `depth` tracks recursion depth; returns `None` when the limit is reached.
@@ -532,33 +935,328 @@ fn resolve_var(value: &Value, custom_props: &HashMap<Arc<str>, Value>, depth: u3
     if let Value::CssVar { name, fallback } = value {
         if let Some(raw) = custom_props.get(name) {
             if let Value::RawCustomProp(raw_str) = raw {
+                let text = substitute_vars(raw_str, custom_props, depth + 1)?;
                 // Re-parse the raw string as a CSS value at use time.
-                let resolved = crate::css::parse_value(raw_str);
-                // Recurse in case the resolved value is itself a var().
-                return Some(resolve_var_value(resolved, custom_props, depth + 1));
+                return Some(crate::css::parse_value(&text));
             }
         }
         // Custom property not found — use fallback if present.
         if let Some(fb) = fallback {
-            return Some(resolve_var_value(*fb.clone(), custom_props, depth + 1));
+            return match fb.as_ref() {
+                v @ Value::CssVar { .. } => resolve_var(v, custom_props, depth + 1),
+                v => Some(v.clone()),
+            };
         }
         return None;
     }
     None
 }
 
-/// Recursively resolve any `CssVar` values inside `value`.
-fn resolve_var_value(value: Value, custom_props: &HashMap<Arc<str>, Value>, depth: u32) -> Value {
-    match &value {
-        Value::CssVar { .. } => resolve_var(&value, custom_props, depth).unwrap_or(value),
-        _ => value,
+fn px_of(v: Option<&Value>) -> Option<f32> {
+    match v {
+        Some(Value::Length(n, Unit::Px)) => Some(*n),
+        _ => None,
     }
+}
+
+/// Resolve em/rem inside a `calc()` keyword to px so layout can evaluate it.
+fn absolutize_calc(expr: &str, em: f32, rem: f32) -> String {
+    let mut out = String::with_capacity(expr.len());
+    let chars: Vec<char> = expr.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let starts_number = c.is_ascii_digit() || (c == '.' && chars.get(i + 1).map_or(false, |d| d.is_ascii_digit()));
+        let prev_alpha = i > 0 && (chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '-');
+        if starts_number && !prev_alpha {
+            let mut j = i;
+            while j < chars.len() && (chars[j].is_ascii_digit() || chars[j] == '.') {
+                j += 1;
+            }
+            let mut k = j;
+            while k < chars.len() && chars[k].is_ascii_alphabetic() {
+                k += 1;
+            }
+            let num: f32 = chars[i..j].iter().collect::<String>().parse().unwrap_or(0.0);
+            let unit: String = chars[j..k].iter().collect();
+            match unit.as_str() {
+                "em" => out.push_str(&format!("{}px", num * em)),
+                "rem" => out.push_str(&format!("{}px", num * rem)),
+                _ => {
+                    out.extend(chars[i..k].iter());
+                }
+            }
+            i = k;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+fn font_weight_number(v: &Value, parent: f32) -> Option<f32> {
+    match v {
+        Value::Number(n) => Some(*n),
+        Value::Keyword(k) => match k.as_ref() {
+            "normal" => Some(400.0),
+            "bold" => Some(700.0),
+            "bolder" => Some(if parent < 350.0 { 400.0 } else if parent < 550.0 { 700.0 } else { 900.0 }),
+            "lighter" => Some(if parent < 550.0 { 100.0 } else if parent < 750.0 { 400.0 } else { 700.0 }),
+            _ => None,
+        },
+        Value::Length(n, _) => Some(*n),
+        _ => None,
+    }
+}
+
+/// Compute the final values of one node from its cascaded (declared) values.
+fn compute_values(
+    mut specified_values: HashMap<Arc<str>, Value>,
+    parent_pm: Option<&PropertyMap>,
+    root_fs: f32,
+    is_text: bool,
+) -> HashMap<Arc<str>, Value> {
+    // --- Step 1: custom properties (inherited) ---
+    // All custom properties live in one shared map under the `--` key; an
+    // element that declares none reuses its parent's map.
+    let parent_custom: Option<Arc<HashMap<Arc<str>, Value>>> = parent_pm.and_then(|p| match p.get(CUSTOM_PROPS_KEY) {
+        Some(Value::CustomProps(cp)) => Some(cp.0.clone()),
+        _ => None,
+    });
+    let own_custom: Vec<(Arc<str>, Value)> = specified_values
+        .iter()
+        .filter(|(k, _)| k.starts_with("--") && k.as_ref() != CUSTOM_PROPS_KEY)
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    for (k, _) in &own_custom {
+        specified_values.remove(k);
+    }
+    let custom_arc: Option<Arc<HashMap<Arc<str>, Value>>> = if own_custom.is_empty() {
+        parent_custom.clone()
+    } else {
+        let mut custom_props: HashMap<Arc<str>, Value> = parent_custom.as_deref().cloned().unwrap_or_default();
+        for (k, v) in &own_custom {
+            custom_props.insert(k.clone(), v.clone());
+        }
+        // Resolve var() references inside this element's own custom properties.
+        for (k, v) in &own_custom {
+            if let Value::RawCustomProp(raw) = v {
+                if raw.contains("var(") {
+                    match substitute_vars(raw, &custom_props, 0) {
+                        Some(text) => {
+                            custom_props.insert(k.clone(), Value::RawCustomProp(intern(&text)));
+                        }
+                        None => match parent_custom.as_ref().and_then(|p| p.get(k)) {
+                            Some(pv) => {
+                                custom_props.insert(k.clone(), pv.clone());
+                            }
+                            None => {
+                                custom_props.remove(k);
+                            }
+                        },
+                    }
+                }
+            }
+        }
+        Some(Arc::new(custom_props))
+    };
+    let empty_custom: HashMap<Arc<str>, Value> = HashMap::new();
+    let custom_props: &HashMap<Arc<str>, Value> = custom_arc.as_deref().unwrap_or(&empty_custom);
+    if let Some(ref arc) = custom_arc {
+        specified_values.insert(intern(CUSTOM_PROPS_KEY), Value::CustomProps(crate::css::CustomProps(arc.clone())));
+    }
+
+    // --- Step 2: substitute var() in ordinary declarations ---
+    let pending: Vec<(Arc<str>, Value)> = specified_values
+        .iter()
+        .filter(|(k, v)| !k.starts_with("--") && matches!(v, Value::RawCustomProp(_) | Value::CssVar { .. }))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    for (k, v) in pending {
+        specified_values.remove(&k);
+        match v {
+            Value::RawCustomProp(raw) => {
+                if let Some(text) = substitute_vars(&raw, custom_props, 0) {
+                    let mut decls = Vec::new();
+                    crate::css::parse_declaration(&k, &text, false, &mut decls);
+                    for d in decls {
+                        if d.name == k || !specified_values.contains_key(&d.name) {
+                            specified_values.insert(d.name, d.value);
+                        }
+                    }
+                }
+            }
+            v @ Value::CssVar { .. } => {
+                if let Some(r) = resolve_var(&v, custom_props, 0) {
+                    specified_values.insert(k, r);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // --- Step 3: Inherit inheritable properties (unless explicitly set) ---
+    if let Some(p) = parent_pm {
+        for prop in INHERITED_PROPERTIES {
+            let prop_arc = intern(prop);
+            if !specified_values.contains_key(&prop_arc) {
+                if let Some(v) = p.get(&prop_arc) {
+                    specified_values.insert(prop_arc, v.clone());
+                }
+            }
+        }
+        // Text decorations propagate to the text of inline descendants.
+        if is_text {
+            let td = intern("text-decoration");
+            if let Some(v) = p.get(&td) {
+                specified_values.insert(td, v.clone());
+            }
+        }
+    }
+
+    // --- Step 4: CSS-wide keywords ---
+    let keys: Vec<Arc<str>> = specified_values.keys().filter(|k| !k.starts_with("--")).cloned().collect();
+    for key in &keys {
+        let action = match specified_values.get(key) {
+            Some(Value::Keyword(kw)) => match kw.as_ref() {
+                "inherit" => 1,
+                "initial" => 2,
+                "unset" => if is_inherited(key) { 1 } else { 2 },
+                _ => 0,
+            },
+            _ => 0,
+        };
+        match action {
+            1 => match parent_pm.and_then(|p| p.get(key)).cloned().or_else(|| initial_value(key)) {
+                Some(v) => { specified_values.insert(key.clone(), v); }
+                None => { specified_values.remove(key); }
+            },
+            2 => match initial_value(key) {
+                Some(v) => { specified_values.insert(key.clone(), v); }
+                None => { specified_values.remove(key); }
+            },
+            _ => {}
+        }
+    }
+
+    // --- Step 5: font-size (needs parent font-size) ---
+    let fs_key = intern("font-size");
+    let parent_fs = parent_pm.and_then(|p| px_of(p.get(&fs_key))).unwrap_or(16.0);
+    if let Some(val) = specified_values.get(&fs_key).cloned() {
+        let resolved_fs = match &val {
+            Value::Length(v, Unit::Px) => Some(*v),
+            Value::Length(v, Unit::Percent) => Some(parent_fs * (v / 100.0)),
+            Value::Length(v, Unit::Em) => Some(parent_fs * v),
+            Value::Length(v, Unit::Rem) => Some(root_fs * v),
+            Value::Length(v, Unit::Vw) => Some(8.0 * v),
+            Value::Length(v, Unit::Vh) => Some(7.68 * v),
+            Value::Number(n) if *n == 0.0 => Some(0.0),
+            Value::Keyword(kw) => match kw.as_ref() {
+                "xx-small" => Some(9.0),
+                "x-small" => Some(10.0),
+                "small" => Some(13.0),
+                "medium" => Some(16.0),
+                "large" => Some(18.0),
+                "x-large" => Some(24.0),
+                "xx-large" => Some(32.0),
+                "xxx-large" => Some(48.0),
+                "smaller" => Some(parent_fs / 1.2),
+                "larger" => Some(parent_fs * 1.2),
+                k if k.starts_with("calc(") => {
+                    crate::css::eval_calc(k, &mut |n, u| match u {
+                        None | Some(Unit::Px) => Some(n),
+                        Some(Unit::Em) | Some(Unit::Percent) => Some(if matches!(u, Some(Unit::Percent)) { parent_fs * n / 100.0 } else { parent_fs * n }),
+                        Some(Unit::Rem) => Some(root_fs * n),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        match resolved_fs {
+            Some(fs) => { specified_values.insert(fs_key.clone(), Value::Length(fs, Unit::Px)); }
+            None => { specified_values.insert(fs_key.clone(), Value::Length(parent_fs, Unit::Px)); }
+        }
+    }
+    let own_fs = px_of(specified_values.get(&fs_key)).unwrap_or(parent_fs);
+
+    // --- Step 6: color / currentColor ---
+    let color_key = intern("color");
+    let own_color = match specified_values.get(&color_key).cloned() {
+        Some(Value::Keyword(kw)) if kw.as_ref() == "currentcolor" => parent_pm.and_then(|p| p.get(&color_key)).cloned(),
+        Some(Value::Color(c)) => Some(Value::Color(c)),
+        Some(_) => parent_pm.and_then(|p| p.get(&color_key)).cloned().or_else(|| initial_value("color")),
+        None => parent_pm.and_then(|p| p.get(&color_key)).cloned(),
+    };
+    if let Some(ref c) = own_color {
+        specified_values.insert(color_key.clone(), c.clone());
+    }
+
+    // --- Step 7: remaining relative values ---
+    let keys: Vec<Arc<str>> = specified_values
+        .keys()
+        .filter(|k| k.as_ref() != "font-size" && k.as_ref() != "color" && !k.starts_with("--"))
+        .cloned()
+        .collect();
+    for key in keys {
+        let val = specified_values[&key].clone();
+        let resolved = match &val {
+            Value::Keyword(kw) if kw.as_ref() == "currentcolor" => own_color.clone(),
+            Value::Length(n, Unit::Em) => Some(Value::Length(n * own_fs, Unit::Px)),
+            Value::Length(n, Unit::Rem) => Some(Value::Length(n * root_fs, Unit::Px)),
+            Value::Length(n, Unit::Vmin) => Some(Value::Length(*n, Unit::Vh)),
+            Value::Length(n, Unit::Vmax) => Some(Value::Length(*n, Unit::Vw)),
+            Value::Length(n, Unit::Percent) if key.as_ref() == "line-height" => {
+                Some(Value::Length(own_fs * n / 100.0, Unit::Px))
+            }
+            Value::Keyword(kw) if kw.starts_with("calc(") && (kw.contains("em") || kw.contains("rem")) => {
+                let text = absolutize_calc(kw, own_fs, root_fs);
+                Some(crate::css::parse_value(&text))
+            }
+            _ => None,
+        };
+        if let Some(r) = resolved {
+            specified_values.insert(key, r);
+        }
+    }
+
+    // opacity: out-of-range values clamp to [0, 1] (percentages become numbers).
+    let op_key = intern("opacity");
+    match specified_values.get(&op_key) {
+        Some(Value::Number(n)) if !(0.0..=1.0).contains(n) => {
+            let n = n.clamp(0.0, 1.0);
+            specified_values.insert(op_key, Value::Number(n));
+        }
+        Some(Value::Length(n, Unit::Percent)) => {
+            let n = (n / 100.0).clamp(0.0, 1.0);
+            specified_values.insert(op_key, Value::Number(n));
+        }
+        _ => {}
+    }
+
+    // font-weight: compute to a number (CSS Fonts 4), resolving bolder/lighter
+    // against the parent; the font matcher picks the nearest face weight.
+    let fw_key = intern("font-weight");
+    if let Some(v) = specified_values.get(&fw_key).cloned() {
+        let parent_w = parent_pm
+            .and_then(|p| p.get(&fw_key))
+            .and_then(|pv| font_weight_number(pv, 400.0))
+            .unwrap_or(400.0);
+        if let Some(w) = font_weight_number(&v, parent_w) {
+            specified_values.insert(fw_key, Value::Number(w.clamp(1.0, 1000.0)));
+        }
+    }
+
+    specified_values
 }
 
 fn build_final_tree(
     root: &Handle,
     arena_idx: &mut usize,
-    raw_styles: &mut [HashMap<Arc<str>, Value>],
+    raw_styles: &mut [Cascaded],
+    arena: &[NodeDataSend],
     initial_parent_style: Option<&PropertyMap>,
     store: &mut StyleStore
 ) -> StyledNode {
@@ -573,10 +1271,6 @@ fn build_final_tree(
     // `*arena_idx` LIVE when it is popped — by that point all preceding Pre frames have
     // already incremented the counter, so `*arena_idx` is the correct sequential index for
     // the current node, matching exactly how `flatten_dom` assigned indices in pre-order.
-    //
-    // Stack discipline (LIFO):
-    //   - Push children in REVERSE so the first child is at the top (popped first).
-    //   - Push Post BEFORE children so Post is processed AFTER all descendants finish.
 
     enum Frame {
         Pre {
@@ -587,6 +1281,9 @@ fn build_final_tree(
             handle: Handle,
             specified_values: PropertyMap,
             num_children: usize,
+            before: Option<StyledNode>,
+            after: Option<StyledNode>,
+            placeholder: Option<StyledNode>,
         },
     }
 
@@ -595,6 +1292,7 @@ fn build_final_tree(
         parent_pm: initial_parent_style.cloned(),
     }];
     let mut results: Vec<StyledNode> = Vec::new();
+    let mut root_fs: f32 = 16.0;
 
     while let Some(frame) = work.pop() {
         match frame {
@@ -603,150 +1301,41 @@ fn build_final_tree(
                 let current_idx = *arena_idx;
                 *arena_idx += 1;
 
-                // Compute specified_values: apply inheritance, defaults, em/% resolution.
-                let mut specified_values = std::mem::take(&mut raw_styles[current_idx]);
-
+                let (declared, before_decl, after_decl, placeholder_decl) = std::mem::take(&mut raw_styles[current_idx]);
+                let mut declared = declared;
                 if parent_pm.is_none() && current_idx == 0 {
-                    specified_values.entry(intern("color")).or_insert_with(|| Value::Color(crate::css::Color { r: 0, g: 0, b: 0, a: 255 }));
-                    specified_values.entry(intern("font-size")).or_insert_with(|| Value::Length(16.0, crate::css::Unit::Px));
+                    declared.entry(intern("color")).or_insert_with(|| Value::Color(crate::css::Color { r: 0, g: 0, b: 0, a: 255 }));
+                    declared.entry(intern("font-size")).or_insert_with(|| Value::Length(16.0, crate::css::Unit::Px));
                 }
+                let is_text = matches!(handle.data, NodeData::Text { .. });
+                let computed = compute_values(declared, parent_pm.as_ref(), root_fs, is_text);
+                if arena[current_idx].tag == "html" {
+                    if let Some(fs) = px_of(computed.get("font-size")) {
+                        root_fs = fs;
+                    }
+                }
+                let interned_map = store.intern(computed);
 
-                // --- Step 1: Collect custom properties from this element's map ---
-                // CSS custom properties are inherited by default.
-                let mut custom_props: HashMap<Arc<str>, Value> = HashMap::new();
-                // Inherit parent custom properties first.
-                if let Some(ref p) = parent_pm {
-                    for (k, v) in p.iter() {
-                        if k.starts_with("--") {
-                            custom_props.insert(k.clone(), v.clone());
-                            // Also insert into specified_values so they flow into the
-                            // PropertyMap and can be inherited by grandchildren.
-                            specified_values.entry(k.clone()).or_insert_with(|| v.clone());
-                        }
+                let make_pseudo = |decl: Option<HashMap<Arc<str>, Value>>, kind: &str| -> Option<StyledNode> {
+                    let decl = decl?;
+                    let pmap = compute_values(decl, Some(&interned_map), root_fs, false);
+                    let content = pseudo_content(pmap.get("content"), &arena[current_idx])?;
+                    if matches!(pmap.get("display"), Some(Value::Keyword(k)) if k.as_ref() == "none") {
+                        return None;
                     }
-                }
-                // Override/add with this element's own custom properties.
-                for (k, v) in &specified_values {
-                    if k.starts_with("--") {
-                        custom_props.insert(k.clone(), v.clone());
-                    }
-                }
-
-                // --- Step 2: Inherit inheritable properties (unless explicitly set) ---
-                if let Some(ref p) = parent_pm {
-                    let inheritable = [
-                        "color",
-                        "font-size",
-                        "font-family",
-                        "font-weight",
-                        "font-style",
-                        "line-height",
-                        "text-align",
-                        "list-style-type",
-                        "white-space",
-                    ];
-                    for prop in inheritable {
-                        let prop_arc = intern(prop);
-                        if let Some(v) = p.get(&prop_arc) {
-                            specified_values.entry(prop_arc).or_insert_with(|| v.clone());
-                        }
-                    }
-                }
-
-                // --- Step 3: Resolve font-size em/% first (needs parent font-size) ---
-                let fs_key = intern("font-size");
-                let parent_fs = parent_pm.as_ref()
-                    .and_then(|p| p.get(&fs_key))
-                    .and_then(|v| if let Value::Length(pv, crate::css::Unit::Px) = v { Some(*pv) } else { None })
-                    .unwrap_or(16.0);
-                if let Some(val) = specified_values.get(&fs_key) {
-                    let resolved_fs = match val {
-                        Value::Length(v, crate::css::Unit::Px) => Some(*v),
-                        Value::Length(v, crate::css::Unit::Percent) => Some(parent_fs * (v / 100.0)),
-                        Value::Length(v, crate::css::Unit::Em) => Some(parent_fs * v),
-                        Value::Keyword(kw) if kw.as_ref() == "inherit" => Some(parent_fs),
-                        Value::Keyword(kw) if kw.as_ref() == "initial" => Some(16.0),
-                        Value::CssVar { .. } => {
-                            resolve_var(val, &custom_props, 0)
-                                .and_then(|resolved| if let Value::Length(pv, crate::css::Unit::Px) = resolved { Some(pv) } else { None })
-                        }
-                        _ => None,
-                    };
-                    if let Some(fs) = resolved_fs {
-                        specified_values.insert(fs_key.clone(), Value::Length(fs, crate::css::Unit::Px));
-                    }
-                }
-                let own_fs = specified_values.get(&fs_key)
-                    .and_then(|v| if let Value::Length(pv, crate::css::Unit::Px) = v { Some(*pv) } else { None })
-                    .unwrap_or(parent_fs);
-
-                // --- Step 4: Resolve inherit / initial / var() / em (non-font-size) / currentColor ---
-                let color_key = intern("color");
-                // We need a snapshot of the current color for currentColor resolution.
-                // First resolve the color property itself if needed.
-                let own_color = {
-                    let color_val = specified_values.get(&color_key).cloned();
-                    match color_val.as_ref() {
-                        Some(Value::Keyword(kw)) if kw.as_ref() == "inherit" => {
-                            parent_pm.as_ref()
-                                .and_then(|p| p.get(&color_key))
-                                .cloned()
-                                .or_else(|| initial_value("color"))
-                        }
-                        Some(Value::Keyword(kw)) if kw.as_ref() == "initial" => initial_value("color"),
-                        Some(Value::CssVar { .. }) => {
-                            color_val.as_ref().and_then(|v| resolve_var(v, &custom_props, 0))
-                        }
-                        Some(v) => Some(v.clone()),
-                        None => parent_pm.as_ref().and_then(|p| p.get(&color_key)).cloned(),
-                    }
+                    Some(make_pseudo_styled_node(content, pmap, kind))
                 };
-                if let Some(ref c) = own_color {
-                    specified_values.insert(color_key.clone(), c.clone());
-                }
-
-                // Now resolve all other properties.
-                let keys: Vec<Arc<str>> = specified_values.keys()
-                    .filter(|k| k.as_ref() != "font-size" && k.as_ref() != "color" && !k.starts_with("--"))
-                    .cloned()
-                    .collect();
-                for key in keys {
-                    let val = specified_values[&key].clone();
-                    let resolved = match &val {
-                        Value::Keyword(kw) if kw.as_ref() == "inherit" => {
-                            parent_pm.as_ref()
-                                .and_then(|p| p.get(&key))
-                                .cloned()
-                                .or_else(|| initial_value(&key))
-                        }
-                        Value::Keyword(kw) if kw.as_ref() == "initial" => initial_value(&key),
-                        Value::Keyword(kw) if kw.as_ref().eq_ignore_ascii_case("currentcolor") => {
-                            own_color.clone()
-                        }
-                        Value::CssVar { .. } => {
-                            resolve_var(&val, &custom_props, 0).map(|v| {
-                                // After resolving var(), also resolve em/currentColor on the result.
-                                match &v {
-                                    Value::Length(n, crate::css::Unit::Em) => Value::Length(n * own_fs, crate::css::Unit::Px),
-                                    Value::Keyword(kw) if kw.as_ref().eq_ignore_ascii_case("currentcolor") => {
-                                        own_color.clone().unwrap_or(v.clone())
-                                    }
-                                    _ => v,
-                                }
-                            })
-                        }
-                        // Em resolution for non-font-size properties (resolves against own font-size).
-                        Value::Length(n, crate::css::Unit::Em) => {
-                            Some(Value::Length(n * own_fs, crate::css::Unit::Px))
-                        }
-                        _ => None,
-                    };
-                    if let Some(r) = resolved {
-                        specified_values.insert(key, r);
+                let before = if matches!(handle.data, NodeData::Element { .. }) { make_pseudo(before_decl, "::before") } else { None };
+                let after = if matches!(handle.data, NodeData::Element { .. }) { make_pseudo(after_decl, "::after") } else { None };
+                // `::placeholder` is shown while the control's value is empty.
+                let placeholder = placeholder_decl.and_then(|decl| {
+                    let text = placeholder_text(&arena[current_idx], arena)?;
+                    let pmap = compute_values(decl, Some(&interned_map), root_fs, false);
+                    if matches!(pmap.get("display"), Some(Value::Keyword(k)) if k.as_ref() == "none") {
+                        return None;
                     }
-                }
-
-                let interned_map = store.intern(specified_values);
+                    Some(make_pseudo_styled_node(text, pmap, "::placeholder"))
+                });
 
                 let children_handles: Vec<Handle> = handle.children.borrow().iter().cloned().collect();
                 let num_children = children_handles.len();
@@ -756,6 +1345,9 @@ fn build_final_tree(
                     handle,
                     specified_values: interned_map.clone(),
                     num_children,
+                    before,
+                    after,
+                    placeholder,
                 });
 
                 // Push Pre frames for children in REVERSE order so the first child
@@ -767,12 +1359,16 @@ fn build_final_tree(
                     });
                 }
             }
-            Frame::Post { handle, specified_values, num_children } => {
+            Frame::Post { handle, specified_values, num_children, before, after, placeholder } => {
                 // Children have all been processed and pushed onto `results`.
                 // Drain the last num_children entries — they are in forward order
                 // because children were pushed in reverse (LIFO gives forward order).
                 let start = results.len().saturating_sub(num_children);
-                let children: Vec<StyledNode> = results.drain(start..).collect();
+                let mut children: Vec<StyledNode> = Vec::with_capacity(num_children + 3);
+                if let Some(p) = placeholder { children.push(p); }
+                if let Some(b) = before { children.push(b); }
+                children.extend(results.drain(start..));
+                if let Some(a) = after { children.push(a); }
                 results.push(StyledNode {
                     node: handle,
                     specified_values,
@@ -785,93 +1381,165 @@ fn build_final_tree(
     results.pop().expect("build_final_tree: results stack should have exactly one element")
 }
 
-fn apply_default_styles(tag: &str, map: &mut HashMap<Arc<str>, Value>) {
+fn apply_default_styles(tag: &str, node: &NodeDataSend, map: &mut HashMap<Arc<str>, Value>) {
+    use crate::css::Unit::Px;
+    let px = |v: f32| Value::Length(v, Px);
+    let kw = |s: &str| Value::Keyword(intern(s));
+    let set = |map: &mut HashMap<Arc<str>, Value>, k: &str, v: Value| { map.entry(intern(k)).or_insert(v); };
+    let set_quad = |map: &mut HashMap<Arc<str>, Value>, prefix: &str, v: f32| {
+        for side in ["top", "right", "bottom", "left"] {
+            map.entry(intern(&format!("{}-{}", prefix, side))).or_insert(Value::Length(v, Px));
+        }
+    };
+    let set_border = |map: &mut HashMap<Arc<str>, Value>, w: f32, style: &str, c: crate::css::Color| {
+        map.entry(intern("border-width")).or_insert(Value::Length(w, Px));
+        map.entry(intern("border-style")).or_insert(Value::Keyword(intern(style)));
+        map.entry(intern("border-color")).or_insert(Value::Color(c.clone()));
+        for side in ["top", "right", "bottom", "left"] {
+            map.entry(intern(&format!("border-{}-width", side))).or_insert(Value::Length(w, Px));
+            map.entry(intern(&format!("border-{}-style", side))).or_insert(Value::Keyword(intern(style)));
+            map.entry(intern(&format!("border-{}-color", side))).or_insert(Value::Color(c.clone()));
+        }
+    };
+    let gray = crate::css::Color { r: 180, g: 180, b: 180, a: 255 };
     match tag {
         "h1" => {
-            map.entry(intern("font-size")).or_insert(Value::Length(32.0, crate::css::Unit::Px));
-            map.entry(intern("font-weight")).or_insert(Value::Keyword(intern("bold")));
-            map.entry(intern("margin-top")).or_insert(Value::Length(21.0, crate::css::Unit::Px));
-            map.entry(intern("margin-bottom")).or_insert(Value::Length(21.0, crate::css::Unit::Px));
+            set(map, "font-size", px(32.0));
+            set(map, "font-weight", kw("bold"));
+            set(map, "margin-top", px(21.0));
+            set(map, "margin-bottom", px(21.0));
         }
         "h2" => {
-            map.entry(intern("font-size")).or_insert(Value::Length(24.0, crate::css::Unit::Px));
-            map.entry(intern("font-weight")).or_insert(Value::Keyword(intern("bold")));
-            map.entry(intern("margin-top")).or_insert(Value::Length(14.0, crate::css::Unit::Px));
-            map.entry(intern("margin-bottom")).or_insert(Value::Length(14.0, crate::css::Unit::Px));
+            set(map, "font-size", px(24.0));
+            set(map, "font-weight", kw("bold"));
+            set(map, "margin-top", px(14.0));
+            set(map, "margin-bottom", px(14.0));
         }
         "h3" => {
-            map.entry(intern("font-size")).or_insert(Value::Length(18.0, crate::css::Unit::Px));
-            map.entry(intern("font-weight")).or_insert(Value::Keyword(intern("bold")));
+            set(map, "font-size", px(18.0));
+            set(map, "font-weight", kw("bold"));
         }
         "h4" | "h5" | "h6" => {
-            map.entry(intern("font-weight")).or_insert(Value::Keyword(intern("bold")));
+            set(map, "font-weight", kw("bold"));
         }
         "a" => {
-            map.entry(intern("color")).or_insert(Value::Color(parse_color("#0000ee").unwrap()));
-            map.entry(intern("text-decoration")).or_insert(Value::Keyword(intern("underline")));
+            set(map, "color", Value::Color(parse_color("#0000ee").unwrap()));
+            set(map, "text-decoration", kw("underline"));
         }
         "strong" | "b" => {
-            map.entry(intern("font-weight")).or_insert(Value::Keyword(intern("bold")));
+            set(map, "font-weight", kw("bold"));
         }
-        "em" | "i" => {
-            map.entry(intern("font-style")).or_insert(Value::Keyword(intern("italic")));
+        "em" | "i" | "cite" | "var" | "dfn" | "address" => {
+            set(map, "font-style", kw("italic"));
         }
         "code" | "pre" | "kbd" | "samp" => {
-            map.entry(intern("font-family")).or_insert(Value::Keyword(intern("monospace")));
-            map.entry(intern("background-color")).or_insert(Value::Color(crate::css::Color { r: 240, g: 240, b: 240, a: 255 }));
+            set(map, "font-family", kw("monospace"));
+            set(map, "background-color", Value::Color(crate::css::Color { r: 240, g: 240, b: 240, a: 255 }));
+            if tag == "pre" {
+                set(map, "white-space", kw("pre"));
+            }
         }
         "input" => {
-            map.entry(intern("border-width")).or_insert(Value::Length(1.0, crate::css::Unit::Px));
-            map.entry(intern("border-color")).or_insert(Value::Color(crate::css::Color { r: 180, g: 180, b: 180, a: 255 }));
-            map.entry(intern("background-color")).or_insert(Value::Color(crate::css::Color { r: 255, g: 255, b: 255, a: 255 }));
-            map.entry(intern("padding")).or_insert(Value::Length(4.0, crate::css::Unit::Px));
-            // UA defaults: HTML spec §14.3 — <input> default size = 20 chars ≈ 160 px at 13 px font.
-            map.entry(intern("width")).or_insert(Value::Length(160.0, crate::css::Unit::Px));
-            // Real browsers render single-line inputs at ~21 px; use 24 for legibility.
-            map.entry(intern("height")).or_insert(Value::Length(24.0, crate::css::Unit::Px));
+            let input_type = attr_value(node, "type").unwrap_or("text").to_ascii_lowercase();
+            if matches!(input_type.as_str(), "checkbox" | "radio") {
+                set(map, "width", px(13.0));
+                set(map, "height", px(13.0));
+                set_quad(map, "margin", 3.0);
+                return;
+            }
+            set_border(map, 1.0, "solid", gray);
+            set(map, "background-color", Value::Color(crate::css::Color { r: 255, g: 255, b: 255, a: 255 }));
+            set_quad(map, "padding", 4.0);
+            if matches!(input_type.as_str(), "submit" | "button" | "reset" | "image") {
+                set(map, "box-sizing", kw("border-box"));
+            } else {
+                // UA defaults: HTML spec §14.3 — <input> default size = 20 chars ≈ 160 px at 13 px font.
+                set(map, "width", px(160.0));
+                // Real browsers render single-line inputs at ~21 px; use 24 for legibility.
+                set(map, "height", px(24.0));
+            }
         }
         "textarea" => {
-            map.entry(intern("border-width")).or_insert(Value::Length(1.0, crate::css::Unit::Px));
-            map.entry(intern("border-color")).or_insert(Value::Color(crate::css::Color { r: 180, g: 180, b: 180, a: 255 }));
-            map.entry(intern("background-color")).or_insert(Value::Color(crate::css::Color { r: 255, g: 255, b: 255, a: 255 }));
-            map.entry(intern("padding")).or_insert(Value::Length(4.0, crate::css::Unit::Px));
+            set_border(map, 1.0, "solid", gray);
+            set(map, "background-color", Value::Color(crate::css::Color { r: 255, g: 255, b: 255, a: 255 }));
+            set_quad(map, "padding", 4.0);
             // UA defaults: cols=20, rows=2 → ~160 × 48 px.
-            map.entry(intern("width")).or_insert(Value::Length(160.0, crate::css::Unit::Px));
-            map.entry(intern("height")).or_insert(Value::Length(48.0, crate::css::Unit::Px));
+            set(map, "width", px(160.0));
+            set(map, "height", px(48.0));
+            set(map, "white-space", kw("pre-wrap"));
         }
         "select" => {
-            map.entry(intern("border-width")).or_insert(Value::Length(1.0, crate::css::Unit::Px));
-            map.entry(intern("border-color")).or_insert(Value::Color(crate::css::Color { r: 180, g: 180, b: 180, a: 255 }));
-            map.entry(intern("background-color")).or_insert(Value::Color(crate::css::Color { r: 255, g: 255, b: 255, a: 255 }));
-            map.entry(intern("padding")).or_insert(Value::Length(4.0, crate::css::Unit::Px));
-            map.entry(intern("width")).or_insert(Value::Length(120.0, crate::css::Unit::Px));
-            map.entry(intern("height")).or_insert(Value::Length(24.0, crate::css::Unit::Px));
+            set_border(map, 1.0, "solid", gray);
+            set(map, "background-color", Value::Color(crate::css::Color { r: 255, g: 255, b: 255, a: 255 }));
+            set_quad(map, "padding", 4.0);
+            set(map, "width", px(120.0));
+            set(map, "height", px(24.0));
+            set(map, "box-sizing", kw("border-box"));
         }
         "button" => {
-            map.entry(intern("border-width")).or_insert(Value::Length(1.0, crate::css::Unit::Px));
-            map.entry(intern("border-color")).or_insert(Value::Color(crate::css::Color { r: 180, g: 180, b: 180, a: 255 }));
-            map.entry(intern("background-color")).or_insert(Value::Color(crate::css::Color { r: 240, g: 240, b: 240, a: 255 }));
-            map.entry(intern("padding")).or_insert(Value::Length(4.0, crate::css::Unit::Px));
+            set_border(map, 1.0, "solid", gray);
+            set(map, "background-color", Value::Color(crate::css::Color { r: 240, g: 240, b: 240, a: 255 }));
+            set_quad(map, "padding", 4.0);
+            set(map, "box-sizing", kw("border-box"));
+            set(map, "text-align", kw("center"));
             // Width is content-driven (shrink-wrap in layout); enforce a minimum height.
-            map.entry(intern("min-height")).or_insert(Value::Length(24.0, crate::css::Unit::Px));
+            set(map, "min-height", px(24.0));
         }
         // <center> is a legacy presentational element — UA default maps it to a block
         // with text-align: center, matching browsers' built-in stylesheet.
         "center" => {
-            map.entry(intern("display")).or_insert(Value::Keyword(intern("block")));
-            map.entry(intern("text-align")).or_insert(Value::Keyword(intern("center")));
+            set(map, "display", kw("block"));
+            set(map, "text-align", kw("center"));
         }
-        "ul" => {
-            map.entry(intern("padding-left")).or_insert(Value::Length(40.0, crate::css::Unit::Px));
-            map.entry(intern("list-style-type")).or_insert(Value::Keyword(intern("disc")));
+        "ul" | "ol" | "menu" | "dir" => {
+            set(map, "padding-left", px(40.0));
+            set(map, "list-style-type", kw(if tag == "ol" { "decimal" } else { "disc" }));
         }
-        "ol" => {
-            map.entry(intern("padding-left")).or_insert(Value::Length(40.0, crate::css::Unit::Px));
-            map.entry(intern("list-style-type")).or_insert(Value::Keyword(intern("decimal")));
+        "dd" => {
+            set(map, "margin-left", px(40.0));
+        }
+        "blockquote" | "figure" => {
+            set(map, "margin-left", px(40.0));
+            set(map, "margin-right", px(40.0));
+            set(map, "margin-top", px(16.0));
+            set(map, "margin-bottom", px(16.0));
         }
         "p" => {
-            map.entry(intern("margin-top")).or_insert(Value::Length(8.0, crate::css::Unit::Px));
-            map.entry(intern("margin-bottom")).or_insert(Value::Length(8.0, crate::css::Unit::Px));
+            set(map, "margin-top", px(8.0));
+            set(map, "margin-bottom", px(8.0));
+        }
+        "td" | "th" => {
+            set_quad(map, "padding", 1.0);
+            if tag == "th" {
+                set(map, "font-weight", kw("bold"));
+            }
+        }
+        "table" => {
+            set(map, "border-spacing", px(2.0));
+        }
+        "hr" => {
+            set_border(map, 1.0, "inset", crate::css::Color { r: 238, g: 238, b: 238, a: 255 });
+            set(map, "margin-top", px(8.0));
+            set(map, "margin-bottom", px(8.0));
+        }
+        "sub" | "sup" => {
+            set(map, "vertical-align", kw(tag));
+            set(map, "font-size", Value::Length(83.0, crate::css::Unit::Percent));
+        }
+        "small" => {
+            set(map, "font-size", kw("smaller"));
+        }
+        "big" => {
+            set(map, "font-size", kw("larger"));
+        }
+        "u" | "ins" => {
+            set(map, "text-decoration", kw("underline"));
+        }
+        "s" | "strike" | "del" => {
+            set(map, "text-decoration", kw("line-through"));
+        }
+        "nobr" => {
+            set(map, "white-space", kw("nowrap"));
         }
         _ => {}
     }
@@ -897,177 +1565,162 @@ fn parse_legacy_length_attr(value: &str) -> Option<Value> {
         .map(|n| Value::Length(n, crate::css::Unit::Px))
 }
 
-// ── Pseudo-element injection ──────────────────────────────────────────────────
+// ── Pseudo-element generation ─────────────────────────────────────────────────
 
-/// Check whether a CSS selector (ignoring its `pseudo_element` field) matches a
-/// styled element node.  This is a simplified match: it only checks the
-/// rightmost part of the selector (tag / id / class) and does not walk ancestor
-/// combinators.  This is sufficient for the most common pseudo-element patterns
-/// (`p::before`, `.clearfix::after`, `div.foo::before`, etc.).
-///
-/// Returns `true` when the selector base matches `node`.
-fn selector_base_matches_element(sel: &crate::css::Selector, node: &StyledNode) -> bool {
-    use crate::css::Selector;
-    let (tag, id, classes) = match &node.node.data {
-        NodeData::Element { ref name, ref attrs, .. } => {
-            let t = name.local.to_string();
-            let mut id: Option<String> = None;
-            let mut classes: Vec<String> = Vec::new();
-            for attr in attrs.borrow().iter() {
-                let k = attr.name.local.to_string();
-                let v = attr.value.to_string();
-                if k == "id" { id = Some(v.clone()); }
-                if k == "class" {
-                    classes = v.split_whitespace().map(|s| s.to_string()).collect();
+/// Decode the `content` property into the generated text, or `None` when no
+/// box is generated (`none`, `normal`, missing).
+fn pseudo_content(content: Option<&Value>, element: &NodeDataSend) -> Option<String> {
+    let raw = match content? {
+        Value::Keyword(k) => k.to_string(),
+        _ => return None,
+    };
+    let raw = raw.trim();
+    if raw == "none" || raw == "normal" || raw.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    let chars: Vec<char> = raw.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '"' || c == '\'' {
+            let q = c;
+            i += 1;
+            while i < chars.len() && chars[i] != q {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    // CSS escape: hex code point or literal char
+                    let mut j = i + 1;
+                    let mut hex = String::new();
+                    while j < chars.len() && hex.len() < 6 && chars[j].is_ascii_hexdigit() {
+                        hex.push(chars[j]);
+                        j += 1;
+                    }
+                    if !hex.is_empty() {
+                        if let Some(ch) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                            out.push(ch);
+                        }
+                        if j < chars.len() && chars[j] == ' ' {
+                            j += 1;
+                        }
+                        i = j;
+                    } else {
+                        out.push(chars[i + 1]);
+                        i += 2;
+                    }
+                    continue;
+                }
+                out.push(chars[i]);
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        // Function or keyword token
+        let mut j = i;
+        while j < chars.len() && !chars[j].is_whitespace() && chars[j] != '(' {
+            j += 1;
+        }
+        let word: String = chars[i..j].iter().collect::<String>().to_ascii_lowercase();
+        if j < chars.len() && chars[j] == '(' {
+            let mut depth = 0;
+            let mut k = j;
+            while k < chars.len() {
+                if chars[k] == '(' { depth += 1; }
+                if chars[k] == ')' {
+                    depth -= 1;
+                    if depth == 0 { break; }
+                }
+                k += 1;
+            }
+            let args: String = chars[j + 1..k.min(chars.len())].iter().collect();
+            if word == "attr" {
+                if let Some(v) = attr_value(element, args.trim()) {
+                    out.push_str(v);
                 }
             }
-            (t, id, classes)
+            // url(), counter(), counters(): no text.
+            i = k + 1;
+            continue;
         }
-        _ => return false, // Only elements can have pseudo-elements
-    };
-
-    if let Some(ref s_tag) = sel.tag {
-        if *s_tag != tag { return false; }
+        match word.as_str() {
+            "open-quote" => out.push('\u{201C}'),
+            "close-quote" => out.push('\u{201D}'),
+            _ => {}
+        }
+        i = j;
     }
-    if let Some(ref s_id) = sel.id {
-        if id.as_deref() != Some(s_id) { return false; }
-    }
-    for s_class in &sel.class {
-        if !classes.contains(s_class) { return false; }
-    }
-    // Require at least one constraint to avoid matching everything with `*::before`.
-    let has_constraint = sel.tag.is_some() || sel.id.is_some() || !sel.class.is_empty();
-    has_constraint
+    Some(out)
 }
 
-/// Build a synthetic `StyledNode` that acts as a pseudo-element.
-///
-/// `content_text` — the text to inject (may be empty for block-level decorators).
-/// `pseudo_decls` — the CSS declarations from the matching rule.
-/// `parent_values` — the parent element's computed style, used to inherit properties.
+/// Build a synthetic element `StyledNode` for a `::before` / `::after` box, with
+/// a text child carrying the generated content (when non-empty).
 fn make_pseudo_styled_node(
     content_text: String,
-    pseudo_decls: &[crate::css::Declaration],
-    parent_values: &PropertyMap,
+    values: HashMap<Arc<str>, Value>,
+    kind: &str,
 ) -> StyledNode {
     use html5ever::tendril::StrTendril;
     use markup5ever_rcdom::Node;
 
-    // Create a real text node handle so that layout recognises it as a text run.
-    let text_handle = Node::new(NodeData::Text {
-        contents: std::cell::RefCell::new(StrTendril::from(content_text.as_str())),
+    let element = Node::new(NodeData::Element {
+        name: html5ever::QualName::new(None, html5ever::ns!(html), html5ever::LocalName::from(kind)),
+        attrs: std::cell::RefCell::new(Vec::new()),
+        template_contents: std::cell::RefCell::new(None),
+        mathml_annotation_xml_integration_point: false,
     });
-
-    // Build the property map: start with inheritable properties from parent, then
-    // apply the pseudo-element's own declarations on top.
-    let mut map: HashMap<Arc<str>, Value> = HashMap::new();
-
-    // Inherit a small set of properties from the parent element.
-    let inheritable = [
-        "color", "font-size", "font-family", "font-weight",
-        "font-style", "line-height", "text-align", "white-space",
-    ];
-    for prop in &inheritable {
-        let key = intern(prop);
-        if let Some(v) = parent_values.get(&key) {
-            map.insert(key, v.clone());
-        }
+    let values = PropertyMap(Arc::new(values));
+    let mut children = Vec::new();
+    if !content_text.is_empty() {
+        let text_handle = Node::new(NodeData::Text {
+            contents: std::cell::RefCell::new(StrTendril::from(content_text.as_str())),
+        });
+        let text_values = compute_values(HashMap::new(), Some(&values), 16.0, true);
+        children.push(StyledNode {
+            node: text_handle,
+            specified_values: PropertyMap(Arc::new(text_values)),
+            children: Vec::new(),
+        });
     }
-
-    // Apply pseudo-element declarations (skip `content` itself).
-    for decl in pseudo_decls {
-        if decl.name.as_ref() == "content" { continue; }
-        map.insert(decl.name.clone(), decl.value.clone());
-    }
-
-    StyledNode {
-        node: text_handle,
-        specified_values: PropertyMap(Arc::new(map)),
-        children: Vec::new(),
-    }
+    StyledNode { node: element, specified_values: values, children }
 }
 
-/// Compute which synthetic nodes to inject for a single element node.
-/// Returns `(before, after)` where each is `Some(StyledNode)` if a matching
-/// `::before` / `::after` rule with a valid `content` exists.
-fn compute_pseudo_injections(
-    node: &StyledNode,
-    all_rules: &[&crate::css::Rule],
-) -> (Option<StyledNode>, Option<StyledNode>) {
-    if !matches!(node.node.data, NodeData::Element { .. }) {
-        return (None, None);
-    }
-
-    let parent_values = &node.specified_values;
-    let mut before_node: Option<StyledNode> = None;
-    let mut after_node:  Option<StyledNode> = None;
-
-    for rule in all_rules {
-        for sel in &rule.selectors {
-            let pe = match &sel.pseudo_element {
-                Some(pe) => pe.as_str(),
-                None => continue,
-            };
-            if pe != "before" && pe != "after" { continue; }
-
-            if !selector_base_matches_element(sel, node) { continue; }
-
-            // Find `content` declaration; skip the rule if absent or suppressed.
-            let content_decl = rule.declarations.iter().find(|d| d.name.as_ref() == "content");
-            let content_str = match content_decl {
-                Some(decl) => match &decl.value {
-                    Value::Keyword(k) if matches!(k.as_ref(), "none" | "normal") => continue,
-                    Value::Keyword(k) => {
-                        // Strip wrapping quotes that the CSS parser preserves.
-                        let s = k.as_ref();
-                        if (s.starts_with('"') && s.ends_with('"'))
-                            || (s.starts_with('\'') && s.ends_with('\''))
-                        {
-                            s[1..s.len()-1].to_string()
-                        } else {
-                            s.to_string()
-                        }
-                    }
-                    _ => continue,
-                },
-                None => continue,
-            };
-
-            let synthetic = make_pseudo_styled_node(content_str, &rule.declarations, parent_values);
-            match pe {
-                "before" => { before_node = Some(synthetic); }
-                "after"  => { after_node  = Some(synthetic); }
-                _ => {}
+/// Placeholder text an `<input>`/`<textarea>` shows right now: its non-empty
+/// `placeholder` attribute while the value is empty (line breaks removed).
+fn placeholder_text(node: &NodeDataSend, arena: &[NodeDataSend]) -> Option<String> {
+    let text = attr_value(node, "placeholder")?;
+    match node.tag.as_str() {
+        "input" => {
+            let ty = attr_value(node, "type").unwrap_or("text").to_ascii_lowercase();
+            let text_like = matches!(
+                ty.as_str(),
+                "text" | "search" | "email" | "url" | "tel" | "password" | "number" | ""
+            );
+            if !text_like || attr_value(node, "value").is_some_and(|v| !v.is_empty()) {
+                return None;
             }
         }
+        "textarea" => {
+            if node.children_idx.iter().any(|&c| arena[c].has_text) {
+                return None;
+            }
+        }
+        _ => return None,
     }
-
-    (before_node, after_node)
+    let text: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+    if text.is_empty() { None } else { Some(text) }
 }
 
-/// Walk the entire styled tree and inject synthetic `::before` / `::after` children
-/// wherever a matching CSS rule with a valid `content` property exists.
-///
-/// Uses an iterative depth-first traversal via raw pointers to avoid stack
-/// overflows on deeply nested DOM trees (5 000+ levels).
-fn inject_pseudo_elements(tree: &mut StyledNode, all_rules: &[&crate::css::Rule]) {
-    // SAFETY: each raw pointer is derived from a live mutable reference.
-    // We never alias two mutable references to the same node simultaneously.
-    let mut work: Vec<*mut StyledNode> = vec![tree as *mut StyledNode];
+/// Returns true when this styled node is a generated `::before` / `::after` box.
+pub fn is_pseudo_element(node: &StyledNode) -> bool {
+    matches!(&node.node.data, NodeData::Element { name, .. } if name.local.starts_with("::"))
+}
 
-    while let Some(ptr) = work.pop() {
-        let node = unsafe { &mut *ptr };
-
-        // Step 1: inject pseudo-elements for this node FIRST, before pushing children.
-        let (before, after) = compute_pseudo_injections(node, all_rules);
-        if let Some(b) = before { node.children.insert(0, b); }
-        if let Some(a) = after  { node.children.push(a); }
-
-        // Step 2: push children onto the work stack after the Vec is stable.
-        for child in node.children.iter_mut().rev() {
-            work.push(child as *mut StyledNode);
-        }
-    }
+pub fn parse_inline_style_into_vec(style_str: &str, list: &mut Vec<crate::css::Declaration>) {
+    list.extend(crate::css::parse_declaration_block(style_str));
 }
 
 #[cfg(test)]
@@ -1138,9 +1791,9 @@ mod tests {
             "",
         );
         let html = find_node(&tree, "html").expect("html not found");
-        // inherit on root → initial value for font-weight is "normal"
-        let kw = get_keyword(html, "font-weight");
-        assert!(kw.is_none() || kw.as_deref() == Some("normal"));
+        // inherit on root → initial value for font-weight is normal (400)
+        let fw = html.specified_values.get(&intern("font-weight"));
+        assert!(fw.is_none() || fw == Some(&Value::Number(400.0)), "got {:?}", fw);
     }
 
     // --- initial keyword ---
@@ -1349,6 +2002,14 @@ mod tests {
             if let markup5ever_rcdom::NodeData::Text { ref contents } = child.node.data {
                 if contents.borrow().as_ref() == text { return true; }
             }
+            // Generated content lives in a synthetic ::before/::after element.
+            if is_pseudo_element(child) {
+                for grandchild in &child.children {
+                    if let markup5ever_rcdom::NodeData::Text { ref contents } = grandchild.node.data {
+                        if contents.borrow().as_ref() == text { return true; }
+                    }
+                }
+            }
         }
         false
     }
@@ -1459,6 +2120,167 @@ mod tests {
         assert!(s.pseudo_class.is_none());
     }
 
+    // --- cascade order, selectors, var() substitution ---
+
+    #[test]
+    fn test_equal_specificity_later_rule_wins() {
+        // Same specificity: source order decides, regardless of class order on the element.
+        let tree = make_tree(
+            r#"<html><body><p class="b a">text</p></body></html>"#,
+            ".a { color: red; } .b { color: blue; }",
+        );
+        let p = find_node(&tree, "p").unwrap();
+        assert_eq!(get_color(p, "color"), Some(Color { r: 0, g: 0, b: 255, a: 255 }));
+    }
+
+    #[test]
+    fn test_structural_pseudo_classes_match() {
+        let tree = make_tree(
+            r#"<html><body><ul><li>1</li><li class="x">2</li><li>3</li></ul></body></html>"#,
+            "li:first-child { width: 1px; } li:last-child { width: 3px; } li:nth-child(2) { height: 2px; } li:not(.x) { margin-top: 7px; }",
+        );
+        let ul = find_node(&tree, "ul").unwrap();
+        let lis: Vec<&StyledNode> = ul.children.iter().filter(|c| matches!(&c.node.data, NodeData::Element { .. })).collect();
+        assert_eq!(get_length_px(lis[0], "width"), Some(1.0));
+        assert_eq!(get_length_px(lis[2], "width"), Some(3.0));
+        assert_eq!(get_length_px(lis[1], "height"), Some(2.0));
+        assert_eq!(get_length_px(lis[0], "margin-top"), Some(7.0));
+        assert_eq!(get_length_px(lis[1], "margin-top"), None);
+    }
+
+    #[test]
+    fn test_attribute_operator_selectors_match() {
+        let tree = make_tree(
+            r#"<html data-theme="greenLight"><body><a href="https://naver.com/x" class="link_a">x</a></body></html>"#,
+            "html[data-theme=greenDark] a { width: 1px; } html[data-theme=greenLight] a { height: 2px; } a[href^='https'] { margin-top: 3px; } a[class*=nk_] { margin-left: 4px; }",
+        );
+        let a = find_node(&tree, "a").unwrap();
+        assert_eq!(get_length_px(a, "width"), None);
+        assert_eq!(get_length_px(a, "height"), Some(2.0));
+        assert_eq!(get_length_px(a, "margin-top"), Some(3.0));
+        assert_eq!(get_length_px(a, "margin-left"), Some(4.0));
+    }
+
+    #[test]
+    fn test_universal_selector_applies() {
+        let tree = make_tree(r#"<html><body><div>x</div></body></html>"#, "* { box-sizing: border-box; }");
+        let div = find_node(&tree, "div").unwrap();
+        assert_eq!(get_keyword(div, "box-sizing").as_deref(), Some("border-box"));
+    }
+
+    #[test]
+    fn test_rem_resolves_against_root_font_size() {
+        let tree = make_tree(
+            r#"<html><body><div><p>x</p></div></body></html>"#,
+            "html { font-size: 10.5px; } div { font-size: 30px; } p { font-size: 1.4rem; margin-top: 2rem; }",
+        );
+        let p = find_node(&tree, "p").unwrap();
+        assert!((get_length_px(p, "font-size").unwrap() - 14.7).abs() < 0.01);
+        assert!((get_length_px(p, "margin-top").unwrap() - 21.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_var_inside_shorthand_expands_after_substitution() {
+        let tree = make_tree(
+            r#"<html><body><div>x</div></body></html>"#,
+            ":root { --gap: 12px; --line: #ff0000; } div { padding: 0 var(--gap); border-bottom: 1px solid var(--line); padding-left: 3px; }",
+        );
+        let div = find_node(&tree, "div").unwrap();
+        assert_eq!(get_length_px(div, "padding-right"), Some(12.0));
+        // A later longhand beats the var() shorthand.
+        assert_eq!(get_length_px(div, "padding-left"), Some(3.0));
+        assert_eq!(get_color(div, "border-bottom-color"), Some(Color { r: 255, g: 0, b: 0, a: 255 }));
+    }
+
+    #[test]
+    fn test_var_resolved_in_box_shadow_layers_and_gradient() {
+        let tree = make_tree(
+            r#"<html><body><div>x</div></body></html>"#,
+            ":root { --stroke: #e3e5e8; --a: #ffffff; --b: #000000; } div { box-shadow: 0 0 0 1px var(--stroke), 0 1px 2px rgba(0,0,0,.04); background-image: linear-gradient(var(--a), var(--b)); }",
+        );
+        let div = find_node(&tree, "div").unwrap();
+        match div.specified_values.get(&intern("box-shadow-layers")) {
+            Some(Value::BoxShadowList(layers)) => {
+                assert_eq!(layers.len(), 2);
+                assert_eq!(layers[0].color, Color { r: 0xe3, g: 0xe5, b: 0xe8, a: 255 });
+            }
+            other => panic!("expected box-shadow-layers list, got {:?}", other),
+        }
+        match div.specified_values.get(&intern("background-image")) {
+            Some(Value::Gradient(crate::css::GradientValue::Linear { stops, .. })) => {
+                assert_eq!(stops.len(), 2);
+                assert_eq!(stops[0].color, Color { r: 255, g: 255, b: 255, a: 255 });
+            }
+            other => panic!("expected gradient, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_pseudo_element_respects_ancestor_selector() {
+        // `.on .x::before` must not generate a box for `.x` outside `.on`.
+        let tree = make_tree(
+            r#"<html><body><div class="off"><span class="x">a</span></div></body></html>"#,
+            r#".on .x::before { content: ""; display: block; }"#,
+        );
+        let span = find_node(&tree, "span").unwrap();
+        assert!(!span.children.iter().any(is_pseudo_element));
+    }
+
+    #[test]
+    fn test_pseudo_element_is_element_box_with_own_style() {
+        let tree = make_tree(
+            r#"<html><body><div class="cf">content</div></body></html>"#,
+            r#".cf::after { content: ""; display: table; clear: both; width: 5px; }"#,
+        );
+        let div = find_node(&tree, "div").unwrap();
+        let after = div.children.last().unwrap();
+        assert!(is_pseudo_element(after));
+        assert_eq!(get_length_px(after, "width"), Some(5.0));
+        assert!(after.children.is_empty(), "empty content generates no text child");
+    }
+
+    #[test]
+    fn test_url_with_at_sign_does_not_break_following_rules() {
+        let tree = make_tree(
+            r#"<html><body><p class="a">x</p></body></html>"#,
+            ".z { background: url(https://x/@bg_1.png) 0 0 no-repeat #fff; } .a { color: rgb(1, 2, 3); }",
+        );
+        let p = find_node(&tree, "p").unwrap();
+        assert_eq!(get_color(p, "color"), Some(Color { r: 1, g: 2, b: 3, a: 255 }));
+    }
+
+    #[test]
+    fn test_hidden_attribute_sets_display_none() {
+        let tree = make_tree(r#"<html><body><div hidden>x</div></body></html>"#, "");
+        let div = find_node(&tree, "div").unwrap();
+        assert_eq!(get_keyword(div, "display").as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn test_opacity_computes_clamped_number() {
+        let tree = make_tree(
+            r#"<html><body><p style="opacity:-56.81">x</p><i style="opacity:40%">y</i></body></html>"#,
+            "",
+        );
+        let op = |tag: &str| find_node(&tree, tag).unwrap().specified_values.get(&intern("opacity")).cloned();
+        assert_eq!(op("p"), Some(Value::Number(0.0)));
+        assert_eq!(op("i"), Some(Value::Number(0.4)));
+    }
+
+    #[test]
+    fn test_font_weight_computes_to_number() {
+        let tree = make_tree(
+            r#"<html><body><p>x<b>y</b></p><i>z</i></body></html>"#,
+            "body { font-weight: 500 } p { font-weight: 800; } i { font-weight: bolder }",
+        );
+        let fw = |tag: &str| find_node(&tree, tag).unwrap().specified_values.get(&intern("font-weight")).cloned();
+        assert_eq!(fw("p"), Some(Value::Number(800.0)));
+        assert_eq!(fw("body"), Some(Value::Number(500.0)));
+        // UA `b { font-weight: bold }` is 700; `bolder` from 500 is 700.
+        assert_eq!(fw("b"), Some(Value::Number(700.0)));
+        assert_eq!(fw("i"), Some(Value::Number(700.0)));
+    }
+
     #[test]
     fn test_parse_selector_pseudo_class_unchanged() {
         use crate::css::parse_selector;
@@ -1467,154 +2289,41 @@ mod tests {
         assert_eq!(s.pseudo_class, Some("hover".to_string()));
         assert!(s.pseudo_element.is_none());
     }
-}
 
-pub fn parse_inline_style_into_vec(style_str: &str, list: &mut Vec<crate::css::Declaration>) {
-    for decl in style_str.split(';') {
-        let decl = decl.trim();
-        if decl.is_empty() { continue; }
-        let mut kv = decl.splitn(2, ':');
-        let key = intern(&kv.next().unwrap_or("").trim().to_lowercase());
-        let val_raw = kv.next().unwrap_or("").trim();
-        if key.is_empty() || val_raw.is_empty() { continue; }
+    fn transform_of(node: &StyledNode) -> Option<Value> {
+        node.specified_values.get(&intern("transform")).cloned()
+    }
 
-        let important = val_raw.ends_with("!important");
-        let val = if important { val_raw.trim_end_matches("!important").trim() } else { val_raw };
+    #[test]
+    fn test_finished_animation_with_fill_forwards_keeps_end_keyframe() {
+        // Keyframes names are case-sensitive (CSS Modules hashes mix case).
+        let css = ".r{width:100%;animation-fill-mode:forwards;animation-name:Roll___2LIf-}\
+                   @keyframes Roll___2LIf-{0%{transform:none}to{transform:translateY(-100%)}}";
+        let tree = make_tree(r#"<div class="r" style="animation-duration: .5s;">x</div>"#, css);
+        let div = find_node(&tree, "div").unwrap();
+        assert!(matches!(transform_of(div), Some(Value::Transform(_))), "got {:?}", transform_of(div));
+    }
 
-        match &*key {
-            "border" => {
-                let mut temp_map = HashMap::new();
-                crate::css::parse_border_shorthand_pub(val, &mut temp_map);
-                for (k, v) in temp_map {
-                    list.push(crate::css::Declaration { name: intern(&k), value: v, important });
-                }
-            }
-            "padding" => {
-                let mut temp_map = HashMap::new();
-                crate::css::parse_quad_shorthand(intern("padding").as_ref(), val, &mut temp_map);
-                for (k, v) in temp_map {
-                    list.push(crate::css::Declaration { name: intern(&k), value: v, important });
-                }
-            }
-            "margin" => {
-                let mut temp_map = HashMap::new();
-                crate::css::parse_quad_shorthand(intern("margin").as_ref(), val, &mut temp_map);
-                for (k, v) in temp_map {
-                    list.push(crate::css::Declaration { name: intern(&k), value: v, important });
-                }
-            }
-            "inset" => {
-                // inset shorthand maps to top/right/bottom/left (same quad syntax).
-                let parts: Vec<&str> = val.split_whitespace().collect();
-                let (top, right, bottom, left) = match parts.len() {
-                    1 => (parts[0], parts[0], parts[0], parts[0]),
-                    2 => (parts[0], parts[1], parts[0], parts[1]),
-                    3 => (parts[0], parts[1], parts[2], parts[1]),
-                    4 => (parts[0], parts[1], parts[2], parts[3]),
-                    _ => ("0", "0", "0", "0"),
-                };
-                use crate::css::parse_value;
-                list.push(crate::css::Declaration { name: intern("top"),    value: parse_value(top),    important });
-                list.push(crate::css::Declaration { name: intern("right"),  value: parse_value(right),  important });
-                list.push(crate::css::Declaration { name: intern("bottom"), value: parse_value(bottom), important });
-                list.push(crate::css::Declaration { name: intern("left"),   value: parse_value(left),   important });
-            }
-            "flex" => {
-                let parts: Vec<&str> = val.split_whitespace().collect();
-                match parts.len() {
-                    0 => {}
-                    1 => match parts[0] {
-                        "none" => {
-                            list.push(crate::css::Declaration { name: intern("flex-grow"), value: crate::css::Value::Number(0.0), important });
-                            list.push(crate::css::Declaration { name: intern("flex-shrink"), value: crate::css::Value::Number(0.0), important });
-                            list.push(crate::css::Declaration { name: intern("flex-basis"), value: crate::css::Value::Keyword(intern("auto")), important });
-                        }
-                        "auto" => {
-                            list.push(crate::css::Declaration { name: intern("flex-grow"), value: crate::css::Value::Number(1.0), important });
-                            list.push(crate::css::Declaration { name: intern("flex-shrink"), value: crate::css::Value::Number(1.0), important });
-                            list.push(crate::css::Declaration { name: intern("flex-basis"), value: crate::css::Value::Keyword(intern("auto")), important });
-                        }
-                        _ => {
-                            if let Ok(n) = parts[0].parse::<f32>() {
-                                list.push(crate::css::Declaration { name: intern("flex-grow"), value: crate::css::Value::Number(n), important });
-                                list.push(crate::css::Declaration { name: intern("flex-shrink"), value: crate::css::Value::Number(1.0), important });
-                                list.push(crate::css::Declaration { name: intern("flex-basis"), value: crate::css::Value::Length(0.0, crate::css::Unit::Percent), important });
-                            }
-                        }
-                    },
-                    2 => {
-                        if let (Ok(g), Ok(s)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>()) {
-                            list.push(crate::css::Declaration { name: intern("flex-grow"), value: crate::css::Value::Number(g), important });
-                            list.push(crate::css::Declaration { name: intern("flex-shrink"), value: crate::css::Value::Number(s), important });
-                        } else if let Ok(g) = parts[0].parse::<f32>() {
-                            list.push(crate::css::Declaration { name: intern("flex-grow"), value: crate::css::Value::Number(g), important });
-                            list.push(crate::css::Declaration { name: intern("flex-shrink"), value: crate::css::Value::Number(1.0), important });
-                            list.push(crate::css::Declaration {
-                                name: intern("flex-basis"),
-                                value: crate::css::parse_value(parts[1]),
-                                important,
-                            });
-                        }
-                    }
-                    _ => {
-                        if let (Ok(g), Ok(s)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>()) {
-                            list.push(crate::css::Declaration { name: intern("flex-grow"), value: crate::css::Value::Number(g), important });
-                            list.push(crate::css::Declaration { name: intern("flex-shrink"), value: crate::css::Value::Number(s), important });
-                            list.push(crate::css::Declaration {
-                                name: intern("flex-basis"),
-                                value: crate::css::parse_value(parts[2]),
-                                important,
-                            });
-                        }
-                    }
-                }
-            }
-            "gap" => {
-                let parts: Vec<&str> = val.split_whitespace().collect();
-                let row_val = parts
-                    .first()
-                    .map(|s| crate::css::parse_value(s))
-                    .unwrap_or(crate::css::Value::Number(0.0));
-                let col_val = parts
-                    .get(1)
-                    .map(|s| crate::css::parse_value(s))
-                    .unwrap_or_else(|| row_val.clone());
-                list.push(crate::css::Declaration { name: intern("row-gap"), value: row_val, important });
-                list.push(crate::css::Declaration { name: intern("column-gap"), value: col_val, important });
-            }
-            // border-radius shorthand: "border-radius: <tl> [<tr> [<br> [<bl>]]]"
-            // Use the first (top-left) value as a uniform radius.  The "/" elliptical syntax
-            // is not supported; we take the text before any "/" as the horizontal radii list
-            // and use the first token from that.
-            "border-radius" => {
-                let first = val.split_whitespace().next().unwrap_or("0");
-                let first = first.split('/').next().unwrap_or("0").trim();
-                let value = crate::css::parse_value(first);
-                list.push(crate::css::Declaration { name: key, value, important });
-            }
-            "box-shadow" => {
-                if let Some(shadow) = crate::css::parse_box_shadow(val) {
-                    list.push(crate::css::Declaration {
-                        name: key,
-                        value: crate::css::Value::BoxShadow(shadow),
-                        important,
-                    });
-                }
-                // box-shadow: none → no declaration (no shadow rendered)
-            }
-            _ => {
-                // CSS custom properties (--foo) in inline styles keep their raw string value.
-                let value = if key.starts_with("--") {
-                    crate::css::Value::RawCustomProp(crate::css::intern(val))
-                } else {
-                    parse_value(val)
-                };
-                list.push(crate::css::Declaration {
-                    name: key,
-                    value,
-                    important,
-                });
-            }
-        }
+    #[test]
+    fn test_animation_without_fill_or_infinite_keeps_base_style() {
+        let css = "@keyframes fade{from{opacity:0}to{opacity:0.5}}\
+                   .a{animation:fade 1s} .b{animation:fade 1s infinite forwards} .c{animation:fade 1s forwards}";
+        let tree = make_tree(r#"<p class="a">a</p><span class="b">b</span><i class="c">c</i>"#, css);
+        let op = |tag: &str| find_node(&tree, tag).unwrap().specified_values.get(&intern("opacity")).cloned();
+        assert_eq!(op("p"), None);
+        assert_eq!(op("span"), None);
+        assert_eq!(op("i"), Some(Value::Number(0.5)));
+    }
+
+    #[test]
+    fn test_animation_direction_and_important() {
+        let css = "@keyframes m{from{opacity:0.25}to{opacity:0.75}}\
+                   .rev{animation:m 1s reverse forwards} .alt{animation:m 1s 2 alternate both}\
+                   .imp{animation:m 1s forwards; opacity:1 !important}";
+        let tree = make_tree(r#"<p class="rev">a</p><span class="alt">b</span><i class="imp">c</i>"#, css);
+        let op = |tag: &str| find_node(&tree, tag).unwrap().specified_values.get(&intern("opacity")).cloned();
+        assert_eq!(op("p"), Some(Value::Number(0.25)));
+        assert_eq!(op("span"), Some(Value::Number(0.25)));
+        assert_eq!(op("i"), Some(Value::Number(1.0)));
     }
 }

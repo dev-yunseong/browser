@@ -4,12 +4,15 @@ use std::collections::HashMap;
 
 pub mod dom;
 pub mod css;
+pub mod background;
 pub mod style;
 pub mod layout;
 pub mod render;
+pub mod fonts;
 pub mod layer_tree;
 pub mod js;
 pub mod matrix;
+pub mod svg;
 pub mod engine;
 
 struct BrowserApp {
@@ -68,7 +71,7 @@ impl BrowserApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // Load Korean font
         let mut fonts = egui::FontDefinitions::default();
-        let nanum_data = include_bytes!("../assets/fonts/NanumGothic.ttf");
+        let nanum_data = fonts::EMBEDDED_FALLBACK;
         fonts.font_data.insert(
             "nanum".to_owned(),
             egui::FontData::from_static(nanum_data),
