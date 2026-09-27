@@ -153,13 +153,13 @@ fn composite_layer_to_surface(
     let (negative, zero, positive) = tree.categorize_children(layer_id);
 
     if let Some(ref mut pixmap) = effect_pixmap {
-        execute_commands_on_tile(&layer.background_commands, pixmap, layer.bounds, image_cache, base_url);
+        execute_commands_with_clips(&layer.background_commands, pixmap, layer.bounds, image_cache, base_url, &layer.ancestor_clips);
 
         for &child_id in &negative {
             composite_layer_to_surface(child_id, tree, pixmap, layer.bounds, image_cache, base_url);
         }
 
-        execute_commands_on_tile(&layer.content_commands, pixmap, layer.bounds, image_cache, base_url);
+        execute_commands_with_clips(&layer.content_commands, pixmap, layer.bounds, image_cache, base_url, &layer.ancestor_clips);
 
         for &child_id in &zero {
             composite_layer_to_surface(child_id, tree, pixmap, layer.bounds, image_cache, base_url);
@@ -168,13 +168,13 @@ fn composite_layer_to_surface(
             composite_layer_to_surface(child_id, tree, pixmap, layer.bounds, image_cache, base_url);
         }
     } else {
-        execute_commands_on_tile(&layer.background_commands, target, surface_rect, image_cache, base_url);
+        execute_commands_with_clips(&layer.background_commands, target, surface_rect, image_cache, base_url, &layer.ancestor_clips);
 
         for &child_id in &negative {
             composite_layer_to_surface(child_id, tree, target, surface_rect, image_cache, base_url);
         }
 
-        execute_commands_on_tile(&layer.content_commands, target, surface_rect, image_cache, base_url);
+        execute_commands_with_clips(&layer.content_commands, target, surface_rect, image_cache, base_url, &layer.ancestor_clips);
 
         for &child_id in &zero {
             composite_layer_to_surface(child_id, tree, target, surface_rect, image_cache, base_url);
@@ -212,6 +212,10 @@ fn build_clip_mask(
 ) -> Option<Mask> {
     if pw == 0 || ph == 0 { return None; }
     let mut m = Mask::new(pw, ph)?;
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        // An empty clip hides everything; a `None` mask would mean "unclipped".
+        return Some(m);
+    }
 
     let local_rect = LayoutRect { x: rect.x + tx, y: rect.y + ty, width: rect.width, height: rect.height };
     let path = if radius > 0.0 {
@@ -240,6 +244,22 @@ fn execute_commands_on_tile(
     image_cache: &HashMap<String, Vec<u8>>,
     base_url: &Url,
 ) {
+    execute_commands_with_clips(commands, pixmap, tile_rect, image_cache, base_url, &[]);
+}
+
+/// Like `execute_commands_on_tile`, but starts from the clip regions a layer
+/// inherits from its ancestors.
+fn execute_commands_with_clips(
+    commands: &[PaintCommand],
+    pixmap: &mut Pixmap,
+    tile_rect: LayoutRect,
+    image_cache: &HashMap<String, Vec<u8>>,
+    base_url: &Url,
+    ancestor_clips: &[crate::layer_tree::ClipRegion],
+) {
+    if commands.is_empty() {
+        return;
+    }
     let tx = -tile_rect.x;
     let ty = -tile_rect.y;
     let transform = Transform::from_translate(tx, ty);
@@ -247,6 +267,14 @@ fn execute_commands_on_tile(
     // Clip mask stack: each entry is the accumulated mask for that clip level.
     // `None` means the clip region did not intersect this tile or allocation failed.
     let mut clip_stack: Vec<Option<Mask>> = Vec::new();
+    for region in ancestor_clips {
+        if region.rect.width <= 0.0 || region.rect.height <= 0.0 {
+            return; // Fully clipped away.
+        }
+        let parent = clip_stack.last().and_then(|m| m.as_ref());
+        let mask = build_clip_mask(region.rect, region.radius, tx, ty, pixmap.width(), pixmap.height(), parent);
+        clip_stack.push(mask);
+    }
 
     // Returns the top active mask (or `None` if the stack is empty / top is None).
     macro_rules! active_mask {
