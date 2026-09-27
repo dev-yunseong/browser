@@ -1179,7 +1179,7 @@ class Node extends EventTarget {
             __aura_append_child(this._id, child._id);
             if (oldParent && oldParent !== this) __aura_child_list_mutation(oldParent, [], [child], oldPrevious, oldNext);
             if (added.length > 0) __aura_child_list_mutation(this, added, [], previous, null);
-            added.forEach(__aura_maybe_run_script);
+            added.forEach(__aura_on_node_inserted);
         }
         return child;
     }
@@ -1203,7 +1203,7 @@ class Node extends EventTarget {
             __aura_insert_before(this._id, newChild._id, refChild ? refChild._id : null);
             if (oldParent && oldParent !== this) __aura_child_list_mutation(oldParent, [], [newChild], oldPrevious, oldNext);
             if (added.length > 0) __aura_child_list_mutation(this, added, [], previous, next);
-            added.forEach(__aura_maybe_run_script);
+            added.forEach(__aura_on_node_inserted);
         }
         return newChild;
     }
@@ -3763,6 +3763,40 @@ function __aura_execute_module_script(script, url, code) {
         console.error('Module script execution error: ' + e);
         __aura_script_fire(script, 'error');
     }
+}
+
+// A node was inserted into the document by script: run inserted <script>
+// elements and load inserted <link> resources, including those inside an
+// inserted subtree, in tree order.
+function __aura_on_node_inserted(node) {
+    if (!node || node.nodeType !== Node.ELEMENT_NODE) return;
+    let tag = String(node.tagName || '').toLowerCase();
+    if (tag === 'script') {
+        __aura_maybe_run_script(node);
+    } else if (tag === 'link') {
+        __aura_maybe_load_link(node);
+    } else if (typeof node.querySelectorAll === 'function') {
+        node.querySelectorAll('script, link').forEach(__aura_on_node_inserted);
+    }
+}
+
+// rel values whose <link> fetches a resource and fires load/error. Bundlers
+// (Turbopack, webpack) wait for a stylesheet link's load event before
+// running the chunks that need it.
+const __aura_fetching_link_rels = ['stylesheet', 'preload', 'modulepreload'];
+
+function __aura_maybe_load_link(link) {
+    if (link._alreadyStarted) return;
+    let rels = String(link.getAttribute('rel') || '').toLowerCase().split(/\s+/);
+    if (!rels.some(rel => __aura_fetching_link_rels.includes(rel))) return;
+    let href = link.href;
+    if (!href) return;
+    link._alreadyStarted = true;
+    new Promise((resolve, reject) => {
+        __aura_fetch(href, 'GET', '', '', resolve, reject, true);
+    })
+        .then(response => __aura_script_fire(link, response.ok ? 'load' : 'error'))
+        .catch(() => __aura_script_fire(link, 'error'));
 }
 
 function __aura_maybe_run_script(node) {
