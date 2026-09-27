@@ -745,7 +745,10 @@ pub fn shorthand_longhands(name: &str) -> &'static [&'static str] {
         "flex-flow" => &["flex-direction", "flex-wrap"],
         "gap" | "grid-gap" => &["row-gap", "column-gap"],
         "font" => &["font-style", "font-variant", "font-weight", "font-size", "line-height", "font-family"],
-        "background" => &["background-color", "background-image", "background-repeat", "background-position", "background-size"],
+        "background" => &[
+            "background-color", "background-image", "background-position", "background-size",
+            "background-repeat", "background-origin", "background-clip",
+        ],
         "overflow" => &["overflow-x", "overflow-y"],
         "box-shadow" => &["box-shadow-layers"],
         "list-style" => &["list-style-type"],
@@ -770,6 +773,11 @@ pub fn parse_declaration(name: &str, raw: &str, important: bool, out: &mut Vec<D
     }
     if raw.contains("var(") {
         push_decl(out, name, Value::RawCustomProp(intern(raw)), important);
+        return;
+    }
+    // background shorthand + image/position/size/repeat/origin/clip longhands (src/background.rs)
+    if crate::background::is_background_property(name) {
+        crate::background::push_background_declarations(name, raw, important, out);
         return;
     }
     let lower = raw.to_ascii_lowercase();
@@ -1001,64 +1009,6 @@ pub fn parse_declaration(name: &str, raw: &str, important: bool, out: &mut Vec<D
                 .unwrap_or_else(|| "none".to_string());
             push_decl(out, "text-decoration", Value::Keyword(intern(&line)), important);
         }
-        "background" => {
-            // Keep the raw shorthand for painters that read it directly.
-            push_decl(out, "background", parse_value(raw), important);
-            let layers = split_top_level(raw, b',');
-            let last = layers.last().copied().unwrap_or("");
-            let first = layers.first().copied().unwrap_or("");
-            let mut color = Value::Color(Color { r: 0, g: 0, b: 0, a: 0 });
-            for p in split_respecting_parens(last) {
-                if let Some(c) = parse_color(&p) {
-                    color = Value::Color(c);
-                }
-            }
-            let mut image = Value::Keyword(intern("none"));
-            let mut repeat: Vec<String> = Vec::new();
-            let mut position: Vec<String> = Vec::new();
-            let mut size: Vec<String> = Vec::new();
-            let mut in_size = false;
-            for p in split_respecting_parens(first) {
-                let pl = p.to_ascii_lowercase();
-                if pl.starts_with("url(") || pl.contains("gradient(") {
-                    image = parse_value(&p);
-                } else if matches!(pl.as_str(), "repeat" | "no-repeat" | "repeat-x" | "repeat-y" | "space" | "round") {
-                    repeat.push(pl);
-                } else if pl == "/" {
-                    in_size = true;
-                } else if parse_color(&p).is_some() || matches!(pl.as_str(), "none" | "scroll" | "fixed" | "local" | "border-box" | "padding-box" | "content-box" | "text") {
-                    // color / attachment / box keywords
-                } else if let Some((pos, sz)) = p.split_once('/') {
-                    if !pos.is_empty() { position.push(pos.to_string()); }
-                    if !sz.is_empty() { size.push(sz.to_string()); }
-                    in_size = true;
-                } else if in_size {
-                    size.push(p.clone());
-                } else {
-                    position.push(p.clone());
-                }
-            }
-            push_decl(out, "background-color", color, important);
-            push_decl(out, "background-image", image, important);
-            push_decl(
-                out,
-                "background-repeat",
-                Value::Keyword(intern(if repeat.is_empty() { "repeat" } else { &repeat[0] })),
-                important,
-            );
-            push_decl(
-                out,
-                "background-position",
-                Value::Keyword(intern(&if position.is_empty() { "0% 0%".to_string() } else { position.join(" ") })),
-                important,
-            );
-            push_decl(
-                out,
-                "background-size",
-                Value::Keyword(intern(&if size.is_empty() { "auto".to_string() } else { size.join(" ") })),
-                important,
-            );
-        }
         "place-items" | "place-content" | "place-self" => {
             let parts: Vec<&str> = raw.split_whitespace().collect();
             let a = parts.first().copied().unwrap_or("normal");
@@ -1074,7 +1024,7 @@ pub fn parse_declaration(name: &str, raw: &str, important: bool, out: &mut Vec<D
             push_decl(out, name, Value::Keyword(intern(raw)), important);
         }
         "font-family" | "content" | "transition" | "animation" | "grid-template-areas" | "grid-area"
-        | "quotes" | "will-change" | "font-feature-settings" | "background-position" | "background-size"
+        | "quotes" | "will-change" | "font-feature-settings"
         | "clip" | "clip-path" | "mask" | "filter" | "backdrop-filter" | "counter-reset" | "counter-increment" => {
             push_decl(out, name, Value::Keyword(intern(raw)), important);
         }
@@ -2766,7 +2716,7 @@ mod tests {
             "@media (prefers-color-scheme: dark) should be included"
         );
         assert!(rules.iter().any(|r| r.declarations.iter().any(|d| {
-            d.name.as_ref() == "background"
+            d.name.as_ref() == "background-color"
         })));
     }
 

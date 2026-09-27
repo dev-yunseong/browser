@@ -153,6 +153,10 @@ function __aura_read_document_type_info(id) {
     return null;
 }
 
+// Marker telling constructors that double as page-visible constructors
+// (`new Image(w, h)`) to wrap an existing native node instead of creating one.
+const __AURA_WRAP_EXISTING = Symbol('aura.wrapExisting');
+
 function __get_or_create_node(id, tag, string_id, kind) {
     if (!id) return null;
     if (__node_registry.has(id)) return __node_registry.get(id);
@@ -179,7 +183,7 @@ function __get_or_create_node(id, tag, string_id, kind) {
         } else if (tagLower === 'script') {
             node = new HTMLScriptElement(id, descriptor.tag, descriptor.id);
         } else if (tagLower === 'img') {
-            node = new HTMLImageElement(id, descriptor.tag, descriptor.id);
+            node = new HTMLImageElement(__AURA_WRAP_EXISTING, id, descriptor.tag, descriptor.id);
         } else if (tagLower === 'input') {
             node = new HTMLInputElement(id, descriptor.tag, descriptor.id);
         } else if (tagLower === 'button') {
@@ -193,7 +197,15 @@ function __get_or_create_node(id, tag, string_id, kind) {
         } else if (tagLower === 'canvas') {
             node = new HTMLCanvasElement(id, descriptor.tag, descriptor.id);
         } else {
-            node = new Element(id, descriptor.tag, descriptor.id);
+            // HTMLElement is declared later in this file; fall back to Element
+            // if a node is wrapped while the bootstrap is still evaluating.
+            let ElementClass = typeof __aura_tag_classes !== 'undefined' && __aura_tag_classes
+                ? __aura_tag_classes[tagLower] || __aura_tag_classes[descriptor.tag]
+                : null;
+            if (!ElementClass) {
+                try { ElementClass = HTMLElement; } catch (e) { ElementClass = Element; }
+            }
+            node = new ElementClass(id, descriptor.tag, descriptor.id);
         }
     } else {
         node = new Node(id, descriptor.kind || 'element');
@@ -272,11 +284,14 @@ function __aura_append_window_to_path(path) {
     if (path[path.length - 1] !== window) path.push(window);
 }
 
-function __aura_event_path(target) {
+function __aura_event_path(target, event) {
     let path = [target];
     if (target === window) return path;
+    // DOM spec "get the parent" of a Document returns null for 'load' events,
+    // so image/script load events never reach window 'load' listeners.
+    let reachesWindow = !(event && event.type === 'load');
     if (target === document) {
-        __aura_append_window_to_path(path);
+        if (reachesWindow) __aura_append_window_to_path(path);
         return path;
     }
     let current = target;
@@ -285,7 +300,7 @@ function __aura_event_path(target) {
         path.push(current);
     }
     if (path[path.length - 1] !== document) path.push(document);
-    __aura_append_window_to_path(path);
+    if (reachesWindow) __aura_append_window_to_path(path);
     return path;
 }
 
@@ -315,7 +330,7 @@ function __aura_dispatch_event(target, event) {
     event.eventPhase = Event.NONE;
     event._stopped = false;
     event._immediateStopped = false;
-    event._path = __aura_event_path(target);
+    event._path = __aura_event_path(target, event);
 
     let path = event._path;
     for (let i = path.length - 1; i >= 1; i--) {
@@ -1263,17 +1278,49 @@ function __aura_css_kebab_to_camel(name) {
     return String(name).replace(/-([a-z])/g, function(_, ch) { return ch.toUpperCase(); });
 }
 
+// Split a declaration block on ';' outside parentheses and quotes, so values
+// such as url(data:image/png;base64,...) stay intact.
+function __aura_split_declarations(text) {
+    let parts = [];
+    let depth = 0;
+    let quote = null;
+    let start = 0;
+    for (let i = 0; i < text.length; i++) {
+        let ch = text[i];
+        if (quote) {
+            if (ch === '\\') i++;
+            else if (ch === quote) quote = null;
+        } else if (ch === '"' || ch === "'") {
+            quote = ch;
+        } else if (ch === '(') {
+            depth++;
+        } else if (ch === ')') {
+            if (depth > 0) depth--;
+        } else if (ch === ';' && depth === 0) {
+            parts.push(text.slice(start, i));
+            start = i + 1;
+        }
+    }
+    parts.push(text.slice(start));
+    return parts;
+}
+
+// An element's CSSStyleDeclaration is backed by its `style` attribute (CSSOM
+// spec): reads parse the current attribute and writes serialize back to it,
+// so script style changes survive DOM serialization and re-rendering.
 class CSSStyleDeclaration {
     constructor(ownerId = null, readonly = false, initial = null) {
         this._ownerId = ownerId;
         this._readonly = readonly;
         this._props = [];
+        this._syncedAttr = null;
+        this._updating = false;
         if (initial) {
             Object.keys(initial).forEach(name => this.setProperty(name, initial[name]));
         }
         return new Proxy(this, {
             get(target, prop, receiver) {
-                if (prop === 'length') return target._props.length;
+                if (prop === 'length') return target.length;
                 if (typeof prop === 'string' && /^(0|[1-9]\d*)$/.test(prop)) return target.item(Number(prop));
                 if (typeof prop === 'string' && !(prop in target)) return target.getPropertyValue(__aura_css_camel_to_kebab(prop));
                 let value = Reflect.get(target, prop, receiver);
@@ -1288,7 +1335,52 @@ class CSSStyleDeclaration {
             }
         });
     }
+    _sync() {
+        if (this._ownerId === null || this._updating || this._batching) return;
+        let attr = __aura_get_attribute(this._ownerId, 'style');
+        if (attr === this._syncedAttr) return;
+        this._syncedAttr = attr;
+        this._props = [];
+        __aura_split_declarations(String(attr || '')).forEach(part => {
+            let idx = part.indexOf(':');
+            if (idx <= 0) return;
+            let name = part.slice(0, idx).trim().toLowerCase();
+            let value = part.slice(idx + 1).trim();
+            let priority = '';
+            if (/!\s*important$/i.test(value)) {
+                value = value.replace(/!\s*important$/i, '').trim();
+                priority = 'important';
+            }
+            if (!name || value === '') return;
+            let existing = this._props.find(entry => entry.name === name);
+            if (existing) {
+                existing.value = value;
+                existing.priority = priority;
+            } else {
+                this._props.push({ name, value, priority });
+            }
+        });
+    }
+    _writeBack() {
+        if (this._ownerId === null) return;
+        let text = this.cssText;
+        let oldValue = __aura_get_attribute(this._ownerId, 'style');
+        if (oldValue === text) {
+            this._syncedAttr = text;
+            return;
+        }
+        this._updating = true;
+        try {
+            __aura_set_attribute(this._ownerId, 'style', text);
+        } finally {
+            this._updating = false;
+        }
+        this._syncedAttr = text;
+        let owner = __node_registry.get(this._ownerId);
+        if (owner) __aura_attribute_mutation(owner, 'style', oldValue);
+    }
     _find(name) {
+        this._sync();
         name = String(name).toLowerCase();
         return this._props.find(entry => entry.name === name);
     }
@@ -1296,12 +1388,15 @@ class CSSStyleDeclaration {
         if (this._readonly) throw new Error('CSSStyleDeclaration is read-only');
     }
     get cssText() {
+        this._sync();
         return this._props.map(entry => entry.name + ': ' + entry.value + (entry.priority ? ' !' + entry.priority : '') + ';').join(' ');
     }
     set cssText(value) {
         this._assertWritable();
         this._props = [];
-        String(value || '').split(';').forEach(part => {
+        this._batching = true;
+        try {
+        __aura_split_declarations(String(value || '')).forEach(part => {
             let idx = part.indexOf(':');
             if (idx <= 0) return;
             let name = part.slice(0, idx).trim();
@@ -1313,6 +1408,10 @@ class CSSStyleDeclaration {
             }
             this.setProperty(name, rawValue, priority);
         });
+        } finally {
+            this._batching = false;
+        }
+        this._writeBack();
     }
     getPropertyValue(name) {
         let entry = this._find(name);
@@ -1329,25 +1428,37 @@ class CSSStyleDeclaration {
         value = String(value == null ? '' : value).trim();
         priority = String(priority || '').toLowerCase();
         if (priority && priority !== 'important') return;
-        let entry = this._find(name);
+        // Setting an empty value removes the declaration (CSSOM).
+        if (value === '') {
+            this.removeProperty(name);
+            return;
+        }
+        let entry = this._batching ? this._props.find(e => e.name === name) : this._find(name);
         if (!entry) {
             entry = { name, value: '', priority: '' };
             this._props.push(entry);
         }
         entry.value = value;
         entry.priority = priority;
-        this[__aura_css_kebab_to_camel(name)] = value;
         if (this._ownerId !== null) __aura_set_style(this._ownerId, name, value);
+        if (!this._batching) this._writeBack();
     }
     removeProperty(name) {
         this._assertWritable();
         name = String(name).trim().toLowerCase();
         let old = this.getPropertyValue(name);
+        let had = this._props.length;
         this._props = this._props.filter(entry => entry.name !== name);
         if (this._ownerId !== null) __aura_set_style(this._ownerId, name, '');
+        if (!this._batching && this._props.length !== had) this._writeBack();
         return old;
     }
+    get length() {
+        this._sync();
+        return this._props.length;
+    }
     item(index) {
+        this._sync();
         let entry = this._props[index];
         return entry ? entry.name : '';
     }
@@ -1543,9 +1654,15 @@ class Element extends Node {
     constructor(id, tag, string_id) {
         super(id, 'element');
         this.tagName = (tag || '').toUpperCase();
-        this.id = string_id || '';
         this._classList = null;
-        this.style = new CSSStyleDeclaration(id);
+        this._style = null;
+    }
+    get style() {
+        if (!this._style) this._style = new CSSStyleDeclaration(this._id);
+        return this._style;
+    }
+    set style(value) {
+        this.style.cssText = String(value);
     }
     get classList() {
         if (!this._classList) this._classList = new DOMTokenList(this._id);
@@ -1571,6 +1688,13 @@ class Element extends Node {
                 return undefined;
             }
         });
+    }
+    // `id` reflects the id content attribute (assignment must reach the DOM).
+    get id() {
+        return __aura_get_attribute(this._id, 'id') || '';
+    }
+    set id(val) {
+        this.setAttribute('id', String(val));
     }
     get className() {
         return __aura_get_attribute(this._id, 'class') || '';
@@ -2294,8 +2418,23 @@ var document = {
     },
     activeElement: null,
     location: { href: '', hostname: '', pathname: '/', search: '', hash: '', protocol: 'https:', host: '', port: '', origin: '' },
-    title: '',
+    get title() {
+        let el = this.querySelector('title');
+        if (!el) return '';
+        return String(el.textContent || '').replace(/[\t\n\f\r ]+/g, ' ').trim();
+    },
+    set title(value) {
+        let el = this.querySelector('title');
+        if (!el) {
+            let head = this.head;
+            if (!head) return;
+            el = this.createElement('title');
+            head.appendChild(el);
+        }
+        el.textContent = String(value);
+    },
     readyState: 'complete',
+    get defaultView() { return window; },
     referrer: '',
     characterSet: 'UTF-8',
     charset: 'UTF-8',
@@ -3103,24 +3242,74 @@ window.postMessage = function(message, targetOrigin, transfer) {
 };
 
 // -- Timers ------------------------------------------------------------------
-window.setTimeout = function(fn, delay) {
-    if (typeof fn === 'function') {
-        __aura_queue_task(fn);
-    } else if (typeof fn === 'string') {
-        __aura_queue_task(() => eval(fn));
-    }
-    return 1;
-};
+// Timers honour their delay against performance.now() and can be cancelled.
+// The Rust event loop calls __aura_timers_begin_turn() once per tick and then
+// __aura_run_next_due_timer() until it returns false, draining microtasks
+// between callbacks the way an HTML event loop runs one task at a time.
+var __aura_timers = new Map();
+var __aura_timer_next_id = 1;
+var __aura_timer_seq = 0;
+var __aura_timer_turn_limit = 0;
 
-window.clearTimeout = function() {};
-window.setInterval = function(fn, delay) {
-    // Simplified: run once as macro task
-    if (typeof fn === 'function') {
-        __aura_queue_task(fn);
+function __aura_timer_callback(fn) {
+    if (typeof fn === 'function') return fn;
+    let code = String(fn);
+    return function() { (0, eval)(code); };
+}
+
+function __aura_add_timer(fn, delay, args, repeat) {
+    let id = __aura_timer_next_id++;
+    let ms = Number(delay);
+    if (!isFinite(ms) || ms < 0) ms = 0;
+    __aura_timers.set(id, {
+        id: id,
+        callback: __aura_timer_callback(fn),
+        args: args,
+        interval: repeat ? Math.max(ms, 4) : null,
+        due: performance.now() + ms,
+        seq: ++__aura_timer_seq,
+    });
+    return id;
+}
+
+function __aura_timers_begin_turn() {
+    __aura_timer_turn_limit = __aura_timer_seq;
+}
+
+function __aura_run_next_due_timer() {
+    let now = performance.now();
+    let next = null;
+    for (const timer of __aura_timers.values()) {
+        if (timer.due > now || timer.seq > __aura_timer_turn_limit) continue;
+        if (!next || timer.due < next.due || (timer.due === next.due && timer.seq < next.seq)) {
+            next = timer;
+        }
     }
-    return 1;
+    if (!next) return false;
+    if (next.interval !== null) {
+        next.due = now + next.interval;
+        next.seq = ++__aura_timer_seq;
+    } else {
+        __aura_timers.delete(next.id);
+    }
+    try {
+        next.callback.apply(window, next.args);
+    } catch (e) {
+        console.error('Uncaught ' + (e && e.stack ? e.stack : e));
+    }
+    return true;
+}
+
+window.setTimeout = function(fn, delay, ...args) {
+    return __aura_add_timer(fn, delay, args, false);
 };
-window.clearInterval = function() {};
+window.setInterval = function(fn, delay, ...args) {
+    return __aura_add_timer(fn, delay, args, true);
+};
+window.clearTimeout = function(id) {
+    __aura_timers.delete(Number(id));
+};
+window.clearInterval = window.clearTimeout;
 
 // -- fetch() -----------------------------------------------------------------
 class Headers {
@@ -3997,10 +4186,16 @@ window.DOMTokenList = DOMTokenList;
 
 // -- Image constructor (HTMLImageElement) ------------------------------------
 class HTMLImageElement extends Element {
-    constructor(width, height) {
-        // Create a real img element in the DOM
+    constructor(width, height, tag, stringId) {
+        if (width === __AURA_WRAP_EXISTING) {
+            // Wrapping an existing <img> node: (marker, nativeId, tag, stringId).
+            super(height, tag, stringId);
+            return;
+        }
+        // `new Image(width, height)`: create a real img element in the DOM.
         var nativeId = __aura_create_element('img');
         super(nativeId, 'img', '');
+        __node_registry.set(nativeId, this);
         if (width !== undefined) __aura_set_attribute(nativeId, 'width', String(width));
         if (height !== undefined) __aura_set_attribute(nativeId, 'height', String(height));
         this.onload = null;
@@ -4031,6 +4226,31 @@ class HTMLElement extends Element {
     constructor(id, tag, string_id) {
         super(id, tag, string_id);
     }
+    // Reflected global attributes (HTML spec) so property writes reach the DOM.
+    get title() { return this.getAttribute('title') || ''; }
+    set title(v) { this.setAttribute('title', String(v)); }
+    get lang() { return this.getAttribute('lang') || ''; }
+    set lang(v) { this.setAttribute('lang', String(v)); }
+    get dir() { return this.getAttribute('dir') || ''; }
+    set dir(v) { this.setAttribute('dir', String(v)); }
+    get hidden() { return this.hasAttribute('hidden'); }
+    set hidden(v) {
+        if (v) this.setAttribute('hidden', '');
+        else this.removeAttribute('hidden');
+    }
+    get tabIndex() {
+        let raw = this.getAttribute('tabindex');
+        let n = raw === null ? NaN : parseInt(raw, 10);
+        if (!isNaN(n)) return n;
+        return /^(A|AREA|BUTTON|INPUT|SELECT|TEXTAREA|IFRAME)$/.test(this.tagName) ? 0 : -1;
+    }
+    set tabIndex(v) { this.setAttribute('tabindex', String(parseInt(v, 10) || 0)); }
+    get placeholder() { return this.getAttribute('placeholder') || ''; }
+    set placeholder(v) { this.setAttribute('placeholder', String(v)); }
+    // innerText approximated by textContent (no layout-aware line breaks).
+    get innerText() { return this.textContent; }
+    set innerText(v) { this.textContent = v === null || v === undefined ? '' : String(v); }
+    get outerText() { return this.textContent; }
 }
 window.HTMLElement = HTMLElement;
 
@@ -4326,6 +4546,7 @@ class HTMLOptionElement extends HTMLElement {
     constructor(text, value, defaultSelected, selected) {
         var nativeId = __aura_create_element('option');
         super(nativeId, 'option', '');
+        __node_registry.set(nativeId, this);
         if (text !== undefined) this.textContent = String(text);
         if (value !== undefined) __aura_set_attribute(nativeId, 'value', String(value));
     }
@@ -4376,8 +4597,12 @@ window.HTMLLIElement = HTMLLIElement;
 
 class HTMLCanvasElement extends HTMLElement {
     getContext(type) {
-        // Stub canvas context
-        return {
+        // Only a (non-drawing) 2D context is offered; other context types are
+        // unsupported and return null as the HTML spec requires. Repeated
+        // calls return the same context whose `canvas` is this element.
+        if (String(type).toLowerCase() !== '2d') return null;
+        if (this._context2d) return this._context2d;
+        this._context2d = {
             fillRect: function() {},
             clearRect: function() {},
             strokeRect: function() {},
@@ -4424,6 +4649,8 @@ class HTMLCanvasElement extends HTMLElement {
             globalAlpha: 1,
             globalCompositeOperation: 'source-over',
         };
+        this._context2d.canvas = this;
+        return this._context2d;
     }
     get width() { return parseInt(__aura_get_attribute(this._id, 'width') || '300'); }
     set width(v) { __aura_set_attribute(this._id, 'width', String(v)); }
@@ -4433,6 +4660,94 @@ class HTMLCanvasElement extends HTMLElement {
     toBlob(callback) { callback(new Blob()); }
 }
 window.HTMLCanvasElement = HTMLCanvasElement;
+
+// Element interfaces without extra behaviour, so `instanceof` checks and
+// `window.HTMLxxxElement` lookups work like in a browser.
+class HTMLLinkElement extends HTMLElement {
+    get rel() { return this.getAttribute('rel') || ''; }
+    set rel(v) { this.setAttribute('rel', String(v)); }
+}
+class HTMLMetaElement extends HTMLElement {
+    get content() { return this.getAttribute('content') || ''; }
+    set content(v) { this.setAttribute('content', String(v)); }
+}
+class HTMLHeadElement extends HTMLElement {}
+class HTMLBodyElement extends HTMLElement {}
+class HTMLHtmlElement extends HTMLElement {}
+class HTMLTitleElement extends HTMLElement {
+    get text() { return this.textContent; }
+    set text(v) { this.textContent = String(v); }
+}
+class HTMLBRElement extends HTMLElement {}
+class HTMLHRElement extends HTMLElement {}
+class HTMLPreElement extends HTMLElement {}
+class HTMLPictureElement extends HTMLElement {}
+class HTMLSourceElement extends HTMLElement {}
+class HTMLMediaElement extends HTMLElement {
+    play() { return Promise.resolve(); }
+    pause() {}
+    load() {}
+    canPlayType() { return ''; }
+    get paused() { return true; }
+    get muted() { return this.hasAttribute('muted'); }
+    set muted(v) { if (v) this.setAttribute('muted', ''); else this.removeAttribute('muted'); }
+}
+class HTMLVideoElement extends HTMLMediaElement {}
+class HTMLAudioElement extends HTMLMediaElement {}
+class HTMLTableSectionElement extends HTMLElement {}
+class HTMLFieldSetElement extends HTMLElement {}
+class HTMLLegendElement extends HTMLElement {}
+class HTMLDListElement extends HTMLElement {}
+class HTMLTemplateElement extends HTMLElement {}
+class SVGElement extends Element {
+    get ownerSVGElement() {
+        let node = this.parentNode;
+        while (node && node.nodeType === 1) {
+            if (node.tagName === 'SVG') return node;
+            node = node.parentNode;
+        }
+        return null;
+    }
+    getBBox() {
+        let m = this._layoutMetrics();
+        return { x: 0, y: 0, width: m.width, height: m.height };
+    }
+}
+class SVGSVGElement extends SVGElement {}
+class SVGGraphicsElement extends SVGElement {}
+[
+    HTMLLinkElement, HTMLMetaElement, HTMLHeadElement, HTMLBodyElement, HTMLHtmlElement,
+    HTMLTitleElement, HTMLBRElement, HTMLHRElement, HTMLPreElement, HTMLPictureElement,
+    HTMLSourceElement, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement,
+    HTMLTableSectionElement, HTMLFieldSetElement, HTMLLegendElement, HTMLDListElement,
+    HTMLTemplateElement, SVGElement, SVGSVGElement, SVGGraphicsElement,
+].forEach(cls => { window[cls.name] = cls; });
+
+// Tag name -> wrapper class used by __get_or_create_node for tags without a
+// dedicated branch there. <select>, <option> and <textarea> stay generic
+// because their classes above are stubs that would shadow Element's working
+// value/options handling.
+var __aura_tag_classes = {
+    link: HTMLLinkElement, meta: HTMLMetaElement, head: HTMLHeadElement,
+    body: HTMLBodyElement, html: HTMLHtmlElement, title: HTMLTitleElement,
+    br: HTMLBRElement, hr: HTMLHRElement, pre: HTMLPreElement,
+    picture: HTMLPictureElement, source: HTMLSourceElement,
+    video: HTMLVideoElement, audio: HTMLAudioElement,
+    p: HTMLParagraphElement, label: HTMLLabelElement,
+    h1: HTMLHeadingElement, h2: HTMLHeadingElement, h3: HTMLHeadingElement,
+    h4: HTMLHeadingElement, h5: HTMLHeadingElement, h6: HTMLHeadingElement,
+    table: HTMLTableElement, thead: HTMLTableSectionElement,
+    tbody: HTMLTableSectionElement, tfoot: HTMLTableSectionElement,
+    tr: HTMLTableRowElement, td: HTMLTableCellElement, th: HTMLTableCellElement,
+    ul: HTMLUListElement, ol: HTMLOListElement, li: HTMLLIElement,
+    dl: HTMLDListElement, fieldset: HTMLFieldSetElement, legend: HTMLLegendElement,
+    template: HTMLTemplateElement,
+    svg: SVGSVGElement,
+};
+['g', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'ellipse', 'use',
+ 'text', 'tspan', 'image', 'foreignObject'].forEach(tag => { __aura_tag_classes[tag] = SVGGraphicsElement; });
+['defs', 'symbol', 'linearGradient', 'radialGradient', 'stop', 'clipPath', 'mask',
+ 'filter', 'feGaussianBlur', 'pattern', 'marker'].forEach(tag => { __aura_tag_classes[tag] = SVGElement; });
 
 
 // -- atob / btoa stubs -------------------------------------------------------

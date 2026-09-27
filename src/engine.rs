@@ -661,7 +661,8 @@ pub fn process_html_with_cache(
                                 url,
                                 start_fetch.elapsed()
                             );
-                            (text, Some(url))
+                            // Resolve relative url() against the stylesheet, not the document.
+                            (crate::background::absolutize_css_urls(&text, &url), Some(url))
                         }
                         Err(e) => {
                             println!("[Error] Parallel Fetch (CSS): {} failed: {}", url, e);
@@ -722,7 +723,7 @@ pub fn process_html_with_cache(
     let mut element_ids = Vec::new();
     let mut focusable_elements = Vec::new();
     let mut layout_metrics = HashMap::new();
-    let image_urls: Vec<String>;
+    let mut image_urls: Vec<String>;
 
     render::render_layout_tree(&layout_tree, &mut pixmap, image_cache, &base_url);
 
@@ -741,6 +742,7 @@ pub fn process_html_with_cache(
         .into_iter()
         .map(|(_, url)| base_url.join(&url).map(|u| u.to_string()).unwrap_or(url))
         .collect();
+    crate::background::collect_background_image_urls(&layout_tree, base_url, &mut image_urls);
 
     let (form_action, form_method) = layout_tree
         .collect_form_element()
@@ -972,10 +974,26 @@ impl BrowserEngine {
         focused_id: Option<&str>,
         width: f32,
     ) -> Result<PageResult, String> {
+        // Pick up DOM mutations made by JS since the last render (timers,
+        // requestAnimationFrame, event handlers) so re-renders are not stale.
+        if let Some(live_html) = self.js_runtime.get_document_html() {
+            if let Some(ref mut last) = self.last_page {
+                last.body = live_html;
+            }
+        }
         let (body, base_url) = match &self.last_page {
             Some(p) => (p.body.clone(), p.base_url.clone()),
             None => return Err("No page loaded".into()),
         };
+        // Without an explicit focus from the UI, honour element.focus() calls
+        // made by page scripts so :focus styles match the live document.
+        let js_focused_id = self.js_runtime.get_focused_node_id();
+        let focused_id = focused_id.or(js_focused_id.as_deref());
+        if let Ok(path) = std::env::var("BROWSER_DEBUG_DUMP_HTML") {
+            if !path.is_empty() {
+                let _ = std::fs::write(path, &body);
+            }
+        }
 
         let mut css_cache = self.css_cache.clone();
         let result = process_html_with_cache(
@@ -1546,7 +1564,7 @@ impl BrowserEngine {
                 .unwrap_or_default();
 
             for specifier in &requests {
-                let resolved = match page_base.join(specifier).or_else(|_| url.join(specifier)) {
+                let resolved = match self.js_runtime.resolve_module_specifier(specifier, &url) {
                     Ok(r) => r,
                     Err(_) => continue,
                 };
@@ -2911,6 +2929,8 @@ mod tests {
             "old"
         );
 
+        // Timers honour their delay, so let the 10ms timer come due first.
+        std::thread::sleep(std::time::Duration::from_millis(20));
         engine.tick_js(Some(20.0), None);
 
         assert_eq!(engine.evaluate_js("globalThis.__timer_fired"), "true");
