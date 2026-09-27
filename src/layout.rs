@@ -1502,8 +1502,10 @@ fn layout_block_level_inner<'a>(
     let content_h = match inner {
         Inner::Replaced => {
             let (_, h) = replaced_size_for(sn, &bm, cb, ctx, Some(border_w));
-            let border_h = specified_h.unwrap_or(h);
-            (border_h - bm.pb_v()).max(0.0)
+            let border_h = clamp_border_height(sn, specified_h.unwrap_or(h), cb.height, &bm, ctx);
+            let content_h = (border_h - bm.pb_v()).max(0.0);
+            layout_placeholder(&mut lb, sn, content_x, content_y, content_w, content_h, ctx);
+            content_h
         }
         Inner::Flex => {
             let out = layout_flex(&mut lb, content_x, content_y, content_w, child_cb, specified_h.is_some(), ctx);
@@ -1685,6 +1687,29 @@ fn replaced_size_for(sn: &StyledNode, bm: &BoxModel, cb: Cb, ctx: &Ctx, used_bor
         },
     };
     (cw + pb_h, (ch + pb_v).max(if tag == "img" { 1.0 } else { 0.0 }))
+}
+
+/// Lay out the generated `::placeholder` box of an empty text control inside
+/// its content box. A single-line `<input>` centers it vertically, like the
+/// inner editor of Chromium; a `<textarea>` keeps it at the top.
+fn layout_placeholder<'a>(
+    lb: &mut LayoutBox<'a>,
+    sn: &'a StyledNode,
+    content_x: f32,
+    content_y: f32,
+    content_w: f32,
+    content_h: f32,
+    ctx: &mut Ctx,
+) {
+    let Some(ph) = sn.children.iter().find(|c| is_tag(c, "::placeholder")) else { return };
+    let cb = Cb { width: content_w, height: Some(content_h) };
+    let Some(out) = layout_block_level(ph, content_x, content_y, cb, None, BlockOpts::default(), ctx) else { return };
+    let mut child = out.lb;
+    if is_tag(sn, "input") {
+        let dy = (content_h - child.dimensions.height) / 2.0;
+        offset_layout_box(&mut child, 0.0, dy);
+    }
+    lb.children.push(child);
 }
 
 /// CSS 2.1 §10.4 table: resolve min/max constraints for a replaced element
@@ -7760,5 +7785,140 @@ mod tests {
             600.0,
         );
         assert_eq!(by_id(&root, "c").dimensions.height, 70.0);
+    }
+}
+
+#[cfg(test)]
+mod replaced_sizing_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn find<'a, 'b>(lb: &'b LayoutBox<'a>, tag: &str) -> Option<&'b LayoutBox<'a>> {
+        if is_tag(lb.style_node, tag) {
+            return Some(lb);
+        }
+        lb.children.iter().find_map(|c| find(c, tag))
+    }
+
+    fn with_layout(html: &str, css: &str, focused: Option<&str>, images: ImageSizes, check: impl FnOnce(&LayoutBox)) {
+        let dom = crate::dom::parse_html(html);
+        let sheet = crate::css::parse_css(css);
+        let st = crate::style::build_style_tree(&dom.document, &sheet, None, &HashMap::new(), None, focused, None);
+        let (lb, _, _) = build_layout_tree_with_images(&st, 0.0, 0.0, 800.0, 800.0, 600.0, None, images);
+        check(&lb.unwrap());
+    }
+
+    fn img_rect(html: &str, images: ImageSizes) -> (f32, f32) {
+        let mut out = (0.0, 0.0);
+        with_layout(html, "", None, images, |lb| {
+            let img = find(lb, "img").expect("img box");
+            out = (img.dimensions.width, img.dimensions.height);
+        });
+        out
+    }
+
+    fn sizes(url: &str, w: f32, h: f32) -> ImageSizes {
+        let mut s = ImageSizes::default();
+        s.insert(url, w, h);
+        s
+    }
+
+    #[test]
+    fn height_attribute_scales_width_by_natural_ratio() {
+        let r = img_rect(r#"<img height="20" src="https://x/logo.png">"#, sizes("https://x/logo.png", 150.0, 40.0));
+        assert_eq!(r, (75.0, 20.0));
+    }
+
+    #[test]
+    fn auto_size_uses_natural_size() {
+        let r = img_rect(r#"<img src="https://x/a.png">"#, sizes("https://x/a.png", 64.0, 32.0));
+        assert_eq!(r, (64.0, 32.0));
+    }
+
+    #[test]
+    fn relative_src_resolves_against_base() {
+        let mut s = ImageSizes::from_cache(&HashMap::new(), url::Url::parse("https://x/dir/page.html").ok().as_ref());
+        s.insert("https://x/dir/a.png", 30.0, 10.0);
+        let r = img_rect(r#"<img height="20" src="a.png">"#, s);
+        assert_eq!(r, (60.0, 20.0));
+    }
+
+    #[test]
+    fn width_and_height_attributes_give_ratio_before_load() {
+        let r = img_rect(
+            r#"<div style="width:300px"><img width="400" height="200" style="width:100%;height:auto" src="https://x/none.png"></div>"#,
+            ImageSizes::default(),
+        );
+        assert_eq!(r, (300.0, 150.0));
+    }
+
+    #[test]
+    fn max_width_keeps_ratio_when_both_auto() {
+        let r = img_rect(r#"<img style="max-width:100px" src="https://x/a.png">"#, sizes("https://x/a.png", 400.0, 200.0));
+        assert_eq!(r, (100.0, 50.0));
+        let r = img_rect(r#"<img style="min-height:100px" src="https://x/a.png">"#, sizes("https://x/a.png", 40.0, 20.0));
+        assert_eq!(r, (200.0, 100.0));
+    }
+
+    #[test]
+    fn aspect_ratio_property_sets_auto_height() {
+        let r = img_rect(r#"<img style="width:200px;aspect-ratio:2 / 1" src="https://x/none.png">"#, ImageSizes::default());
+        assert_eq!(r, (200.0, 100.0));
+        // `auto && <ratio>` prefers the natural ratio once the image is known.
+        let r = img_rect(
+            r#"<img style="width:200px;aspect-ratio:auto 2 / 1" src="https://x/a.png">"#,
+            sizes("https://x/a.png", 100.0, 100.0),
+        );
+        assert_eq!(r, (200.0, 200.0));
+    }
+
+    #[test]
+    fn constraint_table_cases() {
+        assert_eq!(constrain_replaced(400.0, 200.0, 0.0, 100.0, 0.0, f32::INFINITY), (100.0, 50.0));
+        assert_eq!(constrain_replaced(400.0, 200.0, 0.0, 200.0, 0.0, 50.0), (100.0, 50.0));
+        assert_eq!(constrain_replaced(10.0, 20.0, 50.0, f32::INFINITY, 0.0, 60.0), (50.0, 60.0));
+        assert_eq!(constrain_replaced(30.0, 30.0, 0.0, f32::INFINITY, 0.0, f32::INFINITY), (30.0, 30.0));
+    }
+
+    fn placeholder_box<'a, 'b>(lb: &'b LayoutBox<'a>) -> Option<&'b LayoutBox<'a>> {
+        find(lb, "::placeholder")
+    }
+
+    fn collect_text(b: &LayoutBox, out: &mut String) {
+        if let Some(t) = &b.text_fragment {
+            out.push_str(t);
+        }
+        for c in &b.children {
+            collect_text(c, out);
+        }
+    }
+
+    #[test]
+    fn empty_input_shows_placeholder_styled_by_pseudo_element() {
+        let css = "#q::placeholder{color:transparent} #q:focus::placeholder{color:#123456}";
+        let html = r#"<input id="q" type="search" placeholder="Search here" style="width:200px;height:40px;padding:0;border:0">"#;
+        with_layout(html, css, None, ImageSizes::default(), |lb| {
+            let ph = placeholder_box(lb).expect("placeholder box");
+            assert!(matches!(ph.style_node.specified_values.get("color"), Some(Value::Color(c)) if c.a == 0));
+        });
+        with_layout(html, css, Some("q"), ImageSizes::default(), |lb| {
+            let input = find(lb, "input").unwrap();
+            let ph = placeholder_box(lb).expect("placeholder box");
+            assert!(matches!(ph.style_node.specified_values.get("color"), Some(Value::Color(c)) if c.r == 0x12 && c.b == 0x56));
+            let mut text = String::new();
+            collect_text(ph, &mut text);
+            assert_eq!(text, "Search here");
+            // Vertically centered in the 40px input.
+            let mid = ph.dimensions.y + ph.dimensions.height / 2.0;
+            assert!((mid - (input.dimensions.y + 20.0)).abs() < 1.0, "placeholder mid {mid}");
+        });
+    }
+
+    #[test]
+    fn input_with_value_has_no_placeholder() {
+        let html = r#"<input type="text" value="typed" placeholder="Search here">"#;
+        with_layout(html, "", None, ImageSizes::default(), |lb| {
+            assert!(placeholder_box(lb).is_none());
+        });
     }
 }

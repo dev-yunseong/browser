@@ -1727,6 +1727,8 @@ fn parse_compound(p: &mut SelParser) -> Option<Selector> {
                 if double || legacy_element {
                     if name == "before" || name == "after" {
                         sel.pseudo_element = Some(name);
+                    } else if matches!(name.as_str(), "placeholder" | "-webkit-input-placeholder" | "-moz-placeholder") {
+                        sel.pseudo_element = Some("placeholder".to_string());
                     } else {
                         sel.pseudo_element = Some(name);
                         sel.never_matches = true;

@@ -51,7 +51,17 @@ enum PseudoTarget {
     None,
     Before,
     After,
+    Placeholder,
 }
+
+/// Cascaded declarations of an element and of its `::before`, `::after` and
+/// `::placeholder` pseudo-elements.
+type Cascaded = (
+    HashMap<Arc<str>, Value>,
+    Option<HashMap<Arc<str>, Value>>,
+    Option<HashMap<Arc<str>, Value>>,
+    Option<HashMap<Arc<str>, Value>>,
+);
 
 /// An entry in the selector index pointing to a specific selector within a rule.
 #[derive(Clone)]
@@ -90,6 +100,7 @@ impl SelectorIndex {
                     None => PseudoTarget::None,
                     Some("before") => PseudoTarget::Before,
                     Some("after") => PseudoTarget::After,
+                    Some("placeholder") => PseudoTarget::Placeholder,
                     Some(_) => continue,
                 };
                 let entry = IndexEntry {
@@ -578,10 +589,9 @@ pub fn build_style_tree(
             .expect("CSS thread pool init failed")
     });
 
-    type Cascaded = (HashMap<Arc<str>, Value>, Option<HashMap<Arc<str>, Value>>, Option<HashMap<Arc<str>, Value>>);
     let mut raw_styles: Vec<Cascaded> = pool.install(|| {
         arena.par_iter().enumerate().map(|(idx, node)| {
-        if !node.is_element { return (HashMap::new(), None, None); }
+        if !node.is_element { return (HashMap::new(), None, None, None); }
         let mut map = HashMap::new();
         apply_default_styles(&node.tag, node, &mut map);
         apply_attribute_styles_arena(node, &mut map);
@@ -644,7 +654,23 @@ pub fn build_style_tree(
             for (k, v) in imp { apply_declaration(&mut pmap, &k, &v); }
             Some(pmap)
         };
-        (map, pseudo(PseudoTarget::Before), pseudo(PseudoTarget::After))
+        let placeholder = if placeholder_text(node, &arena).is_some() {
+            // UA style (Chromium html.css); author rules override it.
+            let mut pmap = pseudo(PseudoTarget::Placeholder).unwrap_or_default();
+            for (k, v) in [
+                ("color", Value::Color(crate::css::Color { r: 0x75, g: 0x75, b: 0x75, a: 255 })),
+                ("display", Value::Keyword(intern("block"))),
+                ("white-space", Value::Keyword(intern("pre"))),
+                ("overflow-x", Value::Keyword(intern("hidden"))),
+                ("overflow-y", Value::Keyword(intern("hidden"))),
+            ] {
+                pmap.entry(intern(k)).or_insert(v);
+            }
+            Some(pmap)
+        } else {
+            None
+        };
+        (map, pseudo(PseudoTarget::Before), pseudo(PseudoTarget::After), placeholder)
     }).collect()
     });
 
@@ -1215,7 +1241,7 @@ fn compute_values(
 fn build_final_tree(
     root: &Handle,
     arena_idx: &mut usize,
-    raw_styles: &mut [(HashMap<Arc<str>, Value>, Option<HashMap<Arc<str>, Value>>, Option<HashMap<Arc<str>, Value>>)],
+    raw_styles: &mut [Cascaded],
     arena: &[NodeDataSend],
     initial_parent_style: Option<&PropertyMap>,
     store: &mut StyleStore
@@ -1243,6 +1269,7 @@ fn build_final_tree(
             num_children: usize,
             before: Option<StyledNode>,
             after: Option<StyledNode>,
+            placeholder: Option<StyledNode>,
         },
     }
 
@@ -1260,7 +1287,7 @@ fn build_final_tree(
                 let current_idx = *arena_idx;
                 *arena_idx += 1;
 
-                let (declared, before_decl, after_decl) = std::mem::take(&mut raw_styles[current_idx]);
+                let (declared, before_decl, after_decl, placeholder_decl) = std::mem::take(&mut raw_styles[current_idx]);
                 let mut declared = declared;
                 if parent_pm.is_none() && current_idx == 0 {
                     declared.entry(intern("color")).or_insert_with(|| Value::Color(crate::css::Color { r: 0, g: 0, b: 0, a: 255 }));
@@ -1286,6 +1313,15 @@ fn build_final_tree(
                 };
                 let before = if matches!(handle.data, NodeData::Element { .. }) { make_pseudo(before_decl, "::before") } else { None };
                 let after = if matches!(handle.data, NodeData::Element { .. }) { make_pseudo(after_decl, "::after") } else { None };
+                // `::placeholder` is shown while the control's value is empty.
+                let placeholder = placeholder_decl.and_then(|decl| {
+                    let text = placeholder_text(&arena[current_idx], arena)?;
+                    let pmap = compute_values(decl, Some(&interned_map), root_fs, false);
+                    if matches!(pmap.get("display"), Some(Value::Keyword(k)) if k.as_ref() == "none") {
+                        return None;
+                    }
+                    Some(make_pseudo_styled_node(text, pmap, "::placeholder"))
+                });
 
                 let children_handles: Vec<Handle> = handle.children.borrow().iter().cloned().collect();
                 let num_children = children_handles.len();
@@ -1297,6 +1333,7 @@ fn build_final_tree(
                     num_children,
                     before,
                     after,
+                    placeholder,
                 });
 
                 // Push Pre frames for children in REVERSE order so the first child
@@ -1308,12 +1345,13 @@ fn build_final_tree(
                     });
                 }
             }
-            Frame::Post { handle, specified_values, num_children, before, after } => {
+            Frame::Post { handle, specified_values, num_children, before, after, placeholder } => {
                 // Children have all been processed and pushed onto `results`.
                 // Drain the last num_children entries — they are in forward order
                 // because children were pushed in reverse (LIFO gives forward order).
                 let start = results.len().saturating_sub(num_children);
-                let mut children: Vec<StyledNode> = Vec::with_capacity(num_children + 2);
+                let mut children: Vec<StyledNode> = Vec::with_capacity(num_children + 3);
+                if let Some(p) = placeholder { children.push(p); }
                 if let Some(b) = before { children.push(b); }
                 children.extend(results.drain(start..));
                 if let Some(a) = after { children.push(a); }
@@ -1634,6 +1672,32 @@ fn make_pseudo_styled_node(
         });
     }
     StyledNode { node: element, specified_values: values, children }
+}
+
+/// Placeholder text an `<input>`/`<textarea>` shows right now: its non-empty
+/// `placeholder` attribute while the value is empty (line breaks removed).
+fn placeholder_text(node: &NodeDataSend, arena: &[NodeDataSend]) -> Option<String> {
+    let text = attr_value(node, "placeholder")?;
+    match node.tag.as_str() {
+        "input" => {
+            let ty = attr_value(node, "type").unwrap_or("text").to_ascii_lowercase();
+            let text_like = matches!(
+                ty.as_str(),
+                "text" | "search" | "email" | "url" | "tel" | "password" | "number" | ""
+            );
+            if !text_like || attr_value(node, "value").is_some_and(|v| !v.is_empty()) {
+                return None;
+            }
+        }
+        "textarea" => {
+            if node.children_idx.iter().any(|&c| arena[c].has_text) {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    let text: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+    if text.is_empty() { None } else { Some(text) }
 }
 
 /// Returns true when this styled node is a generated `::before` / `::after` box.
