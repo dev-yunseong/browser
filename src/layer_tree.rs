@@ -321,6 +321,9 @@ impl LayerTree {
 ///
 /// Each box that carries a compositing trigger establishes a new `Layer`;
 /// all other boxes paint into the current ancestor layer.
+/// Clip rect that never cuts anything, for text outside any overflow clip.
+const UNBOUNDED_CLIP: LayoutRect = LayoutRect { x: -1.0e7, y: -1.0e7, width: 2.0e7, height: 2.0e7 };
+
 pub struct LayerTreeBuilder;
 
 impl LayerTreeBuilder {
@@ -331,7 +334,10 @@ impl LayerTreeBuilder {
         let mut tree = LayerTree::new();
         let root = Layer::new(0, 0, 1.0, viewport, vec![], Matrix4x4::identity());
         tree.add_layer(root);
-        Self::traverse(layout, &mut tree, 0, viewport);
+        // Text runs are not clipped to the viewport: layer transforms move
+        // content after this clip would apply (a box translated from x=900 to
+        // x=400 must still paint). Overflow clipping is done by clip masks.
+        Self::traverse(layout, &mut tree, 0, UNBOUNDED_CLIP);
         tree
     }
 
@@ -2078,5 +2084,23 @@ mod tests {
         let (_, zero, positive) = tree.categorize_children(0);
         assert!(positive.contains(&high), "z-index 10 box is a positive child of the root context");
         assert!(zero.contains(&later), "z-index auto box stays in the root's zero list");
+    }
+
+    /// Text runs carry no viewport clip: a transform may move text laid out
+    /// past the canvas edge back into view.
+    #[test]
+    fn test_text_clip_is_not_bounded_by_the_viewport() {
+        let tree = build_tree_from_html(
+            r#"<div style="position:absolute;left:900px;top:0;width:300px;transform:translateX(-80%)">far text</div>"#,
+            "",
+        );
+        let clip = tree.layers.iter()
+            .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
+            .find_map(|c| match c {
+                PaintCommand::Text { text, clip, .. } if text.contains("far") => Some(*clip),
+                _ => None,
+            })
+            .expect("text command");
+        assert!(clip.x + clip.width > 1200.0, "text clip must extend past the canvas: {clip:?}");
     }
 }
