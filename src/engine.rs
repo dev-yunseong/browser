@@ -2108,8 +2108,9 @@ impl BrowserEngine {
         self.last_stylesheet = None;
         self.last_page = None;
         self.css_cache.clear();
-        // TODO: also clear the decoded-image caches in render.rs, svg.rs and
-        // background.rs once they expose clear functions.
+        // Decoded raster and SVG images of the previous page.
+        crate::background::clear_decoded_image_cache();
+        crate::svg::clear_svg_caches();
     }
 
     /// Advance the JS event loop by one tick.
