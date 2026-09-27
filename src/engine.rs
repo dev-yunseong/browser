@@ -747,6 +747,7 @@ pub fn process_html_with_scroll(
 ) -> Result<(PageResult, css::Stylesheet), Box<dyn std::error::Error + Send + Sync>> {
     let start_total = Instant::now();
     let width = width.max(1.0);
+    css::set_media_viewport(width, viewport_height);
 
     let start = Instant::now();
     let dom_tree = dom::parse_html(body);
@@ -1256,6 +1257,9 @@ pub struct BrowserEngine {
     pub image_cache: HashMap<String, Vec<u8>>,
     pub css_cache: HashMap<String, String>,
     pub last_stylesheet: Option<css::Stylesheet>,
+    /// Viewport (width, height) `last_stylesheet` was parsed at; `@media`
+    /// rules depend on it, so a different size re-parses the sheet.
+    stylesheet_viewport: (f32, f32),
     pub js_runtime: js::JsRuntime,
     pub console_buffer: js::ConsoleBuffer,
     pub current_csp_policy: Option<js::CspPolicy>,
@@ -1274,6 +1278,7 @@ impl BrowserEngine {
             image_cache: HashMap::new(),
             css_cache: HashMap::new(),
             last_stylesheet: None,
+            stylesheet_viewport: (0.0, 0.0),
             js_runtime: js::JsRuntime::new(None, None, None, None, console_buffer.clone()),
             console_buffer,
             current_csp_policy: None,
@@ -1375,6 +1380,7 @@ impl BrowserEngine {
 
         let (page, stylesheet) = result;
         self.last_stylesheet = Some(stylesheet);
+        self.stylesheet_viewport = (width.max(1.0), self.viewport_height);
         self.current_csp_policy = page.csp_policy.clone();
         self.last_page = Some(page.clone());
         self.init_js_for_page(&page);
@@ -1439,7 +1445,8 @@ impl BrowserEngine {
             &base_url,
             &self.image_cache,
             &mut css_cache,
-            self.last_stylesheet.clone(),
+            // @media rules were resolved against the size the sheet was parsed at.
+            self.last_stylesheet.clone().filter(|_| self.stylesheet_viewport == (width, self.viewport_height)),
             hovered_id,
             focused_id,
             self.current_csp_policy.clone(),
@@ -1452,6 +1459,7 @@ impl BrowserEngine {
         self.css_cache = css_cache;
         let (page, stylesheet) = result;
         self.last_stylesheet = Some(stylesheet);
+        self.stylesheet_viewport = (width.max(1.0), self.viewport_height);
         self.last_page = Some(page.clone());
         self.js_runtime
             .set_layout_metrics(page.layout_metrics.clone());
@@ -1805,8 +1813,10 @@ impl BrowserEngine {
         });
 
         let viewport_h = self.viewport_height;
+        let viewport_w = page.width;
         self.js_runtime.execute(&format!(
-            "window.innerHeight = window.outerHeight = screen.height = screen.availHeight = {viewport_h};"
+            "window.innerHeight = window.outerHeight = screen.height = screen.availHeight = {viewport_h}; \
+             window.innerWidth = window.outerWidth = {viewport_w};"
         ));
         self.js_runtime.set_scroll_extent(
             page.scroll_width,
@@ -3408,6 +3418,37 @@ mod tests {
         let mut engine = BrowserEngine::new();
         engine.init_js_for_page(&page);
         engine
+    }
+
+    /// Re-rendering at a new width re-evaluates `@media` rules, updates
+    /// `window.innerWidth` and fires one `resize` event.
+    #[test]
+    fn test_re_render_at_new_width_reflows_media_rules_and_fires_resize() {
+        let html = r#"<html><head><style>
+            #a { width: 10px; height: 10px; }
+            @media (min-width: 1000px) { #a { width: 50px; } }
+        </style></head><body><div id="a"></div>
+        <script>window.__resizes = 0; window.addEventListener('resize', () => window.__resizes++);</script>
+        </body></html>"#;
+        let base = Url::parse("https://example.com/").unwrap();
+        let (page, stylesheet) = process_html_with_cache(
+            html, &base, &HashMap::new(), &mut HashMap::new(), None, None, None, None, 800.0,
+        )
+        .expect("process_html_with_cache");
+        let mut engine = BrowserEngine::new();
+        engine.last_page = Some(page.clone());
+        engine.last_stylesheet = Some(stylesheet);
+        engine.stylesheet_viewport = (800.0, DEFAULT_VIEWPORT_HEIGHT);
+        engine.init_js_for_page(&page);
+        engine.re_render(None, None, 800.0).expect("render at 800");
+        assert_eq!(engine.evaluate_js("window.innerWidth"), "800");
+        assert_eq!(engine.evaluate_js("document.getElementById('a').getBoundingClientRect().width"), "10");
+
+        engine.re_render(None, None, 1200.0).expect("render at 1200");
+        engine.tick_js(Some(0.0), None);
+        assert_eq!(engine.evaluate_js("window.innerWidth"), "1200");
+        assert_eq!(engine.evaluate_js("window.__resizes"), "1");
+        assert_eq!(engine.evaluate_js("document.getElementById('a').getBoundingClientRect().width"), "50");
     }
 
     #[test]

@@ -450,6 +450,13 @@ async fn run_http_server(handle: EngineHandle, port: u16) {
 
 // ── DaemonBrowserApp — GUI front-end ──────────────────────────────────────────
 
+/// Width kept free for the page scroll area's vertical scrollbar.
+const PANEL_SCROLLBAR_ALLOWANCE: f32 = 12.0;
+/// Narrowest layout width the GUI asks the engine for.
+const MIN_RENDER_WIDTH: f32 = 320.0;
+/// How long the panel width must stay unchanged before the page reflows.
+const RESIZE_SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
+
 struct DaemonBrowserApp {
     handle: EngineHandle,
     url: String,
@@ -482,6 +489,11 @@ struct DaemonBrowserApp {
     console_history_index: Option<usize>,
     console_eval_promise: Option<Promise<browser::js::EvalOutcome>>,
     has_page: bool,
+    /// Page layout width in CSS px: the central panel's width, so the page
+    /// reflows when the window is resized (the HTTP API keeps 800).
+    render_width: f32,
+    /// A new panel width waiting to settle before re-rendering at it.
+    pending_width: Option<(f32, std::time::Instant)>,
 }
 
 impl DaemonBrowserApp {
@@ -534,6 +546,8 @@ impl DaemonBrowserApp {
             console_history_index: None,
             console_eval_promise: None,
             has_page: false,
+            render_width: 800.0,
+            pending_width: None,
         }
     }
 
@@ -640,7 +654,7 @@ impl eframe::App for DaemonBrowserApp {
                     && self.re_render_promise.is_none()
                     && self.content_promise.is_none()
                 {
-                    self.trigger_re_render(ctx, 800.0);
+                    self.trigger_re_render(ctx, self.render_width);
                 } else {
                     ctx.request_repaint();
                 }
@@ -667,7 +681,7 @@ impl eframe::App for DaemonBrowserApp {
                     }
                 };
                 self.focused_id = Some(focusables[next_index].1.clone());
-                self.trigger_re_render(ctx, 800.0);
+                self.trigger_re_render(ctx, self.render_width);
             }
         }
 
@@ -706,14 +720,14 @@ impl eframe::App for DaemonBrowserApp {
 
                     let history = self.handle.history();
                     if btn_style(ui, "←", history.can_go_back()).clicked() {
-                        self.traverse_history(-1, 800.0);
+                        self.traverse_history(-1, self.render_width);
                     }
                     if btn_style(ui, "→", history.can_go_forward()).clicked() {
-                        self.traverse_history(1, 800.0);
+                        self.traverse_history(1, self.render_width);
                     }
                     if btn_style(ui, "⟳", true).clicked() {
                         let url = self.url.clone();
-                        self.load_url(url, 800.0);
+                        self.load_url(url, self.render_width);
                     }
 
                     ui.spacing_mut().item_spacing.x = 8.0;
@@ -732,7 +746,7 @@ impl eframe::App for DaemonBrowserApp {
                         let resp = ui.add(edit);
                         if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             let url = self.url.clone();
-                            self.load_url(url, 800.0);
+                            self.load_url(url, self.render_width);
                         }
                     });
 
@@ -750,7 +764,7 @@ impl eframe::App for DaemonBrowserApp {
                         .clicked()
                     {
                         let url = self.url.clone();
-                        self.load_url(url, 800.0);
+                        self.load_url(url, self.render_width);
                     }
 
                     // Daemon badge
@@ -810,7 +824,7 @@ impl eframe::App for DaemonBrowserApp {
                             self.sync_url_from_history();
                         }
                         if had_script {
-                            self.trigger_re_render(ctx, 800.0);
+                            self.trigger_re_render(ctx, self.render_width);
                         }
                     }
                 }
@@ -820,7 +834,7 @@ impl eframe::App for DaemonBrowserApp {
                         let url = maybe_url.clone();
                         self.submit_promise = None;
                         if let Some(url) = url {
-                            self.load_url(url, 800.0);
+                            self.load_url(url, self.render_width);
                         }
                     }
                 }
@@ -904,7 +918,7 @@ impl eframe::App for DaemonBrowserApp {
                     None => true,
                 });
                 if newly_loaded {
-                    self.trigger_re_render(ctx, 800.0);
+                    self.trigger_re_render(ctx, self.render_width);
                 }
 
                 // Error
@@ -916,6 +930,31 @@ impl eframe::App for DaemonBrowserApp {
                             format!("페이지를 불러올 수 없습니다: {}", err),
                         );
                     });
+                }
+
+                // Reflow the page to the panel width once a resize settles.
+                let panel_width = (ui.available_width() - PANEL_SCROLLBAR_ALLOWANCE)
+                    .floor()
+                    .max(MIN_RENDER_WIDTH);
+                if (panel_width - self.render_width).abs() >= 1.0 {
+                    let settled = match self.pending_width {
+                        Some((w, since)) if (w - panel_width).abs() < 1.0 => {
+                            since.elapsed() >= RESIZE_SETTLE
+                        }
+                        _ => {
+                            self.pending_width = Some((panel_width, std::time::Instant::now()));
+                            false
+                        }
+                    };
+                    if settled && self.has_page && self.re_render_promise.is_none() && self.content_promise.is_none() {
+                        self.render_width = panel_width;
+                        self.pending_width = None;
+                        self.trigger_re_render(ctx, self.render_width);
+                    } else {
+                        ctx.request_repaint_after(RESIZE_SETTLE);
+                    }
+                } else {
+                    self.pending_width = None;
                 }
 
                 // Render page texture + interactive overlay
@@ -1026,7 +1065,7 @@ impl eframe::App for DaemonBrowserApp {
                                     }
                                     if new_focus != self.focused_id {
                                         self.focused_id = new_focus;
-                                        self.trigger_re_render(ctx, 800.0);
+                                        self.trigger_re_render(ctx, self.render_width);
                                     }
 
                                     // GUI-side link navigation
@@ -1057,16 +1096,16 @@ impl eframe::App for DaemonBrowserApp {
                                 }
                                 if new_hovered_id != self.hovered_id {
                                     self.hovered_id = new_hovered_id;
-                                    self.trigger_re_render(ctx, 800.0);
+                                    self.trigger_re_render(ctx, self.render_width);
                                 }
                             } else if self.hovered_id.is_some() {
                                 self.hovered_id = None;
-                                self.trigger_re_render(ctx, 800.0);
+                                self.trigger_re_render(ctx, self.render_width);
                             }
                         });
 
                     if let Some(url) = url_to_load {
-                        self.load_url(url, 800.0);
+                        self.load_url(url, self.render_width);
                     }
                 }
             });

@@ -467,7 +467,7 @@ fn split_top_level_spaces(s: &str) -> Vec<String> {
 /// The parser is brace-, string- and parenthesis-aware, so `url(...)` values that
 /// contain `@`, `;` or `}` and quoted strings with braces do not break rule
 /// boundaries. Comments are removed first. `@media` blocks are evaluated against the
-/// fixed viewport (see [`VIEWPORT_WIDTH_PX`]); non-matching blocks are dropped.
+/// viewport set by [`set_media_viewport`]; non-matching blocks are dropped.
 /// `@supports` and `@layer` blocks are flattened into the surrounding rule list;
 /// other at-rules (`@font-face`, `@keyframes`, `@import`, ...) are skipped.
 pub fn parse_css(source: &str) -> Stylesheet {
@@ -705,14 +705,21 @@ fn evaluate_supports(prelude: &str) -> bool {
 
 // ── Media queries ─────────────────────────────────────────────────────────────
 
-/// Viewport width used for `@media` query evaluation.
-///
-/// The render canvas is fixed at 800 px (see `src/main.rs`). All `@media`
-/// conditions are evaluated against this value so that responsive stylesheets
-/// activate the rules that were authored for an ~800 px viewport.
-const VIEWPORT_WIDTH_PX: f32 = 800.0;
-/// Viewport height used for `@media` height features.
-const VIEWPORT_HEIGHT_PX: f32 = 768.0;
+thread_local! {
+    /// Viewport size (width, height) in CSS px that `@media` queries are
+    /// evaluated against while a stylesheet is parsed. The engine sets it to
+    /// the render size before parsing; defaults to 800 x 768.
+    static MEDIA_VIEWPORT: std::cell::Cell<(f32, f32)> = const { std::cell::Cell::new((800.0, 768.0)) };
+}
+
+/// Set the viewport size used for `@media` evaluation on this thread.
+pub fn set_media_viewport(width: f32, height: f32) {
+    MEDIA_VIEWPORT.with(|v| v.set((width, height)));
+}
+
+fn media_viewport() -> (f32, f32) {
+    MEDIA_VIEWPORT.with(|v| v.get())
+}
 
 /// Returns true if the media query list (the text between `@media` and `{`)
 /// matches the fixed screen viewport. A comma-separated list matches when any
@@ -819,8 +826,8 @@ fn media_condition_matches(inner: &str) -> bool {
                     (parts[1], parts[0], false)
                 };
                 let actual = match name {
-                    "width" | "device-width" => VIEWPORT_WIDTH_PX,
-                    "height" | "device-height" => VIEWPORT_HEIGHT_PX,
+                    "width" | "device-width" => media_viewport().0,
+                    "height" | "device-height" => media_viewport().1,
                     _ => return false,
                 };
                 let Some(v) = media_length_px(val) else { return false };
@@ -841,8 +848,7 @@ fn media_condition_matches(inner: &str) -> bool {
         Some((n, v)) => (n.trim(), v.trim()),
         None => (inner, ""),
     };
-    let w = VIEWPORT_WIDTH_PX;
-    let h = VIEWPORT_HEIGHT_PX;
+    let (w, h) = media_viewport();
     match name {
         "min-width" | "min-device-width" => media_length_px(value).map_or(false, |v| w >= v),
         "max-width" | "max-device-width" => media_length_px(value).map_or(false, |v| w <= v),
@@ -2868,6 +2874,16 @@ mod tests {
             }
             other => panic!("expected linear gradient, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_media_queries_use_the_configured_viewport() {
+        set_media_viewport(1200.0, 768.0);
+        let wide = parse_css("@media (max-width: 900px) { p { color: red; } }");
+        set_media_viewport(800.0, 768.0);
+        let narrow = parse_css("@media (max-width: 900px) { p { color: red; } }");
+        assert!(wide.items.is_empty(), "max-width: 900px must not apply at 1200px");
+        assert!(!narrow.items.is_empty(), "max-width: 900px applies at 800px");
     }
 
     #[test]

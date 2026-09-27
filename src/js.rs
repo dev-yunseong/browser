@@ -1678,6 +1678,12 @@ impl JsRuntime {
         viewport_width: f32,
         viewport_height: f32,
     ) {
+        let resized = SCROLL_STATE.with(|state| {
+            let state = state.borrow();
+            // The first layout only sets the size; later changes are resizes.
+            state.document_width > 0.0
+                && (state.viewport_width != viewport_width as f64 || state.viewport_height != viewport_height as f64)
+        });
         let moved = SCROLL_STATE.with(|state| {
             let mut state = state.borrow_mut();
             state.document_width = document_width as f64;
@@ -1692,6 +1698,13 @@ impl JsRuntime {
         });
         if moved {
             self.execute("if (typeof __aura_queue_scroll_event === 'function') __aura_queue_scroll_event();");
+        }
+        if resized {
+            self.execute(&format!(
+                "window.innerWidth = window.outerWidth = {viewport_width}; \
+                 window.innerHeight = window.outerHeight = {viewport_height}; \
+                 window.dispatchEvent(new Event('resize'));"
+            ));
         }
     }
 
