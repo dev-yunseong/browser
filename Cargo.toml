@@ -18,6 +18,9 @@ path = "src/bin/browser_cli.rs"
 [dependencies]
 ab_glyph = "0.2.32"
 v8 = "147"
+# ICU data for V8 Intl/toLocale* (v8 147 uses ICU 77); without it locale
+# formatting throws or aborts the process.
+deno_core_icudata = "=0.77.0"
 cssparser = "0.37.0"
 eframe = "0.29"
 egui = "0.29"

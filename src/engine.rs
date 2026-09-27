@@ -983,6 +983,15 @@ impl BrowserEngine {
             Some(p) => (p.body.clone(), p.base_url.clone()),
             None => return Err("No page loaded".into()),
         };
+        // Without an explicit focus from the UI, honour element.focus() calls
+        // made by page scripts so :focus styles match the live document.
+        let js_focused_id = self.js_runtime.get_focused_node_id();
+        let focused_id = focused_id.or(js_focused_id.as_deref());
+        if let Ok(path) = std::env::var("BROWSER_DEBUG_DUMP_HTML") {
+            if !path.is_empty() {
+                let _ = std::fs::write(path, &body);
+            }
+        }
 
         let mut css_cache = self.css_cache.clone();
         let result = process_html_with_cache(
@@ -2918,6 +2927,8 @@ mod tests {
             "old"
         );
 
+        // Timers honour their delay, so let the 10ms timer come due first.
+        std::thread::sleep(std::time::Duration::from_millis(20));
         engine.tick_js(Some(20.0), None);
 
         assert_eq!(engine.evaluate_js("globalThis.__timer_fired"), "true");

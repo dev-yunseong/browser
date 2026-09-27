@@ -153,6 +153,10 @@ function __aura_read_document_type_info(id) {
     return null;
 }
 
+// Marker telling constructors that double as page-visible constructors
+// (`new Image(w, h)`) to wrap an existing native node instead of creating one.
+const __AURA_WRAP_EXISTING = Symbol('aura.wrapExisting');
+
 function __get_or_create_node(id, tag, string_id, kind) {
     if (!id) return null;
     if (__node_registry.has(id)) return __node_registry.get(id);
@@ -179,7 +183,7 @@ function __get_or_create_node(id, tag, string_id, kind) {
         } else if (tagLower === 'script') {
             node = new HTMLScriptElement(id, descriptor.tag, descriptor.id);
         } else if (tagLower === 'img') {
-            node = new HTMLImageElement(id, descriptor.tag, descriptor.id);
+            node = new HTMLImageElement(__AURA_WRAP_EXISTING, id, descriptor.tag, descriptor.id);
         } else if (tagLower === 'input') {
             node = new HTMLInputElement(id, descriptor.tag, descriptor.id);
         } else if (tagLower === 'button') {
@@ -193,7 +197,11 @@ function __get_or_create_node(id, tag, string_id, kind) {
         } else if (tagLower === 'canvas') {
             node = new HTMLCanvasElement(id, descriptor.tag, descriptor.id);
         } else {
-            node = new Element(id, descriptor.tag, descriptor.id);
+            // HTMLElement is declared later in this file; fall back to Element
+            // if a node is wrapped while the bootstrap is still evaluating.
+            let ElementClass;
+            try { ElementClass = HTMLElement; } catch (e) { ElementClass = Element; }
+            node = new ElementClass(id, descriptor.tag, descriptor.id);
         }
     } else {
         node = new Node(id, descriptor.kind || 'element');
@@ -272,11 +280,14 @@ function __aura_append_window_to_path(path) {
     if (path[path.length - 1] !== window) path.push(window);
 }
 
-function __aura_event_path(target) {
+function __aura_event_path(target, event) {
     let path = [target];
     if (target === window) return path;
+    // DOM spec "get the parent" of a Document returns null for 'load' events,
+    // so image/script load events never reach window 'load' listeners.
+    let reachesWindow = !(event && event.type === 'load');
     if (target === document) {
-        __aura_append_window_to_path(path);
+        if (reachesWindow) __aura_append_window_to_path(path);
         return path;
     }
     let current = target;
@@ -285,7 +296,7 @@ function __aura_event_path(target) {
         path.push(current);
     }
     if (path[path.length - 1] !== document) path.push(document);
-    __aura_append_window_to_path(path);
+    if (reachesWindow) __aura_append_window_to_path(path);
     return path;
 }
 
@@ -315,7 +326,7 @@ function __aura_dispatch_event(target, event) {
     event.eventPhase = Event.NONE;
     event._stopped = false;
     event._immediateStopped = false;
-    event._path = __aura_event_path(target);
+    event._path = __aura_event_path(target, event);
 
     let path = event._path;
     for (let i = path.length - 1; i >= 1; i--) {
@@ -1543,7 +1554,6 @@ class Element extends Node {
     constructor(id, tag, string_id) {
         super(id, 'element');
         this.tagName = (tag || '').toUpperCase();
-        this.id = string_id || '';
         this._classList = null;
         this.style = new CSSStyleDeclaration(id);
     }
@@ -1571,6 +1581,13 @@ class Element extends Node {
                 return undefined;
             }
         });
+    }
+    // `id` reflects the id content attribute (assignment must reach the DOM).
+    get id() {
+        return __aura_get_attribute(this._id, 'id') || '';
+    }
+    set id(val) {
+        this.setAttribute('id', String(val));
     }
     get className() {
         return __aura_get_attribute(this._id, 'class') || '';
@@ -2294,7 +2311,21 @@ var document = {
     },
     activeElement: null,
     location: { href: '', hostname: '', pathname: '/', search: '', hash: '', protocol: 'https:', host: '', port: '', origin: '' },
-    title: '',
+    get title() {
+        let el = this.querySelector('title');
+        if (!el) return '';
+        return String(el.textContent || '').replace(/[\t\n\f\r ]+/g, ' ').trim();
+    },
+    set title(value) {
+        let el = this.querySelector('title');
+        if (!el) {
+            let head = this.head;
+            if (!head) return;
+            el = this.createElement('title');
+            head.appendChild(el);
+        }
+        el.textContent = String(value);
+    },
     readyState: 'complete',
     referrer: '',
     characterSet: 'UTF-8',
@@ -3103,24 +3134,74 @@ window.postMessage = function(message, targetOrigin, transfer) {
 };
 
 // -- Timers ------------------------------------------------------------------
-window.setTimeout = function(fn, delay) {
-    if (typeof fn === 'function') {
-        __aura_queue_task(fn);
-    } else if (typeof fn === 'string') {
-        __aura_queue_task(() => eval(fn));
-    }
-    return 1;
-};
+// Timers honour their delay against performance.now() and can be cancelled.
+// The Rust event loop calls __aura_timers_begin_turn() once per tick and then
+// __aura_run_next_due_timer() until it returns false, draining microtasks
+// between callbacks the way an HTML event loop runs one task at a time.
+var __aura_timers = new Map();
+var __aura_timer_next_id = 1;
+var __aura_timer_seq = 0;
+var __aura_timer_turn_limit = 0;
 
-window.clearTimeout = function() {};
-window.setInterval = function(fn, delay) {
-    // Simplified: run once as macro task
-    if (typeof fn === 'function') {
-        __aura_queue_task(fn);
+function __aura_timer_callback(fn) {
+    if (typeof fn === 'function') return fn;
+    let code = String(fn);
+    return function() { (0, eval)(code); };
+}
+
+function __aura_add_timer(fn, delay, args, repeat) {
+    let id = __aura_timer_next_id++;
+    let ms = Number(delay);
+    if (!isFinite(ms) || ms < 0) ms = 0;
+    __aura_timers.set(id, {
+        id: id,
+        callback: __aura_timer_callback(fn),
+        args: args,
+        interval: repeat ? Math.max(ms, 4) : null,
+        due: performance.now() + ms,
+        seq: ++__aura_timer_seq,
+    });
+    return id;
+}
+
+function __aura_timers_begin_turn() {
+    __aura_timer_turn_limit = __aura_timer_seq;
+}
+
+function __aura_run_next_due_timer() {
+    let now = performance.now();
+    let next = null;
+    for (const timer of __aura_timers.values()) {
+        if (timer.due > now || timer.seq > __aura_timer_turn_limit) continue;
+        if (!next || timer.due < next.due || (timer.due === next.due && timer.seq < next.seq)) {
+            next = timer;
+        }
     }
-    return 1;
+    if (!next) return false;
+    if (next.interval !== null) {
+        next.due = now + next.interval;
+        next.seq = ++__aura_timer_seq;
+    } else {
+        __aura_timers.delete(next.id);
+    }
+    try {
+        next.callback.apply(window, next.args);
+    } catch (e) {
+        console.error('Uncaught ' + (e && e.stack ? e.stack : e));
+    }
+    return true;
+}
+
+window.setTimeout = function(fn, delay, ...args) {
+    return __aura_add_timer(fn, delay, args, false);
 };
-window.clearInterval = function() {};
+window.setInterval = function(fn, delay, ...args) {
+    return __aura_add_timer(fn, delay, args, true);
+};
+window.clearTimeout = function(id) {
+    __aura_timers.delete(Number(id));
+};
+window.clearInterval = window.clearTimeout;
 
 // -- fetch() -----------------------------------------------------------------
 class Headers {
@@ -3997,10 +4078,16 @@ window.DOMTokenList = DOMTokenList;
 
 // -- Image constructor (HTMLImageElement) ------------------------------------
 class HTMLImageElement extends Element {
-    constructor(width, height) {
-        // Create a real img element in the DOM
+    constructor(width, height, tag, stringId) {
+        if (width === __AURA_WRAP_EXISTING) {
+            // Wrapping an existing <img> node: (marker, nativeId, tag, stringId).
+            super(height, tag, stringId);
+            return;
+        }
+        // `new Image(width, height)`: create a real img element in the DOM.
         var nativeId = __aura_create_element('img');
         super(nativeId, 'img', '');
+        __node_registry.set(nativeId, this);
         if (width !== undefined) __aura_set_attribute(nativeId, 'width', String(width));
         if (height !== undefined) __aura_set_attribute(nativeId, 'height', String(height));
         this.onload = null;
@@ -4031,6 +4118,31 @@ class HTMLElement extends Element {
     constructor(id, tag, string_id) {
         super(id, tag, string_id);
     }
+    // Reflected global attributes (HTML spec) so property writes reach the DOM.
+    get title() { return this.getAttribute('title') || ''; }
+    set title(v) { this.setAttribute('title', String(v)); }
+    get lang() { return this.getAttribute('lang') || ''; }
+    set lang(v) { this.setAttribute('lang', String(v)); }
+    get dir() { return this.getAttribute('dir') || ''; }
+    set dir(v) { this.setAttribute('dir', String(v)); }
+    get hidden() { return this.hasAttribute('hidden'); }
+    set hidden(v) {
+        if (v) this.setAttribute('hidden', '');
+        else this.removeAttribute('hidden');
+    }
+    get tabIndex() {
+        let raw = this.getAttribute('tabindex');
+        let n = raw === null ? NaN : parseInt(raw, 10);
+        if (!isNaN(n)) return n;
+        return /^(A|AREA|BUTTON|INPUT|SELECT|TEXTAREA|IFRAME)$/.test(this.tagName) ? 0 : -1;
+    }
+    set tabIndex(v) { this.setAttribute('tabindex', String(parseInt(v, 10) || 0)); }
+    get placeholder() { return this.getAttribute('placeholder') || ''; }
+    set placeholder(v) { this.setAttribute('placeholder', String(v)); }
+    // innerText approximated by textContent (no layout-aware line breaks).
+    get innerText() { return this.textContent; }
+    set innerText(v) { this.textContent = v === null || v === undefined ? '' : String(v); }
+    get outerText() { return this.textContent; }
 }
 window.HTMLElement = HTMLElement;
 
@@ -4326,6 +4438,7 @@ class HTMLOptionElement extends HTMLElement {
     constructor(text, value, defaultSelected, selected) {
         var nativeId = __aura_create_element('option');
         super(nativeId, 'option', '');
+        __node_registry.set(nativeId, this);
         if (text !== undefined) this.textContent = String(text);
         if (value !== undefined) __aura_set_attribute(nativeId, 'value', String(value));
     }
@@ -4376,8 +4489,12 @@ window.HTMLLIElement = HTMLLIElement;
 
 class HTMLCanvasElement extends HTMLElement {
     getContext(type) {
-        // Stub canvas context
-        return {
+        // Only a (non-drawing) 2D context is offered; other context types are
+        // unsupported and return null as the HTML spec requires. Repeated
+        // calls return the same context whose `canvas` is this element.
+        if (String(type).toLowerCase() !== '2d') return null;
+        if (this._context2d) return this._context2d;
+        this._context2d = {
             fillRect: function() {},
             clearRect: function() {},
             strokeRect: function() {},
@@ -4424,6 +4541,8 @@ class HTMLCanvasElement extends HTMLElement {
             globalAlpha: 1,
             globalCompositeOperation: 'source-over',
         };
+        this._context2d.canvas = this;
+        return this._context2d;
     }
     get width() { return parseInt(__aura_get_attribute(this._id, 'width') || '300'); }
     set width(v) { __aura_set_attribute(this._id, 'width', String(v)); }
