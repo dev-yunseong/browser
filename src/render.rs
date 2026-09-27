@@ -392,9 +392,10 @@ fn execute_commands_on_tile(
                             match object_fit {
                                 ObjectFit::Fill => {
                                     // Stretch to fill — existing behavior
-                                    pixmap.draw_pixmap(r.x as i32, r.y as i32, img_pixmap.as_ref(),
+                                    // Translate before scaling: draw_pixmap's x/y would be scaled too.
+                                    pixmap.draw_pixmap(0, 0, img_pixmap.as_ref(),
                                         &PixmapPaint::default(),
-                                        transform.post_scale(r.width / img_w, r.height / img_h), active_mask!());
+                                        transform.pre_translate(r.x, r.y).pre_scale(r.width / img_w, r.height / img_h), active_mask!());
                                 }
                                 ObjectFit::Contain => {
                                     // Scale uniformly to fit inside rect; letterbox with transparency
@@ -403,9 +404,9 @@ fn execute_commands_on_tile(
                                     let sh = img_h * s;
                                     let ox = r.x + (r.width - sw) / 2.0;
                                     let oy = r.y + (r.height - sh) / 2.0;
-                                    pixmap.draw_pixmap(ox as i32, oy as i32, img_pixmap.as_ref(),
+                                    pixmap.draw_pixmap(0, 0, img_pixmap.as_ref(),
                                         &PixmapPaint::default(),
-                                        transform.post_scale(s, s), active_mask!());
+                                        transform.pre_translate(ox, oy).pre_scale(s, s), active_mask!());
                                 }
                                 ObjectFit::Cover => {
                                     // Scale uniformly to fill rect; draw into a temp pixmap to clip overflow
@@ -417,9 +418,9 @@ fn execute_commands_on_tile(
                                     if let Some(mut tmp) = Pixmap::new(rw.max(1), rh.max(1)) {
                                         let local_ox = (r.width - sw) / 2.0;
                                         let local_oy = (r.height - sh) / 2.0;
-                                        tmp.draw_pixmap(local_ox as i32, local_oy as i32,
+                                        tmp.draw_pixmap(0, 0,
                                             img_pixmap.as_ref(), &PixmapPaint::default(),
-                                            Transform::from_scale(s, s), None);
+                                            Transform::from_translate(local_ox, local_oy).pre_scale(s, s), None);
                                         pixmap.draw_pixmap(r.x as i32, r.y as i32, tmp.as_ref(),
                                             &PixmapPaint::default(), transform, active_mask!());
                                     }
@@ -1706,6 +1707,35 @@ mod tests {
             pixmap.data().chunks_exact(4).any(|px| px[0] != 0 || px[1] != 0 || px[2] != 0 || px[3] != 0),
             "relative image paint command should render using absolute cached bytes"
         );
+    }
+
+    /// A scaled image must land at its layout rect, not at (x * scale, y * scale).
+    #[test]
+    fn test_scaled_image_is_drawn_at_its_rect() {
+        use crate::layer_tree::{ObjectFit, PaintCommand};
+        use url::Url;
+
+        let red = encode_png(&image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255])));
+        for fit in [ObjectFit::Fill, ObjectFit::Contain, ObjectFit::Cover] {
+            let mut pixmap = Pixmap::new(40, 40).unwrap();
+            pixmap.fill(tiny_skia::Color::WHITE);
+            let tile_rect = LayoutRect { x: 0.0, y: 0.0, width: 40.0, height: 40.0 };
+            let cmds = vec![PaintCommand::Image {
+                rect: LayoutRect { x: 20.0, y: 20.0, width: 10.0, height: 10.0 },
+                url: "https://example.com/red.png".to_string(),
+                object_fit: fit.clone(),
+                alt: String::new(),
+            }];
+            let mut image_cache = HashMap::new();
+            image_cache.insert("https://example.com/red.png".to_string(), red.clone());
+            let base_url = Url::parse("https://example.com/").unwrap();
+
+            execute_commands_on_tile(&cmds, &mut pixmap, tile_rect, &image_cache, &base_url);
+
+            let at = |x: u32, y: u32| pixmap.pixel(x, y).unwrap();
+            assert_eq!((at(25, 25).red(), at(25, 25).green()), (255, 0), "{fit:?}: rect centre must be red");
+            assert_eq!(at(5, 5).green(), 255, "{fit:?}: nothing may be drawn at the scaled origin");
+        }
     }
 
     fn encode_png(img: &image::RgbaImage) -> Vec<u8> {
