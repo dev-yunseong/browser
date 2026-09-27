@@ -1594,8 +1594,7 @@ impl BrowserEngine {
 
     /// Execute JavaScript in the current page's runtime and return a result/error.
     pub fn evaluate_js_with_result(&mut self, script: &str) -> js::EvalOutcome {
-        let outcome = self.js_runtime.execute_with_result(script);
-        outcome
+        self.js_runtime.execute_with_result(script)
     }
 
     /// Execute JavaScript in the current page's runtime (fire-and-forget).
