@@ -3279,10 +3279,11 @@ function __aura_post_message_impl(target, message, targetOrigin) {
     if (typeof target.dispatchEvent !== 'function') return;
     setTimeout(function() {
         try {
-            var ev = new Event('message');
-            ev.data = message;
-            ev.origin = typeof targetOrigin === 'string' ? targetOrigin : '*';
-            ev.source = target;
+            var ev = new MessageEvent('message', {
+                data: message,
+                origin: (location && location.origin) || '',
+                source: window
+            });
             target.dispatchEvent(ev);
         } catch (e) {
             console.error('Error dispatching message event: ' + e);
@@ -3292,6 +3293,119 @@ function __aura_post_message_impl(target, message, targetOrigin) {
 window.postMessage = function(message, targetOrigin, transfer) {
     __aura_post_message_impl(globalThis, message, targetOrigin);
 };
+
+// -- Frames ------------------------------------------------------------------
+// postMessage between documents in different engines. Calls queue here; the
+// engine drains the queue (__aura_frame_take_outbox) and routes each message
+// to the parent or child frame engine, which dispatches it with
+// __aura_frame_receive_message. Data crosses as JSON.
+var __aura_frame_outbox = [];
+
+function __aura_frame_serialize(message) {
+    try {
+        var json = JSON.stringify(message === undefined ? null : message);
+        return json === undefined ? 'null' : json;
+    } catch (e) {
+        return 'null';
+    }
+}
+
+function __aura_frame_target_origin(targetOrigin) {
+    var target = targetOrigin === undefined ? '/' : String(targetOrigin);
+    return target === '/' ? ((location && location.origin) || '') : target;
+}
+
+function __aura_frame_take_outbox() {
+    var out = JSON.stringify(__aura_frame_outbox);
+    __aura_frame_outbox = [];
+    return out;
+}
+
+// Absolute http(s) src of a network <iframe>, as the engine names frames.
+function __aura_frame_src(frame) {
+    if (!frame || typeof frame.getAttribute !== 'function') return null;
+    if (frame.hasAttribute && frame.hasAttribute('srcdoc')) return null;
+    var raw = String(frame.getAttribute('src') || '').trim();
+    if (!raw) return null;
+    var abs = __aura_resolve_url_attribute(raw);
+    return /^https?:/i.test(abs) ? abs : null;
+}
+
+// [src, ordinal] naming `frame` for the engine: the ordinal counts earlier
+// <iframe> elements with the same src in document order.
+function __aura_frame_identity(frame) {
+    var src = __aura_frame_src(frame);
+    if (!src) return null;
+    var frames = document.getElementsByTagName('iframe');
+    var ordinal = 0;
+    for (var i = 0; i < frames.length; i++) {
+        if (frames[i] === frame) return [src, ordinal];
+        if (__aura_frame_src(frames[i]) === src) ordinal++;
+    }
+    return null;
+}
+
+function __aura_find_frame_element(src, ordinal) {
+    var frames = document.getElementsByTagName('iframe');
+    var seen = 0;
+    for (var i = 0; i < frames.length; i++) {
+        if (__aura_frame_src(frames[i]) !== src) continue;
+        if (seen === ordinal) return frames[i];
+        seen++;
+    }
+    return null;
+}
+
+// Make this document a frame of a document with origin `parentOrigin`:
+// window.parent / window.top become a cross-origin window proxy whose
+// postMessage reaches the parent engine.
+function __aura_install_frame_parent(parentOrigin, frameName) {
+    var parentWindow = new EventTarget();
+    parentWindow.postMessage = function(message, targetOrigin, transfer) {
+        __aura_frame_outbox.push({
+            to: 'parent',
+            data: __aura_frame_serialize(message),
+            targetOrigin: String(targetOrigin === undefined ? '' : targetOrigin)
+        });
+    };
+    parentWindow.self = parentWindow;
+    parentWindow.window = parentWindow;
+    parentWindow.top = parentWindow;
+    parentWindow.parent = parentWindow;
+    parentWindow.frames = parentWindow;
+    parentWindow.length = 1;
+    parentWindow.closed = false;
+    parentWindow.opener = null;
+    parentWindow.focus = function() {};
+    parentWindow.blur = function() {};
+    window.parent = parentWindow;
+    window.top = parentWindow;
+    window.frameElement = null;
+    window.name = String(frameName || '');
+    window.__aura_parent_origin = String(parentOrigin || '');
+    if (location && location.ancestorOrigins === undefined) {
+        try { location.ancestorOrigins = [String(parentOrigin || '')]; } catch (e) {}
+    }
+}
+
+// Dispatch a message from another frame engine. `src` null means the parent
+// document; otherwise the child frame (src, ordinal) of this document.
+function __aura_frame_receive_message(src, ordinal, data, origin) {
+    var source = null;
+    if (src === null || src === undefined) {
+        source = window.parent;
+    } else {
+        var frame = __aura_find_frame_element(src, ordinal);
+        source = frame ? frame.contentWindow : null;
+    }
+    var value;
+    try { value = JSON.parse(data); } catch (e) { value = data; }
+    try {
+        window.dispatchEvent(new MessageEvent('message', { data: value, origin: origin, source: source }));
+    } catch (e) {
+        console.error('Error dispatching message event: ' + e);
+    }
+}
 
 // -- Timers ------------------------------------------------------------------
 // Timers honour their delay against performance.now() and can be cancelled.
@@ -4489,7 +4603,8 @@ class HTMLIFrameElement extends HTMLElement {
                 configurable: true
             });
             self._contentWindow.self = self._contentWindow;
-            self._contentWindow.top = self._contentWindow;
+            self._contentWindow.window = self._contentWindow;
+            self._contentWindow.top = window.top;
             self._contentWindow.parent = window;
             self._contentWindow.frames = self._contentWindow;
             self._contentWindow.length = 0;
@@ -4499,6 +4614,18 @@ class HTMLIFrameElement extends HTMLElement {
             self._contentWindow.opener = null;
             self._contentWindow.frameElement = self;
             self._contentWindow.postMessage = function(message, targetOrigin, transfer) {
+                // A frame with a network document runs in its own engine.
+                var identity = __aura_frame_identity(self);
+                if (identity) {
+                    __aura_frame_outbox.push({
+                        to: 'child',
+                        src: identity[0],
+                        ordinal: identity[1],
+                        data: __aura_frame_serialize(message),
+                        targetOrigin: __aura_frame_target_origin(targetOrigin)
+                    });
+                    return;
+                }
                 __aura_post_message_impl(self._contentWindow, message, targetOrigin);
             };
         }
