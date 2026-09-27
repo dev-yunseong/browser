@@ -1222,7 +1222,22 @@ fn compute_values(
         }
     }
 
-    // font-weight: compute to a keyword the painter understands (bold / normal).
+    // opacity: out-of-range values clamp to [0, 1] (percentages become numbers).
+    let op_key = intern("opacity");
+    match specified_values.get(&op_key) {
+        Some(Value::Number(n)) if !(0.0..=1.0).contains(n) => {
+            let n = n.clamp(0.0, 1.0);
+            specified_values.insert(op_key, Value::Number(n));
+        }
+        Some(Value::Length(n, Unit::Percent)) => {
+            let n = (n / 100.0).clamp(0.0, 1.0);
+            specified_values.insert(op_key, Value::Number(n));
+        }
+        _ => {}
+    }
+
+    // font-weight: compute to a number (CSS Fonts 4), resolving bolder/lighter
+    // against the parent; the font matcher picks the nearest face weight.
     let fw_key = intern("font-weight");
     if let Some(v) = specified_values.get(&fw_key).cloned() {
         let parent_w = parent_pm
@@ -1230,8 +1245,7 @@ fn compute_values(
             .and_then(|pv| font_weight_number(pv, 400.0))
             .unwrap_or(400.0);
         if let Some(w) = font_weight_number(&v, parent_w) {
-            let kw = if w >= 600.0 { "bold" } else { "normal" };
-            specified_values.insert(fw_key, Value::Keyword(intern(kw)));
+            specified_values.insert(fw_key, Value::Number(w.clamp(1.0, 1000.0)));
         }
     }
 
@@ -1777,9 +1791,9 @@ mod tests {
             "",
         );
         let html = find_node(&tree, "html").expect("html not found");
-        // inherit on root → initial value for font-weight is "normal"
-        let kw = get_keyword(html, "font-weight");
-        assert!(kw.is_none() || kw.as_deref() == Some("normal"));
+        // inherit on root → initial value for font-weight is normal (400)
+        let fw = html.specified_values.get(&intern("font-weight"));
+        assert!(fw.is_none() || fw == Some(&Value::Number(400.0)), "got {:?}", fw);
     }
 
     // --- initial keyword ---
@@ -2243,10 +2257,28 @@ mod tests {
     }
 
     #[test]
-    fn test_numeric_font_weight_computes_to_bold() {
-        let tree = make_tree(r#"<html><body><p>x</p></body></html>"#, "p { font-weight: 800; }");
-        let p = find_node(&tree, "p").unwrap();
-        assert_eq!(get_keyword(p, "font-weight").as_deref(), Some("bold"));
+    fn test_opacity_computes_clamped_number() {
+        let tree = make_tree(
+            r#"<html><body><p style="opacity:-56.81">x</p><i style="opacity:40%">y</i></body></html>"#,
+            "",
+        );
+        let op = |tag: &str| find_node(&tree, tag).unwrap().specified_values.get(&intern("opacity")).cloned();
+        assert_eq!(op("p"), Some(Value::Number(0.0)));
+        assert_eq!(op("i"), Some(Value::Number(0.4)));
+    }
+
+    #[test]
+    fn test_font_weight_computes_to_number() {
+        let tree = make_tree(
+            r#"<html><body><p>x<b>y</b></p><i>z</i></body></html>"#,
+            "body { font-weight: 500 } p { font-weight: 800; } i { font-weight: bolder }",
+        );
+        let fw = |tag: &str| find_node(&tree, tag).unwrap().specified_values.get(&intern("font-weight")).cloned();
+        assert_eq!(fw("p"), Some(Value::Number(800.0)));
+        assert_eq!(fw("body"), Some(Value::Number(500.0)));
+        // UA `b { font-weight: bold }` is 700; `bolder` from 500 is 700.
+        assert_eq!(fw("b"), Some(Value::Number(700.0)));
+        assert_eq!(fw("i"), Some(Value::Number(700.0)));
     }
 
     #[test]
