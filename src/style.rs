@@ -549,6 +549,19 @@ pub fn build_style_tree(
     focused_id: Option<&str>,
     _csp_policy: Option<&crate::js::CspPolicy>,
 ) -> StyledNode {
+    // Quirks-mode detection: a document with no doctype (the common real-world
+    // trigger — e.g. Hacker News ships no `<!DOCTYPE>`) renders in quirks
+    // mode. `root` is the document node here, so a `Doctype` child means
+    // standards/almost-standards mode. This does not attempt to replicate the
+    // full legacy-doctype quirks list (html5ever already computes that
+    // authoritatively on `RcDom::quirks_mode`, see `dom.rs`/`RcDom`), but the
+    // no-doctype case is what matters for the quirks-only style resets below.
+    let quirks_mode = !root
+        .children
+        .borrow()
+        .iter()
+        .any(|c| matches!(c.data, NodeData::Doctype { .. }));
+
     let mut arena = Vec::new();
     flatten_dom(root, &mut arena, None);
 
@@ -593,7 +606,7 @@ pub fn build_style_tree(
         arena.par_iter().enumerate().map(|(idx, node)| {
         if !node.is_element { return (HashMap::new(), None, None, None); }
         let mut map = HashMap::new();
-        apply_default_styles(&node.tag, node, &mut map);
+        apply_default_styles(&node.tag, node, &mut map, quirks_mode);
         apply_attribute_styles_arena(node, &mut map);
 
         let rule_matches = collect_matches(node, idx, &sel_index, &sig_cache, &all_rules, &ctx, PseudoTarget::None);
@@ -1394,7 +1407,7 @@ fn build_final_tree(
     results.pop().expect("build_final_tree: results stack should have exactly one element")
 }
 
-fn apply_default_styles(tag: &str, node: &NodeDataSend, map: &mut HashMap<Arc<str>, Value>) {
+fn apply_default_styles(tag: &str, node: &NodeDataSend, map: &mut HashMap<Arc<str>, Value>, quirks_mode: bool) {
     use crate::css::Unit::Px;
     let px = |v: f32| Value::Length(v, Px);
     let kw = |s: &str| Value::Keyword(intern(s));
@@ -1529,6 +1542,21 @@ fn apply_default_styles(tag: &str, node: &NodeDataSend, map: &mut HashMap<Arc<st
         }
         "table" => {
             set(map, "border-spacing", px(2.0));
+            // In quirks mode, Chromium's quirks UA sheet resets `table` so it
+            // does not inherit alignment/text properties from an ancestor
+            // like `<center>` (real-world case: Hacker News wraps its story
+            // table in `<center>` with no doctype). `color` is left alone —
+            // the spec's `-internal-quirk-inherit` for it means "still
+            // inherit normally", which is what happens if we don't set it.
+            if quirks_mode {
+                set(map, "text-align", kw("start"));
+                set(map, "white-space", kw("normal"));
+                set(map, "line-height", kw("normal"));
+                set(map, "font-weight", kw("normal"));
+                set(map, "font-size", kw("medium"));
+                set(map, "font-variant", kw("normal"));
+                set(map, "font-style", kw("normal"));
+            }
         }
         "hr" => {
             set_border(map, 1.0, "inset", crate::css::Color { r: 238, g: 238, b: 238, a: 255 });
@@ -1917,6 +1945,43 @@ mod tests {
             get_length_px(p, "width"),
             Some(999.0),
             "empty --accent must not fall back to 999px"
+        );
+    }
+
+    // --- quirks mode ---
+
+    #[test]
+    fn test_quirks_mode_table_does_not_inherit_center_alignment() {
+        // Hacker News has no doctype and wraps its story table in `<center>`.
+        // Chromium's quirks-mode UA sheet resets `table { text-align: start; ... }`
+        // so the table (and its cells) don't inherit the `<center>` alignment.
+        // Without a doctype, this document is in quirks mode.
+        let tree = make_tree(
+            r#"<center><table><tr><td id="cell">text</td></tr></table></center>"#,
+            "",
+        );
+        let table = find_node(&tree, "table").expect("table not found");
+        assert_eq!(
+            get_keyword(table, "text-align").as_deref(),
+            Some("start"),
+            "quirks-mode table must reset text-align to start, not inherit center"
+        );
+    }
+
+    #[test]
+    fn test_standards_mode_table_inherits_center_alignment() {
+        // The same markup, but with a doctype: standards mode. No reset
+        // applies, so the table inherits `text-align: center` from `<center>`
+        // normally.
+        let tree = make_tree(
+            r#"<!DOCTYPE html><html><body><center><table><tr><td id="cell">text</td></tr></table></center></body></html>"#,
+            "",
+        );
+        let table = find_node(&tree, "table").expect("table not found");
+        assert_eq!(
+            get_keyword(table, "text-align").as_deref(),
+            Some("center"),
+            "standards-mode table must inherit center alignment normally"
         );
     }
 
