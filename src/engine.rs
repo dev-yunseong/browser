@@ -665,7 +665,6 @@ pub fn collect_css_in_order(
 pub fn fetch_and_process(
     url_str: &str,
     css_cache: &mut HashMap<String, String>,
-    js_overrides: &HashMap<String, HashMap<String, String>>,
     hovered_id: Option<&str>,
     focused_id: Option<&str>,
     width: f32,
@@ -686,7 +685,6 @@ pub fn fetch_and_process(
         &HashMap::new(),
         css_cache,
         None,
-        js_overrides,
         hovered_id,
         focused_id,
         csp_header,
@@ -710,7 +708,6 @@ pub fn process_html_with_cache(
     image_cache: &HashMap<String, Vec<u8>>,
     css_cache: &mut HashMap<String, String>,
     cached_stylesheet: Option<css::Stylesheet>,
-    js_overrides: &HashMap<String, HashMap<String, String>>,
     hovered_id: Option<&str>,
     focused_id: Option<&str>,
     csp_policy: Option<js::CspPolicy>,
@@ -722,7 +719,6 @@ pub fn process_html_with_cache(
         image_cache,
         css_cache,
         cached_stylesheet,
-        js_overrides,
         hovered_id,
         focused_id,
         csp_policy,
@@ -742,7 +738,6 @@ pub fn process_html_with_scroll(
     image_cache: &HashMap<String, Vec<u8>>,
     css_cache: &mut HashMap<String, String>,
     cached_stylesheet: Option<css::Stylesheet>,
-    js_overrides: &HashMap<String, HashMap<String, String>>,
     hovered_id: Option<&str>,
     focused_id: Option<&str>,
     csp_policy: Option<js::CspPolicy>,
@@ -808,11 +803,13 @@ pub fn process_html_with_scroll(
     };
 
     let start = Instant::now();
+    // Inline styles written by script live in the DOM's style attributes;
+    // style.rs still takes a separate override map, which is always empty.
     let style_tree = style::build_style_tree(
         &dom_tree.document,
         &stylesheet,
         None,
-        js_overrides,
+        &HashMap::new(),
         hovered_id,
         focused_id,
         csp_policy.as_ref(),
@@ -1259,7 +1256,6 @@ pub struct BrowserEngine {
     pub js_runtime: js::JsRuntime,
     pub console_buffer: js::ConsoleBuffer,
     pub current_csp_policy: Option<js::CspPolicy>,
-    pub js_style_overrides: HashMap<String, HashMap<String, String>>,
     /// The most recently rendered page result.
     pub last_page: Option<PageResult>,
     /// Session history of top-level documents.
@@ -1278,7 +1274,6 @@ impl BrowserEngine {
             js_runtime: js::JsRuntime::new(None, None, None, None, console_buffer.clone()),
             console_buffer,
             current_csp_policy: None,
-            js_style_overrides: HashMap::new(),
             last_page: None,
             history: SharedHistory::default(),
             viewport_height: DEFAULT_VIEWPORT_HEIGHT,
@@ -1368,7 +1363,6 @@ impl BrowserEngine {
         let result = fetch_and_process(
             url_str,
             &mut self.css_cache,
-            &self.js_style_overrides,
             None,
             None,
             width,
@@ -1443,7 +1437,6 @@ impl BrowserEngine {
             &self.image_cache,
             &mut css_cache,
             self.last_stylesheet.clone(),
-            &self.js_style_overrides,
             hovered_id,
             focused_id,
             self.current_csp_policy.clone(),
@@ -1498,14 +1491,6 @@ impl BrowserEngine {
             if hit_test(x, y, rect) {
                 self.js_runtime.execute(script);
                 results.push(ClickResult::ScriptExecuted);
-            }
-        }
-
-        // Collect JS style overrides produced by onclick handlers
-        let overrides = self.js_runtime.get_style_overrides();
-        if !overrides.is_empty() {
-            for (id, props) in overrides {
-                self.js_style_overrides.entry(id).or_default().extend(props);
             }
         }
 
@@ -1607,12 +1592,6 @@ impl BrowserEngine {
     /// Execute JavaScript in the current page's runtime and return a result/error.
     pub fn evaluate_js_with_result(&mut self, script: &str) -> js::EvalOutcome {
         let outcome = self.js_runtime.execute_with_result(script);
-        let overrides = self.js_runtime.get_style_overrides();
-        if !overrides.is_empty() {
-            for (id, props) in overrides {
-                self.js_style_overrides.entry(id).or_default().extend(props);
-            }
-        }
         outcome
     }
 
@@ -2040,12 +2019,6 @@ impl BrowserEngine {
             }
         }
 
-        let overrides = self.js_runtime.get_style_overrides();
-        if !overrides.is_empty() {
-            for (id, props) in overrides {
-                self.js_style_overrides.entry(id).or_default().extend(props);
-            }
-        }
     }
 
     pub fn load_external_module_with<F, E>(
@@ -2123,7 +2096,6 @@ impl BrowserEngine {
 
     /// Reset all state in preparation for navigating to a new URL.
     pub fn clear_for_new_url(&mut self) {
-        self.js_style_overrides.clear();
         self.clear_console();
         let console = self.console_buffer.clone();
         drop_js_runtime_before_create(&mut self.js_runtime, || {
@@ -2133,11 +2105,6 @@ impl BrowserEngine {
         self.last_stylesheet = None;
         self.last_page = None;
         self.css_cache.clear();
-    }
-
-    /// Drain JS style overrides produced since the last call.
-    pub fn get_style_overrides(&mut self) -> HashMap<String, HashMap<String, String>> {
-        self.js_runtime.get_style_overrides()
     }
 
     /// Advance the JS event loop by one tick.
@@ -2362,10 +2329,6 @@ fn run_engine_actor_with_engine(rx: mpsc::Receiver<EngineCmd>, eng: &mut Browser
                 reply,
             } => {
                 let needs = eng.tick_js(Some(timestamp), deadline) | follow_script_navigation(eng);
-                let overrides = eng.get_style_overrides();
-                for (id, props) in overrides {
-                    eng.js_style_overrides.entry(id).or_default().extend(props);
-                }
                 let _ = reply.send(needs);
             }
             EngineCmd::Submit { reply } => {
@@ -2779,7 +2742,6 @@ mod tests {
         assert!(engine.last_page.is_none());
         assert!(engine.image_cache.is_empty());
         assert!(engine.css_cache.is_empty());
-        assert!(engine.js_style_overrides.is_empty());
         assert!(engine.last_stylesheet.is_none());
         assert!(engine.current_csp_policy.is_none());
         assert!(engine.console_entries().is_empty());
@@ -3129,7 +3091,6 @@ mod tests {
             &HashMap::new(),
             &mut cache,
             None,
-            &HashMap::new(),
             None,
             None,
             None,
@@ -3149,7 +3110,6 @@ mod tests {
             &HashMap::new(),
             &mut cache,
             None,
-            &HashMap::new(),
             None,
             None,
             None,
@@ -3183,7 +3143,6 @@ mod tests {
             &HashMap::new(),
             &mut cache,
             None,
-            &HashMap::new(),
             None,
             None,
             None,
@@ -3197,7 +3156,6 @@ mod tests {
             &HashMap::new(),
             &mut cache,
             None,
-            &HashMap::new(),
             None,
             None,
             None,
@@ -3225,7 +3183,6 @@ mod tests {
             &HashMap::new(),
             &mut cache,
             None,
-            &HashMap::new(),
             None,
             None,
             None,
@@ -3256,7 +3213,6 @@ mod tests {
             &HashMap::new(),
             &mut cache,
             None,
-            &HashMap::new(),
             None,
             None,
             None,
@@ -3278,7 +3234,6 @@ mod tests {
             &HashMap::new(),
             &mut cache,
             None,
-            &HashMap::new(),
             None,
             None,
             None,
@@ -3332,7 +3287,6 @@ mod tests {
             &HashMap::new(),
             &mut cache,
             None,
-            &HashMap::new(),
             None,
             None,
             None,
@@ -3415,7 +3369,6 @@ mod tests {
             &HashMap::new(),
             &mut css_cache,
             None,
-            &HashMap::new(),
             None,
             None,
             None,
@@ -3587,18 +3540,17 @@ mod tests {
     }
 
     #[test]
-    fn test_module_style_override_captured() {
+    fn test_module_style_write_lands_in_style_attribute() {
         let mut engine = engine_with_page_html(
             r#"<html><body>
                 <div id='test'>text</div>
-                <script type="module">__aura_set_style('test', 'color', 'red');</script>
+                <script type="module">document.getElementById('test').style.color = 'red';</script>
             </body></html>"#,
         );
-        let color = engine
-            .js_style_overrides
-            .get("test")
-            .and_then(|props| props.get("color").cloned());
-        assert_eq!(color, Some("red".to_string()));
+        assert_eq!(
+            engine.evaluate_js("document.getElementById('test').getAttribute('style')"),
+            "color: red;"
+        );
     }
 
     #[test]
@@ -3642,7 +3594,7 @@ mod tests {
                 <script type="module">
                     document.getElementById('a').textContent = 'new-a';
                     document.getElementById('b').setAttribute('data-x', 'y');
-                    __aura_set_style('c', 'font-size', '20px');
+                    document.getElementById('c').style.fontSize = '20px';
                 </script>
             </body></html>"#,
         );
@@ -3655,11 +3607,8 @@ mod tests {
             "y"
         );
         assert_eq!(
-            engine
-                .js_style_overrides
-                .get("c")
-                .and_then(|p| p.get("font-size").cloned()),
-            Some("20px".to_string())
+            engine.evaluate_js("document.getElementById('c').style.fontSize"),
+            "20px"
         );
     }
 
@@ -3694,7 +3643,6 @@ mod tests {
             &HashMap::new(),
             &mut css_cache,
             None,
-            &HashMap::new(),
             None,
             None,
             None,

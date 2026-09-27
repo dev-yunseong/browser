@@ -2,12 +2,7 @@
 // (Loaded at compile-time via include_bytes! in js.rs)
 
 // -- Tracking state ----------------------------------------------------------
-var __aura_style_log = [];
 var __aura_inner_html_log = [];
-
-function __aura_set_style(id, prop, value) {
-    __aura_style_log.push(id + '||||' + prop + '||||' + value);
-}
 
 function __aura_url_parts(href) {
     var value = String(href || '');
@@ -1440,7 +1435,6 @@ class CSSStyleDeclaration {
         }
         entry.value = value;
         entry.priority = priority;
-        if (this._ownerId !== null) __aura_set_style(this._ownerId, name, value);
         if (!this._batching) this._writeBack();
     }
     removeProperty(name) {
@@ -1449,7 +1443,6 @@ class CSSStyleDeclaration {
         let old = this.getPropertyValue(name);
         let had = this._props.length;
         this._props = this._props.filter(entry => entry.name !== name);
-        if (this._ownerId !== null) __aura_set_style(this._ownerId, name, '');
         if (!this._batching && this._props.length !== had) this._writeBack();
         return old;
     }

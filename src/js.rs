@@ -1618,44 +1618,6 @@ impl JsRuntime {
         Ok(specifiers)
     }
 
-    pub fn get_style_overrides(&mut self) -> HashMap<String, HashMap<String, String>> {
-        let mut result = HashMap::new();
-        let hs = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
-        let hs = &mut hs.init();
-        let local_context = v8::Local::new(hs, &self.global_context);
-        let scope = &mut v8::ContextScope::new(hs, local_context);
-        {
-            let tc = std::pin::pin!(v8::TryCatch::new(scope));
-            let tc = &mut tc.init();
-            let src = v8::String::new(tc, "__aura_style_log.join('####')").unwrap();
-            if let Some(script) = v8::Script::compile(tc, src, None) {
-                if let Some(val) = script.run(tc) {
-                    if let Some(s) = val.to_string(tc) {
-                        let s_std = s.to_rust_string_lossy(tc);
-                        for entry in s_std.split("####") {
-                            let parts: Vec<&str> = entry.splitn(3, "||||").collect();
-                            if parts.len() == 3 && !parts[0].is_empty() {
-                                result
-                                    .entry(parts[0].to_string())
-                                    .or_insert_with(HashMap::new)
-                                    .insert(parts[1].to_string(), parts[2].to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        {
-            let tc2 = std::pin::pin!(v8::TryCatch::new(scope));
-            let tc2 = &mut tc2.init();
-            let clear = v8::String::new(tc2, "__aura_style_log = [];").unwrap();
-            if let Some(script) = v8::Script::compile(tc2, clear, None) {
-                let _ = script.run(tc2);
-            }
-        }
-        result
-    }
-
     /// Current document scroll state (position and clamping ranges).
     pub fn scroll_state(&self) -> ScrollState {
         SCROLL_STATE.with(|state| *state.borrow())
