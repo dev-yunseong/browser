@@ -595,7 +595,8 @@ impl LayerTreeBuilder {
             };
             commands.push(PaintCommand::Text {
                 rect: d,
-                text: contents.borrow().to_string(),
+                // Line fragments carry only the text shown on their line.
+                text: layout.text_fragment.clone().unwrap_or_else(|| contents.borrow().to_string()),
                 font_size,
                 color,
                 clip,
