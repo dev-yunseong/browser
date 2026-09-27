@@ -843,9 +843,18 @@ pub const CUSTOM_PROPS_KEY: &str = "--";
 /// cyclic custom property references (e.g. `--a: var(--b); --b: var(--a)`).
 const VAR_RESOLVE_MAX_DEPTH: u32 = 32;
 
+/// Maximum total length (in bytes) a single `var()`-substituted value may grow
+/// to. Without this, a chain like `--a: var(--b) var(--b); --b: var(--c)
+/// var(--c); ...` doubles in size at every level and can exhaust memory well
+/// before `VAR_RESOLVE_MAX_DEPTH` is reached. Exceeding it makes the
+/// declaration invalid at computed-value time, matching how an unresolvable
+/// `var()` is already handled.
+const VAR_SUBSTITUTE_MAX_LEN: usize = 64 * 1024;
+
 /// Substitute every `var(--name[, fallback])` in `text` using `custom`.
 /// Returns `None` when a referenced property is missing and has no fallback
-/// (the declaration is then invalid at computed-value time).
+/// (the declaration is then invalid at computed-value time), or when the
+/// substituted result would exceed `VAR_SUBSTITUTE_MAX_LEN`.
 fn substitute_vars(text: &str, custom: &HashMap<Arc<str>, Value>, depth: u32) -> Option<String> {
     if depth > VAR_RESOLVE_MAX_DEPTH {
         return None;
@@ -886,17 +895,21 @@ fn substitute_vars(text: &str, custom: &HashMap<Arc<str>, Value>, depth: u32) ->
             }
             [] => (String::new(), None),
         };
+        // A custom property that is *registered* (present in `custom`, even with an
+        // empty value from `--x: ;`) always substitutes its own value; the fallback
+        // is only used when the property is not registered at all.
         let replacement = match custom.get(name.as_str()) {
-            Some(Value::RawCustomProp(raw)) if !raw.trim().is_empty() || fallback.is_none() => {
-                substitute_vars(raw, custom, depth + 1)
-            }
-            Some(other) if !matches!(other, Value::RawCustomProp(_)) => Some(value_to_css_text(other)),
-            _ => match fallback {
+            Some(Value::RawCustomProp(raw)) => substitute_vars(raw, custom, depth + 1),
+            Some(other) => Some(value_to_css_text(other)),
+            None => match fallback {
                 Some(fb) => substitute_vars(fb.trim(), custom, depth + 1),
                 None => None,
             },
         }?;
         out.push_str(&replacement);
+        if out.len() > VAR_SUBSTITUTE_MAX_LEN {
+            return None;
+        }
         rest = if j < rest.len() { &rest[j + 1..] } else { "" };
     }
     out.push_str(rest);
@@ -1887,6 +1900,54 @@ mod tests {
         let p = find_node(&tree, "p").expect("p not found");
         let c = get_color(p, "color").expect("color not found");
         assert_eq!(c, Color { r: 0, g: 0, b: 255, a: 255 });
+    }
+
+    #[test]
+    fn test_var_empty_custom_property_does_not_use_fallback() {
+        // `--accent: ;` is a valid, explicitly-empty custom property. Per spec,
+        // `var(--accent, 999px)` must substitute the empty value, not the
+        // fallback `999px` — so `width` must NOT end up as 999px (it becomes
+        // an invalid, non-Length value instead, since `width: ` is empty).
+        let tree = make_tree(
+            r#"<html><body><p>text</p></body></html>"#,
+            "html { --accent: ; } p { width: var(--accent, 999px); }",
+        );
+        let p = find_node(&tree, "p").expect("p not found");
+        assert_ne!(
+            get_length_px(p, "width"),
+            Some(999.0),
+            "empty --accent must not fall back to 999px"
+        );
+    }
+
+    #[test]
+    fn test_var_fanout_length_is_capped() {
+        // `--a` doubles `--b` each level; without a total-length cap this
+        // explodes exponentially. It must resolve to invalid-at-computed-value
+        // (no color) instead of hanging or exhausting memory.
+        let css = "html { \
+            --z: red; \
+            --y: var(--z) var(--z) var(--z) var(--z) var(--z) var(--z) var(--z) var(--z); \
+            --x: var(--y) var(--y) var(--y) var(--y) var(--y) var(--y) var(--y) var(--y); \
+            --w: var(--x) var(--x) var(--x) var(--x) var(--x) var(--x) var(--x) var(--x); \
+            --v: var(--w) var(--w) var(--w) var(--w) var(--w) var(--w) var(--w) var(--w); \
+            --u: var(--v) var(--v) var(--v) var(--v) var(--v) var(--v) var(--v) var(--v); \
+            --t: var(--u) var(--u) var(--u) var(--u) var(--u) var(--u) var(--u) var(--u); \
+        } p { color: var(--t); }";
+        let tree = make_tree(r#"<html><body><p>text</p></body></html>"#, css);
+        let p = find_node(&tree, "p").expect("p not found");
+        // 8^6 = ~262144 "red " repetitions — far past the 64 KiB cap. If the cap
+        // did not kick in, `color` would resolve to `red`. Instead the
+        // declaration must be treated as invalid at computed-value time, which
+        // for the inherited `color` property means falling back to the
+        // inherited/initial value (black here, since there is no ancestor
+        // `color` declaration) rather than `red` — and this must not hang or
+        // blow the stack.
+        assert_ne!(
+            get_color(p, "color"),
+            Some(Color { r: 255, g: 0, b: 0, a: 255 }),
+            "fanned-out var() chain must be capped, not resolved to red"
+        );
     }
 
     #[test]
