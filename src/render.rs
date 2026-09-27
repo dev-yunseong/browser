@@ -1,7 +1,7 @@
 use tiny_skia::{Pixmap, Paint, Transform, Stroke, PathBuilder, PixmapPaint, Mask, FillRule,
     LinearGradient, RadialGradient, GradientStop, SpreadMode, Point as SkPoint,
     StrokeDash, LineCap};
-use ab_glyph::{Font, FontRef, PxScale, point};
+use ab_glyph::{Font, PxScale, point};
 use crate::layout::{LayoutBox, Rect as LayoutRect};
 use crate::css::{Color, CssColorStop, LinearDirection};
 use crate::layer_tree::{LayerTree, LayerTreeBuilder, PaintCommand, ObjectFit, BorderStyle};
@@ -12,41 +12,36 @@ use lazy_static::lazy_static;
 use std::time::Instant;
 use url::Url;
 
-const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/NanumGothic.ttf");
 
 // ── Glyph Cache ───────────────────────────────────────────────────────────────
 
 /// Cache key for a single rasterized glyph.
 ///
-/// Uses the glyph ID, font size (as bit-pattern to allow use in HashMap), and
-/// synthesis flags.  The cache is keyed on font size rounded to the nearest
-/// 0.5 px so that minutely different float values produced by the same logical
-/// size collapse to the same entry.
+/// Keyed on the face, glyph, font size (1/64 px), quarter-pixel horizontal
+/// position and synthesis flags.
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 struct GlyphKey {
+    face: usize,
     glyph_id: u16,
     /// `(font_size * 2.0).round() as u32` — rounds to nearest 0.5 px.
     font_size_half_px: u32,
+    /// `(font_size * 64.0).round() as u32`.
+    size_64: u32,
+    /// Subpixel x bin (0..SUBPIXEL_STEPS).
+    subpixel: u8,
     bold: bool,
     italic: bool,
 }
 
-/// Pre-rasterized pixels for one glyph at a specific size and synthesis setting.
-///
-/// Pixel coordinates are stored as offsets relative to the glyph's bounding-box
-/// origin `(bx, by)` so that the same entry can be replayed at any placement.
-#[derive(Clone)]
+/// LCD coverage bitmap for one glyph, relative to the pixel column of the pen
+/// position (`left`) and the baseline row (`top`).
 struct GlyphPixels {
-    /// `bx - floor(placement_x)` — signed delta from the floor of the placement
-    /// x coordinate to the left edge of the glyph's bounding box.
-    bx_delta: i32,
-    /// `by - floor(placement_y)` — same for y (baseline direction).
-    by_delta: i32,
-    /// `(gx_offset, gy_offset, coverage)` — raw pixels from `outline.draw()`.
-    /// Bold synthesis pixels are already expanded (up to 4× pixels per glyph
-    /// sample), and italic shear is NOT pre-applied here (shear depends on
-    /// `current_y - (by + gy)` which must be computed at paint time).
-    pixels: Vec<(i32, i32, f32)>,
+    left: i32,
+    top: i32,
+    width: u32,
+    height: u32,
+    /// Row-major R/G/B subpixel coverage.
+    coverage: Vec<[u8; 3]>,
 }
 
 lazy_static! {
@@ -56,7 +51,7 @@ lazy_static! {
     ///
     /// Populated on first use of each (glyph, size, style) combination.
     /// Call `clear_glyph_cache()` between page navigations to free memory.
-    static ref GLYPH_CACHE: Mutex<HashMap<GlyphKey, GlyphPixels>> =
+    static ref GLYPH_CACHE: Mutex<HashMap<GlyphKey, std::sync::Arc<GlyphPixels>>> =
         Mutex::new(HashMap::new());
 }
 
@@ -447,14 +442,21 @@ fn execute_commands_on_tile(
                     draw_broken_image(pixmap, *r, alt, transform);
                 }
             }
-            PaintCommand::Text { rect, text, font_size, color, clip, bold, italic, text_decoration } => {
+            PaintCommand::Text { rect, text, font_size, color, clip, italic, text_decoration, font_family, font_weight, line_height, letter_spacing, .. } => {
                 let mut adjusted_rect = *rect;
                 adjusted_rect.x += tx;
                 adjusted_rect.y += ty;
                 let mut adjusted_clip = *clip;
                 adjusted_clip.x += tx;
                 adjusted_clip.y += ty;
-                render_text_raw(text.clone(), adjusted_rect, *font_size, color, adjusted_clip, pixmap, *bold, *italic, *text_decoration);
+                let font = TextFont {
+                    family: font_family,
+                    weight: *font_weight,
+                    italic: *italic,
+                    line_height: Some(*line_height),
+                    letter_spacing: *letter_spacing,
+                };
+                render_text_run(text, adjusted_rect, *font_size, color, adjusted_clip, pixmap, &font, *text_decoration);
             }
             PaintCommand::Shadow(r, s, radius) => {
                 paint_box_shadow(pixmap, tx, ty, active_mask!(), *r, s, *radius);
@@ -890,26 +892,22 @@ fn create_rounded_rect_path(r: LayoutRect, radius: f32) -> Option<tiny_skia::Pat
     pb.finish()
 }
 
-use std::sync::OnceLock;
-static FONT: OnceLock<FontRef<'static>> = OnceLock::new();
+/// Font selection for one text run (see `crate::fonts`).
+#[derive(Clone, Debug)]
+pub struct TextFont<'a> {
+    /// Raw CSS `font-family` value.
+    pub family: &'a str,
+    /// CSS `font-weight` (1..=1000).
+    pub weight: u16,
+    pub italic: bool,
+    /// Used line box height in px; `None` means `line-height: normal`.
+    pub line_height: Option<f32>,
+    /// CSS `letter-spacing` in px, added after every character.
+    pub letter_spacing: f32,
+}
 
-/// Render a text run into `pixmap`.
-///
-/// # Synthesis notes
-/// - **Bold** — re-draws each glyph up to 2 extra times at ±1 px offsets so the
-///   strokes appear thicker.  This is a lightweight approximation that works
-///   reasonably well for the NanumGothic TTF which only ships one weight.
-/// - **Italic** — applies a horizontal shear (skew) to every pixel coordinate
-///   before blending.  Each column is shifted left by `ITALIC_SHEAR * (baseline - y)`.
-/// - **Underline / Line-through / Overline** — drawn as filled rectangles after all
-///   glyphs are placed.
-///
-/// # Glyph cache
-/// Glyph outlines are expensive to rasterize.  This function uses `GLYPH_CACHE`
-/// to avoid re-running `outline_glyph` + `draw` for every glyph on every repaint.
-/// On a cache miss the pixels are collected once and stored; subsequent calls
-/// for the same (glyph, size, bold, italic) combination replay the stored pixels
-/// directly into the pixmap.
+/// Render a text run with the default font (sans-serif), weight 700 when
+/// `bold`, italic when `italic`, and `line-height: normal`.
 fn render_text_raw(
     text: String,
     rect: LayoutRect,
@@ -921,101 +919,203 @@ fn render_text_raw(
     italic: bool,
     text_decoration: u8,
 ) {
-    let trimmed = text.trim();
-    if trimmed.is_empty() { return; }
-    let font = FONT.get_or_init(|| {
-        FontRef::try_from_slice(FONT_DATA).expect("Failed to parse embedded font")
+    let font = TextFont {
+        family: "sans-serif",
+        weight: if bold { 700 } else { 400 },
+        italic,
+        line_height: None,
+        letter_spacing: 0.0,
+    };
+    render_text_run(&text, rect, font_size, color, clip, pixmap, &font, text_decoration);
+}
+
+/// Skia's synthetic italic skew (`SK_ScalarSkewX` = 1/4).
+const ITALIC_SKEW: f32 = 0.25;
+/// Horizontal glyph-position quantization (Skia uses 1/4 px subpixel positions).
+const SUBPIXEL_STEPS: f32 = 4.0;
+/// FreeType's default LCD filter (`FT_LCD_FILTER_DEFAULT`), weights out of 256.
+const LCD_FILTER: [f32; 5] = [8.0 / 256.0, 77.0 / 256.0, 86.0 / 256.0, 77.0 / 256.0, 8.0 / 256.0];
+
+/// Rasterize one glyph into an LCD (RGB subpixel) coverage bitmap.
+///
+/// The outline is drawn at 3x horizontal resolution, synthetic bold dilates it
+/// by `font_size / 24` px (the FreeType embolden strength Skia uses), synthetic
+/// italic skews rows by 1/4, and the FreeType default LCD filter turns the three
+/// subpixel samples per pixel into R/G/B coverage.
+fn rasterize_glyph(g: &crate::fonts::GlyphChoice, font_size: f32, subpixel_x: f32) -> GlyphPixels {
+    let empty = GlyphPixels { left: 0, top: 0, width: 0, height: 0, coverage: Vec::new() };
+    // ab_glyph scales so that `PxScale` spans ascent - descent, not the em square.
+    let px = font_size * g.font.height_unscaled() / g.font.units_per_em().unwrap_or(1000.0);
+    let scale = PxScale { x: px * 3.0, y: px };
+    let glyph = g.glyph.with_scale_and_position(scale, point(subpixel_x * 3.0, 0.0));
+    let Some(outline) = g.font.outline_glyph(glyph) else { return empty };
+    let bounds = outline.px_bounds();
+    let (min_x, min_y) = (bounds.min.x as i32, bounds.min.y as i32);
+    let (ow, oh) = (bounds.width() as i32, bounds.height() as i32);
+    if ow <= 0 || oh <= 0 {
+        return empty;
+    }
+
+    let embolden = if g.synth_bold { font_size / 24.0 } else { 0.0 };
+    let rad_x = embolden * 1.5; // half the extra width, in subpixels
+    let rad_y = embolden * 0.5;
+    let skew_max = if g.synth_italic {
+        (ITALIC_SKEW * 3.0 * (min_y.abs().max((min_y + oh).abs()) as f32 + rad_y + 1.0)).ceil() as i32
+    } else {
+        0
+    };
+    let pad_x = rad_x.ceil() as i32 + skew_max + 3;
+    let pad_y = rad_y.ceil() as i32;
+
+    // Subpixel buffer origin, aligned so that index 0 starts a whole pixel.
+    let x0 = (min_x - pad_x).div_euclid(3) * 3;
+    let w = (((min_x + ow + pad_x) - x0 + 2) / 3 * 3) as usize;
+    let y0 = min_y - pad_y;
+    let h = (oh + 2 * pad_y) as usize;
+    let mut buf = vec![0f32; w * h];
+    let (ox, oy) = ((min_x - x0) as usize, (min_y - y0) as usize);
+    outline.draw(|gx, gy, c| {
+        let i = (gy as usize + oy) * w + gx as usize + ox;
+        if i < buf.len() {
+            buf[i] = (buf[i] + c).min(1.0);
+        }
     });
-    let scale = PxScale::from(font_size);
-    let units = font.units_per_em().unwrap_or(1000.0) as f32;
-    let baseline_offset = font_size * 0.85;
-    let mut current_y = rect.y + baseline_offset;
+
+    if embolden > 0.0 {
+        buf = dilate(&buf, w, h, rad_x, true);
+        buf = dilate(&buf, w, h, rad_y, false);
+    }
+
+    if g.synth_italic {
+        let mut out = vec![0f32; w * h];
+        for row in 0..h {
+            // Rows above the baseline shift right.
+            let y = (y0 + row as i32) as f32 + 0.5;
+            let shift = -y * ITALIC_SKEW * 3.0;
+            let (si, sf) = (shift.floor() as i32, shift - shift.floor());
+            for col in 0..w as i32 {
+                let src = col - si;
+                let a = sample(&buf, w, row, src);
+                let b = sample(&buf, w, row, src - 1);
+                out[row * w + col as usize] = a * (1.0 - sf) + b * sf;
+            }
+        }
+        buf = out;
+    }
+
+    let pw = w / 3;
+    let mut coverage = vec![[0u8; 3]; pw * h];
+    for row in 0..h {
+        for sx in 0..w as i32 {
+            let mut v = 0.0;
+            for (k, wt) in LCD_FILTER.iter().enumerate() {
+                v += wt * sample(&buf, w, row, sx + k as i32 - 2);
+            }
+            coverage[row * pw + sx as usize / 3][sx as usize % 3] = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        }
+    }
+    GlyphPixels { left: x0 / 3, top: y0, width: pw as u32, height: h as u32, coverage }
+}
+
+fn sample(buf: &[f32], w: usize, row: usize, col: i32) -> f32 {
+    if col < 0 || col as usize >= w { 0.0 } else { buf[row * w + col as usize] }
+}
+
+/// Grey-scale morphological dilation by a fractional radius along one axis.
+fn dilate(buf: &[f32], w: usize, h: usize, radius: f32, horizontal: bool) -> Vec<f32> {
+    if radius <= 0.0 {
+        return buf.to_vec();
+    }
+    let whole = radius.floor() as i32;
+    let frac = radius - radius.floor();
+    let get = |x: i32, y: i32| -> f32 {
+        if x < 0 || y < 0 || x as usize >= w || y as usize >= h { 0.0 } else { buf[y as usize * w + x as usize] }
+    };
+    let mut out = vec![0f32; w * h];
+    for y in 0..h as i32 {
+        for x in 0..w as i32 {
+            let mut m = 0f32;
+            for d in -whole..=whole {
+                m = m.max(if horizontal { get(x + d, y) } else { get(x, y + d) });
+            }
+            if frac > 0.0 {
+                let d = whole + 1;
+                let e = if horizontal { get(x - d, y).max(get(x + d, y)) } else { get(x, y - d).max(get(x, y + d)) };
+                m = m.max(e * frac);
+            }
+            out[y as usize * w + x as usize] = m;
+        }
+    }
+    out
+}
+
+/// Render a text run into `pixmap` using the fonts selected by `font`.
+///
+/// Word wrapping mirrors `layout.rs` (`FontChain::measure` per word, one space
+/// advance between words) and each line is `line_height` tall with the baseline
+/// at ascent plus half-leading, as in Chromium's line box model.
+///
+/// Rasterized glyphs are cached in `GLYPH_CACHE` keyed by face, glyph, size,
+/// subpixel x position and synthesis flags.
+pub fn render_text_run(
+    text: &str,
+    rect: LayoutRect,
+    font_size: f32,
+    color: &Color,
+    clip: LayoutRect,
+    pixmap: &mut Pixmap,
+    font: &TextFont,
+    text_decoration: u8,
+) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || font_size <= 0.0 { return; }
+    let chain = crate::fonts::db().chain(font.family, font.weight, font.italic);
+    let metrics = chain.metrics(font_size);
+    let line_height = font.line_height.unwrap_or_else(|| metrics.normal_line_height());
+    let mut current_y = rect.y + metrics.baseline(line_height);
     let mut current_x = rect.x;
-    let space_w = font.h_advance_unscaled(font.glyph_id(' ')) * (scale.x / units);
+    let space_w = chain.advance(' ', font_size) + font.letter_spacing;
 
-    // Shear coefficient for italic synthesis: shifts pixels ~12° (tan 12° ≈ 0.213)
-    const ITALIC_SHEAR: f32 = 0.213;
-
-    // We track line segments so we can draw decorations per line.
     // Each entry: (line_start_x, line_end_x, baseline_y)
     let mut decoration_lines: Vec<(f32, f32, f32)> = Vec::new();
     let mut line_start_x = current_x;
     let mut line_end_x = current_x;
 
-    // font_size_half_px: rounds to nearest 0.5 px so that glyphs at the same
-    // logical size share a cache entry regardless of tiny float differences.
     let font_size_half_px = (font_size * 2.0).round() as u32;
+    let size_64 = (font_size * 64.0).round() as u32;
+    let (pw, ph) = (pixmap.width() as i32, pixmap.height() as i32);
 
     for word in trimmed.split_whitespace() {
-        let mut word_w = 0.0;
-        let mut glyphs = Vec::new();
-        for c in word.chars() {
-            let gid = font.glyph_id(c);
-            let adv = font.h_advance_unscaled(gid) * (scale.x / units);
-            glyphs.push((gid, adv));
-            word_w += adv;
-        }
+        let (glyphs, word_w) = chain.shape_spaced(word, font_size, font.letter_spacing);
         if current_x + word_w > rect.x + rect.width + 1.0 && current_x > rect.x {
-            // End the current decoration line segment before wrapping.
             decoration_lines.push((line_start_x, line_end_x, current_y));
             current_x = rect.x;
-            current_y += font_size * 1.4;
+            current_y += line_height;
             line_start_x = current_x;
-            line_end_x = current_x;
         }
-        for (gid, adv) in glyphs {
+        let baseline_px = current_y.round() as i32;
+        for (g, gx) in glyphs {
+            let pen = current_x + gx;
+            let mut base = pen.floor();
+            let mut bin = ((pen - base) * SUBPIXEL_STEPS).round() as u8;
+            if bin as f32 >= SUBPIXEL_STEPS {
+                base += 1.0;
+                bin = 0;
+            }
             let key = GlyphKey {
-                glyph_id: gid.0,
+                face: g.face,
+                glyph_id: g.glyph.0,
                 font_size_half_px,
-                bold,
-                italic: false, // Italic shear is applied at paint time; do not vary cache by italic
+                size_64,
+                subpixel: bin,
+                bold: g.synth_bold,
+                italic: g.synth_italic,
             };
-
-            // ── Cache lookup ──────────────────────────────────────────────────
-            //
-            // Try to find a pre-rasterized entry.  On a miss, rasterize the glyph
-            // and store it.  We use a temporary placement of (0.0, 0.0) so that
-            // the resulting pixels (gx, gy, coverage) are purely relative to the
-            // glyph's own bounding-box origin and can be replayed at any position.
-            let cached: GlyphPixels = {
-                // Fast path: check cache without holding the lock across the
-                // potentially-expensive rasterization.
-                let cached_opt = GLYPH_CACHE.lock()
-                    .ok()
-                    .and_then(|c| c.get(&key).cloned());
-
-                if let Some(entry) = cached_opt {
-                    entry
-                } else {
-                    // Cache miss — rasterize using a canonical origin (0, 0) so
-                    // that bx_delta/by_delta are position-independent.
-                    let canonical = gid.with_scale_and_position(scale, point(0.0, 0.0));
-                    let entry = if let Some(outline) = font.outline_glyph(canonical) {
-                        let bounds = outline.px_bounds();
-                        let bx_delta = bounds.min.x.floor() as i32;
-                        let by_delta = bounds.min.y.floor() as i32;
-
-                        // Bold: expand each sample to up to 4 pixel offsets.
-                        let bold_offsets: &[(i32, i32)] = if bold {
-                            &[(0, 0), (1, 0), (-1, 0), (0, 1)]
-                        } else {
-                            &[(0, 0)]
-                        };
-
-                        let mut pixels: Vec<(i32, i32, f32)> = Vec::new();
-                        outline.draw(|gx, gy, coverage| {
-                            for &(dx, dy) in bold_offsets {
-                                pixels.push((gx as i32 + dx, gy as i32 + dy, coverage));
-                            }
-                        });
-
-                        GlyphPixels { bx_delta, by_delta, pixels }
-                    } else {
-                        // No outline (e.g. space character) — empty entry.
-                        GlyphPixels { bx_delta: 0, by_delta: 0, pixels: Vec::new() }
-                    };
-
-                    // Store in cache (best-effort; ignore poisoned mutex).
+            let cached = GLYPH_CACHE.lock().ok().and_then(|c| c.get(&key).cloned());
+            let cached = match cached {
+                Some(entry) => entry,
+                None => {
+                    let entry = std::sync::Arc::new(rasterize_glyph(&g, font_size, bin as f32 / SUBPIXEL_STEPS));
                     if let Ok(mut cache) = GLYPH_CACHE.lock() {
                         cache.insert(key, entry.clone());
                     }
@@ -1023,81 +1123,84 @@ fn render_text_raw(
                 }
             };
 
-            // ── Replay cached pixels ──────────────────────────────────────────
-            let place_x = current_x.floor() as i32;
-            let place_y = current_y.floor() as i32;
-            let bx = place_x + cached.bx_delta;
-            let by = place_y + cached.by_delta;
-
-            for &(gx_off, gy_off, coverage) in &cached.pixels {
-                let mut px = bx + gx_off;
-                let py = by + gy_off;
-                let pyf = py as f32;
-
-                // Italic shear: shift x based on distance from baseline.
-                // `current_y - pyf` ≈ `-(by_delta + gy_off)` since
-                // `current_y - place_y` is < 1.0 (fractional part only).
-                if italic {
-                    let shear_px = (ITALIC_SHEAR * (current_y - pyf)) as i32;
-                    px += shear_px;
+            let bx = base as i32 + cached.left;
+            let by = baseline_px + cached.top;
+            for row in 0..cached.height as i32 {
+                let py = by + row;
+                if py < 0 || py >= ph || (py as f32) < clip.y || (py as f32) >= clip.y + clip.height {
+                    continue;
                 }
-
-                let pxf = px as f32;
-                if pxf >= clip.x && pxf < (clip.x + clip.width) &&
-                   pyf >= clip.y && pyf < (clip.y + clip.height) {
-                    if px >= 0 && py >= 0 && px < pixmap.width() as i32 && py < pixmap.height() as i32 {
-                        blend_glyph_pixel(pixmap, px as u32, py as u32, coverage, color);
+                for col in 0..cached.width as i32 {
+                    let px = bx + col;
+                    if px < 0 || px >= pw || (px as f32) < clip.x || (px as f32) >= clip.x + clip.width {
+                        continue;
+                    }
+                    let cov = cached.coverage[(row * cached.width as i32 + col) as usize];
+                    if cov != [0, 0, 0] {
+                        blend_glyph_pixel_lcd(pixmap, px as u32, py as u32, cov, color);
                     }
                 }
             }
-
-            current_x += adv;
-            line_end_x = current_x;
         }
-        current_x += space_w;
+        current_x += word_w;
         line_end_x = current_x;
+        current_x += space_w;
     }
 
-    // Close the last line segment.
     if line_end_x > line_start_x {
-        decoration_lines.push((line_start_x, line_end_x - space_w, current_y));
+        decoration_lines.push((line_start_x, line_end_x, current_y));
     }
 
-    // Draw text decorations.
     if text_decoration != 0 {
-        let line_thickness = (font_size * 0.07).max(1.0);
+        let line_thickness = (font_size / 14.0).round().max(1.0);
         let mut paint = Paint::default();
         paint.set_color_rgba8(color.r, color.g, color.b, color.a);
 
         for (seg_start_x, seg_end_x, baseline_y) in decoration_lines {
             let seg_w = (seg_end_x - seg_start_x).max(0.0);
             if seg_w < 1.0 { continue; }
-
-            // Underline: slightly below the baseline.
+            let baseline_y = baseline_y.round();
+            let mut draw = |y: f32| {
+                if let Some(r) = tiny_skia::Rect::from_xywh(seg_start_x, y, seg_w, line_thickness) {
+                    pixmap.fill_rect(r, &paint, Transform::identity(), None);
+                }
+            };
             if text_decoration & 0b001 != 0 {
-                let uy = baseline_y + line_thickness;
-                if let Some(r) = tiny_skia::Rect::from_xywh(seg_start_x, uy, seg_w, line_thickness) {
-                    pixmap.fill_rect(r, &paint, Transform::identity(), None);
-                }
+                draw(baseline_y + (font_size / 12.0).round().max(1.0));
             }
-
-            // Line-through: at mid-height of the em square (≈ 40% up from baseline).
             if text_decoration & 0b010 != 0 {
-                let ly = baseline_y - font_size * 0.30;
-                if let Some(r) = tiny_skia::Rect::from_xywh(seg_start_x, ly, seg_w, line_thickness) {
-                    pixmap.fill_rect(r, &paint, Transform::identity(), None);
-                }
+                draw((baseline_y - font_size * 0.3).round());
             }
-
-            // Overline: above the em square top.
             if text_decoration & 0b100 != 0 {
-                let oy = baseline_y - font_size * 0.85;
-                if let Some(r) = tiny_skia::Rect::from_xywh(seg_start_x, oy, seg_w, line_thickness) {
-                    pixmap.fill_rect(r, &paint, Transform::identity(), None);
-                }
+                draw(baseline_y - metrics.ascent);
             }
         }
     }
+}
+
+/// Blend LCD coverage into an opaque destination per channel; non-opaque
+/// destinations get grey-scale coverage (as Skia disables LCD text there).
+fn blend_glyph_pixel_lcd(pixmap: &mut Pixmap, x: u32, y: u32, cov: [u8; 3], color: &Color) {
+    let index = (y * pixmap.width() + x) as usize;
+    let pixel = &mut pixmap.pixels_mut()[index];
+    if pixel.alpha() != 255 {
+        let gray = (cov[0] as f32 + cov[1] as f32 + cov[2] as f32) / (3.0 * 255.0);
+        blend_glyph_pixel(pixmap, x, y, gray, color);
+        return;
+    }
+    let dst = pixel.demultiply();
+    let ca = color.a as f32 / 255.0;
+    let mix = |src: u8, dst: u8, c: u8| -> u8 {
+        let a = c as f32 / 255.0 * ca;
+        (src as f32 * a + dst as f32 * (1.0 - a)).round() as u8
+    };
+    *pixel = tiny_skia::ColorU8::from_rgba(
+        mix(color.r, dst.red(), cov[0]),
+        mix(color.g, dst.green(), cov[1]),
+        mix(color.b, dst.blue(), cov[2]),
+        255,
+    )
+    .premultiply();
 }
 
 /// Convert a `CssColorStop` slice into `tiny_skia::GradientStop`s.
@@ -1413,6 +1516,67 @@ mod tests {
         render_text_raw("Hi".to_string(), rect, 16.0, &red(), rect, &mut p_red, false, false, 0);
 
         assert_ne!(p_black.data(), p_red.data(), "black and red text must produce different pixel output");
+    }
+
+    fn ink_left_edge(p: &Pixmap) -> Option<u32> {
+        (0..p.width()).find(|&x| (0..p.height()).any(|y| p.pixel(x, y).unwrap().red() < 200))
+    }
+
+    fn ink_right_edge(p: &Pixmap) -> Option<u32> {
+        (0..p.width()).rev().find(|&x| (0..p.height()).any(|y| p.pixel(x, y).unwrap().red() < 200))
+    }
+
+    /// `letter-spacing` must widen a painted run by one spacing per character.
+    #[test]
+    fn test_letter_spacing_widens_painted_run() {
+        let rect = full_rect(300.0, 40.0);
+        let paint = |ls: f32| {
+            let mut p = white_pixmap(300, 40);
+            let font = TextFont { family: "sans-serif", weight: 400, italic: false, line_height: None, letter_spacing: ls };
+            render_text_run("IIII", rect, 16.0, &black(), rect, &mut p, &font, 0);
+            p
+        };
+        let plain = paint(0.0);
+        let spaced = paint(10.0);
+        assert_eq!(ink_left_edge(&plain), ink_left_edge(&spaced));
+        let grow = ink_right_edge(&spaced).unwrap() as i32 - ink_right_edge(&plain).unwrap() as i32;
+        assert!((29..=31).contains(&grow), "3 gaps of 10px expected, got {grow}");
+    }
+
+    /// Text on an opaque background uses LCD coverage (colour fringes); on a
+    /// transparent layer it falls back to grey-scale coverage.
+    #[test]
+    fn test_lcd_text_only_on_opaque_destination() {
+        let rect = full_rect(200.0, 40.0);
+        let font = TextFont { family: "sans-serif", weight: 400, italic: false, line_height: None, letter_spacing: 0.0 };
+        let mut opaque = white_pixmap(200, 40);
+        render_text_run("Wave", rect, 16.0, &black(), rect, &mut opaque, &font, 0);
+        let fringed = opaque.pixels().iter().any(|p| {
+            let c = p.demultiply();
+            c.red().abs_diff(c.blue()) > 30
+        });
+        assert!(fringed, "LCD text should have coloured edges on white");
+
+        let mut clear = Pixmap::new(200, 40).unwrap();
+        render_text_run("Wave", rect, 16.0, &black(), rect, &mut clear, &font, 0);
+        assert!(clear.pixels().iter().any(|p| p.alpha() > 0));
+        assert!(clear.pixels().iter().all(|p| {
+            let c = p.demultiply();
+            c.red() == c.green() && c.green() == c.blue()
+        }));
+    }
+
+    /// The baseline sits at ascent plus half-leading inside the line box.
+    #[test]
+    fn test_line_height_moves_baseline_by_half_leading() {
+        let rect = full_rect(200.0, 80.0);
+        let bottom = |lh: f32| {
+            let mut p = white_pixmap(200, 80);
+            let font = TextFont { family: "sans-serif", weight: 400, italic: false, line_height: Some(lh), letter_spacing: 0.0 };
+            render_text_run("H", rect, 16.0, &black(), rect, &mut p, &font, 0);
+            (0..80).rev().find(|&y| (0..200).any(|x| p.pixel(x, y).unwrap().red() < 128)).unwrap()
+        };
+        assert_eq!(bottom(40.0) as i32 - bottom(20.0) as i32, 10);
     }
 
     // ── Shadow blur ───────────────────────────────────────────────────────────

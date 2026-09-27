@@ -717,6 +717,7 @@ dependencies = [
  "image",
  "lazy_static",
  "markup5ever_rcdom",
+ "memmap2",
  "poll-promise",
  "rayon",
  "reqwest",
@@ -727,6 +728,7 @@ dependencies = [
  "tiny-skia 0.12.0",
  "tokio",
  "tower 0.4.13",
+ "ttf-parser",
  "url",
  "v8",
 ]

@@ -1,6 +1,5 @@
 use crate::css::{Unit, Value};
 use crate::style::StyledNode;
-use ab_glyph::{Font, FontRef, PxScale};
 use markup5ever_rcdom::NodeData;
 use std::collections::HashMap;
 extern crate stacker;
@@ -69,6 +68,7 @@ impl IntrinsicSizeCache {
                         Some(measure_text_width(
                             &contents.borrow(),
                             font_size,
+                            &node.specified_values,
                             f32::INFINITY,
                         ))
                     } else {
@@ -210,7 +210,7 @@ impl IntrinsicSizeCache {
                             Some(
                                 trimmed
                                     .split_whitespace()
-                                    .map(|word| measure_text_width(word, font_size, f32::INFINITY))
+                                    .map(|word| measure_text_width(word, font_size, &node.specified_values, f32::INFINITY))
                                     .fold(0.0f32, f32::max),
                             )
                         }
@@ -271,24 +271,24 @@ impl IntrinsicSizeCache {
 /// Measure the width of `text` rendered at `font_size` px.
 /// When `wrap_width` is `f32::INFINITY`, no wrapping occurs (max-content).
 /// When finite, line-breaks at word boundaries (min-content: longest word).
-fn measure_text_width(text: &str, font_size: f32, wrap_width: f32) -> f32 {
+fn measure_text_width(
+    text: &str,
+    font_size: f32,
+    values: &HashMap<std::sync::Arc<str>, Value>,
+    wrap_width: f32,
+) -> f32 {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return 0.0;
     }
-    let font = FontRef::try_from_slice(FONT_DATA).unwrap();
-    let scale = PxScale::from(font_size.max(1.0));
-    let units = font.units_per_em().unwrap_or(1000.0) as f32;
-    let space_w = font.h_advance_unscaled(font.glyph_id(' ')) * (scale.x / units);
+    let font_size = font_size.max(1.0);
+    let space_w = crate::fonts::text_width(values, " ", font_size);
 
     let mut max_w: f32 = 0.0;
     let mut line_w: f32 = 0.0;
 
     for word in trimmed.split_whitespace() {
-        let mut word_w = 0.0f32;
-        for c in word.chars() {
-            word_w += font.h_advance_unscaled(font.glyph_id(c)) * (scale.x / units);
-        }
+        let word_w = crate::fonts::text_width(values, word, font_size);
         if wrap_width.is_finite() && line_w + word_w > wrap_width && line_w > 0.0 {
             max_w = max_w.max(line_w);
             line_w = 0.0;
@@ -447,8 +447,6 @@ impl FloatContext {
         self.areas.push(area);
     }
 }
-
-const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/NanumGothic.ttf");
 
 #[derive(Default, Debug, Clone, Copy, PartialEq)]
 pub struct Rect {
@@ -2551,11 +2549,10 @@ impl<'a> LayoutBox<'a> {
             Some(Value::Length(v, Unit::Px)) => v.max(1.0),
             _ => 16.0,
         };
-        let font = FontRef::try_from_slice(FONT_DATA).unwrap();
-        let scale = PxScale::from(font_size);
-        let units = font.units_per_em().unwrap_or(1000.0) as f32;
-        let line_height = font_size * 1.4;
-        let space_w = font.h_advance_unscaled(font.glyph_id(' ')) * (scale.x / units);
+        let font = crate::fonts::chain_for(&self.style_node.specified_values);
+        let line_height = resolved_line_height_px(self.style_node);
+        let letter_spacing = crate::fonts::letter_spacing_px(&self.style_node.specified_values, font_size);
+        let space_w = font.advance(' ', font_size) + letter_spacing;
         let white_space = self
             .style_node
             .specified_values
@@ -2603,10 +2600,7 @@ impl<'a> LayoutBox<'a> {
         }
 
         for word in trimmed.split_whitespace() {
-            let mut word_w = 0.0;
-            for c in word.chars() {
-                word_w += font.h_advance_unscaled(font.glyph_id(c)) * (scale.x / units);
-            }
+            let word_w = font.measure_spaced(word, font_size, letter_spacing);
 
             if no_wrap {
                 if line_w > 0.0 {
@@ -2626,7 +2620,7 @@ impl<'a> LayoutBox<'a> {
             // If a single word is LONGER than the entire container, we must break it char-by-char
             if container_width.is_finite() && word_w > container_width {
                 for c in word.chars() {
-                    let char_w = font.h_advance_unscaled(font.glyph_id(c)) * (scale.x / units);
+                    let char_w = font.advance(c, font_size) + letter_spacing;
                     if line_w + char_w > container_width && line_w > 0.0 {
                         max_w = max_w.max(line_w);
                         line_w = 0.0;
@@ -2767,7 +2761,7 @@ fn resolved_line_height_px(sn: &StyledNode) -> f32 {
     match sn.specified_values.get(&crate::css::intern("line-height")) {
         Some(Value::Length(v, Unit::Px)) => (*v).max(0.0),
         Some(Value::Number(v)) => (font_size * *v).max(0.0),
-        _ => font_size * 1.4,
+        _ => crate::fonts::line_height_px(&sn.specified_values, font_size),
     }
 }
 
@@ -3701,7 +3695,8 @@ mod tests {
         let second = find_element_by_id(&layout, "second").expect("second span");
 
         assert!(
-            second.dimensions.y >= first.dimensions.y + 40.0,
+            // Two `line-height: normal` lines of at least 1em each.
+            second.dimensions.y >= first.dimensions.y + 32.0,
             "consecutive <br> should create a blank line of vertical space: first.y={}, second.y={}",
             first.dimensions.y,
             second.dimensions.y

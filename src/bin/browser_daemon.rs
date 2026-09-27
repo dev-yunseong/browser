@@ -419,7 +419,7 @@ impl DaemonBrowserApp {
     fn new(cc: &eframe::CreationContext<'_>, handle: EngineHandle) -> Self {
         // Load Korean font (same as BrowserApp)
         let mut fonts = egui::FontDefinitions::default();
-        let nanum_data = include_bytes!("../../assets/fonts/NanumGothic.ttf");
+        let nanum_data = browser::fonts::EMBEDDED_FALLBACK;
         fonts
             .font_data
             .insert("nanum".to_owned(), egui::FontData::from_static(nanum_data));
