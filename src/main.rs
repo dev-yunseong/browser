@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 pub mod dom;
 pub mod css;
+pub mod background;
 pub mod style;
 pub mod layout;
 pub mod render;

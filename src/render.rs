@@ -348,6 +348,29 @@ fn execute_commands_on_tile(
                     }
                 }
             }
+            PaintCommand::BackgroundImage { url, clip, radius, area, position, size, repeat_x, repeat_y } => {
+                let rounded_mask;
+                let mask = if *radius > 0.0 {
+                    rounded_mask = build_clip_mask(*clip, *radius, tx, ty, pixmap.width(), pixmap.height(), active_mask!());
+                    match rounded_mask.as_ref() {
+                        Some(m) => Some(m),
+                        None => continue,
+                    }
+                } else {
+                    active_mask!()
+                };
+                let layer = BackgroundImagePaint {
+                    clip: *clip,
+                    area: *area,
+                    position: *position,
+                    size: *size,
+                    repeat_x: *repeat_x,
+                    repeat_y: *repeat_y,
+                };
+                if let Some((key, data)) = lookup_image_bytes(image_cache, base_url, url) {
+                    paint_background_image(pixmap, key, data, &layer, transform, mask);
+                }
+            }
             PaintCommand::Image { rect: r, url, object_fit, alt } => {
                 let resolved_url = if image_cache.contains_key(url) {
                     None
@@ -364,6 +387,8 @@ fn execute_commands_on_tile(
                         let img_h = rgba.height() as f32;
                         if let Some(mut img_pixmap) = Pixmap::new(rgba.width(), rgba.height()) {
                             img_pixmap.data_mut().copy_from_slice(&rgba);
+                            // `image` decodes straight alpha; tiny-skia expects premultiplied.
+                            crate::background::premultiply_rgba_in_place(img_pixmap.data_mut());
                             match object_fit {
                                 ObjectFit::Fill => {
                                     // Stretch to fill — existing behavior
@@ -713,6 +738,95 @@ fn box_blur_alpha(pixmap: &mut Pixmap, radius: usize) {
         for y in 0..h {
             data[(y * w + col) * 4 + 3] = tmp[y];
         }
+    }
+}
+
+/// Find cached bytes for `url`, trying it verbatim and then resolved against
+/// `base_url`. Returns the cache key that matched along with the bytes.
+fn lookup_image_bytes<'c>(
+    image_cache: &'c HashMap<String, Vec<u8>>,
+    base_url: &Url,
+    url: &str,
+) -> Option<(&'c str, &'c [u8])> {
+    if let Some((k, v)) = image_cache.get_key_value(url) {
+        return Some((k.as_str(), v.as_slice()));
+    }
+    let resolved = base_url.join(url).ok()?.to_string();
+    image_cache.get_key_value(&resolved).map(|(k, v)| (k.as_str(), v.as_slice()))
+}
+
+/// Geometry of one `background-image` layer, as carried by
+/// `PaintCommand::BackgroundImage`.
+struct BackgroundImagePaint {
+    clip: LayoutRect,
+    area: LayoutRect,
+    position: crate::background::BackgroundPosition,
+    size: crate::background::BackgroundSize,
+    repeat_x: bool,
+    repeat_y: bool,
+}
+
+/// Largest downscaled tile (in pixels) that is pre-resampled on the CPU;
+/// bigger tiles are scaled by the pattern transform instead.
+const MAX_PRESCALED_TILE_PIXELS: f32 = 4096.0 * 4096.0;
+
+/// Paint one background image layer: size the tile from the image's intrinsic
+/// size, place the anchor tile per `background-position`, and fill the clip
+/// box (repeating axes) or the anchor tile's part of it (non-repeating axes).
+fn paint_background_image(
+    pixmap: &mut Pixmap,
+    key: &str,
+    data: &[u8],
+    layer: &BackgroundImagePaint,
+    transform: Transform,
+    mask: Option<&Mask>,
+) {
+    use crate::background::{anchor_tile, decoded_image, intrinsic_size, tile_size};
+    let Some((iw, ih)) = intrinsic_size(key, data) else { return };
+    let (tw, th) = tile_size(layer.size, iw as f32, ih as f32, layer.area.width, layer.area.height);
+    if !(tw > 0.0 && th > 0.0) {
+        return;
+    }
+    let tile = anchor_tile(layer.area, tw, th, layer.position);
+    let clip = layer.clip;
+    let (x0, x1) = if layer.repeat_x {
+        (clip.x, clip.x + clip.width)
+    } else {
+        (tile.x.max(clip.x), (tile.x + tw).min(clip.x + clip.width))
+    };
+    let (y0, y1) = if layer.repeat_y {
+        (clip.y, clip.y + clip.height)
+    } else {
+        (tile.y.max(clip.y), (tile.y + th).min(clip.y + clip.height))
+    };
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let (rw, rh) = (tw.round().max(1.0), th.round().max(1.0));
+    // Downscales are pre-resampled with an area filter; upscales use the
+    // pattern's bilinear filter.
+    let prescale = (rw as u32 != iw || rh as u32 != ih)
+        && rw as u32 <= iw
+        && rh as u32 <= ih
+        && rw * rh <= MAX_PRESCALED_TILE_PIXELS;
+    let target = if prescale { Some((rw as u32, rh as u32)) } else { None };
+    let Some(img) = decoded_image(key, data, target) else { return };
+    let sx = tw / img.width() as f32;
+    let sy = th / img.height() as f32;
+    let exact = (sx - 1.0).abs() < 1e-3 && (sy - 1.0).abs() < 1e-3;
+    let quality = if exact { tiny_skia::FilterQuality::Nearest } else { tiny_skia::FilterQuality::Bilinear };
+    let shader = tiny_skia::Pattern::new(
+        img.as_ref().as_ref(),
+        SpreadMode::Repeat,
+        quality,
+        1.0,
+        Transform::from_row(sx, 0.0, 0.0, sy, tile.x, tile.y),
+    );
+    let mut paint = Paint::default();
+    paint.shader = shader;
+    paint.anti_alias = false;
+    if let Some(r) = tiny_skia::Rect::from_ltrb(x0, y0, x1, y1) {
+        pixmap.fill_rect(r, &paint, transform, mask);
     }
 }
 
@@ -1592,6 +1706,105 @@ mod tests {
             pixmap.data().chunks_exact(4).any(|px| px[0] != 0 || px[1] != 0 || px[2] != 0 || px[3] != 0),
             "relative image paint command should render using absolute cached bytes"
         );
+    }
+
+    fn encode_png(img: &image::RgbaImage) -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    /// Sprite sheet: 4x2 image, left half red, right half green.
+    fn sprite_png() -> Vec<u8> {
+        let img = image::RgbaImage::from_fn(4, 2, |x, _| {
+            if x < 2 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([0, 255, 0, 255]) }
+        });
+        encode_png(&img)
+    }
+
+    fn paint_bg(cmd: PaintCommand, url: &str, bytes: Vec<u8>) -> Pixmap {
+        use url::Url;
+        let mut pixmap = Pixmap::new(10, 10).unwrap();
+        pixmap.fill(tiny_skia::Color::WHITE);
+        let tile_rect = LayoutRect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 };
+        let mut cache = HashMap::new();
+        cache.insert(url.to_string(), bytes);
+        let base = Url::parse("https://example.com/").unwrap();
+        execute_commands_on_tile(&[cmd], &mut pixmap, tile_rect, &cache, &base);
+        pixmap
+    }
+
+    fn px(p: &Pixmap, x: u32, y: u32) -> [u8; 4] {
+        let c = p.pixel(x, y).unwrap();
+        [c.red(), c.green(), c.blue(), c.alpha()]
+    }
+
+    #[test]
+    fn test_background_sprite_position_selects_region_and_no_repeat_clips() {
+        use crate::background::{parse_position, parse_size};
+        let bx = LayoutRect { x: 2.0, y: 2.0, width: 4.0, height: 4.0 };
+        // Draw a 2x sprite sheet (16x8) at 8x4 and shift left by 4px: only the green half shows.
+        let cmd = PaintCommand::BackgroundImage {
+            url: "https://example.com/sp.png".into(),
+            clip: bx,
+            radius: 0.0,
+            area: bx,
+            position: parse_position("-4px 0"),
+            size: parse_size("8px 4px"),
+            repeat_x: false,
+            repeat_y: false,
+        };
+        let sheet = image::RgbaImage::from_fn(16, 8, |x, _| {
+            if x < 8 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([0, 255, 0, 255]) }
+        });
+        let p = paint_bg(cmd, "https://example.com/sp.png", encode_png(&sheet));
+        assert_eq!(px(&p, 2, 2), [0, 255, 0, 255], "sprite region at box origin must be green");
+        assert_eq!(px(&p, 5, 5), [0, 255, 0, 255]);
+        assert_eq!(px(&p, 1, 1), [255, 255, 255, 255], "outside the box stays white");
+        assert_eq!(px(&p, 6, 2), [255, 255, 255, 255], "outside the box stays white");
+    }
+
+    #[test]
+    fn test_background_repeat_x_fills_row_only() {
+        use crate::background::{parse_position, parse_size};
+        let bx = LayoutRect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 };
+        let cmd = PaintCommand::BackgroundImage {
+            url: "sp.png".into(),
+            clip: bx,
+            radius: 0.0,
+            area: bx,
+            position: parse_position("0 0"),
+            size: parse_size("auto"),
+            repeat_x: true,
+            repeat_y: false,
+        };
+        let p = paint_bg(cmd, "https://example.com/sp.png", sprite_png());
+        // Tiles repeat every 4px horizontally: x=4..5 red, x=6..7 green.
+        assert_eq!(px(&p, 4, 0), [255, 0, 0, 255]);
+        assert_eq!(px(&p, 7, 1), [0, 255, 0, 255]);
+        assert_eq!(px(&p, 9, 1), [255, 0, 0, 255]);
+        assert_eq!(px(&p, 3, 2), [255, 255, 255, 255], "no vertical repeat");
+    }
+
+    #[test]
+    fn test_background_image_alpha_is_premultiplied() {
+        use crate::background::{parse_position, parse_size};
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 255, 128]));
+        let bx = LayoutRect { x: 0.0, y: 0.0, width: 2.0, height: 2.0 };
+        let cmd = PaintCommand::BackgroundImage {
+            url: "a.png".into(),
+            clip: bx,
+            radius: 0.0,
+            area: bx,
+            position: parse_position("0 0"),
+            size: parse_size("auto"),
+            repeat_x: false,
+            repeat_y: false,
+        };
+        let p = paint_bg(cmd, "https://example.com/a.png", encode_png(&img));
+        let [r, g, b, _] = px(&p, 0, 0);
+        // Half-transparent blue over white is roughly (127, 127, 255).
+        assert!((120..=135).contains(&r) && (120..=135).contains(&g) && b == 255, "got {r},{g},{b}");
     }
 
     /// Text rendered via the cache must respect the clip rectangle (pixels outside

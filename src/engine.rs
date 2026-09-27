@@ -661,7 +661,8 @@ pub fn process_html_with_cache(
                                 url,
                                 start_fetch.elapsed()
                             );
-                            (text, Some(url))
+                            // Resolve relative url() against the stylesheet, not the document.
+                            (crate::background::absolutize_css_urls(&text, &url), Some(url))
                         }
                         Err(e) => {
                             println!("[Error] Parallel Fetch (CSS): {} failed: {}", url, e);
@@ -722,7 +723,7 @@ pub fn process_html_with_cache(
     let mut element_ids = Vec::new();
     let mut focusable_elements = Vec::new();
     let mut layout_metrics = HashMap::new();
-    let image_urls: Vec<String>;
+    let mut image_urls: Vec<String>;
 
     render::render_layout_tree(&layout_tree, &mut pixmap, image_cache, &base_url);
 
@@ -741,6 +742,7 @@ pub fn process_html_with_cache(
         .into_iter()
         .map(|(_, url)| base_url.join(&url).map(|u| u.to_string()).unwrap_or(url))
         .collect();
+    crate::background::collect_background_image_urls(&layout_tree, base_url, &mut image_urls);
 
     let (form_action, form_method) = layout_tree
         .collect_form_element()
