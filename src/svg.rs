@@ -23,9 +23,29 @@ lazy_static::lazy_static! {
     static ref DATA_URLS: Mutex<HashMap<u64, Option<Arc<Vec<u8>>>>> = Mutex::new(HashMap::new());
 }
 
+/// Cheap content-based cache key.
+///
+/// Hashing an entire SVG document (or image buffer) on every paint just to
+/// look up its cache entry defeats the point of caching for anything but
+/// tiny documents. Beyond a small size, this samples a fixed number of
+/// fixed-size windows spread across the buffer instead of reading every
+/// byte; it is not collision-proof, but combined with the buffer length it
+/// is more than good enough for a same-process render cache.
 fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut h = DefaultHasher::new();
-    bytes.hash(&mut h);
+    let len = bytes.len();
+    len.hash(&mut h);
+    const SAMPLES: usize = 16;
+    const WINDOW: usize = 64;
+    if len <= SAMPLES * WINDOW {
+        bytes.hash(&mut h);
+    } else {
+        for i in 0..SAMPLES {
+            let start = i * len / SAMPLES;
+            let end = (start + WINDOW).min(len);
+            bytes[start..end].hash(&mut h);
+        }
+    }
     h.finish()
 }
 
@@ -149,26 +169,91 @@ pub fn rasterize_tree(tree: &usvg::Tree, width: f32, height: f32, frac_x: f32, f
     Some(pixmap)
 }
 
+type RasterKey = (u64, u32, u32);
+type RasterValue = Option<Arc<Pixmap>>;
+
+fn raster_value_bytes(value: &RasterValue) -> usize {
+    value.as_ref().map(|p| p.width() as usize * p.height() as usize * 4).unwrap_or(0)
+}
+
+/// Rasterized SVG cache bounded by total pixel bytes rather than entry
+/// count, since a single 8192² raster alone is 256 MiB — an entry-count cap
+/// does not bound memory at all once rasters that size are cached. Oldest
+/// entries are evicted first once the byte budget is exceeded.
+struct RasterCache {
+    map: HashMap<RasterKey, RasterValue>,
+    order: std::collections::VecDeque<RasterKey>,
+    bytes: usize,
+}
+
+impl RasterCache {
+    fn new() -> Self {
+        Self { map: HashMap::new(), order: std::collections::VecDeque::new(), bytes: 0 }
+    }
+
+    fn get(&self, key: &RasterKey) -> Option<RasterValue> {
+        self.map.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: RasterKey, value: RasterValue) {
+        if let Some(old) = self.map.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(raster_value_bytes(&old));
+            self.order.retain(|k| k != &key);
+        }
+        self.bytes += raster_value_bytes(&value);
+        self.map.insert(key, value);
+        self.order.push_back(key);
+        while self.bytes > RASTER_CACHE_MAX_BYTES {
+            let Some(oldest) = self.order.pop_front() else { break };
+            if let Some(evicted) = self.map.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(raster_value_bytes(&evicted));
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+        self.bytes = 0;
+    }
+}
+
+/// Total rasterized-SVG bytes kept before older entries are evicted.
+const RASTER_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
+
+lazy_static::lazy_static! {
+    static ref RASTERS: Mutex<RasterCache> = Mutex::new(RasterCache::new());
+}
+
 /// Rasterize an SVG image at exactly `width` x `height` px (cached by the
 /// content and size), for crisp scaled drawing.
 pub fn rasterize(bytes: &[u8], width: u32, height: u32) -> Option<Arc<Pixmap>> {
-    lazy_static::lazy_static! {
-        static ref RASTERS: Mutex<HashMap<(u64, u32, u32), Option<Arc<Pixmap>>>> = Mutex::new(HashMap::new());
-    }
     let key = (hash_bytes(bytes), width, height);
-    if let Some(hit) = RASTERS.lock().ok().and_then(|c| c.get(&key).cloned()) {
+    if let Some(hit) = RASTERS.lock().ok().and_then(|c| c.get(&key)) {
         return hit;
     }
     let result = parse(bytes)
         .and_then(|t| rasterize_tree(&t, width as f32, height as f32, 0.0, 0.0))
         .map(Arc::new);
     if let Ok(mut c) = RASTERS.lock() {
-        if c.len() >= 128 {
-            c.clear();
-        }
         c.insert(key, result.clone());
     }
     result
+}
+
+/// Evict every cached parsed SVG tree, decoded `data:` URL and rasterized
+/// SVG image. Called on navigation so a previous page's SVG caches do not
+/// linger in memory.
+pub fn clear_svg_caches() {
+    if let Ok(mut c) = TREES.lock() {
+        c.clear();
+    }
+    if let Ok(mut c) = DATA_URLS.lock() {
+        c.clear();
+    }
+    if let Ok(mut c) = RASTERS.lock() {
+        c.clear();
+    }
 }
 
 // ── Inline <svg> serialization ───────────────────────────────────────────────
@@ -419,6 +504,27 @@ mod tests {
         let p = rasterize_tree(&tree, 2.0, 2.0, 0.0, 0.0).unwrap();
         let px = p.pixel(1, 1).unwrap();
         assert_eq!((px.red(), px.green(), px.blue(), px.alpha()), (0, 255, 0, 255));
+    }
+
+    /// The rasterized-SVG cache is bounded by total pixel bytes, not entry
+    /// count: a single very large raster could otherwise dwarf a naive
+    /// count-based budget. Oldest entries are evicted first once the byte
+    /// budget is exceeded.
+    #[test]
+    fn test_raster_cache_evicts_oldest_once_over_budget() {
+        let mut cache = RasterCache::new();
+        // Each 4096x4096 pixmap is 64 MiB; three of them (192 MiB) fit, a
+        // fourth (256 MiB total) pushes it over the 128 MiB budget.
+        for i in 0..4u64 {
+            let pixmap = Arc::new(Pixmap::new(4096, 4096).unwrap());
+            cache.insert((i, 0, 0), Some(pixmap));
+        }
+        assert!(cache.bytes <= RASTER_CACHE_MAX_BYTES, "cache stayed within its byte budget");
+        assert!(cache.get(&(0, 0, 0)).is_none(), "oldest entry was evicted");
+        assert!(cache.get(&(3, 0, 0)).is_some(), "newest entry was kept");
+        cache.clear();
+        assert_eq!(cache.bytes, 0);
+        assert!(cache.get(&(3, 0, 0)).is_none());
     }
 
     fn styled_svg(html: &str, css: &str) -> (StyledNode, ()) {
