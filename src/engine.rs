@@ -46,7 +46,29 @@ pub struct PageResult {
     /// Form metadata (action, method, and named controls) for the first `<form>` on the page.
     /// `None` if the page has no `<form>` element.
     pub form_metadata: Option<FormMetadata>,
+    /// Scrollable document size (layout overflow extent) in CSS px, at least
+    /// the viewport width and the laid-out height.
+    pub scroll_width: f32,
+    pub scroll_height: f32,
+    /// Document scroll offset this page was rendered at. `position: fixed`
+    /// boxes are painted relative to the viewport at this offset.
+    pub scroll_x: f32,
+    pub scroll_y: f32,
+    /// The full rendering when the document is wider than the viewport.
+    /// `pixmap_bytes` keeps only the leftmost `width` columns of it.
+    pub wide_canvas: Option<std::sync::Arc<WideCanvas>>,
 }
+
+/// Premultiplied RGBA pixels of a rendering wider than the viewport.
+#[derive(Debug)]
+pub struct WideCanvas {
+    pub width: u32,
+    pub height: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// Widest canvas rendered for horizontally overflowing documents.
+const MAX_CANVAS_WIDTH: f32 = 4096.0;
 
 /// Result of a click action in headless mode.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -645,6 +667,37 @@ pub fn process_html_with_cache(
     csp_policy: Option<js::CspPolicy>,
     width: f32,
 ) -> Result<(PageResult, css::Stylesheet), Box<dyn std::error::Error + Send + Sync>> {
+    process_html_with_scroll(
+        body,
+        base_url,
+        image_cache,
+        css_cache,
+        cached_stylesheet,
+        js_overrides,
+        hovered_id,
+        focused_id,
+        csp_policy,
+        width,
+        (0.0, 0.0),
+    )
+}
+
+/// `process_html_with_cache` for a document scrolled to `scroll` (x, y):
+/// `position: fixed` boxes are moved to the viewport at that offset.
+#[allow(clippy::too_many_arguments)]
+pub fn process_html_with_scroll(
+    body: &str,
+    base_url: &Url,
+    image_cache: &HashMap<String, Vec<u8>>,
+    css_cache: &mut HashMap<String, String>,
+    cached_stylesheet: Option<css::Stylesheet>,
+    js_overrides: &HashMap<String, HashMap<String, String>>,
+    hovered_id: Option<&str>,
+    focused_id: Option<&str>,
+    csp_policy: Option<js::CspPolicy>,
+    width: f32,
+    scroll: (f32, f32),
+) -> Result<(PageResult, css::Stylesheet), Box<dyn std::error::Error + Send + Sync>> {
     let start_total = Instant::now();
     let width = width.max(1.0);
 
@@ -717,15 +770,24 @@ pub fn process_html_with_cache(
     let start = Instant::now();
     let (layout_tree_opt, _, final_y) =
         layout::build_layout_tree(&style_tree, 0.0, 0.0, 0.0, width, width, viewport_height());
-    let layout_tree = layout_tree_opt.ok_or("Failed to build layout tree")?;
+    let mut layout_tree = layout_tree_opt.ok_or("Failed to build layout tree")?;
     let layout_elapsed = start.elapsed();
+
+    let (scroll_x, scroll_y) = scroll;
+    if scroll_x != 0.0 || scroll_y != 0.0 {
+        shift_fixed_boxes(&mut layout_tree, scroll_x, scroll_y);
+    }
+    let (scroll_width, scroll_height) = document_scroll_extent(&layout_tree, width, final_y);
 
     let height = (final_y.ceil() as u32).clamp(600, 16384);
     let w_u32 = width as u32;
+    // Render the horizontal overflow too, so a viewport capture scrolled to
+    // the right has pixels to show.
+    let canvas_w = (scroll_width.min(MAX_CANVAS_WIDTH).ceil() as u32).max(w_u32);
 
     let start = Instant::now();
-    let mut pixmap = tiny_skia::Pixmap::new(w_u32, height)
-        .ok_or_else(|| format!("Failed to create pixmap with size {}x{}", w_u32, height))?;
+    let mut pixmap = tiny_skia::Pixmap::new(canvas_w, height)
+        .ok_or_else(|| format!("Failed to create pixmap with size {}x{}", canvas_w, height))?;
 
     pixmap.fill(tiny_skia::Color::WHITE);
 
@@ -825,7 +887,18 @@ pub fn process_html_with_cache(
         })
         .collect();
 
-    let pixmap_bytes = pixmap.data().to_vec();
+    let (pixmap_bytes, wide_canvas) = if canvas_w > w_u32 {
+        let wide = pixmap.data();
+        let (row_wide, row) = (canvas_w as usize * 4, w_u32 as usize * 4);
+        let mut bytes = Vec::with_capacity(row * height as usize);
+        for y in 0..height as usize {
+            bytes.extend_from_slice(&wide[y * row_wide..y * row_wide + row]);
+        }
+        let canvas = WideCanvas { width: canvas_w, height, bytes: pixmap.take() };
+        (bytes, Some(std::sync::Arc::new(canvas)))
+    } else {
+        (pixmap.data().to_vec(), None)
+    };
     let data_copy_elapsed = start.elapsed();
 
     let total_elapsed = start_total.elapsed();
@@ -855,9 +928,89 @@ pub fn process_html_with_cache(
             base_url: base_url.clone(),
             csp_policy,
             form_metadata,
+            scroll_width,
+            scroll_height,
+            scroll_x,
+            scroll_y,
+            wide_canvas,
         },
         stylesheet,
     ))
+}
+
+/// Move every `position: fixed` box (with its subtree) by `(dx, dy)`.
+///
+/// Layout places fixed boxes against the viewport at the document origin;
+/// with the document scrolled, the viewport sits at the scroll offset.
+fn shift_fixed_boxes(root: &mut layout::LayoutBox, dx: f32, dy: f32) {
+    let mut stack: Vec<&mut layout::LayoutBox> = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.position == layout::PositionType::Fixed {
+            translate_subtree(node, dx, dy);
+            continue;
+        }
+        stack.extend(node.children.iter_mut());
+    }
+}
+
+fn translate_subtree(root: &mut layout::LayoutBox, dx: f32, dy: f32) {
+    let mut stack: Vec<&mut layout::LayoutBox> = vec![root];
+    while let Some(node) = stack.pop() {
+        node.dimensions.x += dx;
+        node.dimensions.y += dy;
+        stack.extend(node.children.iter_mut());
+    }
+}
+
+/// Whether `overflow` (or the per-axis longhand) clips on the given axis.
+fn overflow_clips(layout: &layout::LayoutBox, axis_prop: &str) -> bool {
+    ["overflow", axis_prop].iter().any(|prop| {
+        matches!(
+            layout.style_node.specified_values.get(&css::intern(prop)),
+            Some(css::Value::Keyword(k)) if matches!(k.as_ref(), "hidden" | "clip" | "auto" | "scroll")
+        )
+    })
+}
+
+fn element_tag(layout: &layout::LayoutBox) -> Option<String> {
+    match &layout.style_node.node.data {
+        markup5ever_rcdom::NodeData::Element { name, .. } => Some(name.local.to_string()),
+        _ => None,
+    }
+}
+
+/// Scrollable size of the document: the union of border boxes that are not
+/// fixed and not inside a clipping (`overflow` other than visible) box, but at
+/// least `viewport_width` x `min_height`. An `overflow` clip on `<html>` or
+/// `<body>` applies to the viewport and disables scrolling on that axis.
+fn document_scroll_extent(root: &layout::LayoutBox, viewport_width: f32, min_height: f32) -> (f32, f32) {
+    let mut right = viewport_width;
+    let mut bottom = min_height;
+    let mut clip_x = false;
+    let mut clip_y = false;
+    let mut stack: Vec<&layout::LayoutBox> = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.position == layout::PositionType::Fixed {
+            continue;
+        }
+        let d = &node.dimensions;
+        if d.width > 0.0 && d.height > 0.0 {
+            right = right.max(d.x + d.width);
+            bottom = bottom.max(d.y + d.height);
+        }
+        let root_element = matches!(element_tag(node).as_deref(), Some("html" | "body"));
+        if root_element {
+            clip_x |= overflow_clips(node, "overflow-x");
+            clip_y |= overflow_clips(node, "overflow-y");
+        } else if overflow_clips(node, "overflow-x") || overflow_clips(node, "overflow-y") {
+            continue;
+        }
+        stack.extend(node.children.iter());
+    }
+    (
+        if clip_x { viewport_width } else { right },
+        if clip_y { min_height } else { bottom },
+    )
 }
 
 fn fetch_text_with_timeout(url: &Url) -> Result<String, reqwest::Error> {
@@ -873,26 +1026,127 @@ fn collect_layout_metrics(
     layout_tree: &layout::LayoutBox,
     out: &mut HashMap<String, js::LayoutMetrics>,
 ) {
-    let mut stack = vec![layout_tree];
-    while let Some(layout) = stack.pop() {
+    // Metrics feed getBoundingClientRect, so they include CSS transforms of
+    // the box and its ancestors (as the axis-aligned bounds of the
+    // transformed border box), matching what is painted.
+    let mut stack = vec![(layout_tree, Affine::IDENTITY)];
+    while let Some((layout, parent)) = stack.pop() {
+        let d = layout.dimensions;
+        let transform = match box_transform(layout) {
+            Some(own) => parent.then(&own),
+            None => parent,
+        };
         if matches!(
             layout.style_node.node.data,
             markup5ever_rcdom::NodeData::Element { .. }
         ) {
+            let (x, y, width, height) = transform.bounds(d.x, d.y, d.width, d.height);
             out.insert(
                 js::node_path_key(&layout.style_node.node),
-                js::LayoutMetrics {
-                    x: layout.dimensions.x,
-                    y: layout.dimensions.y,
-                    width: layout.dimensions.width,
-                    height: layout.dimensions.height,
-                },
+                js::LayoutMetrics { x, y, width, height },
             );
         }
         for child in layout.children.iter().rev() {
-            stack.push(child);
+            stack.push((child, transform));
         }
     }
+}
+
+/// 2D affine map `(x, y) -> (a*x + c*y + e, b*x + d*y + f)`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Affine {
+    a: f32,
+    b: f32,
+    c: f32,
+    d: f32,
+    e: f32,
+    f: f32,
+}
+
+impl Affine {
+    const IDENTITY: Affine = Affine { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 };
+
+    fn translate(x: f32, y: f32) -> Affine {
+        Affine { e: x, f: y, ..Affine::IDENTITY }
+    }
+
+    /// `self` applied after `inner`: `self.then(inner)(p) = self(inner(p))`.
+    fn then(&self, inner: &Affine) -> Affine {
+        Affine {
+            a: self.a * inner.a + self.c * inner.b,
+            b: self.b * inner.a + self.d * inner.b,
+            c: self.a * inner.c + self.c * inner.d,
+            d: self.b * inner.c + self.d * inner.d,
+            e: self.a * inner.e + self.c * inner.f + self.e,
+            f: self.b * inner.e + self.d * inner.f + self.f,
+        }
+    }
+
+    fn apply(&self, x: f32, y: f32) -> (f32, f32) {
+        (self.a * x + self.c * y + self.e, self.b * x + self.d * y + self.f)
+    }
+
+    /// Axis-aligned bounds `(x, y, width, height)` of the mapped rectangle.
+    fn bounds(&self, x: f32, y: f32, width: f32, height: f32) -> (f32, f32, f32, f32) {
+        if *self == Affine::IDENTITY {
+            return (x, y, width, height);
+        }
+        let corners = [
+            self.apply(x, y),
+            self.apply(x + width, y),
+            self.apply(x, y + height),
+            self.apply(x + width, y + height),
+        ];
+        let min_x = corners.iter().map(|p| p.0).fold(f32::INFINITY, f32::min);
+        let min_y = corners.iter().map(|p| p.1).fold(f32::INFINITY, f32::min);
+        let max_x = corners.iter().map(|p| p.0).fold(f32::NEG_INFINITY, f32::max);
+        let max_y = corners.iter().map(|p| p.1).fold(f32::NEG_INFINITY, f32::max);
+        (min_x, min_y, max_x - min_x, max_y - min_y)
+    }
+}
+
+/// The box's own CSS `transform` in document coordinates, about the default
+/// `transform-origin` (the border box center).
+fn box_transform(layout: &layout::LayoutBox) -> Option<Affine> {
+    let Some(css::Value::Transform(ops)) = layout
+        .style_node
+        .specified_values
+        .get(&css::intern("transform"))
+    else {
+        return None;
+    };
+    if ops.is_empty() {
+        return None;
+    }
+    let d = layout.dimensions;
+    let mut m = Affine::IDENTITY;
+    for op in ops {
+        let step = match op {
+            css::TransformOp::Translate(x, y) => {
+                Affine::translate(x.resolve(d.width), y.resolve(d.height))
+            }
+            css::TransformOp::Scale(x, y) => Affine { a: x.0, d: y.0, ..Affine::IDENTITY },
+            css::TransformOp::Rotate(rad) => {
+                let (sin, cos) = rad.0.sin_cos();
+                Affine { a: cos, b: sin, c: -sin, d: cos, e: 0.0, f: 0.0 }
+            }
+            css::TransformOp::Matrix(a, b, c, dd, e, f) => Affine {
+                a: a.0,
+                b: b.0,
+                c: c.0,
+                d: dd.0,
+                e: e.0,
+                f: f.0,
+            },
+        };
+        m = m.then(&step);
+    }
+    let (ox, oy) = (d.x + d.width / 2.0, d.y + d.height / 2.0);
+    Some(
+        Affine::translate(ox, oy)
+            .then(&m)
+            .then(&Affine::translate(-ox, -oy)),
+    )
 }
 
 // ── BrowserEngine ─────────────────────────────────────────────────────────────
@@ -1010,7 +1264,7 @@ impl BrowserEngine {
         }
 
         let mut css_cache = self.css_cache.clone();
-        let result = process_html_with_cache(
+        let result = process_html_with_scroll(
             &body,
             &base_url,
             &self.image_cache,
@@ -1021,6 +1275,7 @@ impl BrowserEngine {
             focused_id,
             self.current_csp_policy.clone(),
             width,
+            self.js_runtime.scroll_position(),
         )
         .map_err(|e| e.to_string())?;
 
@@ -1030,6 +1285,12 @@ impl BrowserEngine {
         self.last_page = Some(page.clone());
         self.js_runtime
             .set_layout_metrics(page.layout_metrics.clone());
+        self.js_runtime.set_scroll_extent(
+            page.scroll_width,
+            page.scroll_height,
+            page.width as f32,
+            viewport_height(),
+        );
         self.refresh_after_image_loads(page, width)
     }
 
@@ -1197,12 +1458,52 @@ impl BrowserEngine {
     }
 
     /// Reconstruct a `Pixmap` from the last rendered page's pixel data.
+    /// This is the full page from the document origin, `width` px wide.
     pub fn screenshot(&self) -> Option<tiny_skia::Pixmap> {
         let page = self.last_page.as_ref()?;
         tiny_skia::Pixmap::from_vec(
             page.pixmap_bytes.clone(),
             tiny_skia::IntSize::from_wh(page.width, page.height)?,
         )
+    }
+
+    /// Current document scroll offset `(scrollX, scrollY)`.
+    pub fn scroll_position(&self) -> (f32, f32) {
+        self.js_runtime.scroll_position()
+    }
+
+    /// Capture the viewport (`width` x `viewport_height()`) at the current
+    /// document scroll offset, as Chromium's page screenshot does. Re-renders
+    /// first when the page scrolled since the last render, so fixed boxes
+    /// sit at the new offset.
+    pub fn screenshot_viewport(&mut self) -> Option<tiny_skia::Pixmap> {
+        let (sx, sy) = self.scroll_position();
+        let (rendered_at, width) = {
+            let page = self.last_page.as_ref()?;
+            ((page.scroll_x, page.scroll_y), page.width)
+        };
+        if rendered_at != (sx, sy) {
+            if let Err(error) = self.re_render(None, None, width as f32) {
+                eprintln!("[screenshot] re-render at scroll offset failed: {}", error);
+            }
+        }
+        let page = self.last_page.as_ref()?;
+        let (sx, sy) = (page.scroll_x, page.scroll_y);
+        let (src_w, src_h, src) = match &page.wide_canvas {
+            Some(canvas) => (canvas.width, canvas.height, canvas.bytes.as_slice()),
+            None => (page.width, page.height, page.pixmap_bytes.as_slice()),
+        };
+        let vh = viewport_height().round().max(1.0) as u32;
+        let bytes = crop_viewport(
+            src,
+            src_w,
+            src_h,
+            sx.max(0.0).round() as u32,
+            sy.max(0.0).round() as u32,
+            page.width,
+            vh,
+        );
+        tiny_skia::Pixmap::from_vec(bytes, tiny_skia::IntSize::from_wh(page.width, vh)?)
     }
 
     /// Return the raw HTML source of the last loaded page.
@@ -1322,6 +1623,12 @@ impl BrowserEngine {
         self.js_runtime.execute(&format!(
             "window.innerHeight = window.outerHeight = screen.height = screen.availHeight = {viewport_h};"
         ));
+        self.js_runtime.set_scroll_extent(
+            page.scroll_width,
+            page.scroll_height,
+            page.width as f32,
+            viewport_h,
+        );
 
         let scripts = js::extract_script_sources_from_dom(&dom.document, Some(&page.base_url));
 
@@ -1656,6 +1963,26 @@ fn drop_js_runtime_before_create(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Copy the `out_w` x `out_h` rectangle at `(x, y)` out of a premultiplied
+/// RGBA buffer; pixels past the source edge are opaque white.
+fn crop_viewport(src: &[u8], src_w: u32, src_h: u32, x: u32, y: u32, out_w: u32, out_h: u32) -> Vec<u8> {
+    let mut out = vec![255u8; out_w as usize * out_h as usize * 4];
+    let copy_w = src_w.saturating_sub(x).min(out_w) as usize;
+    if copy_w == 0 {
+        return out;
+    }
+    for row in 0..out_h {
+        let sy = y + row;
+        if sy >= src_h {
+            break;
+        }
+        let from = (sy as usize * src_w as usize + x as usize) * 4;
+        let to = row as usize * out_w as usize * 4;
+        out[to..to + copy_w * 4].copy_from_slice(&src[from..from + copy_w * 4]);
+    }
+    out
+}
+
 #[inline]
 fn hit_test(x: f32, y: f32, r: &layout::Rect) -> bool {
     x >= r.x && x <= r.x + r.width && y >= r.y && y <= r.y + r.height
@@ -1697,6 +2024,10 @@ pub enum EngineCmd {
         reply: mpsc::Sender<js::EvalOutcome>,
     },
     Screenshot {
+        reply: mpsc::Sender<Option<Vec<u8>>>,
+    },
+    /// PNG of the viewport at the current document scroll offset.
+    ScreenshotViewport {
         reply: mpsc::Sender<Option<Vec<u8>>>,
     },
     DomTree {
@@ -1776,6 +2107,10 @@ fn run_engine_actor_with_engine(rx: mpsc::Receiver<EngineCmd>, eng: &mut Browser
             }
             EngineCmd::Screenshot { reply } => {
                 let png = eng.screenshot().and_then(|pm| pm.encode_png().ok());
+                let _ = reply.send(png);
+            }
+            EngineCmd::ScreenshotViewport { reply } => {
+                let png = eng.screenshot_viewport().and_then(|pm| pm.encode_png().ok());
                 let _ = reply.send(png);
             }
             EngineCmd::DomTree { reply } => {
@@ -2010,6 +2345,16 @@ impl EngineHandle {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.tx
             .send(EngineCmd::Screenshot { reply: reply_tx })
+            .map_err(|_| EngineRequestError::Disconnected)?;
+        recv_control(reply_rx)
+    }
+
+    /// PNG of the viewport at the current scroll offset (see
+    /// `BrowserEngine::screenshot_viewport`).
+    pub fn send_screenshot_viewport_control(&self) -> Result<Option<Vec<u8>>, EngineRequestError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .send(EngineCmd::ScreenshotViewport { reply: reply_tx })
             .map_err(|_| EngineRequestError::Disconnected)?;
         recv_control(reply_rx)
     }
@@ -3006,5 +3351,248 @@ mod tests {
             engine.evaluate_js("document.getElementById('test').textContent"),
             "during-module"
         );
+    }
+
+    // ── Document scrolling and viewport capture ─────────────────────────────
+
+    /// Like `engine_with_page_html`, but also keeps the rendered page so the
+    /// engine can re-render and capture screenshots.
+    fn engine_with_rendered_page(html: &str) -> BrowserEngine {
+        let base = Url::parse("https://example.com/").unwrap();
+        let mut css_cache = HashMap::new();
+        let (page, stylesheet) = process_html_with_cache(
+            html,
+            &base,
+            &HashMap::new(),
+            &mut css_cache,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            800.0,
+        )
+        .expect("process_html_with_cache");
+        let mut engine = BrowserEngine::new();
+        engine.last_stylesheet = Some(stylesheet);
+        engine.last_page = Some(page.clone());
+        engine.init_js_for_page(&page);
+        engine
+    }
+
+    fn scroll_json(engine: &mut BrowserEngine) -> String {
+        engine.evaluate_js("JSON.stringify([scrollX, scrollY, pageXOffset, pageYOffset])")
+    }
+
+    const WIDE_PAGE: &str = r#"<html><head><style>
+        body { margin: 0; }
+        #wide { width: 1400px; height: 3000px; }
+        #target { margin-left: 900px; margin-top: 50px; width: 100px; height: 20px; }
+        #low { margin-top: 2000px; width: 100px; height: 40px; }
+    </style></head><body><div id="wide"><div id="target"></div><div id="low"></div></div></body></html>"#;
+
+    #[test]
+    fn test_scroll_extent_covers_horizontal_overflow() {
+        let mut engine = engine_with_rendered_page(WIDE_PAGE);
+        let page = engine.last_page.as_ref().unwrap();
+        assert_eq!(page.scroll_width, 1400.0);
+        // #target's top margin collapses through #wide, which starts at y=50.
+        assert_eq!(page.scroll_height, 3050.0);
+        assert_eq!(
+            engine.evaluate_js(
+                "JSON.stringify([document.documentElement.scrollWidth, document.documentElement.scrollHeight, document.documentElement.clientWidth, document.scrollingElement === document.documentElement])"
+            ),
+            "[1400,3050,800,true]"
+        );
+    }
+
+    #[test]
+    fn test_scroll_extent_ignores_overflow_hidden_content() {
+        let engine = engine_with_rendered_page(
+            r#"<html><body style="margin:0">
+                <div style="width:300px;height:100px;overflow:hidden"><div style="width:5000px;height:10px"></div></div>
+            </body></html>"#,
+        );
+        assert_eq!(engine.last_page.as_ref().unwrap().scroll_width, 800.0);
+    }
+
+    #[test]
+    fn test_window_scroll_to_clamps_to_scrollable_range() {
+        let mut engine = engine_with_rendered_page(WIDE_PAGE);
+        let max_y = 3050.0 - viewport_height();
+        engine.evaluate_js("window.scrollTo(5000, 99999)");
+        assert_eq!(
+            scroll_json(&mut engine),
+            format!("[600,{max_y},600,{max_y}]")
+        );
+        engine.evaluate_js("window.scrollTo({ top: 10 })");
+        assert_eq!(scroll_json(&mut engine), "[600,10,600,10]");
+        engine.evaluate_js("window.scrollBy(-100, 5); window.scroll(-1, -1); window.scrollBy({ left: 40 })");
+        assert_eq!(scroll_json(&mut engine), "[40,0,40,0]");
+        assert_eq!(engine.scroll_position(), (40.0, 0.0));
+    }
+
+    #[test]
+    fn test_document_element_scroll_offsets_scroll_the_window() {
+        let mut engine = engine_with_rendered_page(WIDE_PAGE);
+        engine.evaluate_js("document.documentElement.scrollTop = 120; document.documentElement.scrollLeft = 30;");
+        assert_eq!(scroll_json(&mut engine), "[30,120,30,120]");
+        assert_eq!(
+            engine.evaluate_js(
+                "JSON.stringify([document.documentElement.scrollTop, document.documentElement.scrollLeft, document.body.scrollTop])"
+            ),
+            "[120,30,0]"
+        );
+    }
+
+    #[test]
+    fn test_bounding_client_rect_subtracts_scroll_offset() {
+        let mut engine = engine_with_rendered_page(WIDE_PAGE);
+        engine.evaluate_js("window.scrollTo(100, 30)");
+        assert_eq!(
+            engine.evaluate_js(
+                "var r = document.getElementById('target').getBoundingClientRect(); JSON.stringify([r.x, r.y, r.left, r.top, r.right, r.bottom, r.width])"
+            ),
+            "[800,20,800,20,900,40,100]"
+        );
+    }
+
+    #[test]
+    fn test_scroll_into_view_alignments() {
+        let mut engine = engine_with_rendered_page(WIDE_PAGE);
+        // #low border box: y 2070..2110, x 0..100.
+        engine.evaluate_js("document.getElementById('low').scrollIntoView()");
+        assert_eq!(scroll_json(&mut engine), "[0,2070,0,2070]");
+        engine.evaluate_js("window.scrollTo(0, 0); document.getElementById('low').scrollIntoView(false)");
+        let end = 2110.0 - viewport_height();
+        assert_eq!(scroll_json(&mut engine), format!("[0,{end},0,{end}]"));
+        engine.evaluate_js(
+            "window.scrollTo(0, 0); document.getElementById('target').scrollIntoView({ block: 'center', inline: 'center' })",
+        );
+        let center_y = 60.0 - viewport_height() / 2.0;
+        let (x, y) = engine.scroll_position();
+        assert_eq!(x, 550.0);
+        assert_eq!(y, center_y.max(0.0));
+        // `nearest` leaves an already visible element alone.
+        engine.evaluate_js("document.getElementById('target').scrollIntoView({ block: 'nearest', inline: 'nearest' })");
+        assert_eq!(engine.scroll_position(), (550.0, center_y.max(0.0)));
+    }
+
+    #[test]
+    fn test_focus_scrolls_element_into_view_nearest_edge() {
+        let mut engine = engine_with_rendered_page(WIDE_PAGE);
+        // #target spans x 900..1000; the nearest-edge alignment puts its right
+        // edge on the viewport's right edge.
+        engine.evaluate_js("document.getElementById('target').focus()");
+        assert_eq!(scroll_json(&mut engine), "[200,0,200,0]");
+        assert_eq!(
+            engine.evaluate_js("document.getElementById('target').getBoundingClientRect().right"),
+            "800"
+        );
+    }
+
+    #[test]
+    fn test_focus_prevent_scroll_keeps_position() {
+        let mut engine = engine_with_rendered_page(WIDE_PAGE);
+        engine.evaluate_js("document.getElementById('target').focus({ preventScroll: true })");
+        assert_eq!(scroll_json(&mut engine), "[0,0,0,0]");
+        assert_eq!(engine.evaluate_js("document.activeElement.id"), "target");
+    }
+
+    #[test]
+    fn test_scroll_event_fires_once_per_task_and_reaches_window() {
+        let mut engine = engine_with_rendered_page(WIDE_PAGE);
+        engine.evaluate_js(
+            "window.events = []; \
+             document.addEventListener('scroll', function() { events.push('document:' + scrollY); }); \
+             window.addEventListener('scroll', function() { events.push('window:' + scrollY); }); \
+             window.scrollTo(0, 10); window.scrollTo(0, 20); window.scrollTo(0, 20);",
+        );
+        assert_eq!(engine.evaluate_js("events.length"), "0", "scroll events are async");
+        for _ in 0..3 {
+            engine.tick_js(Some(0.0), None);
+        }
+        assert_eq!(
+            engine.evaluate_js("JSON.stringify(events)"),
+            r#"["document:20","window:20"]"#
+        );
+        // Scrolling to the current position fires nothing.
+        engine.evaluate_js("window.scrollTo(0, 20)");
+        engine.tick_js(Some(0.0), None);
+        assert_eq!(engine.evaluate_js("events.length"), "2");
+    }
+
+    #[test]
+    fn test_layout_metrics_include_css_transforms() {
+        let mut engine = engine_with_rendered_page(
+            r#"<html><body style="margin:0">
+                <div id="box" style="position:absolute;left:400px;top:10px;width:200px;height:50px;transform:translateX(-50%)">
+                    <div id="inner" style="width:20px;height:10px"></div>
+                </div>
+            </body></html>"#,
+        );
+        assert_eq!(
+            engine.evaluate_js(
+                "var b = document.getElementById('box').getBoundingClientRect(); var i = document.getElementById('inner').getBoundingClientRect(); JSON.stringify([b.x, b.y, b.width, i.x, i.y])"
+            ),
+            "[300,10,200,300,10]"
+        );
+    }
+
+    fn pixel(pixmap: &tiny_skia::Pixmap, x: u32, y: u32) -> (u8, u8, u8) {
+        let p = pixmap.pixel(x, y).expect("pixel in range");
+        (p.red(), p.green(), p.blue())
+    }
+
+    const FIXED_PAGE: &str = r#"<html><head><style>
+        body { margin: 0; }
+        #wide { width: 1200px; height: 3000px; position: relative; }
+        #fixed { position: fixed; top: 0; left: 0; width: 40px; height: 40px; background: rgb(255, 0, 0); }
+        #marker { position: absolute; left: 300px; top: 600px; width: 20px; height: 20px; background: rgb(0, 0, 255); }
+    </style></head><body><div id="wide"><div id="marker"></div></div><div id="fixed"></div></body></html>"#;
+
+    #[test]
+    fn test_viewport_screenshot_at_origin_matches_full_page_top() {
+        let mut engine = engine_with_rendered_page(FIXED_PAGE);
+        let full = engine.screenshot().unwrap();
+        let viewport = engine.screenshot_viewport().unwrap();
+        assert_eq!(full.width(), 800);
+        assert_eq!(viewport.width(), 800);
+        assert_eq!(viewport.height(), viewport_height().round() as u32);
+        assert_eq!(pixel(&viewport, 10, 10), (255, 0, 0));
+        assert_eq!(pixel(&full, 10, 10), (255, 0, 0));
+    }
+
+    #[test]
+    fn test_viewport_screenshot_follows_scroll_and_keeps_fixed_boxes_in_view() {
+        let mut engine = engine_with_rendered_page(FIXED_PAGE);
+        engine.evaluate_js("window.scrollTo(250, 500)");
+        let viewport = engine.screenshot_viewport().unwrap();
+        // The fixed box stays at the viewport origin.
+        assert_eq!(pixel(&viewport, 10, 10), (255, 0, 0));
+        // The marker at document (300, 600) shows at viewport (50, 100).
+        assert_eq!(pixel(&viewport, 55, 105), (0, 0, 255));
+        assert_eq!(pixel(&viewport, 45, 105), (255, 255, 255));
+        // Fixed boxes report client rects relative to the viewport.
+        assert_eq!(
+            engine.evaluate_js(
+                "var r = document.getElementById('fixed').getBoundingClientRect(); JSON.stringify([r.x, r.y])"
+            ),
+            "[0,0]"
+        );
+        // The full-page capture keeps the document origin and viewport width.
+        let full = engine.screenshot().unwrap();
+        assert_eq!(full.width(), 800);
+        assert_eq!(pixel(&full, 305, 605), (0, 0, 255));
+    }
+
+    #[test]
+    fn test_crop_viewport_pads_past_the_source_edge_with_white() {
+        // 2x2 source: every pixel opaque black.
+        let src = [0u8, 0, 0, 255].repeat(4);
+        let out = crop_viewport(&src, 2, 2, 1, 1, 2, 2);
+        assert_eq!(&out[0..4], &[0, 0, 0, 255]);
+        assert_eq!(&out[4..8], &[255, 255, 255, 255]);
+        assert_eq!(&out[8..16], &[255u8; 8]);
     }
 }

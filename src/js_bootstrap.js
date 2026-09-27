@@ -1755,11 +1755,16 @@ class Element extends Node {
         __aura_remove_self(this._id);
         if (parent) __aura_child_list_mutation(parent, [], [this], previous, next);
     }
-    focus() {
+    focus(options) {
         __aura_set_focus(this.id);
         document.activeElement = this;
         this.dispatchEvent(new Event('focus', { bubbles: false }));
         this.dispatchEvent(new Event('focusin', { bubbles: true }));
+        // Chromium scrolls a focused element into view "if needed", aligning
+        // the nearest edge, unless the caller passes {preventScroll: true}.
+        if (!(options && options.preventScroll)) {
+            __aura_scroll_element_into_view(this, 'nearest', 'nearest');
+        }
     }
     blur() {
         if (document.activeElement === this) document.activeElement = document.body;
@@ -1839,18 +1844,35 @@ class Element extends Node {
         }
         return { x: 0, y: 0, width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 };
     }
+    // Layout metrics are in document coordinates; client rects are relative
+    // to the viewport, so subtract the document scroll offset.
     getBoundingClientRect() {
-        return this._layoutMetrics();
+        return __aura_client_rect(this._layoutMetrics());
     }
     getClientRects() {
-        let rect = this._layoutMetrics();
+        let rect = this.getBoundingClientRect();
         return rect.width > 0 || rect.height > 0 ? [rect] : [];
     }
-    // scrollIntoView stub
-    scrollIntoView() {}
-    scroll() {}
-    scrollTo() {}
-    scrollBy() {}
+    // Only the document scrolling element (<html>) scrolls; other scroll
+    // containers keep a zero offset.
+    _isScrollingElement() {
+        return typeof __aura_get_document_element === 'function' &&
+            this._id === __aura_get_document_element();
+    }
+    scrollIntoView(arg) {
+        let block = 'start';
+        let inline = 'nearest';
+        if (arg === false) {
+            block = 'end';
+        } else if (arg && typeof arg === 'object') {
+            if (arg.block) block = String(arg.block);
+            if (arg.inline) inline = String(arg.inline);
+        }
+        __aura_scroll_element_into_view(this, block, inline);
+    }
+    scroll(x, y) { if (this._isScrollingElement()) window.scroll(x, y); }
+    scrollTo(x, y) { if (this._isScrollingElement()) window.scrollTo(x, y); }
+    scrollBy(x, y) { if (this._isScrollingElement()) window.scrollBy(x, y); }
     // nodeType for Element is always ELEMENT_NODE (1)
     get nodeType() { return 1; }
     // insertAdjacentHTML: inject HTML relative to this element
@@ -2023,14 +2045,22 @@ class Element extends Node {
     get offsetHeight() { return this._layoutMetrics().height; }
     get offsetTop() { return this._layoutMetrics().top; }
     get offsetLeft() { return this._layoutMetrics().left; }
-    get scrollWidth() { return this._layoutMetrics().width; }
-    get scrollHeight() { return this._layoutMetrics().height; }
-    get scrollTop() { return 0; }
-    set scrollTop(v) {}
-    get scrollLeft() { return 0; }
-    set scrollLeft(v) {}
-    get clientWidth() { return this._layoutMetrics().width; }
-    get clientHeight() { return this._layoutMetrics().height; }
+    get scrollWidth() {
+        return this._isScrollingElement() ? __aura_scroll_metrics()[6] : this._layoutMetrics().width;
+    }
+    get scrollHeight() {
+        return this._isScrollingElement() ? __aura_scroll_metrics()[7] : this._layoutMetrics().height;
+    }
+    get scrollTop() { return this._isScrollingElement() ? __aura_scroll_metrics()[1] : 0; }
+    set scrollTop(v) { if (this._isScrollingElement()) window.scrollTo(window.scrollX, v); }
+    get scrollLeft() { return this._isScrollingElement() ? __aura_scroll_metrics()[0] : 0; }
+    set scrollLeft(v) { if (this._isScrollingElement()) window.scrollTo(v, window.scrollY); }
+    get clientWidth() {
+        return this._isScrollingElement() ? __aura_scroll_metrics()[4] : this._layoutMetrics().width;
+    }
+    get clientHeight() {
+        return this._isScrollingElement() ? __aura_scroll_metrics()[5] : this._layoutMetrics().height;
+    }
     // namespaceURI
     get namespaceURI() { return 'http://www.w3.org/1999/xhtml'; }
     // setAttributeNS / getAttributeNS / removeAttributeNS
@@ -2318,7 +2348,10 @@ var document = {
         __aura_remove_listener(this, type, callback, options);
     },
     dispatchEvent: function(event) {
-        return __aura_dispatch_event(this, event);
+        // `this` is the raw object behind the `document` Proxy (the Proxy
+        // binds methods to its target). Dispatch at the Proxy so the event
+        // path is [document, window] instead of visiting document twice.
+        return __aura_dispatch_event(document, event);
     },
 
     get currentScript() {
@@ -2406,6 +2439,9 @@ var document = {
     get documentElement() {
         let nativeId = __aura_get_document_element();
         return nativeId ? __get_or_create_node(nativeId, 'html', null, 'element') : null;
+    },
+    get scrollingElement() {
+        return this.documentElement;
     },
     get doctype() {
         let nativeId = 0;
@@ -2735,21 +2771,37 @@ Object.assign(window.screen, {
     onchange: null,
 });
 window.devicePixelRatio = 1;
-window.scrollX = 0;
-window.scrollY = 0;
-window.pageXOffset = 0;
-window.pageYOffset = 0;
+// Scroll offsets live in the native scroll state so the engine can read and
+// clamp them; see __aura_scroll_metrics().
+['scrollX', 'pageXOffset'].forEach(function(name) {
+    Object.defineProperty(window, name, {
+        get: function() { return __aura_scroll_metrics()[0]; },
+        set: function(v) {},
+        configurable: true,
+        enumerable: true,
+    });
+});
+['scrollY', 'pageYOffset'].forEach(function(name) {
+    Object.defineProperty(window, name, {
+        get: function() { return __aura_scroll_metrics()[1]; },
+        set: function(v) {},
+        configurable: true,
+        enumerable: true,
+    });
+});
 window.visualViewport = new EventTarget();
 Object.assign(window.visualViewport, {
-    width: 800,
-    height: 600,
     scale: 1,
     offsetLeft: 0,
     offsetTop: 0,
-    pageLeft: 0,
-    pageTop: 0,
     onresize: null,
     onscroll: null,
+});
+Object.defineProperties(window.visualViewport, {
+    width: { get: function() { return __aura_scroll_metrics()[4]; }, configurable: true, enumerable: true },
+    height: { get: function() { return __aura_scroll_metrics()[5]; }, configurable: true, enumerable: true },
+    pageLeft: { get: function() { return __aura_scroll_metrics()[0]; }, configurable: true, enumerable: true },
+    pageTop: { get: function() { return __aura_scroll_metrics()[1]; }, configurable: true, enumerable: true },
 });
 window.locationbar = { visible: true };
 window.menubar = { visible: true };
@@ -4754,25 +4806,82 @@ var __aura_tag_classes = {
 window.atob = function(s) { return ''; };
 window.btoa = function(s) { return ''; };
 
-// -- window.scroll / scrollTo / scrollBy ------------------------------------
-function __aura_set_scroll(x, y) {
-    window.scrollX = Number(x) || 0;
-    window.scrollY = Number(y) || 0;
-    window.pageXOffset = window.scrollX;
-    window.pageYOffset = window.scrollY;
-    window.visualViewport.pageLeft = window.scrollX;
-    window.visualViewport.pageTop = window.scrollY;
-    window.dispatchEvent(new Event('scroll'));
-    window.visualViewport.dispatchEvent(new Event('scroll'));
+// -- Document scrolling -------------------------------------------------------
+// The scroll offset is stored natively (clamped to the document's scrollable
+// range) so the engine can capture the viewport at the current position.
+// `scroll` events fire asynchronously, once per task, at the document and
+// bubble to window, as in Chromium.
+var __aura_scroll_event_pending = false;
+function __aura_queue_scroll_event() {
+    if (__aura_scroll_event_pending) return;
+    __aura_scroll_event_pending = true;
+    setTimeout(function() {
+        __aura_scroll_event_pending = false;
+        document.dispatchEvent(new Event('scroll', { bubbles: true }));
+        window.visualViewport.dispatchEvent(new Event('scroll'));
+    }, 0);
+}
+function __aura_scroll_window_to(x, y) {
+    if (__aura_scroll_store(x, y)) __aura_queue_scroll_event();
+}
+function __aura_scroll_coord(value, fallback) {
+    if (value === undefined) return fallback;
+    let n = Number(value);
+    return isFinite(n) ? n : 0;
+}
+function __aura_client_rect(m) {
+    let s = __aura_scroll_metrics();
+    let x = m.x - s[0];
+    let y = m.y - s[1];
+    let rect = {
+        x: x, y: y, width: m.width, height: m.height,
+        top: y, left: x, right: x + m.width, bottom: y + m.height,
+    };
+    rect.toJSON = function() {
+        return { x: rect.x, y: rect.y, width: rect.width, height: rect.height,
+            top: rect.top, left: rect.left, right: rect.right, bottom: rect.bottom };
+    };
+    return rect;
+}
+// Target scroll offset along one axis that aligns [start, start+size) inside
+// a viewport of `view` px currently scrolled to `current` (CSSOM View
+// "determine the scroll-into-view position").
+function __aura_scroll_align(start, size, current, view, align) {
+    let end = start + size;
+    if (align === 'start') return start;
+    if (align === 'end') return end - view;
+    if (align === 'center') return start + (size - view) / 2;
+    // nearest
+    if (start >= current && end <= current + view) return current;
+    if (start <= current && end >= current + view) return current;
+    if ((start < current && size <= view) || (end > current + view && size > view)) return start;
+    return end - view;
+}
+function __aura_scroll_element_into_view(el, block, inline) {
+    if (!el || typeof __aura_get_layout_metrics !== 'function') return;
+    let m = __aura_get_layout_metrics(el._id);
+    if (!m) return;
+    let s = __aura_scroll_metrics();
+    let x = __aura_scroll_align(m.x, m.width, s[0], s[4], inline);
+    let y = __aura_scroll_align(m.y, m.height, s[1], s[5], block);
+    __aura_scroll_window_to(x, y);
 }
 window.scroll = function(x, y) {
-    if (typeof x === 'object' && x !== null) __aura_set_scroll(x.left || 0, x.top || 0);
-    else __aura_set_scroll(x, y);
+    let s = __aura_scroll_metrics();
+    if (typeof x === 'object' && x !== null) {
+        __aura_scroll_window_to(__aura_scroll_coord(x.left, s[0]), __aura_scroll_coord(x.top, s[1]));
+    } else if (x !== undefined) {
+        __aura_scroll_window_to(__aura_scroll_coord(x, 0), __aura_scroll_coord(y, 0));
+    }
 };
 window.scrollTo = window.scroll;
 window.scrollBy = function(x, y) {
-    if (typeof x === 'object' && x !== null) __aura_set_scroll(window.scrollX + (Number(x.left) || 0), window.scrollY + (Number(x.top) || 0));
-    else __aura_set_scroll(window.scrollX + (Number(x) || 0), window.scrollY + (Number(y) || 0));
+    let s = __aura_scroll_metrics();
+    if (typeof x === 'object' && x !== null) {
+        __aura_scroll_window_to(s[0] + __aura_scroll_coord(x.left, 0), s[1] + __aura_scroll_coord(x.top, 0));
+    } else if (x !== undefined) {
+        __aura_scroll_window_to(s[0] + __aura_scroll_coord(x, 0), s[1] + __aura_scroll_coord(y, 0));
+    }
 };
 window.alert = function(message) { console.log(String(message)); };
 window.confirm = function(message) { console.log(String(message)); return false; };

@@ -68,6 +68,8 @@ thread_local! {
     static CURRENT_ORIGIN: RefCell<Option<Url>> = RefCell::new(None);
     static CSP_POLICY: RefCell<Option<CspPolicy>> = RefCell::new(None);
     static LAYOUT_METRICS: RefCell<HashMap<String, LayoutMetrics>> = RefCell::new(HashMap::new());
+    /// Document scroll position and the ranges it is clamped to.
+    static SCROLL_STATE: RefCell<ScrollState> = RefCell::new(ScrollState::default());
     static CONSOLE_BUFFER: RefCell<Option<ConsoleBuffer>> = const { RefCell::new(None) };
     static RUN_PENDING: RefCell<Vec<(v8::Global<v8::Function>, Option<f64>)>> = RefCell::new(Vec::new());
     static FETCH_PENDING: RefCell<VecDeque<(v8::Global<v8::Function>, String, bool)>> = RefCell::new(VecDeque::new());
@@ -477,6 +479,53 @@ pub struct LayoutMetrics {
     pub height: f32,
 }
 
+/// Document (viewport) scroll state shared by the JS scroll APIs and the engine.
+///
+/// `x`/`y` are always kept inside `0..=max_x()` / `0..=max_y()`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollState {
+    pub x: f64,
+    pub y: f64,
+    /// Scrollable document size (layout overflow extent).
+    pub document_width: f64,
+    pub document_height: f64,
+    /// Viewport size in CSS px.
+    pub viewport_width: f64,
+    pub viewport_height: f64,
+}
+
+impl Default for ScrollState {
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            document_width: 0.0,
+            document_height: 0.0,
+            viewport_width: 800.0,
+            viewport_height: 600.0,
+        }
+    }
+}
+
+impl ScrollState {
+    pub fn max_x(&self) -> f64 {
+        (self.document_width - self.viewport_width).max(0.0)
+    }
+
+    pub fn max_y(&self) -> f64 {
+        (self.document_height - self.viewport_height).max(0.0)
+    }
+
+    /// Clamp `(x, y)` into the scrollable range. Non-finite values become 0.
+    pub fn clamp(&self, x: f64, y: f64) -> (f64, f64) {
+        let finite = |v: f64| if v.is_finite() { v } else { 0.0 };
+        (
+            finite(x).clamp(0.0, self.max_x()),
+            finite(y).clamp(0.0, self.max_y()),
+        )
+    }
+}
+
 impl LayoutMetrics {
     pub fn right(&self) -> f32 {
         self.x + self.width
@@ -704,6 +753,7 @@ impl JsRuntime {
         CURRENT_ORIGIN.with(|origin| *origin.borrow_mut() = base_url);
         CSP_POLICY.with(|p| *p.borrow_mut() = policy);
         LAYOUT_METRICS.with(|metrics| *metrics.borrow_mut() = layout_metrics.unwrap_or_default());
+        SCROLL_STATE.with(|state| *state.borrow_mut() = ScrollState::default());
         CONSOLE_BUFFER.with(|cell| *cell.borrow_mut() = Some(console_buffer));
 
         static INIT: std::sync::Once = std::sync::Once::new();
@@ -1594,6 +1644,50 @@ impl JsRuntime {
         result
     }
 
+    /// Current document scroll state (position and clamping ranges).
+    pub fn scroll_state(&self) -> ScrollState {
+        SCROLL_STATE.with(|state| *state.borrow())
+    }
+
+    /// Current document scroll offset `(scrollX, scrollY)`.
+    pub fn scroll_position(&self) -> (f32, f32) {
+        let state = self.scroll_state();
+        (state.x as f32, state.y as f32)
+    }
+
+    /// Update the scrollable document size and viewport size after a layout.
+    /// The scroll position is re-clamped; when that moves it, a `scroll` event
+    /// is queued for page scripts.
+    pub fn set_scroll_extent(
+        &mut self,
+        document_width: f32,
+        document_height: f32,
+        viewport_width: f32,
+        viewport_height: f32,
+    ) {
+        let moved = SCROLL_STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.document_width = document_width as f64;
+            state.document_height = document_height as f64;
+            state.viewport_width = viewport_width as f64;
+            state.viewport_height = viewport_height as f64;
+            let (x, y) = state.clamp(state.x, state.y);
+            let moved = (x, y) != (state.x, state.y);
+            state.x = x;
+            state.y = y;
+            moved
+        });
+        if moved {
+            self.execute("if (typeof __aura_queue_scroll_event === 'function') __aura_queue_scroll_event();");
+        }
+    }
+
+    /// Scroll the document as `window.scrollTo(x, y)` would (clamped, and
+    /// queues a `scroll` event when the position changes).
+    pub fn scroll_to(&mut self, x: f32, y: f32) {
+        self.execute(&format!("window.scrollTo({}, {});", x, y));
+    }
+
     pub fn get_focused_node_id(&self) -> Option<String> {
         FOCUSED_NODE.with(|f| (*f.borrow()).clone())
     }
@@ -1762,6 +1856,8 @@ fn register_native_functions(
         get_doctype_info_cb,
     );
     register_fn(scope, global, "__aura_set_focus", set_focus_cb);
+    register_fn(scope, global, "__aura_scroll_metrics", scroll_metrics_cb);
+    register_fn(scope, global, "__aura_scroll_store", scroll_store_cb);
     register_fn(scope, global, "__aura_queue_task", queue_task_cb);
     register_fn(scope, global, "__aura_resolve_url", resolve_url_cb);
     register_fn(
@@ -2866,6 +2962,51 @@ fn get_doctype_info_cb(
         rv.set_null();
     }
 }
+/// `__aura_scroll_metrics()` -> `[scrollX, scrollY, maxX, maxY,
+/// viewportWidth, viewportHeight, documentWidth, documentHeight]`.
+fn scroll_metrics_cb(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let state = SCROLL_STATE.with(|state| *state.borrow());
+    let values = [
+        state.x,
+        state.y,
+        state.max_x(),
+        state.max_y(),
+        state.viewport_width,
+        state.viewport_height,
+        state.document_width.max(state.viewport_width),
+        state.document_height.max(state.viewport_height),
+    ];
+    let elements: Vec<v8::Local<v8::Value>> = values
+        .iter()
+        .map(|v| v8::Number::new(scope, *v).into())
+        .collect();
+    rv.set(v8::Array::new_with_elements(scope, &elements).into());
+}
+
+/// `__aura_scroll_store(x, y)` clamps and stores the document scroll offset;
+/// returns whether the offset changed.
+fn scroll_store_cb(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let x = args.get(0).number_value(scope).unwrap_or(0.0);
+    let y = args.get(1).number_value(scope).unwrap_or(0.0);
+    let changed = SCROLL_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let (x, y) = state.clamp(x, y);
+        let changed = (x, y) != (state.x, state.y);
+        state.x = x;
+        state.y = y;
+        changed
+    });
+    rv.set_bool(changed);
+}
+
 fn set_focus_cb(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -3584,6 +3725,40 @@ mod tests {
             None,
             new_console_buffer(),
         )
+    }
+
+    #[test]
+    fn test_scroll_state_clamps_to_document_minus_viewport() {
+        let state = ScrollState {
+            document_width: 1340.0,
+            document_height: 900.0,
+            viewport_width: 800.0,
+            viewport_height: 1200.0,
+            ..ScrollState::default()
+        };
+        assert_eq!(state.max_x(), 540.0);
+        assert_eq!(state.max_y(), 0.0);
+        assert_eq!(state.clamp(64.0, 50.0), (64.0, 0.0));
+        assert_eq!(state.clamp(-5.0, f64::NAN), (0.0, 0.0));
+        assert_eq!(state.clamp(9999.0, 0.0), (540.0, 0.0));
+    }
+
+    #[test]
+    fn test_set_scroll_extent_reclamps_and_queues_scroll_event() {
+        let mut rt = make_dom_runtime("<html><body></body></html>", "https://example.com/");
+        rt.set_scroll_extent(2000.0, 3000.0, 800.0, 600.0);
+        rt.execute("window.scrollTo(1000, 2000); window.seen = 0; window.addEventListener('scroll', function() { seen++; });");
+        rt.tick(Some(0.0), None);
+        assert_eq!(rt.scroll_position(), (1000.0, 2000.0));
+        assert_eq!(rt.execute_with_result("seen").result.as_deref(), Some("1"));
+        // The document shrank: the offset is clamped and page scripts hear it.
+        rt.set_scroll_extent(1000.0, 1000.0, 800.0, 600.0);
+        assert_eq!(rt.scroll_position(), (200.0, 400.0));
+        rt.tick(Some(0.0), None);
+        assert_eq!(
+            rt.execute_with_result("JSON.stringify([scrollX, scrollY, seen])").result.as_deref(),
+            Some("[200,400,2]")
+        );
     }
 
     #[test]
