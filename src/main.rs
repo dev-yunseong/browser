@@ -208,22 +208,29 @@ impl eframe::App for BrowserApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // JS tick — at most one in-flight at a time to prevent unbounded thread spawns.
         let timestamp = self.start_time.elapsed().as_secs_f64() * 1000.0;
+        if let Some(tick_p) = &self.tick_promise {
+            if tick_p.ready().is_some() {
+                self.tick_promise = None;
+            }
+        }
+        // The tick thread wakes the UI again only when the page has work: at
+        // once after script ran, when the next timer is due, or to poll an
+        // in-flight fetch. With nothing pending the UI sleeps until input.
         if self.tick_promise.is_none()
             && self.content_promise.is_none()
             && self.re_render_promise.is_none()
         {
             let handle = self.engine.clone();
+            let ctx = ctx.clone();
             self.tick_promise = Some(Promise::spawn_thread("tick", move || {
-                handle.send_tick(timestamp, None)
-            }));
-        }
-        if let Some(tick_p) = &self.tick_promise {
-            if let Some(needs) = tick_p.ready() {
-                if *needs {
+                let outcome = handle.send_tick(timestamp, None);
+                if outcome.worked {
                     ctx.request_repaint();
+                } else if let Some(wake) = outcome.wake_after {
+                    ctx.request_repaint_after(wake);
                 }
-                self.tick_promise = None;
-            }
+                outcome.worked
+            }));
         }
 
         self.console_entries = self.engine.send_get_console();

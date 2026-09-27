@@ -3327,6 +3327,16 @@ function __aura_timers_begin_turn() {
     __aura_timer_turn_limit = __aura_timer_seq;
 }
 
+// Milliseconds until the earliest pending timer is due (0 when one is
+// overdue), or -1 when no timer is pending.
+function __aura_next_timer_delay() {
+    let due = Infinity;
+    for (const timer of __aura_timers.values()) {
+        if (timer.due < due) due = timer.due;
+    }
+    return due === Infinity ? -1 : Math.max(0, due - performance.now());
+}
+
 function __aura_run_next_due_timer() {
     let now = performance.now();
     let next = null;

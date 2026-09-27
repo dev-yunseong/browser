@@ -974,6 +974,45 @@ impl JsRuntime {
 
     /// Call a global zero-argument JS function and report whether it
     /// returned `true`. Missing functions and exceptions count as `false`.
+    /// How long the event loop can sleep before it has work that is not
+    /// queued yet: until the earliest timer is due, or a short poll interval
+    /// while a fetch is in flight. `None` when nothing is pending, so a
+    /// caller can wait for input.
+    pub fn next_wake(&mut self) -> Option<std::time::Duration> {
+        const FETCH_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+        let queued = MACRO_TASKS.with(|tasks| !tasks.borrow().is_empty())
+            || RAF_TASKS.with(|tasks| !tasks.borrow().is_empty());
+        if queued {
+            return Some(std::time::Duration::ZERO);
+        }
+        let timer = self
+            .call_global_number("__aura_next_timer_delay")
+            .filter(|ms| *ms >= 0.0)
+            .map(|ms| std::time::Duration::from_secs_f64(ms / 1000.0));
+        let fetching = FETCH_REGISTRY.with(|registry| !registry.borrow().is_empty());
+        match (timer, fetching) {
+            (Some(timer), true) => Some(timer.min(FETCH_POLL)),
+            (Some(timer), false) => Some(timer),
+            (None, true) => Some(FETCH_POLL),
+            (None, false) => None,
+        }
+    }
+
+    fn call_global_number(&mut self, name: &str) -> Option<f64> {
+        let hs = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
+        let hs = &mut hs.init();
+        let local_context = v8::Local::new(hs, &self.global_context);
+        let scope = &mut v8::ContextScope::new(hs, local_context);
+        let tc = std::pin::pin!(v8::TryCatch::new(scope));
+        let tc = &mut tc.init();
+        let global = local_context.global(tc);
+        let key = v8::String::new(tc, name)?;
+        let value = global.get(tc, key.into())?;
+        let func = v8::Local::<v8::Function>::try_from(value).ok()?;
+        let undef = v8::undefined(tc);
+        func.call(tc, undef.into(), &[])?.number_value(tc)
+    }
+
     fn call_global_bool(&mut self, name: &str) -> bool {
         let hs = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
         let hs = &mut hs.init();

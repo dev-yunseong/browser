@@ -2236,7 +2236,7 @@ pub enum EngineCmd {
     Tick {
         timestamp: f64,
         deadline: Option<f64>,
-        reply: mpsc::Sender<bool>,
+        reply: mpsc::Sender<TickOutcome>,
     },
     /// Submit the current page's form. Constructs the navigation URL from form
     /// metadata (action/method) and current DOM field values.
@@ -2334,8 +2334,9 @@ fn run_engine_actor_with_engine(rx: mpsc::Receiver<EngineCmd>, eng: &mut Browser
                 deadline,
                 reply,
             } => {
-                let needs = eng.tick_js(Some(timestamp), deadline) | follow_script_navigation(eng);
-                let _ = reply.send(needs);
+                let worked = eng.tick_js(Some(timestamp), deadline) | follow_script_navigation(eng);
+                let wake_after = eng.js_runtime.next_wake();
+                let _ = reply.send(TickOutcome { worked, wake_after });
             }
             EngineCmd::Submit { reply } => {
                 let _ = reply.send(eng.submit_form());
@@ -2343,6 +2344,16 @@ fn run_engine_actor_with_engine(rx: mpsc::Receiver<EngineCmd>, eng: &mut Browser
             EngineCmd::Shutdown => break,
         }
     }
+}
+
+/// What one event-loop tick did and when the next one is needed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TickOutcome {
+    /// Script ran (the page may need a re-render).
+    pub worked: bool,
+    /// Tick again after this long (a timer comes due or a fetch is in
+    /// flight); `None` when nothing is pending.
+    pub wake_after: Option<Duration>,
 }
 
 /// Load the document a script asked for while the actor ran a command that
@@ -2636,7 +2647,7 @@ impl EngineHandle {
         reply_rx.recv().unwrap_or_default()
     }
 
-    pub fn send_tick(&self, timestamp: f64, deadline: Option<f64>) -> bool {
+    pub fn send_tick(&self, timestamp: f64, deadline: Option<f64>) -> TickOutcome {
         let (reply_tx, reply_rx) = mpsc::channel();
         if self
             .tx
@@ -2647,9 +2658,9 @@ impl EngineHandle {
             })
             .is_err()
         {
-            return false;
+            return TickOutcome::default();
         }
-        reply_rx.recv().unwrap_or(false)
+        reply_rx.recv().unwrap_or_default()
     }
 
     pub fn send_tick_control(
@@ -2665,7 +2676,7 @@ impl EngineHandle {
                 reply: reply_tx,
             })
             .map_err(|_| EngineRequestError::Disconnected)?;
-        recv_control(reply_rx)
+        recv_control(reply_rx).map(|outcome| outcome.worked)
     }
 
     pub fn send_submit(&self) -> Option<String> {
@@ -2739,6 +2750,20 @@ mod tests {
                 url: "https://example.com/other".to_string(),
                 replace: false,
             })
+        );
+    }
+
+    #[test]
+    fn test_next_wake_waits_for_the_earliest_timer() {
+        let mut engine = engine_with_page_html("<html><body></body></html>");
+        while engine.tick_js(Some(0.0), None) {}
+        assert_eq!(engine.js_runtime.next_wake(), None);
+        engine.evaluate_js("setInterval(function() {}, 10000); setTimeout(function() {}, 5000);");
+        assert!(!engine.tick_js(Some(0.0), None));
+        let wake = engine.js_runtime.next_wake().expect("timers pending");
+        assert!(
+            wake > Duration::from_secs(4) && wake <= Duration::from_secs(5),
+            "{wake:?}"
         );
     }
 
