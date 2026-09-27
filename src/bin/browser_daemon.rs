@@ -95,6 +95,15 @@ struct TickRequest {
     width: Option<f32>,
 }
 
+/// `GET /screenshot?mode=viewport|full`. `full` (the default) is the whole
+/// page from the document origin; `viewport` is the `width` x
+/// `--viewport-height` rectangle at the current document scroll offset, as a
+/// Chromium page screenshot.
+#[derive(serde::Deserialize, Default)]
+struct ScreenshotQuery {
+    mode: Option<String>,
+}
+
 #[derive(serde::Deserialize)]
 struct StyleQuery {
     selector: Option<String>,
@@ -254,8 +263,26 @@ async fn console_eval_handler(
         .into_response()
 }
 
-async fn screenshot_handler(State(handle): State<EngineHandle>) -> impl IntoResponse {
-    let png_opt = blocking!(move || handle.send_screenshot_control());
+async fn screenshot_handler(
+    State(handle): State<EngineHandle>,
+    Query(query): Query<ScreenshotQuery>,
+) -> impl IntoResponse {
+    let viewport = match query.mode.as_deref() {
+        None | Some("") | Some("full") | Some("full-page") | Some("full_page") => false,
+        Some("viewport") => true,
+        Some(other) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("unknown screenshot mode '{}' (expected viewport or full)", other),
+            )
+                .into_response()
+        }
+    };
+    let png_opt = blocking!(move || if viewport {
+        handle.send_screenshot_viewport_control()
+    } else {
+        handle.send_screenshot_control()
+    });
     match png_opt {
         Ok(Some(bytes)) => (
             StatusCode::OK,
@@ -1405,6 +1432,24 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_http_screenshot_modes() {
+        for (uri, expected) in [
+            ("/screenshot?mode=viewport", StatusCode::NOT_FOUND),
+            ("/screenshot?mode=full", StatusCode::NOT_FOUND),
+            ("/screenshot?mode=sideways", StatusCode::BAD_REQUEST),
+        ] {
+            let app = build_router(make_test_handle());
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), expected, "{uri}");
+        }
     }
 
     #[tokio::test]
