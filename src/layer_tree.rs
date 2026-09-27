@@ -559,6 +559,32 @@ impl LayerTreeBuilder {
         Some(BorderSides { widths, colors, styles })
     }
 
+    /// `src` of an `<iframe>` box that loads a network document (`http(s)` or
+    /// relative), or `None` for no src, `about:`, `data:`, `javascript:` and
+    /// `srcdoc` frames.
+    fn iframe_src(layout: &LayoutBox) -> Option<String> {
+        let NodeData::Element { ref name, ref attrs, .. } = layout.style_node.node.data else { return None };
+        if name.local.as_ref() != "iframe" {
+            return None;
+        }
+        let attrs = attrs.borrow();
+        if attrs.iter().any(|a| a.name.local.as_ref() == "srcdoc") {
+            return None;
+        }
+        let src = attrs.iter().find(|a| a.name.local.as_ref() == "src")?.value.trim().to_string();
+        if src.is_empty() {
+            return None;
+        }
+        if let Some((scheme, _)) = src.split_once(':') {
+            let scheme = scheme.to_ascii_lowercase();
+            let is_scheme = !scheme.is_empty() && scheme.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c));
+            if is_scheme && !matches!(scheme.as_str(), "http" | "https") {
+                return None;
+            }
+        }
+        Some(src)
+    }
+
     /// Whether `layout` is an `<svg>` element box.
     fn is_svg_element(layout: &LayoutBox) -> bool {
         matches!(layout.style_node.node.data, NodeData::Element { ref name, .. } if name.local.as_ref() == "svg")
@@ -832,6 +858,20 @@ impl LayerTreeBuilder {
                     let source = crate::svg::serialize_inline(layout.style_node, content.width, content.height);
                     commands.push(PaintCommand::Svg { rect: content, source: source.into() });
                 }
+            } else if let Some(src) = Self::iframe_src(layout) {
+                // The frame's rendered document, if the frames track has put
+                // it in the image cache; otherwise nothing (no placeholder).
+                let content = crate::background::box_rect(layout, crate::background::BoxArea::Content);
+                let (w, h) = (content.width.round() as u32, content.height.round() as u32);
+                if w > 0 && h > 0 {
+                    commands.push(PaintCommand::Image {
+                        rect: content,
+                        url: iframe_frame_key(&src, w, h),
+                        object_fit: ObjectFit::Fill,
+                        alt: String::new(),
+                        radius: inner_radius(crate::background::BoxArea::Content),
+                    });
+                }
             }
         }
 
@@ -1003,6 +1043,23 @@ impl LayerTreeBuilder {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// Image-cache key under which the rendered document of an `<iframe>` with
+/// `src` and a `width` x `height` px content box is stored (as PNG bytes).
+/// Layer building has no base URL, so `src` may be relative here; the
+/// renderer resolves it against the page URL before the cache lookup, so the
+/// cached key always carries the absolute URL.
+pub fn iframe_frame_key(src: &str, width: u32, height: u32) -> String {
+    format!("iframe:{width}x{height}:{src}")
+}
+
+/// Split an `iframe_frame_key` into its `(width, height, src)` parts.
+pub fn parse_iframe_frame_key(key: &str) -> Option<(u32, u32, &str)> {
+    let rest = key.strip_prefix("iframe:")?;
+    let (size, src) = rest.split_once(':')?;
+    let (w, h) = size.split_once('x')?;
+    Some((w.parse().ok()?, h.parse().ok()?, src))
+}
 
 /// Resolve CSS `transform-origin` against a `w` x `h` border box, as an offset
 /// from its top-left corner. Defaults to the centre; a single value sets the
@@ -1851,5 +1908,19 @@ mod tests {
         assert_eq!(sides.widths, [0.0, 0.0, 1.0, 3.0]);
         assert_eq!(sides.colors[3].b, 255);
         assert_eq!(sides.colors[2].g, 255, "missing border color is currentColor");
+    }
+
+    #[test]
+    fn test_iframe_emits_frame_key_image_only_for_network_src() {
+        let tree = build_tree_from_html(
+            r#"<iframe src="/ad?x=1" style="width:30px;height:20px;border:0"></iframe><iframe style="width:30px;height:20px"></iframe><iframe src="about:blank" style="width:30px;height:20px"></iframe>"#,
+            "",
+        );
+        let urls: Vec<String> = all_commands(&tree).iter().filter_map(|c| match c {
+            PaintCommand::Image { url, .. } => Some(url.clone()),
+            _ => None,
+        }).collect();
+        assert_eq!(urls, vec![iframe_frame_key("/ad?x=1", 30, 20)]);
+        assert_eq!(parse_iframe_frame_key("iframe:30x20:https://a.b/c:1"), Some((30, 20, "https://a.b/c:1")));
     }
 }

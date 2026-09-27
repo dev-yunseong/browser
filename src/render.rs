@@ -435,7 +435,8 @@ fn execute_commands_with_clips(
                     }
                     None => false,
                 };
-                if !drawn {
+                // A frame whose document is not rendered (yet) paints nothing.
+                if !drawn && crate::layer_tree::parse_iframe_frame_key(url).is_none() {
                     draw_broken_image(pixmap, *r, alt, transform);
                 }
             }
@@ -780,6 +781,16 @@ fn resolve_image_bytes<'c>(
     if url.trim_start().get(..5).is_some_and(|p| p.eq_ignore_ascii_case("data:")) {
         let bytes = crate::svg::decode_data_url(url)?;
         return Some((std::borrow::Cow::Owned(url.to_string()), ImageBytes::Data(bytes)));
+    }
+    if let Some((w, h, src)) = crate::layer_tree::parse_iframe_frame_key(url) {
+        // Frame documents are cached under the absolute frame URL.
+        if let Some((k, v)) = image_cache.get_key_value(url) {
+            return Some((std::borrow::Cow::Borrowed(k.as_str()), ImageBytes::Cached(v.as_slice())));
+        }
+        let abs = base_url.join(src).ok()?;
+        let key = crate::layer_tree::iframe_frame_key(abs.as_str(), w, h);
+        let (k, v) = image_cache.get_key_value(&key)?;
+        return Some((std::borrow::Cow::Borrowed(k.as_str()), ImageBytes::Cached(v.as_slice())));
     }
     let (key, data) = lookup_image_bytes(image_cache, base_url, url)?;
     Some((std::borrow::Cow::Borrowed(key), ImageBytes::Cached(data)))
@@ -2430,5 +2441,20 @@ mod tests {
         assert_eq!(px(&p, 10, 19), [255, 0, 0, 255], "bottom side");
         assert_eq!(px(&p, 10, 1), [255, 255, 255, 255], "no top side");
         assert_eq!(px(&p, 10, 10), [255, 255, 255, 255], "interior");
+    }
+
+    #[test]
+    fn test_iframe_frame_image_uses_absolute_key_or_paints_nothing() {
+        let url = crate::layer_tree::iframe_frame_key("/ad", 4, 4);
+        let cmds = vec![PaintCommand::Image { rect: full_rect(4.0, 4.0), url, object_fit: ObjectFit::Fill, alt: String::new(), radius: 0.0 }];
+        let base = url::Url::parse("https://e.com/page").unwrap();
+        let mut p = white_pixmap(4, 4);
+        execute_commands_on_tile(&cmds, &mut p, full_rect(4.0, 4.0), &HashMap::new(), &base);
+        assert!(p.data().iter().all(|b| *b == 255), "missing frame paints nothing");
+        let mut cache = HashMap::new();
+        let green = encode_png(&image::RgbaImage::from_pixel(4, 4, image::Rgba([0, 255, 0, 255])));
+        cache.insert(crate::layer_tree::iframe_frame_key("https://e.com/ad", 4, 4), green);
+        execute_commands_on_tile(&cmds, &mut p, full_rect(4.0, 4.0), &cache, &base);
+        assert_eq!(px(&p, 2, 2), [0, 255, 0, 255]);
     }
 }
