@@ -4569,6 +4569,18 @@ mod tests {
     }
 
     #[test]
+    fn test_global_function_can_shadow_event_handler_attribute() {
+        // news.ycombinator.com's hn.js declares `function onclick (ev)`.
+        let mut rt = make_dom_runtime("<html><body></body></html>", "https://example.com/");
+        let outcome = rt.execute_with_result(
+            "function onclick (ev) { return 'page'; } \
+             document.addEventListener('click', onclick); onclick()",
+        );
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("page"));
+    }
+
+    #[test]
     fn test_form_submit_skips_submit_event_and_navigates() {
         let mut rt = make_dom_runtime(
             r#"<html><body><form id='f' action='/find'><input name='q' value='a b'>

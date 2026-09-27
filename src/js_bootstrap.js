@@ -2101,9 +2101,15 @@ class Element extends Node {
     for (var i = 0; i < handlers.length; i++) {
         (function(name) {
             var key = '_' + name;
+            // Configurable like WebIDL attributes: a page script's global
+            // `function onclick() {}` must be able to replace the accessor
+            // (a non-configurable one makes V8 throw "Identifier 'onclick'
+            // has already been declared").
             defs[name] = {
                 get: function() { return this[key] || null; },
-                set: function(fn) { this[key] = fn; }
+                set: function(fn) { this[key] = fn; },
+                configurable: true,
+                enumerable: true
             };
         })(handlers[i]);
     }
