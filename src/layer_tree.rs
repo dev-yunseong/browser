@@ -30,6 +30,14 @@ pub enum BorderStyle {
     Dotted,
 }
 
+/// Per-side border data, in `top, right, bottom, left` order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BorderSides {
+    pub widths: [f32; 4],
+    pub colors: [Color; 4],
+    pub styles: [BorderStyle; 4],
+}
+
 // ── Paint Commands ────────────────────────────────────────────────────────────
 
 /// A single atomic drawing operation. Moved from render.rs so that layer_tree.rs
@@ -41,8 +49,14 @@ pub enum PaintCommand {
     Rect(LayoutRect, Color, f32),
     /// Stroked rectangle border: (bounds, stroke-width, color, corner-radius, style)
     Border(LayoutRect, f32, Color, f32, BorderStyle),
-    /// Image: layout rect, source URL, object-fit mode, alt text
-    Image { rect: LayoutRect, url: String, object_fit: ObjectFit, alt: String },
+    /// Border whose sides differ in width, color or style.
+    BorderSides { rect: LayoutRect, sides: Box<BorderSides>, radius: f32 },
+    /// Image: layout rect, source URL, object-fit mode, alt text, and the
+    /// border-box corner radius its content is clipped to.
+    Image { rect: LayoutRect, url: String, object_fit: ObjectFit, alt: String, radius: f32 },
+    /// Inline `<svg>` element, serialized to a standalone document whose size
+    /// is the content box `rect`.
+    Svg { rect: LayoutRect, source: std::sync::Arc<str> },
     /// Text run with clipping rect
     Text {
         rect: LayoutRect,
@@ -389,6 +403,21 @@ impl LayerTreeBuilder {
 
                     // Skip zero-sized boxes but still visit children.
                     if d.width < 0.1 || d.height < 0.1 {
+                        // A spread or blurred outset shadow is visible even
+                        // around an empty box (e.g. a 0px-tall ad iframe).
+                        let shadows: Vec<PaintCommand> = Self::box_shadows(frame_layout)
+                            .into_iter()
+                            .filter(|s| !s.inset && (*s.spread > 0.0 || *s.blur > 0.0))
+                            .map(|s| PaintCommand::Shadow(d, s, 0.0))
+                            .collect();
+                        if !shadows.is_empty() && d.width >= 0.0 && d.height >= 0.0 {
+                            let layer = &mut tree.layers[frame_layer_id];
+                            for tile in &mut layer.tiles {
+                                tile.content_commands.extend(shadows.iter().cloned());
+                                tile.dirty = true;
+                            }
+                            layer.content_commands.extend(shadows);
+                        }
                         // An empty clipping box still hides its in-flow children.
                         if Self::has_overflow_hidden(frame_layout) && !frame_layout.children.is_empty() {
                             let push_cmd = PaintCommand::PushClip { rect: d, radius: 0.0 };
@@ -472,6 +501,67 @@ impl LayerTreeBuilder {
                 }
             }
         }
+    }
+
+    /// Every `box-shadow` layer of `layout` in paint order: the first CSS layer
+    /// is on top, so layers are returned last-to-first.
+    fn box_shadows(layout: &LayoutBox) -> Vec<BoxShadow> {
+        let sv = &layout.style_node.specified_values;
+        match sv.get(&crate::css::intern("box-shadow-layers")) {
+            Some(Value::BoxShadowList(list)) => list.iter().rev().cloned().collect(),
+            _ => match sv.get(&crate::css::intern("box-shadow")) {
+                Some(Value::BoxShadow(shadow)) => vec![shadow.clone()],
+                _ => Vec::new(),
+            },
+        }
+    }
+
+    /// Per-side border widths, colors and styles, or `None` when no side
+    /// paints. A missing `border-*-color` falls back to `currentColor`.
+    fn border_sides(layout: &LayoutBox) -> Option<BorderSides> {
+        let sv = &layout.style_node.specified_values;
+        let b = layout.border;
+        let widths = [b.top, b.right, b.bottom, b.left];
+        if widths.iter().all(|w| *w <= 0.0) {
+            return None;
+        }
+        let current_color = match sv.get(&crate::css::intern("color")) {
+            Some(Value::Color(c)) => c.clone(),
+            _ => Color { r: 0, g: 0, b: 0, a: 255 },
+        };
+        let mut colors: [Color; 4] = std::array::from_fn(|_| current_color.clone());
+        let mut styles = [BorderStyle::Solid; 4];
+        let mut widths = widths;
+        for (i, side) in ["top", "right", "bottom", "left"].iter().enumerate() {
+            let color = sv
+                .get(&crate::css::intern(&format!("border-{side}-color")))
+                .or_else(|| sv.get(&crate::css::intern("border-color")));
+            if let Some(Value::Color(c)) = color {
+                colors[i] = c.clone();
+            }
+            let style = sv
+                .get(&crate::css::intern(&format!("border-{side}-style")))
+                .or_else(|| sv.get(&crate::css::intern("border-style")));
+            match style {
+                Some(Value::Keyword(k)) => match k.as_ref() {
+                    "dashed" => styles[i] = BorderStyle::Dashed,
+                    "dotted" => styles[i] = BorderStyle::Dotted,
+                    "none" | "hidden" => widths[i] = 0.0,
+                    _ => {}
+                },
+                // No style declaration at all: keep an explicit width solid.
+                _ => {}
+            }
+        }
+        if widths.iter().all(|w| *w <= 0.0) {
+            return None;
+        }
+        Some(BorderSides { widths, colors, styles })
+    }
+
+    /// Whether `layout` is an `<svg>` element box.
+    fn is_svg_element(layout: &LayoutBox) -> bool {
+        matches!(layout.style_node.node.data, NodeData::Element { ref name, .. } if name.local.as_ref() == "svg")
     }
 
     /// Returns `true` if this box has `overflow: hidden` set.
@@ -591,7 +681,12 @@ impl LayerTreeBuilder {
         if let Some(Value::Transform(ops)) = sv.get(&crate::css::intern("transform")) {
             let w = layout.dimensions.width;
             let h = layout.dimensions.height;
-            matrix = Self::compute_transform_matrix(ops, w, h);
+            // Apply the transform around `transform-origin` (default: the
+            // border box centre): T(origin) · M · T(-origin).
+            let (ox, oy) = transform_origin(sv.get(&crate::css::intern("transform-origin")), w, h);
+            matrix = Matrix4x4::translate(ox, oy, 0.0)
+                .multiply(&Self::compute_transform_matrix(ops, w, h))
+                .multiply(&Matrix4x4::translate(-ox, -oy, 0.0));
             triggers.push(CompositingTrigger::Transform(matrix));
         }
 
@@ -640,17 +735,12 @@ impl LayerTreeBuilder {
 
         let mut commands = Vec::new();
 
-        let box_shadow = match sv.get(&crate::css::intern("box-shadow")) {
-            Some(Value::BoxShadow(shadow)) => Some(shadow.clone()),
-            _ => None,
-        };
+        let box_shadows = Self::box_shadows(layout);
 
         // Outset box-shadow paints behind the background/border, like a drop
         // shadow cast by the box onto whatever is underneath it.
-        if let Some(ref shadow) = box_shadow {
-            if !shadow.inset {
-                commands.push(PaintCommand::Shadow(d, shadow.clone(), radius));
-            }
+        for shadow in box_shadows.iter().filter(|s| !s.inset) {
+            commands.push(PaintCommand::Shadow(d, shadow.clone(), radius));
         }
 
         // Background: color first, then image layers bottom-most first.
@@ -698,36 +788,24 @@ impl LayerTreeBuilder {
         }
 
         // Border. `border-style: none`/`hidden` (the initial value) suppresses
-        // the border outline entirely, even when a width/color is set, per spec.
-        let border_style = match sv.get(&crate::css::intern("border-style")) {
-            Some(Value::Keyword(k)) => match k.as_ref() {
-                "dashed" => Some(BorderStyle::Dashed),
-                "dotted" => Some(BorderStyle::Dotted),
-                "none" | "hidden" => None,
-                _ => Some(BorderStyle::Solid),
-            },
-            // No border-style declaration at all (should not normally happen —
-            // style.rs supplies "none" as the initial value — but fall back to
-            // solid defensively so an explicit width/color still renders).
-            _ => Some(BorderStyle::Solid),
-        };
-        if layout.border.left > 0.0 {
-            if let Some(style) = border_style {
-                let color = match sv.get(&crate::css::intern("border-color")) {
-                    Some(Value::Color(c)) => c.clone(),
-                    _ => Color { r: 180, g: 180, b: 180, a: 255 },
-                };
-                commands.push(PaintCommand::Border(d, layout.border.left, color, radius, style));
+        // a side entirely, even when a width/color is set, per spec; layout
+        // already resolves such sides to width 0.
+        if let Some(border) = Self::border_sides(layout) {
+            let uniform = border.widths.iter().all(|w| (*w - border.widths[0]).abs() < 0.01)
+                && border.colors.iter().all(|c| *c == border.colors[0])
+                && border.styles.iter().all(|st| *st == border.styles[0]);
+            if uniform {
+                commands.push(PaintCommand::Border(d, border.widths[0], border.colors[0].clone(), radius, border.styles[0]));
+            } else {
+                commands.push(PaintCommand::BorderSides { rect: d, sides: Box::new(border), radius });
             }
         }
 
         // Inset box-shadow paints on top of the background (and below any
         // content/border painted after it), simulating a shadow cast onto the
         // box's own interior from its edges.
-        if let Some(ref shadow) = box_shadow {
-            if shadow.inset {
-                commands.push(PaintCommand::Shadow(d, shadow.clone(), radius));
-            }
+        for shadow in box_shadows.iter().filter(|s| s.inset) {
+            commands.push(PaintCommand::Shadow(d, shadow.clone(), radius));
         }
 
         // Image
@@ -743,7 +821,17 @@ impl LayerTreeBuilder {
                     _ => ObjectFit::Fill,
                 };
                 let alt = layout.alt_text.clone().unwrap_or_default();
-                commands.push(PaintCommand::Image { rect: d, url: url.clone(), object_fit, alt });
+                // Replaced content fills the content box, clipped to the
+                // correspondingly reduced border radius.
+                let content = crate::background::box_rect(layout, crate::background::BoxArea::Content);
+                let content_radius = inner_radius(crate::background::BoxArea::Content);
+                commands.push(PaintCommand::Image { rect: content, url: url.clone(), object_fit, alt, radius: content_radius });
+            } else if Self::is_svg_element(layout) {
+                let content = crate::background::box_rect(layout, crate::background::BoxArea::Content);
+                if content.width > 0.0 && content.height > 0.0 {
+                    let source = crate::svg::serialize_inline(layout.style_node, content.width, content.height);
+                    commands.push(PaintCommand::Svg { rect: content, source: source.into() });
+                }
             }
         }
 
@@ -888,7 +976,9 @@ impl LayerTreeBuilder {
             let cmd_rect = match &cmd {
                 PaintCommand::Rect(r, ..) => *r,
                 PaintCommand::Border(r, ..) => *r,
+                PaintCommand::BorderSides { rect, .. } => *rect,
                 PaintCommand::Image { rect, .. } => *rect,
+                PaintCommand::Svg { rect, .. } => *rect,
                 PaintCommand::Text { rect, .. } => *rect,
                 PaintCommand::Shadow(r, ..) => *r,
                 PaintCommand::LinearGradient { rect, .. } => *rect,
@@ -913,6 +1003,42 @@ impl LayerTreeBuilder {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// Resolve CSS `transform-origin` against a `w` x `h` border box, as an offset
+/// from its top-left corner. Defaults to the centre; a single value sets the
+/// horizontal position (or the vertical one for `top`/`bottom`).
+fn transform_origin(value: Option<&Value>, w: f32, h: f32) -> (f32, f32) {
+    let text = match value {
+        Some(Value::Keyword(k)) => k.to_string(),
+        Some(Value::Length(v, crate::css::Unit::Percent)) => format!("{v}%"),
+        Some(Value::Length(v, _)) => format!("{v}px"),
+        Some(Value::Number(v)) => format!("{v}px"),
+        _ => return (w / 2.0, h / 2.0),
+    };
+    let tokens: Vec<String> = text.split_whitespace().map(|t| t.to_ascii_lowercase()).collect();
+    let resolve = |t: &str, size: f32| -> Option<f32> {
+        match t {
+            "left" | "top" => Some(0.0),
+            "center" => Some(size / 2.0),
+            "right" | "bottom" => Some(size),
+            _ => {
+                if let Some(p) = t.strip_suffix('%') {
+                    p.parse::<f32>().ok().map(|p| p / 100.0 * size)
+                } else {
+                    t.trim_end_matches("px").parse::<f32>().ok()
+                }
+            }
+        }
+    };
+    let (mut x_tok, mut y_tok) = (tokens.first().map(String::as_str), tokens.get(1).map(String::as_str));
+    // Keywords may come in either order (`top left`).
+    if matches!(x_tok, Some("top" | "bottom")) || matches!(y_tok, Some("left" | "right")) {
+        std::mem::swap(&mut x_tok, &mut y_tok);
+    }
+    let x = x_tok.and_then(|t| resolve(t, w)).unwrap_or(w / 2.0);
+    let y = y_tok.and_then(|t| resolve(t, h)).unwrap_or(h / 2.0);
+    (x, y)
+}
 
 /// Raw CSS `font-family` of a node (`serif` when unset, the initial value).
 fn text_font_family(sv: &std::collections::HashMap<std::sync::Arc<str>, Value>) -> std::sync::Arc<str> {
@@ -1647,5 +1773,83 @@ mod tests {
         );
         let clips = layer_clips_for_text(&tree, "blind");
         assert!(clips.iter().any(|c| c.rect.width == 0.0 && c.rect.height == 0.0), "{clips:?}");
+    }
+
+    fn map_point(m: &Matrix4x4, x: f32, y: f32) -> (f32, f32) {
+        let mut pts = [tiny_skia::Point::from_xy(x, y)];
+        m.to_skia().map_points(&mut pts);
+        (pts[0].x, pts[0].y)
+    }
+
+    fn transformed_layer(tree: &LayerTree) -> &Layer {
+        tree.layers.iter().find(|l| l.triggers.iter().any(|t| matches!(t, CompositingTrigger::Transform(_)))).expect("transform layer")
+    }
+
+    /// `rotate(180deg)` turns the box around its centre (the default
+    /// `transform-origin`), so its top-left corner lands on its bottom-right.
+    #[test]
+    fn test_rotate_uses_default_centre_origin() {
+        let tree = build_tree_from_html(r#"<div style="width:20px;height:10px;transform:rotate(180deg)"></div>"#, "");
+        let (x, y) = map_point(&transformed_layer(&tree).transform, 0.0, 0.0);
+        assert!((x - 20.0).abs() < 0.01 && (y - 10.0).abs() < 0.01, "got ({x}, {y})");
+    }
+
+    #[test]
+    fn test_transform_origin_keywords_and_lengths() {
+        let tree = build_tree_from_html(r#"<div style="width:20px;height:10px;transform:rotate(90deg);transform-origin:0 0"></div>"#, "");
+        let (x, y) = map_point(&transformed_layer(&tree).transform, 10.0, 0.0);
+        assert!((x - 0.0).abs() < 0.01 && (y - 10.0).abs() < 0.01, "origin 0 0: got ({x}, {y})");
+        let tree = build_tree_from_html(r#"<div style="width:20px;height:10px;transform:scale(2);transform-origin:right bottom"></div>"#, "");
+        let (x, y) = map_point(&transformed_layer(&tree).transform, 20.0, 10.0);
+        assert!((x - 20.0).abs() < 0.01 && (y - 10.0).abs() < 0.01, "right bottom is fixed: got ({x}, {y})");
+        assert_eq!(transform_origin(Some(&Value::Keyword(css::intern("top"))), 20.0, 10.0), (10.0, 0.0));
+        assert_eq!(transform_origin(Some(&Value::Keyword(css::intern("25% 4px"))), 20.0, 10.0), (5.0, 4.0));
+    }
+
+    #[test]
+    fn test_inline_svg_emits_svg_command_sized_to_content_box() {
+        let tree = build_tree_from_html(
+            r#"<svg width="24" height="12" viewBox="0 0 2 1" style="padding:2px"><rect width="2" height="1"></rect></svg>"#,
+            "",
+        );
+        let svg = all_commands(&tree).into_iter().find_map(|c| match c {
+            PaintCommand::Svg { rect, source } => Some((*rect, source.clone())),
+            _ => None,
+        }).expect("svg command");
+        assert!((svg.0.width - 24.0).abs() < 0.5 && (svg.0.height - 12.0).abs() < 0.5, "{:?}", svg.0);
+        assert!(svg.1.contains("<rect"), "{}", svg.1);
+    }
+
+    /// A spread shadow around a 0px-tall box still paints (Chromium draws the
+    /// 1px ring of an empty ad iframe as a line).
+    #[test]
+    fn test_zero_height_box_still_emits_spread_shadow() {
+        let tree = build_tree_from_html(r#"<div style="width:100px;height:0;box-shadow:0 0 0 1px #e5e5e5"></div>"#, "");
+        assert!(all_commands(&tree).iter().any(|c| matches!(c, PaintCommand::Shadow(..))));
+    }
+
+    #[test]
+    fn test_box_shadow_list_emits_every_layer_bottom_first() {
+        let tree = build_tree_from_html(r#"<div style="width:10px;height:10px;box-shadow:0 0 0 1px #111111, 0 2px 2px #222222"></div>"#, "");
+        let colors: Vec<u8> = all_commands(&tree).iter().filter_map(|c| match c {
+            PaintCommand::Shadow(_, s, _) => Some(s.color.r),
+            _ => None,
+        }).collect();
+        assert_eq!(colors, vec![0x22, 0x11]);
+    }
+
+    #[test]
+    fn test_per_side_border_emits_border_sides_with_current_color() {
+        let tree = build_tree_from_html(
+            r#"<div style="color:#00ff00;width:10px;height:10px;border-left:3px solid #0000ff;border-bottom:1px solid"></div>"#,
+            "",
+        );
+        let sides = all_commands(&tree).into_iter().find_map(|c| match c {
+            PaintCommand::BorderSides { sides, .. } => Some(sides.clone()),
+            _ => None,
+        }).expect("border sides command");
+        assert_eq!(sides.widths, [0.0, 0.0, 1.0, 3.0]);
+        assert_eq!(sides.colors[3].b, 255);
+        assert_eq!(sides.colors[2].g, 255, "missing border color is currentColor");
     }
 }
