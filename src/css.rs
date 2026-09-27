@@ -298,6 +298,10 @@ pub fn parse_css(source: &str) -> Stylesheet {
             }
 
             match &*key {
+                // background shorthand + image/position/size/repeat/origin/clip longhands (src/background.rs)
+                k if crate::background::is_background_property(k) => {
+                    crate::background::push_background_declarations(k, &val_raw, important, &mut declarations);
+                }
                 "border" => {
                     let mut temp_map = HashMap::new();
                     parse_border_shorthand(&val_raw, &mut temp_map);
@@ -1580,7 +1584,7 @@ mod tests {
             "@media (prefers-color-scheme: dark) should be included"
         );
         assert!(rules.iter().any(|r| r.declarations.iter().any(|d| {
-            d.name.as_ref() == "background"
+            d.name.as_ref() == "background-color"
         })));
     }
 

@@ -1482,6 +1482,10 @@ pub fn parse_inline_style_into_vec(style_str: &str, list: &mut Vec<crate::css::D
         let val = if important { val_raw.trim_end_matches("!important").trim() } else { val_raw };
 
         match &*key {
+            // background shorthand + image/position/size/repeat/origin/clip longhands (src/background.rs)
+            k if crate::background::is_background_property(k) => {
+                crate::background::push_background_declarations(k, val, important, list);
+            }
             "border" => {
                 let mut temp_map = HashMap::new();
                 crate::css::parse_border_shorthand_pub(val, &mut temp_map);

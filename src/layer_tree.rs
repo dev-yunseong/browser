@@ -74,6 +74,21 @@ pub enum PaintCommand {
         stops: Vec<CssColorStop>,
         radius: f32,
     },
+    /// CSS `background-image: url(...)` layer. The tile size depends on the
+    /// image's intrinsic size, so it is resolved at raster time.
+    BackgroundImage {
+        url: String,
+        /// Painting area (`background-clip` box), in page coordinates.
+        clip: LayoutRect,
+        /// Corner radius of the clip box.
+        radius: f32,
+        /// Positioning area (`background-origin` box).
+        area: LayoutRect,
+        position: crate::background::BackgroundPosition,
+        size: crate::background::BackgroundSize,
+        repeat_x: bool,
+        repeat_y: bool,
+    },
     /// Push a clip region onto the clip stack.
     /// All subsequent commands are clipped to `rect` (optionally with rounded corners
     /// when `radius` > 0). Paired with `PopClip`.
@@ -511,51 +526,47 @@ impl LayerTreeBuilder {
             }
         }
 
-        // Background
-        let bg = sv.get(&crate::css::intern("background-color"))
-            .or_else(|| sv.get(&crate::css::intern("background")))
-            .or_else(|| sv.get(&crate::css::intern("background-image")));
-        match bg {
-            Some(Value::Color(c)) if c.a > 0 => {
-                commands.push(PaintCommand::Rect(d, c.clone(), radius));
+        // Background: color first, then image layers bottom-most first.
+        let layers = crate::background::background_layers(sv);
+        let inner_radius = |area: crate::background::BoxArea| -> f32 {
+            match area {
+                crate::background::BoxArea::Border => radius,
+                crate::background::BoxArea::Padding => (radius - layout.border.left).max(0.0),
+                crate::background::BoxArea::Content => (radius - layout.border.left - layout.padding.left).max(0.0),
             }
-            Some(Value::Gradient(GradientValue::Linear { direction, stops })) => {
-                commands.push(PaintCommand::LinearGradient {
-                    rect: d,
-                    direction: direction.clone(),
-                    stops: stops.clone(),
-                    radius,
-                });
+        };
+        // `background-color` is clipped like the bottom-most image layer.
+        let color_clip = layers.first().map(|l| l.clip).unwrap_or(crate::background::BoxArea::Border);
+        let bg_color = sv.get(&crate::css::intern("background-color"))
+            .or_else(|| sv.get(&crate::css::intern("background")));
+        if let Some(Value::Color(c)) = bg_color {
+            if c.a > 0 {
+                let r = crate::background::box_rect(layout, color_clip);
+                commands.push(PaintCommand::Rect(r, c.clone(), inner_radius(color_clip)));
             }
-            Some(Value::Gradient(GradientValue::Radial { stops, .. })) => {
-                commands.push(PaintCommand::RadialGradient {
-                    rect: d,
-                    stops: stops.clone(),
-                    radius,
-                });
-            }
-            _ => {}
         }
-        // Also check background-image for gradients (separate from background-color)
-        if matches!(bg, Some(Value::Color(_)) | None) {
-            let bg_img = sv.get(&crate::css::intern("background-image"));
-            match bg_img {
-                Some(Value::Gradient(GradientValue::Linear { direction, stops })) => {
-                    commands.push(PaintCommand::LinearGradient {
-                        rect: d,
-                        direction: direction.clone(),
-                        stops: stops.clone(),
-                        radius,
+        for layer in layers {
+            let clip_rect = crate::background::box_rect(layout, layer.clip);
+            let clip_radius = inner_radius(layer.clip);
+            match layer.image {
+                crate::background::LayerImage::Gradient(GradientValue::Linear { direction, stops }) => {
+                    commands.push(PaintCommand::LinearGradient { rect: clip_rect, direction, stops, radius: clip_radius });
+                }
+                crate::background::LayerImage::Gradient(GradientValue::Radial { stops, .. }) => {
+                    commands.push(PaintCommand::RadialGradient { rect: clip_rect, stops, radius: clip_radius });
+                }
+                crate::background::LayerImage::Url(url) => {
+                    commands.push(PaintCommand::BackgroundImage {
+                        url,
+                        clip: clip_rect,
+                        radius: clip_radius,
+                        area: crate::background::box_rect(layout, layer.origin),
+                        position: layer.position,
+                        size: layer.size,
+                        repeat_x: layer.repeat_x,
+                        repeat_y: layer.repeat_y,
                     });
                 }
-                Some(Value::Gradient(GradientValue::Radial { stops, .. })) => {
-                    commands.push(PaintCommand::RadialGradient {
-                        rect: d,
-                        stops: stops.clone(),
-                        radius,
-                    });
-                }
-                _ => {}
             }
         }
 
@@ -741,6 +752,7 @@ impl LayerTreeBuilder {
                 PaintCommand::Shadow(r, ..) => *r,
                 PaintCommand::LinearGradient { rect, .. } => *rect,
                 PaintCommand::RadialGradient { rect, .. } => *rect,
+                PaintCommand::BackgroundImage { clip, .. } => *clip,
                 PaintCommand::PushClip { rect, .. } => *rect,
                 PaintCommand::PopClip => continue,
             };
@@ -961,6 +973,51 @@ mod tests {
                 PaintCommand::Image { object_fit: ObjectFit::Cover, alt, .. } if alt == "test"
             ));
         assert!(has_cover, "expected PaintCommand::Image with ObjectFit::Cover and alt='test'");
+    }
+
+    fn all_commands(tree: &LayerTree) -> Vec<&PaintCommand> {
+        tree.layers.iter()
+            .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
+            .collect()
+    }
+
+    #[test]
+    fn test_background_shorthand_emits_color_then_image() {
+        let tree = build_tree_from_html(
+            r#"<div class="ico"></div>"#,
+            ".ico{width:20px;height:20px;background:url(https://x/sp.png) -10px -20px/100px 50px no-repeat #fff}",
+        );
+        let cmds = all_commands(&tree);
+        let color_idx = cmds.iter().position(|c| matches!(c, PaintCommand::Rect(_, c, _) if c.r == 255 && c.g == 255));
+        let img_idx = cmds.iter().position(|c| matches!(c,
+            PaintCommand::BackgroundImage { url, repeat_x: false, repeat_y: false, .. } if url == "https://x/sp.png"));
+        assert!(color_idx.is_some() && img_idx.is_some(), "expected color + image commands, got {:?}", cmds);
+        assert!(color_idx < img_idx, "background-color must paint below the image");
+    }
+
+    #[test]
+    fn test_background_image_longhands_emit_command_with_position_and_size() {
+        let tree = build_tree_from_html(
+            r#"<span class="s"></span>"#,
+            ".s{display:inline-block;width:20px;height:20px;background-image:url(sp.png);background-size:484px 476px;background-position:-468px -126px;background-repeat:no-repeat}",
+        );
+        let cmd = all_commands(&tree).into_iter().find_map(|c| match c {
+            PaintCommand::BackgroundImage { position, size, .. } => Some((*position, *size)),
+            _ => None,
+        });
+        let (position, size) = cmd.expect("BackgroundImage command");
+        assert_eq!(position.x.resolve(0.0), -468.0);
+        assert_eq!(position.y.resolve(0.0), -126.0);
+        assert_eq!(crate::background::tile_size(size, 968.0, 952.0, 20.0, 20.0), (484.0, 476.0));
+    }
+
+    #[test]
+    fn test_background_gradient_shorthand_still_paints_gradient() {
+        let tree = build_tree_from_html(
+            r#"<div class="g"></div>"#,
+            ".g{width:20px;height:20px;background:linear-gradient(to right,red,blue)}",
+        );
+        assert!(all_commands(&tree).iter().any(|c| matches!(c, PaintCommand::LinearGradient { .. })));
     }
 
     #[test]
