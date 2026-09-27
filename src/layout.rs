@@ -264,7 +264,25 @@ pub fn build_layout_tree_with_cb<'a>(
     vh: f32,
     containing_block: Option<Rect>,
 ) -> (Option<LayoutBox<'a>>, f32, f32) {
+    build_layout_tree_with_images(style_node, container_start_x, current_y, container_width, vw, vh, containing_block, ImageSizes::default())
+}
+
+/// [`build_layout_tree_with_cb`] with the natural sizes of loaded images, so
+/// `<img>` boxes with an `auto` width or height get their decoded size and
+/// aspect ratio.
+#[allow(clippy::too_many_arguments)]
+pub fn build_layout_tree_with_images<'a>(
+    style_node: &'a StyledNode,
+    container_start_x: f32,
+    current_y: f32,
+    container_width: f32,
+    vw: f32,
+    vh: f32,
+    containing_block: Option<Rect>,
+    images: ImageSizes,
+) -> (Option<LayoutBox<'a>>, f32, f32) {
     let mut ctx = Ctx::new(vw, vh);
+    ctx.images = images;
     let result = layout_root(style_node, container_start_x, current_y, container_width, &mut ctx);
     let Some(mut root) = result else {
         return (None, container_start_x, current_y);
@@ -301,11 +319,76 @@ struct Ctx {
     margin_chain: HashMap<(usize, u32), (Strut, bool)>,
     /// Memoized `inline_contains_block` results.
     contains_block: HashMap<usize, bool>,
+    /// Natural sizes of loaded images.
+    images: ImageSizes,
 }
 
 impl Ctx {
     fn new(vw: f32, vh: f32) -> Self {
-        Ctx { vw, vh, intrinsic: HashMap::new(), pending_abs: 0, margin_chain: HashMap::new(), contains_block: HashMap::new() }
+        Ctx {
+            vw,
+            vh,
+            intrinsic: HashMap::new(),
+            pending_abs: 0,
+            margin_chain: HashMap::new(),
+            contains_block: HashMap::new(),
+            images: ImageSizes::default(),
+        }
+    }
+}
+
+/// Natural (intrinsic) pixel sizes of loaded images, keyed by absolute URL.
+/// Layout uses them to size `<img>` elements whose width or height is `auto`.
+#[derive(Debug, Clone, Default)]
+pub struct ImageSizes {
+    base: Option<url::Url>,
+    sizes: HashMap<String, (f32, f32)>,
+}
+
+lazy_static::lazy_static! {
+    /// Header-decoded dimensions keyed by (url, byte length).
+    static ref IMAGE_DIMENSIONS: std::sync::Mutex<HashMap<(String, usize), Option<(u32, u32)>>> =
+        std::sync::Mutex::new(HashMap::new());
+}
+
+impl ImageSizes {
+    /// Read the dimensions of every encoded image in `cache` (only the image
+    /// header is parsed; results are memoized). `base` resolves relative `src`.
+    pub fn from_cache(cache: &HashMap<String, Vec<u8>>, base: Option<&url::Url>) -> Self {
+        let mut out = ImageSizes { base: base.cloned(), sizes: HashMap::new() };
+        let mut memo = IMAGE_DIMENSIONS.lock().unwrap_or_else(|e| e.into_inner());
+        if memo.len() > 4096 {
+            memo.clear();
+        }
+        for (url, bytes) in cache {
+            let dims = *memo.entry((url.clone(), bytes.len())).or_insert_with(|| {
+                image::ImageReader::new(std::io::Cursor::new(bytes.as_slice()))
+                    .with_guessed_format()
+                    .ok()
+                    .and_then(|r| r.into_dimensions().ok())
+            });
+            if let Some((w, h)) = dims {
+                out.sizes.insert(url.clone(), (w as f32, h as f32));
+            }
+        }
+        out
+    }
+
+    /// Record the natural size of the image at `url`.
+    pub fn insert(&mut self, url: &str, width: f32, height: f32) {
+        self.sizes.insert(url.to_string(), (width, height));
+    }
+
+    fn get(&self, src: &str) -> Option<(f32, f32)> {
+        let src = src.trim();
+        if src.is_empty() {
+            return None;
+        }
+        if let Some(v) = self.sizes.get(src) {
+            return Some(*v);
+        }
+        let resolved = self.base.as_ref()?.join(src).ok()?;
+        self.sizes.get(resolved.as_str()).copied()
     }
 }
 
@@ -1418,7 +1501,7 @@ fn layout_block_level_inner<'a>(
     let mut collapsed_through = false;
     let content_h = match inner {
         Inner::Replaced => {
-            let (_, h) = replaced_size(sn, &bm, cb, ctx);
+            let (_, h) = replaced_size_for(sn, &bm, cb, ctx, Some(border_w));
             let border_h = specified_h.unwrap_or(h);
             (border_h - bm.pb_v()).max(0.0)
         }
@@ -1504,7 +1587,15 @@ fn layout_block_level_inner<'a>(
 
 /// Border-box size of a replaced element.
 fn replaced_size(sn: &StyledNode, bm: &BoxModel, cb: Cb, ctx: &Ctx) -> (f32, f32) {
-    let w = specified_border_width(sn, Some(cb.width), bm, ctx);
+    replaced_size_for(sn, bm, cb, ctx, None)
+}
+
+/// Border-box size of a replaced element (CSS 2.1 §10.3.2, §10.4, §10.6.2 and
+/// CSS Sizing 4 aspect-ratio). `used_border_w` overrides the width when the
+/// formatting context already decided it (e.g. a stretched flex item), so the
+/// height follows the aspect ratio of that width.
+fn replaced_size_for(sn: &StyledNode, bm: &BoxModel, cb: Cb, ctx: &Ctx, used_border_w: Option<f32>) -> (f32, f32) {
+    let w = used_border_w.or_else(|| specified_border_width(sn, Some(cb.width), bm, ctx));
     let h = specified_border_height(sn, cb.height, bm, ctx);
     let tag = tag_name(sn).unwrap_or_default();
     let (default_w, default_h) = match tag.as_str() {
@@ -1514,8 +1605,8 @@ fn replaced_size(sn: &StyledNode, bm: &BoxModel, cb: Cb, ctx: &Ctx) -> (f32, f32
         "textarea" => (160.0, 48.0),
         _ => (300.0, 150.0),
     };
-    let mut ratio = default_h / default_w;
     if tag == "svg" {
+        let mut ratio = default_h / default_w;
         // Outer <svg>: `auto` width is 100% of the containing block; the height
         // follows the viewBox aspect ratio (or the 150px default).
         let vb = svg_view_box(sn);
@@ -1536,25 +1627,149 @@ fn replaced_size(sn: &StyledNode, bm: &BoxModel, cb: Cb, ctx: &Ctx) -> (f32, f32
             }
         }
     }
-    let (w, h) = match (w, h) {
-        (Some(w), Some(h)) => (w, h),
+    let (pb_h, pb_v) = (bm.pb_h(), bm.pb_v());
+    let (nat_w, nat_h, nat_ratio) = natural_dimensions(sn, &tag, ctx);
+    // Used aspect ratio (width / height): `aspect-ratio: <ratio>` wins over the
+    // natural ratio; `auto && <ratio>` only fills in when there is none.
+    let ratio = match aspect_ratio(sn) {
+        Some((true, r)) => nat_ratio.or(r),
+        Some((false, r)) => r.or(nat_ratio),
+        None => nat_ratio,
+    };
+    let limit = |prop: &str, base: Option<f32>, pb: f32| {
+        prop_len(sn, prop, base, ctx).map(|v| if is_border_box(sn) { (v - pb).max(0.0) } else { v.max(0.0) })
+    };
+    let min_w = limit("min-width", Some(cb.width), pb_h).unwrap_or(0.0);
+    let max_w = limit("max-width", Some(cb.width), pb_h).unwrap_or(f32::INFINITY).max(min_w);
+    let min_h = limit("min-height", cb.height, pb_v).unwrap_or(0.0);
+    let max_h = limit("max-height", cb.height, pb_v).unwrap_or(f32::INFINITY).max(min_h);
+    let clamp_w = |v: f32| if used_border_w.is_some() { v } else { v.min(max_w).max(min_w) };
+    let clamp_h = |v: f32| v.min(max_h).max(min_h);
+    let spec_w = w.map(|w| (w - pb_h).max(0.0));
+    let spec_h = h.map(|h| (h - pb_v).max(0.0));
+    let (cw, ch) = match (spec_w, spec_h) {
+        (Some(w), Some(h)) => (clamp_w(w), clamp_h(h)),
         (Some(w), None) => {
-            let cw = (w - bm.pb_h()).max(0.0);
-            (w, cw * if tag == "img" { 0.667 } else { ratio } + bm.pb_v())
+            let w = clamp_w(w);
+            let h = ratio.map(|r| w / r).or(nat_h).unwrap_or(if tag == "img" { w * 0.667 } else { default_h });
+            (w, clamp_h(h))
         }
         (None, Some(h)) => {
-            let ch = (h - bm.pb_v()).max(0.0);
-            (ch / if tag == "img" { 0.667 } else { ratio } + bm.pb_h(), h)
+            let h = clamp_h(h);
+            let w = ratio.map(|r| h * r).or(nat_w).unwrap_or(if tag == "img" { h / 0.667 } else { default_w });
+            (clamp_w(w), h)
         }
-        (None, None) => {
-            let w = if tag == "img" { default_w.min(cb.width.max(1.0)) } else { default_w };
-            let h = if tag == "img" { w * 0.667 } else { default_h };
-            (w + bm.pb_h(), h + bm.pb_v())
-        }
+        (None, None) => match (nat_w, nat_h, ratio) {
+            (Some(nw), Some(nh), Some(r)) => {
+                let nh = if nat_ratio == Some(r) { nh } else { nw / r };
+                constrain_replaced(nw, nh, min_w, max_w, min_h, max_h)
+            }
+            (Some(nw), Some(nh), None) => (clamp_w(nw), clamp_h(nh)),
+            (Some(nw), None, r) => {
+                let w = clamp_w(nw);
+                (w, clamp_h(r.map_or(default_h, |r| w / r)))
+            }
+            (None, Some(nh), r) => {
+                let h = clamp_h(nh);
+                (clamp_w(r.map_or(default_w, |r| h * r)), h)
+            }
+            (None, None, Some(r)) => {
+                let w = if tag == "img" { default_w.min(cb.width.max(1.0)) } else { default_w };
+                constrain_replaced(w, w / r, min_w, max_w, min_h, max_h)
+            }
+            (None, None, None) => {
+                let w = if tag == "img" { default_w.min(cb.width.max(1.0)) } else { default_w };
+                let h = if tag == "img" { w * 0.667 } else { default_h };
+                (clamp_w(w), clamp_h(h))
+            }
+        },
     };
-    let w = clamp_border_width(sn, w, Some(cb.width), bm, ctx);
-    let h = clamp_border_height(sn, h, cb.height, bm, ctx);
-    (w, h.max(if tag == "img" { 1.0 } else { 0.0 }))
+    (cw + pb_h, (ch + pb_v).max(if tag == "img" { 1.0 } else { 0.0 }))
+}
+
+/// CSS 2.1 §10.4 table: resolve min/max constraints for a replaced element
+/// whose width and height are both `auto`, preserving the aspect ratio.
+fn constrain_replaced(w: f32, h: f32, min_w: f32, max_w: f32, min_h: f32, max_h: f32) -> (f32, f32) {
+    if w <= 0.0 || h <= 0.0 {
+        return (w.min(max_w).max(min_w), h.min(max_h).max(min_h));
+    }
+    let (over_w, under_w) = (w > max_w, w < min_w);
+    let (over_h, under_h) = (h > max_h, h < min_h);
+    match (over_w, under_w, over_h, under_h) {
+        (true, _, true, _) => {
+            if max_w / w <= max_h / h {
+                (max_w, (max_w * h / w).max(min_h))
+            } else {
+                ((max_h * w / h).max(min_w), max_h)
+            }
+        }
+        (_, true, _, true) => {
+            if min_w / w <= min_h / h {
+                ((min_h * w / h).min(max_w), min_h)
+            } else {
+                (min_w, (min_w * h / w).min(max_h))
+            }
+        }
+        (_, true, true, _) => (min_w, max_h),
+        (true, _, _, true) => (max_w, min_h),
+        (true, _, _, _) => (max_w, (max_w * h / w).max(min_h)),
+        (_, true, _, _) => (min_w, (min_w * h / w).min(max_h)),
+        (_, _, true, _) => ((max_h * w / h).max(min_w), max_h),
+        (_, _, _, true) => ((min_h * w / h).min(max_w), min_h),
+        _ => (w, h),
+    }
+}
+
+/// Natural width, height and aspect ratio (width / height) of a replaced
+/// element. Images use the decoded size when loaded; otherwise the
+/// `width`/`height` attributes still give the ratio (HTML maps them to
+/// `aspect-ratio: auto w / h`).
+fn natural_dimensions(sn: &StyledNode, tag: &str, ctx: &Ctx) -> (Option<f32>, Option<f32>, Option<f32>) {
+    let attr_px = |name: &str| attr(sn, name).and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok()).filter(|v| *v > 0.0);
+    match tag {
+        "img" => {
+            if let Some((w, h)) = attr(sn, "src").and_then(|src| ctx.images.get(&src)) {
+                let r = if w > 0.0 && h > 0.0 { Some(w / h) } else { None };
+                return (Some(w), Some(h), r);
+            }
+            let r = match (attr_px("width"), attr_px("height")) {
+                (Some(w), Some(h)) => Some(w / h),
+                _ => None,
+            };
+            (None, None, r)
+        }
+        "canvas" => {
+            let w = attr_px("width").unwrap_or(300.0);
+            let h = attr_px("height").unwrap_or(150.0);
+            (Some(w), Some(h), Some(w / h))
+        }
+        "video" | "iframe" | "embed" | "object" => (Some(300.0), Some(150.0), if tag == "video" { Some(2.0) } else { None }),
+        "svg" => (None, None, svg_view_box(sn).map(|(w, h)| w / h)),
+        _ => (None, None, None),
+    }
+}
+
+/// Parsed `aspect-ratio`: `(has auto, ratio)`, or `None` when it is `auto`/unset.
+fn aspect_ratio(sn: &StyledNode) -> Option<(bool, Option<f32>)> {
+    let text = match sval(sn, "aspect-ratio")? {
+        Value::Number(n) => return if *n > 0.0 { Some((false, Some(*n))) } else { None },
+        Value::Keyword(k) => k.to_string(),
+        Value::Length(n, Unit::Px) if *n > 0.0 => return Some((false, Some(*n))),
+        _ => return None,
+    };
+    let has_auto = text.split_whitespace().any(|t| t == "auto");
+    let rest: String = text.split_whitespace().filter(|t| *t != "auto").collect::<Vec<_>>().join(" ");
+    if rest.is_empty() {
+        return None;
+    }
+    let mut parts = rest.split('/').map(|p| p.trim().parse::<f32>().ok());
+    let r = match (parts.next().flatten(), parts.next()) {
+        (Some(a), None) => Some(a),
+        (Some(a), Some(Some(b))) if b > 0.0 => Some(a / b),
+        _ => None,
+    }
+    .filter(|r| *r > 0.0 && r.is_finite());
+    Some((has_auto, r))
 }
 
 /// `viewBox="minx miny w h"` of an svg element, as (w, h).

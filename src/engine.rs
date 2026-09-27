@@ -715,8 +715,10 @@ pub fn process_html_with_cache(
     let style_elapsed = start.elapsed();
 
     let start = Instant::now();
-    let (layout_tree_opt, _, final_y) =
-        layout::build_layout_tree(&style_tree, 0.0, 0.0, 0.0, width, width, viewport_height());
+    let image_sizes = layout::ImageSizes::from_cache(image_cache, Some(base_url));
+    let (layout_tree_opt, _, final_y) = layout::build_layout_tree_with_images(
+        &style_tree, 0.0, 0.0, width, width, viewport_height(), None, image_sizes,
+    );
     let layout_tree = layout_tree_opt.ok_or("Failed to build layout tree")?;
     let layout_elapsed = start.elapsed();
 
