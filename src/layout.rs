@@ -932,9 +932,6 @@ impl<'a> LayoutBox<'a> {
     fn content_y(&self) -> f32 {
         self.dimensions.y + self.border.top + self.padding.top
     }
-    fn content_width(&self) -> f32 {
-        (self.dimensions.width - self.border.horizontal() - self.padding.horizontal()).max(0.0)
-    }
     fn padding_box(&self) -> Rect {
         Rect {
             x: self.dimensions.x + self.border.left,
@@ -1304,9 +1301,6 @@ struct BlockOpts {
     forced_width: Option<f32>,
     /// Force this border-box height (stretched flex items, positioned boxes).
     forced_height: Option<f32>,
-    /// The box is a flex/grid item (its percentage heights resolve against the
-    /// container only when definite).
-    is_item: bool,
 }
 
 struct BlockOut<'a> {
@@ -1929,6 +1923,7 @@ enum PieceKind<'a> {
     /// A (collapsed or preserved) space.
     Space(&'a StyledNode, String),
     Open(&'a StyledNode),
+    #[allow(dead_code)]
     Close(&'a StyledNode),
     Atomic(usize, &'a StyledNode),
     Break(&'a StyledNode),
@@ -2642,7 +2637,7 @@ fn build_line<'a>(
     // Shifts computed per piece index for the placement pass.
     let mut piece_shift: Vec<f32> = vec![0.0; line.len()];
     let mut aligned_edges: Vec<(usize, bool, f32)> = Vec::new(); // (piece idx, is_top, height)
-    let mut contributes = |m: &InlineMetrics, shift: f32, min_top: &mut f32, max_bottom: &mut f32| {
+    let contributes = |m: &InlineMetrics, shift: f32, min_top: &mut f32, max_bottom: &mut f32| {
         let hl = m.half_leading();
         *min_top = min_top.min(shift - m.ascent - hl);
         *max_bottom = max_bottom.max(shift + m.descent + hl);
@@ -3246,7 +3241,7 @@ fn layout_flex<'a>(
             } else {
                 // Column: lay out at the cross size to measure the height.
                 let cross_w = column_item_cross_width(node, &bm, content_w, &item_cb, ctx);
-                layout_block_level(node, 0.0, 0.0, item_cb, None, BlockOpts { forced_width: Some(cross_w), is_item: true, ..Default::default() }, ctx)
+                layout_block_level(node, 0.0, 0.0, item_cb, None, BlockOpts { forced_width: Some(cross_w), ..Default::default() }, ctx)
                     .map(|o| o.lb.dimensions.height)
                     .unwrap_or(0.0)
             }
@@ -3342,10 +3337,10 @@ fn layout_flex<'a>(
             FlexChild::Element(_) => {
                 let bm = item.bm;
                 let opts = if row {
-                    BlockOpts { forced_width: Some(item.main), is_item: true, ..Default::default() }
+                    BlockOpts { forced_width: Some(item.main), ..Default::default() }
                 } else {
                     let cross_w = column_item_cross_width(node, &bm, content_w, &item_cb, ctx);
-                    BlockOpts { forced_width: Some(cross_w), forced_height: Some(item.main), is_item: true, ..Default::default() }
+                    BlockOpts { forced_width: Some(cross_w), forced_height: Some(item.main), ..Default::default() }
                 };
                 if let Some(out) = layout_block_level(node, 0.0, 0.0, item_cb, None, opts, ctx) {
                     let b = out.lb;
@@ -3458,9 +3453,9 @@ fn layout_flex<'a>(
                 }
                 FlexChild::Element(_) => {
                     let opts = if row {
-                        BlockOpts { forced_width: Some(it.main), forced_height: Some(target), is_item: true, ..Default::default() }
+                        BlockOpts { forced_width: Some(it.main), forced_height: Some(target), ..Default::default() }
                     } else {
-                        BlockOpts { forced_width: Some(target), forced_height: Some(it.main), is_item: true, ..Default::default() }
+                        BlockOpts { forced_width: Some(target), forced_height: Some(it.main), ..Default::default() }
                     };
                     if let Some(out) = layout_block_level(node, 0.0, 0.0, item_cb, None, opts, ctx) {
                         let b = out.lb;
@@ -4029,7 +4024,7 @@ fn layout_grid<'a>(lb: &mut LayoutBox<'a>, content_x: f32, content_y: f32, conte
             Some(sw) => sw,
             None => (w - bm.margin.horizontal()).max(0.0),
         };
-        if let Some(out) = layout_block_level(c, 0.0, 0.0, Cb { width: w, height: None }, None, BlockOpts { forced_width: Some(fw), is_item: true, ..Default::default() }, ctx) {
+        if let Some(out) = layout_block_level(c, 0.0, 0.0, Cb { width: w, height: None }, None, BlockOpts { forced_width: Some(fw), ..Default::default() }, ctx) {
             placed.push((row, col, out.lb));
         }
     }
@@ -7327,5 +7322,281 @@ mod tests {
             "Row 2 should be below row 1: c.y={}, a.y={}",
             c.dimensions.y, a.dimensions.y
         );
+    }
+
+    // ── Layout rewrite: feature tests ─────────────────────────────────────────
+
+    fn by_id<'a>(root: &'a LayoutBox<'a>, id: &str) -> &'a LayoutBox<'a> {
+        find_element_by_id(root, id).unwrap_or_else(|| panic!("#{} not found", id))
+    }
+
+    #[test]
+    fn test_content_box_width_adds_padding_and_border() {
+        let (root, _, _) = layout_from_html_css(
+            r#"<div id="a"></div><div id="b"></div>"#,
+            "body{margin:0} #a{width:40px;padding:10px;border:5px solid red} #b{width:40px;padding:10px;border:5px solid red;box-sizing:border-box}",
+            800.0,
+            600.0,
+        );
+        assert_eq!(by_id(&root, "a").dimensions.width, 70.0);
+        assert_eq!(by_id(&root, "b").dimensions.width, 40.0);
+    }
+
+    #[test]
+    fn test_margin_collapses_through_parent_top() {
+        let (root, _, _) = layout_from_html_css(
+            r#"<div id="p"><div id="c">x</div></div>"#,
+            "body{margin:0} #p{margin-top:10px} #c{margin-top:30px}",
+            800.0,
+            600.0,
+        );
+        let p = by_id(&root, "p");
+        let c = by_id(&root, "c");
+        assert_eq!(p.dimensions.y, 30.0, "parent moves down by the collapsed margin");
+        assert_eq!(c.dimensions.y, 30.0, "child shares the parent's top edge");
+    }
+
+    #[test]
+    fn test_empty_block_margins_collapse_through() {
+        let (root, _, _) = layout_from_html_css(
+            r#"<div id="a" style="height:10px"></div><div style="margin:20px 0"></div><div id="b" style="margin-top:15px">x</div>"#,
+            "body{margin:0}",
+            800.0,
+            600.0,
+        );
+        assert_eq!(by_id(&root, "b").dimensions.y, 30.0, "10 + max(20, 20, 15)");
+    }
+
+    #[test]
+    fn test_overflow_hidden_block_avoids_float() {
+        let (root, _, _) = layout_from_html_css(
+            r#"<div id="w"><div style="float:left;width:100px;height:50px"></div><div id="bfc" style="overflow:hidden">text</div></div>"#,
+            "body{margin:0} #w{width:500px}",
+            800.0,
+            600.0,
+        );
+        let bfc = by_id(&root, "bfc");
+        assert_eq!(bfc.dimensions.x, 100.0);
+        assert_eq!(bfc.dimensions.width, 400.0);
+    }
+
+    #[test]
+    fn test_korean_text_breaks_between_syllables() {
+        let (root, _, _) = layout_from_html_css(
+            r#"<div id="d">가나다라마바사아자차카타파하</div>"#,
+            "body{margin:0} #d{width:60px;font-size:16px}",
+            800.0,
+            600.0,
+        );
+        let mut frags = Vec::new();
+        collect_text_fragments(&root, "가나다", &mut frags);
+        assert!(frags.len() >= 3, "no-space Korean text wraps between syllables, got {} lines", frags.len());
+        for f in &frags {
+            assert!(f.dimensions.width <= 61.0, "line width {} exceeds the container", f.dimensions.width);
+        }
+    }
+
+    #[test]
+    fn test_nowrap_keeps_text_on_one_line() {
+        let (root, _, _) = layout_from_html_css(
+            r#"<div id="d">one two three four five six</div>"#,
+            "body{margin:0} #d{width:40px;white-space:nowrap}",
+            800.0,
+            600.0,
+        );
+        let mut frags = Vec::new();
+        collect_text_fragments(&root, "one two", &mut frags);
+        assert_eq!(frags.len(), 1);
+    }
+
+    #[test]
+    fn test_text_overflow_ellipsis_truncates_line() {
+        let (root, _, _) = layout_from_html_css(
+            r#"<div id="d">a long headline that does not fit in the box</div>"#,
+            "body{margin:0} #d{width:80px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+            800.0,
+            600.0,
+        );
+        let mut frags = Vec::new();
+        collect_text_fragments(&root, "a long headline", &mut frags);
+        let t = frags[0].text_fragment.clone().unwrap();
+        assert!(t.ends_with('\u{2026}'), "ellipsis appended, got {:?}", t);
+        assert!(t.len() < "a long headline that does not fit in the box".len());
+    }
+
+    #[test]
+    fn test_line_clamp_limits_lines() {
+        let (root, _, _) = layout_from_html_css(
+            r#"<div id="d">one two three four five six seven eight nine ten eleven twelve</div>"#,
+            "body{margin:0} #d{width:60px;line-height:20px;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}",
+            800.0,
+            600.0,
+        );
+        assert_eq!(by_id(&root, "d").dimensions.height, 40.0);
+    }
+
+    #[test]
+    fn test_line_height_sets_line_box_height() {
+        let (root, _, _) = layout_from_html_css(
+            r#"<div id="d">text</div>"#,
+            "body{margin:0} #d{line-height:30px;font-size:12px}",
+            800.0,
+            600.0,
+        );
+        assert_eq!(by_id(&root, "d").dimensions.height, 30.0);
+    }
+
+    #[test]
+    fn test_inline_block_sits_on_baseline_and_middle_aligns() {
+        let (root, _, _) = layout_from_html_css(
+            r#"<div id="d">x<span id="m" style="display:inline-block;width:10px;height:40px;vertical-align:middle"></span></div>"#,
+            "body{margin:0} #d{line-height:20px;font-size:16px}",
+            800.0,
+            600.0,
+        );
+        let d = by_id(&root, "d");
+        let m = by_id(&root, "m");
+        assert!(d.dimensions.height >= 40.0);
+        assert!(m.dimensions.y >= d.dimensions.y - 0.01);
+        assert!(m.dimensions.y + 40.0 <= d.dimensions.y + d.dimensions.height + 0.01);
+    }
+
+    #[test]
+    fn test_inline_block_shrinks_to_fit_content() {
+        let (root, _, _) = layout_from_html_css(
+            r#"<div><span id="s" style="display:inline-block;padding:0 5px">abc</span></div>"#,
+            "body{margin:0}",
+            800.0,
+            600.0,
+        );
+        let s = by_id(&root, "s");
+        let text_w = text_width("abc", 16.0, 0.0);
+        assert!((s.dimensions.width - (text_w + 10.0)).abs() < 0.5, "got {}", s.dimensions.width);
+    }
+
+    #[test]
+    fn test_flex_shrink_respects_min_content() {
+        let (root, _, _) = layout_from_html_css(
+            r#"<div id="f"><div id="a">unbreakableword</div><div id="b" style="width:500px"></div></div>"#,
+            "body{margin:0} #f{display:flex;width:300px}",
+            800.0,
+            600.0,
+        );
+        let a = by_id(&root, "a");
+        let min_word = text_width("unbreakableword", 16.0, 0.0);
+        assert!(a.dimensions.width >= min_word - 0.5, "item {} shrank below its min-content {}", a.dimensions.width, min_word);
+    }
+
+    #[test]
+    fn test_flex_auto_margin_pushes_item_to_end() {
+        let (root, _, _) = layout_from_html_css(
+            r#"<div id="f"><div id="a" style="width:50px"></div><div id="b" style="width:50px;margin-left:auto"></div></div>"#,
+            "body{margin:0} #f{display:flex;width:400px}",
+            800.0,
+            600.0,
+        );
+        assert_eq!(by_id(&root, "b").dimensions.x, 350.0);
+    }
+
+    #[test]
+    fn test_flex_column_grow_fills_definite_height() {
+        let (root, _, _) = layout_from_html_css(
+            r#"<div id="f"><div id="a" style="height:20px"></div><div id="b" style="flex:1"></div></div>"#,
+            "body{margin:0} #f{display:flex;flex-direction:column;height:200px}",
+            800.0,
+            600.0,
+        );
+        let b = by_id(&root, "b");
+        assert_eq!(b.dimensions.y, 20.0);
+        assert_eq!(b.dimensions.height, 180.0);
+        assert_eq!(b.dimensions.width, 800.0, "column items stretch across");
+    }
+
+    #[test]
+    fn test_flex_wrap_and_gap() {
+        let (root, _, _) = layout_from_html_css(
+            r#"<div id="f"><div id="a"></div><div id="b"></div><div id="c"></div></div>"#,
+            "body{margin:0} #f{display:flex;flex-wrap:wrap;gap:10px 20px;width:250px} #f div{width:100px;height:30px}",
+            800.0,
+            600.0,
+        );
+        assert_eq!(by_id(&root, "b").dimensions.x, 120.0);
+        assert_eq!(by_id(&root, "c").dimensions.x, 0.0);
+        assert_eq!(by_id(&root, "c").dimensions.y, 40.0);
+    }
+
+    #[test]
+    fn test_absolute_bottom_right_uses_final_container_size() {
+        let (root, _, _) = layout_from_html_css(
+            r#"<div id="p"><div style="height:100px"></div><span id="a">x</span></div>"#,
+            "body{margin:0} #p{position:relative;width:300px} #a{position:absolute;right:10px;bottom:5px;width:20px;height:10px}",
+            800.0,
+            600.0,
+        );
+        let a = by_id(&root, "a");
+        assert_eq!(a.dimensions.x, 270.0);
+        assert_eq!(a.dimensions.y, 85.0);
+    }
+
+    #[test]
+    fn test_absolute_centered_with_auto_margins() {
+        let (root, _, _) = layout_from_html_css(
+            r#"<div id="p"><div id="a"></div></div>"#,
+            "body{margin:0} #p{position:relative;width:300px;height:200px} #a{position:absolute;top:0;bottom:0;left:0;right:0;margin:auto;width:100px;height:50px}",
+            800.0,
+            600.0,
+        );
+        let a = by_id(&root, "a");
+        assert_eq!((a.dimensions.x, a.dimensions.y), (100.0, 75.0));
+    }
+
+    #[test]
+    fn test_svg_without_size_uses_view_box_ratio() {
+        let (root, _, _) = layout_from_html_css(
+            r#"<span id="s"><svg id="g" viewBox="0 0 24 12"></svg></span>"#,
+            "body{margin:0} #s{display:block;width:48px}",
+            800.0,
+            600.0,
+        );
+        let g = by_id(&root, "g");
+        assert_eq!((g.dimensions.width, g.dimensions.height), (48.0, 24.0));
+    }
+
+    #[test]
+    fn test_table_columns_share_width() {
+        let (root, _, _) = layout_from_html_css(
+            r#"<table id="t"><tr><td id="a">a</td><td id="b">bbbbbbbb</td></tr></table>"#,
+            "body{margin:0} #t{width:400px;border-collapse:collapse} td{padding:0}",
+            800.0,
+            600.0,
+        );
+        let a = by_id(&root, "a");
+        let b = by_id(&root, "b");
+        assert!((a.dimensions.width + b.dimensions.width - 400.0).abs() < 0.5);
+        assert!(b.dimensions.width > a.dimensions.width);
+        assert_eq!(b.dimensions.x, a.dimensions.x + a.dimensions.width);
+    }
+
+    #[test]
+    fn test_pseudo_element_box_takes_space() {
+        let (root, _, _) = layout_from_html_css(
+            r#"<div><span id="s">x</span></div>"#,
+            r#"body{margin:0} #s::before{content:"";display:inline-block;width:30px;height:10px}"#,
+            800.0,
+            600.0,
+        );
+        let s = by_id(&root, "s");
+        assert!(s.dimensions.width >= 30.0 + text_width("x", 16.0, 0.0) - 0.5);
+    }
+
+    #[test]
+    fn test_clearfix_after_contains_floats() {
+        let (root, _, _) = layout_from_html_css(
+            r#"<div id="c"><div style="float:left;width:10px;height:70px"></div></div>"#,
+            r#"body{margin:0} #c::after{content:"";display:table;clear:both}"#,
+            800.0,
+            600.0,
+        );
+        assert_eq!(by_id(&root, "c").dimensions.height, 70.0);
     }
 }

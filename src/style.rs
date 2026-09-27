@@ -1,4 +1,4 @@
-use crate::css::{Stylesheet, Value, Selector, parse_value, parse_color, Combinator, intern, SelectorKey, PseudoClass, Unit};
+use crate::css::{Stylesheet, Value, Selector, parse_color, Combinator, intern, SelectorKey, PseudoClass, Unit};
 
 use markup5ever_rcdom::{Handle, NodeData};
 use std::collections::{HashMap, HashSet};
@@ -1264,7 +1264,7 @@ fn apply_default_styles(tag: &str, node: &NodeDataSend, map: &mut HashMap<Arc<st
             set(map, "font-size", px(18.0));
             set(map, "font-weight", kw("bold"));
         }
-        "h4" | "h5" | "h6" | "th" => {
+        "h4" | "h5" | "h6" => {
             set(map, "font-weight", kw("bold"));
         }
         "a" => {
@@ -1355,6 +1355,9 @@ fn apply_default_styles(tag: &str, node: &NodeDataSend, map: &mut HashMap<Arc<st
         }
         "td" | "th" => {
             set_quad(map, "padding", 1.0);
+            if tag == "th" {
+                set(map, "font-weight", kw("bold"));
+            }
         }
         "table" => {
             set(map, "border-spacing", px(2.0));

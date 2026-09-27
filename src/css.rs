@@ -1326,9 +1326,6 @@ impl<'a> SelParser<'a> {
     fn peek(&self) -> Option<char> {
         self.chars.get(self.pos).copied()
     }
-    fn peek_at(&self, off: usize) -> Option<char> {
-        self.chars.get(self.pos + off).copied()
-    }
     fn bump(&mut self) -> Option<char> {
         let c = self.peek();
         if c.is_some() {
