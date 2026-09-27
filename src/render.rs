@@ -135,12 +135,17 @@ fn composite_layer_to_surface(
     }
 
     let has_effect = layer.opacity < 1.0 || layer.transform != Matrix4x4::identity();
+    // An effect layer paints into its own surface covering everything the
+    // layer and its descendants draw (overflowing children included), not
+    // just its border box.
+    let effect_rect = if has_effect { layer_paint_extent(tree, layer_id) } else { layer.bounds };
     let mut effect_pixmap = if has_effect {
-        let width = layer.bounds.width.max(1.0).ceil() as u32;
-        let height = layer.bounds.height.max(1.0).ceil() as u32;
-        let mut pixmap = Pixmap::new(width, height).expect("Failed to allocate layer pixmap");
-        pixmap.fill(tiny_skia::Color::TRANSPARENT);
-        Some(pixmap)
+        let width = effect_rect.width.max(1.0).ceil() as u32;
+        let height = effect_rect.height.max(1.0).ceil() as u32;
+        match Pixmap::new(width, height) {
+            Some(p) => Some(p),
+            None => return,
+        }
     } else {
         None
     };
@@ -148,19 +153,19 @@ fn composite_layer_to_surface(
     let (negative, zero, positive) = tree.categorize_children(layer_id);
 
     if let Some(ref mut pixmap) = effect_pixmap {
-        execute_commands_with_clips(&layer.background_commands, pixmap, layer.bounds, image_cache, base_url, &layer.ancestor_clips);
+        execute_commands_with_clips(&layer.background_commands, pixmap, effect_rect, image_cache, base_url, &layer.ancestor_clips);
 
         for &child_id in &negative {
-            composite_layer_to_surface(child_id, tree, pixmap, layer.bounds, image_cache, base_url);
+            composite_layer_to_surface(child_id, tree, pixmap, effect_rect, image_cache, base_url);
         }
 
-        execute_commands_with_clips(&layer.content_commands, pixmap, layer.bounds, image_cache, base_url, &layer.ancestor_clips);
+        execute_commands_with_clips(&layer.content_commands, pixmap, effect_rect, image_cache, base_url, &layer.ancestor_clips);
 
         for &child_id in &zero {
-            composite_layer_to_surface(child_id, tree, pixmap, layer.bounds, image_cache, base_url);
+            composite_layer_to_surface(child_id, tree, pixmap, effect_rect, image_cache, base_url);
         }
         for &child_id in &positive {
-            composite_layer_to_surface(child_id, tree, pixmap, layer.bounds, image_cache, base_url);
+            composite_layer_to_surface(child_id, tree, pixmap, effect_rect, image_cache, base_url);
         }
     } else {
         execute_commands_with_clips(&layer.background_commands, target, surface_rect, image_cache, base_url, &layer.ancestor_clips);
@@ -183,12 +188,79 @@ fn composite_layer_to_surface(
         let mut paint = PixmapPaint::default();
         paint.opacity = layer.opacity;
 
+        // The layer transform is relative to its border box origin.
         let local_x = layer.bounds.x - surface_rect.x;
         let local_y = layer.bounds.y - surface_rect.y;
-        let transform = Transform::from_translate(local_x, local_y).pre_concat(layer.transform.to_skia());
+        let transform = Transform::from_translate(local_x, local_y)
+            .pre_concat(layer.transform.to_skia())
+            .pre_translate(effect_rect.x - layer.bounds.x, effect_rect.y - layer.bounds.y);
 
         target.draw_pixmap(0, 0, pixmap.as_ref(), &paint, transform, None);
     }
+}
+
+/// Largest effect-layer surface side, in px; bigger extents are cropped
+/// around the layer's border box.
+const MAX_EFFECT_SURFACE_SIDE: f32 = 8192.0;
+
+/// Union of the rects painted by `layer_id` and its descendant layers (page
+/// coordinates, ignoring descendant transforms), including the border box.
+/// Ancestor clips of the layer bound the result.
+fn layer_paint_extent(tree: &LayerTree, layer_id: usize) -> LayoutRect {
+    let layer = &tree.layers[layer_id];
+    let (mut x0, mut y0) = (layer.bounds.x, layer.bounds.y);
+    let (mut x1, mut y1) = (layer.bounds.x + layer.bounds.width, layer.bounds.y + layer.bounds.height);
+    let mut stack = vec![layer_id];
+    while let Some(id) = stack.pop() {
+        let l = &tree.layers[id];
+        for cmd in l.background_commands.iter().chain(l.content_commands.iter()) {
+            let r = match cmd {
+                PaintCommand::Rect(r, ..) | PaintCommand::Border(r, ..) => *r,
+                PaintCommand::BorderSides { rect, .. }
+                | PaintCommand::Image { rect, .. }
+                | PaintCommand::Svg { rect, .. }
+                | PaintCommand::LinearGradient { rect, .. }
+                | PaintCommand::RadialGradient { rect, .. } => *rect,
+                PaintCommand::Text { rect, .. } => LayoutRect { x: rect.x - 2.0, y: rect.y - 2.0, width: rect.width + 4.0, height: rect.height + 4.0 },
+                PaintCommand::BackgroundImage { clip, .. } => *clip,
+                PaintCommand::Shadow(r, s, _) => {
+                    let grow = (*s.blur).max(0.0) * 1.5 + (*s.spread).max(0.0) + 2.0;
+                    LayoutRect {
+                        x: r.x + *s.offset_x - grow,
+                        y: r.y + *s.offset_y - grow,
+                        width: r.width + 2.0 * grow,
+                        height: r.height + 2.0 * grow,
+                    }
+                }
+                PaintCommand::PushClip { .. } | PaintCommand::PopClip => continue,
+            };
+            if !(r.width > 0.0 && r.height > 0.0) || !r.x.is_finite() || !r.y.is_finite() {
+                continue;
+            }
+            x0 = x0.min(r.x);
+            y0 = y0.min(r.y);
+            x1 = x1.max(r.x + r.width);
+            y1 = y1.max(r.y + r.height);
+        }
+        stack.extend(l.child_layer_ids.iter().copied());
+    }
+    // Ancestor clips cut everything outside them anyway.
+    for c in &layer.ancestor_clips {
+        x0 = x0.max(c.rect.x);
+        y0 = y0.max(c.rect.y);
+        x1 = x1.min(c.rect.x + c.rect.width);
+        y1 = y1.min(c.rect.y + c.rect.height);
+    }
+    let b = layer.bounds;
+    let half = MAX_EFFECT_SURFACE_SIDE / 2.0;
+    x0 = x0.max(b.x + b.width / 2.0 - half).floor();
+    y0 = y0.max(b.y + b.height / 2.0 - half).floor();
+    x1 = x1.min(b.x + b.width / 2.0 + half);
+    y1 = y1.min(b.y + b.height / 2.0 + half);
+    if x1 <= x0 || y1 <= y0 {
+        return LayoutRect { x: b.x, y: b.y, width: 1.0, height: 1.0 };
+    }
+    LayoutRect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }
 }
 
 /// Build a `Mask` (sized to the tile pixmap) for an overflow clip region.
@@ -2456,5 +2528,20 @@ mod tests {
         cache.insert(crate::layer_tree::iframe_frame_key("https://e.com/ad", 4, 4), green);
         execute_commands_on_tile(&cmds, &mut p, full_rect(4.0, 4.0), &cache, &base);
         assert_eq!(px(&p, 2, 2), [0, 255, 0, 255]);
+    }
+
+    /// Children overflowing an opacity layer's border box are still painted
+    /// (the layer surface covers the painted extent, not just the box).
+    #[test]
+    fn test_opacity_layer_paints_overflowing_children() {
+        let html = r#"<html><body style="margin:0"><div style="position:relative;width:10px;height:10px;opacity:0.5"><div style="position:absolute;left:20px;top:0;width:10px;height:10px;background:#000"></div></div></body></html>"#;
+        let dom = crate::dom::parse_html(html);
+        let sheet = crate::css::parse_css("");
+        let styled = crate::style::build_style_tree(&dom.document, &sheet, None, &HashMap::new(), None, None, None);
+        let (layout, _, _) = crate::layout::build_layout_tree(&styled, 0.0, 0.0, 0.0, 40.0, 40.0, 40.0);
+        let mut p = white_pixmap(40, 40);
+        render_layout_tree(&layout.unwrap(), &mut p, &HashMap::new(), &url::Url::parse("https://e.com/").unwrap());
+        let c = px(&p, 25, 5);
+        assert!(c[0] > 100 && c[0] < 160, "half-transparent black child, got {c:?}");
     }
 }

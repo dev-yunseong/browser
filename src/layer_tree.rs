@@ -704,14 +704,20 @@ impl LayerTreeBuilder {
             triggers.push(CompositingTrigger::Opacity(opacity));
         }
 
-        if let Some(Value::Transform(ops)) = sv.get(&crate::css::intern("transform")) {
-            let w = layout.dimensions.width;
-            let h = layout.dimensions.height;
+        let w = layout.dimensions.width;
+        let h = layout.dimensions.height;
+        let local = match sv.get(&crate::css::intern("transform")) {
+            Some(Value::Transform(ops)) => Some(Self::compute_transform_matrix(ops, w, h)),
+            // Function lists the CSS parser keeps as text (e.g. `skew()`).
+            Some(Value::Keyword(k)) if k.contains('(') => keyword_transform_matrix(k, w, h),
+            _ => None,
+        };
+        if let Some(local) = local {
             // Apply the transform around `transform-origin` (default: the
             // border box centre): T(origin) · M · T(-origin).
             let (ox, oy) = transform_origin(sv.get(&crate::css::intern("transform-origin")), w, h);
             matrix = Matrix4x4::translate(ox, oy, 0.0)
-                .multiply(&Self::compute_transform_matrix(ops, w, h))
+                .multiply(&local)
                 .multiply(&Matrix4x4::translate(-ox, -oy, 0.0));
             triggers.push(CompositingTrigger::Transform(matrix));
         }
@@ -1059,6 +1065,82 @@ pub fn parse_iframe_frame_key(key: &str) -> Option<(u32, u32, &str)> {
     let (size, src) = rest.split_once(':')?;
     let (w, h) = size.split_once('x')?;
     Some((w.parse().ok()?, h.parse().ok()?, src))
+}
+
+/// Matrix of a 2D CSS transform function list kept as raw text by the CSS
+/// parser (it only models translate/scale/rotate/matrix). Supports those plus
+/// `skew`, `skewX` and `skewY`; `None` if any function is unknown.
+fn keyword_transform_matrix(text: &str, w: f32, h: f32) -> Option<Matrix4x4> {
+    let angle = |a: &str| -> Option<f32> {
+        let a = a.trim().to_ascii_lowercase();
+        if let Some(v) = a.strip_suffix("deg") {
+            v.parse::<f32>().ok().map(f32::to_radians)
+        } else if let Some(v) = a.strip_suffix("grad") {
+            v.parse::<f32>().ok().map(|g| g * std::f32::consts::PI / 200.0)
+        } else if let Some(v) = a.strip_suffix("rad") {
+            v.parse::<f32>().ok()
+        } else if let Some(v) = a.strip_suffix("turn") {
+            v.parse::<f32>().ok().map(|t| t * std::f32::consts::TAU)
+        } else {
+            a.parse::<f32>().ok().filter(|v| *v == 0.0)
+        }
+    };
+    let length = |a: &str, size: f32| -> Option<f32> {
+        let a = a.trim();
+        if let Some(p) = a.strip_suffix('%') {
+            p.parse::<f32>().ok().map(|p| p / 100.0 * size)
+        } else {
+            a.trim_end_matches("px").parse::<f32>().ok()
+        }
+    };
+    let mut result = Matrix4x4::identity();
+    let mut rest = text.trim();
+    while !rest.is_empty() {
+        let open = rest.find('(')?;
+        let close = open + rest[open..].find(')')?;
+        let name = rest[..open].trim().to_ascii_lowercase();
+        let args: Vec<&str> = rest[open + 1..close]
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|a| !a.is_empty())
+            .collect();
+        let arg = |i: usize| args.get(i).copied();
+        // Row-major [a c e; b d f; 0 0 1].
+        let m = |a: f32, b: f32, c: f32, d: f32, e: f32, f: f32| Matrix4x4::from_2d(Matrix3x3([a, c, e, b, d, f, 0.0, 0.0, 1.0]));
+        let op = match name.as_str() {
+            "translate" => m(1.0, 0.0, 0.0, 1.0, length(arg(0)?, w)?, arg(1).map_or(Some(0.0), |a| length(a, h))?),
+            "translatex" => m(1.0, 0.0, 0.0, 1.0, length(arg(0)?, w)?, 0.0),
+            "translatey" => m(1.0, 0.0, 0.0, 1.0, 0.0, length(arg(0)?, h)?),
+            "scale" => {
+                let sx = arg(0)?.parse::<f32>().ok()?;
+                let sy = arg(1).map_or(Some(sx), |a| a.parse::<f32>().ok())?;
+                m(sx, 0.0, 0.0, sy, 0.0, 0.0)
+            }
+            "scalex" => m(arg(0)?.parse::<f32>().ok()?, 0.0, 0.0, 1.0, 0.0, 0.0),
+            "scaley" => m(1.0, 0.0, 0.0, arg(0)?.parse::<f32>().ok()?, 0.0, 0.0),
+            "rotate" | "rotatez" => {
+                let (sin, cos) = angle(arg(0)?)?.sin_cos();
+                m(cos, sin, -sin, cos, 0.0, 0.0)
+            }
+            "skew" => {
+                let ax = angle(arg(0)?)?;
+                let ay = arg(1).map_or(Some(0.0), angle)?;
+                m(1.0, ay.tan(), ax.tan(), 1.0, 0.0, 0.0)
+            }
+            "skewx" => m(1.0, 0.0, angle(arg(0)?)?.tan(), 1.0, 0.0, 0.0),
+            "skewy" => m(1.0, angle(arg(0)?)?.tan(), 0.0, 1.0, 0.0, 0.0),
+            "matrix" => {
+                let v: Vec<f32> = args.iter().filter_map(|a| a.parse::<f32>().ok()).collect();
+                if v.len() != 6 {
+                    return None;
+                }
+                m(v[0], v[1], v[2], v[3], v[4], v[5])
+            }
+            _ => return None,
+        };
+        result = result.multiply(&op);
+        rest = rest[close + 1..].trim_start();
+    }
+    Some(result)
 }
 
 /// Resolve CSS `transform-origin` against a `w` x `h` border box, as an offset
@@ -1922,5 +2004,16 @@ mod tests {
         }).collect();
         assert_eq!(urls, vec![iframe_frame_key("/ad?x=1", 30, 20)]);
         assert_eq!(parse_iframe_frame_key("iframe:30x20:https://a.b/c:1"), Some((30, 20, "https://a.b/c:1")));
+    }
+
+    /// `skew()` is kept as text by the CSS parser and resolved here.
+    #[test]
+    fn test_skew_transform_is_applied_around_the_centre() {
+        let tree = build_tree_from_html(r#"<div style="width:10px;height:10px;transform:skewX(45deg)"></div>"#, "");
+        let (x, y) = map_point(&transformed_layer(&tree).transform, 5.0, 10.0);
+        assert!((x - 10.0).abs() < 0.01 && (y - 10.0).abs() < 0.01, "got ({x}, {y})");
+        let tree = build_tree_from_html(r#"<div style="width:1px;height:15px;transform:skew(-15deg)"></div>"#, "");
+        let (x, _) = map_point(&transformed_layer(&tree).transform, 0.5, 0.0);
+        assert!((x - (0.5 + 7.5 * 15f32.to_radians().tan())).abs() < 0.01, "top edge leans right: {x}");
     }
 }
