@@ -129,8 +129,7 @@ pub fn parse(bytes: &[u8]) -> Option<Arc<usvg::Tree>> {
     if let Some(hit) = TREES.lock().ok().and_then(|c| c.get(&key).cloned()) {
         return hit;
     }
-    let mut opt = usvg::Options::default();
-    opt.image_href_resolver = image_href_resolver();
+    let opt = usvg::Options { image_href_resolver: image_href_resolver(), ..usvg::Options::default() };
     let tree = usvg::Tree::from_data(bytes, &opt).ok().map(Arc::new);
     cache_insert(&TREES, key, tree.clone());
     tree
