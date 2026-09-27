@@ -38,6 +38,21 @@ fn cache_insert<V>(cache: &Mutex<HashMap<u64, V>>, key: u64, value: V) {
     }
 }
 
+/// An `xlink:href`/`href` resolver that only ever loads image data already
+/// embedded as a `data:` URL. `usvg::Options::default()` otherwise installs
+/// a string resolver that treats any other `href` as a local filesystem
+/// path and reads it — so a remote or attacker-supplied SVG could make the
+/// engine read arbitrary local files (e.g. `href="/etc/passwd"` or a
+/// relative path escaping the page's own directory). Data URLs are still
+/// handled by the default data resolver, which only ever sees bytes the
+/// SVG document itself carried inline.
+fn image_href_resolver() -> usvg::ImageHrefResolver<'static> {
+    usvg::ImageHrefResolver {
+        resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
+        resolve_string: Box::new(|_href: &str, _opts: &usvg::Options| None),
+    }
+}
+
 // ── Detection ────────────────────────────────────────────────────────────────
 
 /// Whether `bytes` is an SVG document (sniffed from the content, since cached
@@ -94,7 +109,8 @@ pub fn parse(bytes: &[u8]) -> Option<Arc<usvg::Tree>> {
     if let Some(hit) = TREES.lock().ok().and_then(|c| c.get(&key).cloned()) {
         return hit;
     }
-    let opt = usvg::Options::default();
+    let mut opt = usvg::Options::default();
+    opt.image_href_resolver = image_href_resolver();
     let tree = usvg::Tree::from_data(bytes, &opt).ok().map(Arc::new);
     cache_insert(&TREES, key, tree.clone());
     tree
@@ -357,6 +373,52 @@ mod tests {
         assert_eq!((p.width(), p.height()), (40, 20));
         let px = p.pixel(39, 19).unwrap();
         assert_eq!((px.red(), px.alpha()), (255, 255));
+    }
+
+    /// A local (non-`data:`) `xlink:href` must never be read from disk: a
+    /// remote or attacker-supplied SVG could otherwise read arbitrary local
+    /// files through an `<image>` element. Only `data:` URLs may load image
+    /// bytes.
+    #[test]
+    fn test_local_file_href_is_never_resolved() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("browser_svg_href_test_{}_{}.png", std::process::id(), line!()));
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255]));
+        img.save(&path).expect("write temp png");
+        let svg = format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="4" height="4"><image xlink:href="{}" width="4" height="4"/></svg>"##,
+            path.display()
+        );
+        let tree = parse(svg.as_bytes());
+        let _ = std::fs::remove_file(&path);
+        let tree = tree.expect("svg document itself still parses");
+        let p = rasterize_tree(&tree, 4.0, 4.0, 0.0, 0.0).unwrap();
+        let px = p.pixel(2, 2).unwrap();
+        assert_eq!(
+            (px.red(), px.green(), px.blue(), px.alpha()),
+            (0, 0, 0, 0),
+            "local file href must be ignored, not rasterized"
+        );
+    }
+
+    /// `data:` URLs must keep working: they carry their own bytes inline
+    /// and never touch the filesystem. (Uses a nested `image/svg+xml` data
+    /// URL rather than a raster format, since this build's `resvg` has
+    /// `default-features = false` and does not decode raster image
+    /// formats regardless of the href resolver.)
+    #[test]
+    fn test_data_url_href_is_still_resolved() {
+        use base64::Engine;
+        let inner = r##"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2" fill="#00ff00"/></svg>"##;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(inner);
+        let svg = format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="2" height="2"><image xlink:href="data:image/svg+xml;base64,{}" width="2" height="2"/></svg>"##,
+            encoded
+        );
+        let tree = parse(svg.as_bytes()).expect("svg parses");
+        let p = rasterize_tree(&tree, 2.0, 2.0, 0.0, 0.0).unwrap();
+        let px = p.pixel(1, 1).unwrap();
+        assert_eq!((px.red(), px.green(), px.blue(), px.alpha()), (0, 255, 0, 255));
     }
 
     fn styled_svg(html: &str, css: &str) -> (StyledNode, ()) {
