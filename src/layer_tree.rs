@@ -18,6 +18,17 @@ pub enum ObjectFit {
     None,
 }
 
+/// CSS `border-style` values that affect how a `PaintCommand::Border` strokes
+/// its outline. `border-style: none` (and `hidden`) suppress the border
+/// entirely, so they never reach this enum — `collect_paint_commands` simply
+/// does not emit a `Border` command for them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BorderStyle {
+    Solid,
+    Dashed,
+    Dotted,
+}
+
 // ── Paint Commands ────────────────────────────────────────────────────────────
 
 /// A single atomic drawing operation. Moved from render.rs so that layer_tree.rs
@@ -27,8 +38,8 @@ pub enum ObjectFit {
 pub enum PaintCommand {
     /// Filled rectangle: (bounds, color, corner-radius)
     Rect(LayoutRect, Color, f32),
-    /// Stroked rectangle border: (bounds, stroke-width, color, corner-radius)
-    Border(LayoutRect, f32, Color, f32),
+    /// Stroked rectangle border: (bounds, stroke-width, color, corner-radius, style)
+    Border(LayoutRect, f32, Color, f32, BorderStyle),
     /// Image: layout rect, source URL, object-fit mode, alt text
     Image { rect: LayoutRect, url: String, object_fit: ObjectFit, alt: String },
     /// Text run with clipping rect
@@ -46,7 +57,10 @@ pub enum PaintCommand {
         text_decoration: u8,
     },
     /// Outer box-shadow
-    Shadow(LayoutRect, BoxShadow),
+    /// Rect, shadow parameters, and the element's border-radius (so the shadow
+    /// shape — and, for `inset` shadows, the un-shadowed "hole" — follows the
+    /// same rounding as the box itself).
+    Shadow(LayoutRect, BoxShadow, f32),
     /// CSS `linear-gradient()` background fill.
     LinearGradient {
         rect: LayoutRect,
@@ -484,10 +498,16 @@ impl LayerTreeBuilder {
 
         let mut commands = Vec::new();
 
-        // Box shadow (outer only)
-        if let Some(Value::BoxShadow(shadow)) = sv.get(&crate::css::intern("box-shadow")) {
+        let box_shadow = match sv.get(&crate::css::intern("box-shadow")) {
+            Some(Value::BoxShadow(shadow)) => Some(shadow.clone()),
+            _ => None,
+        };
+
+        // Outset box-shadow paints behind the background/border, like a drop
+        // shadow cast by the box onto whatever is underneath it.
+        if let Some(ref shadow) = box_shadow {
             if !shadow.inset {
-                commands.push(PaintCommand::Shadow(d, shadow.clone()));
+                commands.push(PaintCommand::Shadow(d, shadow.clone(), radius));
             }
         }
 
@@ -539,13 +559,37 @@ impl LayerTreeBuilder {
             }
         }
 
-        // Border
+        // Border. `border-style: none`/`hidden` (the initial value) suppresses
+        // the border outline entirely, even when a width/color is set, per spec.
+        let border_style = match sv.get(&crate::css::intern("border-style")) {
+            Some(Value::Keyword(k)) => match k.as_ref() {
+                "dashed" => Some(BorderStyle::Dashed),
+                "dotted" => Some(BorderStyle::Dotted),
+                "none" | "hidden" => None,
+                _ => Some(BorderStyle::Solid),
+            },
+            // No border-style declaration at all (should not normally happen —
+            // style.rs supplies "none" as the initial value — but fall back to
+            // solid defensively so an explicit width/color still renders).
+            _ => Some(BorderStyle::Solid),
+        };
         if layout.border.left > 0.0 {
-            let color = match sv.get(&crate::css::intern("border-color")) {
-                Some(Value::Color(c)) => c.clone(),
-                _ => Color { r: 180, g: 180, b: 180, a: 255 },
-            };
-            commands.push(PaintCommand::Border(d, layout.border.left, color, radius));
+            if let Some(style) = border_style {
+                let color = match sv.get(&crate::css::intern("border-color")) {
+                    Some(Value::Color(c)) => c.clone(),
+                    _ => Color { r: 180, g: 180, b: 180, a: 255 },
+                };
+                commands.push(PaintCommand::Border(d, layout.border.left, color, radius, style));
+            }
+        }
+
+        // Inset box-shadow paints on top of the background (and below any
+        // content/border painted after it), simulating a shadow cast onto the
+        // box's own interior from its edges.
+        if let Some(ref shadow) = box_shadow {
+            if shadow.inset {
+                commands.push(PaintCommand::Shadow(d, shadow.clone(), radius));
+            }
         }
 
         // Image
@@ -1267,5 +1311,94 @@ mod tests {
             "Shadow command (idx {}) must come before background Rect (idx {})",
             shadow_idx.unwrap(), rect_idx.unwrap()
         );
+    }
+
+    /// An `inset` box-shadow must still emit a `PaintCommand::Shadow`, but
+    /// (unlike an outset shadow) it must appear AFTER the background rect,
+    /// since it paints on top of the background rather than behind it.
+    #[test]
+    fn test_inset_box_shadow_appears_after_background() {
+        let tree = build_tree_from_html(
+            r#"<div style="width:100px;height:50px;background-color:red;box-shadow:inset 0 0 4px #888;">Content</div>"#,
+            "",
+        );
+        let cmds: Vec<&PaintCommand> = tree.layers.iter()
+            .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
+            .collect();
+
+        let shadow_idx = cmds.iter().position(|c| matches!(c, PaintCommand::Shadow(..)));
+        let rect_idx   = cmds.iter().position(|c| matches!(c, PaintCommand::Rect(..)));
+
+        assert!(shadow_idx.is_some(), "inset box-shadow must still emit a Shadow command");
+        assert!(rect_idx.is_some(),   "must have a Rect (background) command");
+        assert!(
+            shadow_idx.unwrap() > rect_idx.unwrap(),
+            "inset Shadow command (idx {}) must come after background Rect (idx {})",
+            shadow_idx.unwrap(), rect_idx.unwrap()
+        );
+    }
+
+    /// A `PaintCommand::Shadow` must carry the element's border-radius so the
+    /// shadow shape follows the box's own rounding.
+    #[test]
+    fn test_box_shadow_command_carries_border_radius() {
+        let tree = build_tree_from_html(
+            r#"<div style="width:100px;height:50px;background-color:red;border-radius:12px;box-shadow:0 2px 4px #888;">Content</div>"#,
+            "",
+        );
+        let shadow_radius = tree.layers.iter()
+            .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
+            .find_map(|cmd| match cmd {
+                PaintCommand::Shadow(_, _, radius) => Some(*radius),
+                _ => None,
+            });
+        assert_eq!(shadow_radius, Some(12.0), "Shadow command must carry the element's border-radius");
+    }
+
+    /// `border-style: dashed` must emit a `Border` command tagged `Dashed`.
+    #[test]
+    fn test_border_style_dashed_emits_dashed_border_command() {
+        let tree = build_tree_from_html(
+            r#"<div style="width:100px;height:50px;border:2px dashed #333;">Content</div>"#,
+            "",
+        );
+        let style = tree.layers.iter()
+            .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
+            .find_map(|cmd| match cmd {
+                PaintCommand::Border(_, _, _, _, style) => Some(*style),
+                _ => None,
+            });
+        assert_eq!(style, Some(BorderStyle::Dashed), "border:2px dashed must emit a Border command tagged Dashed");
+    }
+
+    /// `border-style: dotted` must emit a `Border` command tagged `Dotted`.
+    #[test]
+    fn test_border_style_dotted_emits_dotted_border_command() {
+        let tree = build_tree_from_html(
+            r#"<div style="width:100px;height:50px;border:2px dotted #333;">Content</div>"#,
+            "",
+        );
+        let style = tree.layers.iter()
+            .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
+            .find_map(|cmd| match cmd {
+                PaintCommand::Border(_, _, _, _, style) => Some(*style),
+                _ => None,
+            });
+        assert_eq!(style, Some(BorderStyle::Dotted), "border:2px dotted must emit a Border command tagged Dotted");
+    }
+
+    /// `border-style: none` must suppress the `Border` command entirely, even
+    /// when a `border-width`/`border-color` is set, matching the CSS spec's
+    /// initial value for `border-style`.
+    #[test]
+    fn test_border_style_none_suppresses_border_command() {
+        let tree = build_tree_from_html(
+            r#"<div style="width:100px;height:50px;border-width:3px;border-color:red;border-style:none;">Content</div>"#,
+            "",
+        );
+        let has_border = tree.layers.iter()
+            .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
+            .any(|cmd| matches!(cmd, PaintCommand::Border(..)));
+        assert!(!has_border, "border-style:none must suppress the Border paint command");
     }
 }
