@@ -264,7 +264,25 @@ pub fn build_layout_tree_with_cb<'a>(
     vh: f32,
     containing_block: Option<Rect>,
 ) -> (Option<LayoutBox<'a>>, f32, f32) {
+    build_layout_tree_with_images(style_node, container_start_x, current_y, container_width, vw, vh, containing_block, ImageSizes::default())
+}
+
+/// [`build_layout_tree_with_cb`] with the natural sizes of loaded images, so
+/// `<img>` boxes with an `auto` width or height get their decoded size and
+/// aspect ratio.
+#[allow(clippy::too_many_arguments)]
+pub fn build_layout_tree_with_images<'a>(
+    style_node: &'a StyledNode,
+    container_start_x: f32,
+    current_y: f32,
+    container_width: f32,
+    vw: f32,
+    vh: f32,
+    containing_block: Option<Rect>,
+    images: ImageSizes,
+) -> (Option<LayoutBox<'a>>, f32, f32) {
     let mut ctx = Ctx::new(vw, vh);
+    ctx.images = images;
     let result = layout_root(style_node, container_start_x, current_y, container_width, &mut ctx);
     let Some(mut root) = result else {
         return (None, container_start_x, current_y);
@@ -301,11 +319,76 @@ struct Ctx {
     margin_chain: HashMap<(usize, u32), (Strut, bool)>,
     /// Memoized `inline_contains_block` results.
     contains_block: HashMap<usize, bool>,
+    /// Natural sizes of loaded images.
+    images: ImageSizes,
 }
 
 impl Ctx {
     fn new(vw: f32, vh: f32) -> Self {
-        Ctx { vw, vh, intrinsic: HashMap::new(), pending_abs: 0, margin_chain: HashMap::new(), contains_block: HashMap::new() }
+        Ctx {
+            vw,
+            vh,
+            intrinsic: HashMap::new(),
+            pending_abs: 0,
+            margin_chain: HashMap::new(),
+            contains_block: HashMap::new(),
+            images: ImageSizes::default(),
+        }
+    }
+}
+
+/// Natural (intrinsic) pixel sizes of loaded images, keyed by absolute URL.
+/// Layout uses them to size `<img>` elements whose width or height is `auto`.
+#[derive(Debug, Clone, Default)]
+pub struct ImageSizes {
+    base: Option<url::Url>,
+    sizes: HashMap<String, (f32, f32)>,
+}
+
+lazy_static::lazy_static! {
+    /// Header-decoded dimensions keyed by (url, byte length).
+    static ref IMAGE_DIMENSIONS: std::sync::Mutex<HashMap<(String, usize), Option<(u32, u32)>>> =
+        std::sync::Mutex::new(HashMap::new());
+}
+
+impl ImageSizes {
+    /// Read the dimensions of every encoded image in `cache` (only the image
+    /// header is parsed; results are memoized). `base` resolves relative `src`.
+    pub fn from_cache(cache: &HashMap<String, Vec<u8>>, base: Option<&url::Url>) -> Self {
+        let mut out = ImageSizes { base: base.cloned(), sizes: HashMap::new() };
+        let mut memo = IMAGE_DIMENSIONS.lock().unwrap_or_else(|e| e.into_inner());
+        if memo.len() > 4096 {
+            memo.clear();
+        }
+        for (url, bytes) in cache {
+            let dims = *memo.entry((url.clone(), bytes.len())).or_insert_with(|| {
+                image::ImageReader::new(std::io::Cursor::new(bytes.as_slice()))
+                    .with_guessed_format()
+                    .ok()
+                    .and_then(|r| r.into_dimensions().ok())
+            });
+            if let Some((w, h)) = dims {
+                out.sizes.insert(url.clone(), (w as f32, h as f32));
+            }
+        }
+        out
+    }
+
+    /// Record the natural size of the image at `url`.
+    pub fn insert(&mut self, url: &str, width: f32, height: f32) {
+        self.sizes.insert(url.to_string(), (width, height));
+    }
+
+    fn get(&self, src: &str) -> Option<(f32, f32)> {
+        let src = src.trim();
+        if src.is_empty() {
+            return None;
+        }
+        if let Some(v) = self.sizes.get(src) {
+            return Some(*v);
+        }
+        let resolved = self.base.as_ref()?.join(src).ok()?;
+        self.sizes.get(resolved.as_str()).copied()
     }
 }
 
@@ -1418,9 +1501,11 @@ fn layout_block_level_inner<'a>(
     let mut collapsed_through = false;
     let content_h = match inner {
         Inner::Replaced => {
-            let (_, h) = replaced_size(sn, &bm, cb, ctx);
-            let border_h = specified_h.unwrap_or(h);
-            (border_h - bm.pb_v()).max(0.0)
+            let (_, h) = replaced_size_for(sn, &bm, cb, ctx, Some(border_w));
+            let border_h = clamp_border_height(sn, specified_h.unwrap_or(h), cb.height, &bm, ctx);
+            let content_h = (border_h - bm.pb_v()).max(0.0);
+            layout_placeholder(&mut lb, sn, content_x, content_y, content_w, content_h, ctx);
+            content_h
         }
         Inner::Flex => {
             let out = layout_flex(&mut lb, content_x, content_y, content_w, child_cb, specified_h.is_some(), ctx);
@@ -1504,7 +1589,15 @@ fn layout_block_level_inner<'a>(
 
 /// Border-box size of a replaced element.
 fn replaced_size(sn: &StyledNode, bm: &BoxModel, cb: Cb, ctx: &Ctx) -> (f32, f32) {
-    let w = specified_border_width(sn, Some(cb.width), bm, ctx);
+    replaced_size_for(sn, bm, cb, ctx, None)
+}
+
+/// Border-box size of a replaced element (CSS 2.1 §10.3.2, §10.4, §10.6.2 and
+/// CSS Sizing 4 aspect-ratio). `used_border_w` overrides the width when the
+/// formatting context already decided it (e.g. a stretched flex item), so the
+/// height follows the aspect ratio of that width.
+fn replaced_size_for(sn: &StyledNode, bm: &BoxModel, cb: Cb, ctx: &Ctx, used_border_w: Option<f32>) -> (f32, f32) {
+    let w = used_border_w.or_else(|| specified_border_width(sn, Some(cb.width), bm, ctx));
     let h = specified_border_height(sn, cb.height, bm, ctx);
     let tag = tag_name(sn).unwrap_or_default();
     let (default_w, default_h) = match tag.as_str() {
@@ -1514,8 +1607,8 @@ fn replaced_size(sn: &StyledNode, bm: &BoxModel, cb: Cb, ctx: &Ctx) -> (f32, f32
         "textarea" => (160.0, 48.0),
         _ => (300.0, 150.0),
     };
-    let mut ratio = default_h / default_w;
     if tag == "svg" {
+        let mut ratio = default_h / default_w;
         // Outer <svg>: `auto` width is 100% of the containing block; the height
         // follows the viewBox aspect ratio (or the 150px default).
         let vb = svg_view_box(sn);
@@ -1536,25 +1629,172 @@ fn replaced_size(sn: &StyledNode, bm: &BoxModel, cb: Cb, ctx: &Ctx) -> (f32, f32
             }
         }
     }
-    let (w, h) = match (w, h) {
-        (Some(w), Some(h)) => (w, h),
+    let (pb_h, pb_v) = (bm.pb_h(), bm.pb_v());
+    let (nat_w, nat_h, nat_ratio) = natural_dimensions(sn, &tag, ctx);
+    // Used aspect ratio (width / height): `aspect-ratio: <ratio>` wins over the
+    // natural ratio; `auto && <ratio>` only fills in when there is none.
+    let ratio = match aspect_ratio(sn) {
+        Some((true, r)) => nat_ratio.or(r),
+        Some((false, r)) => r.or(nat_ratio),
+        None => nat_ratio,
+    };
+    let limit = |prop: &str, base: Option<f32>, pb: f32| {
+        prop_len(sn, prop, base, ctx).map(|v| if is_border_box(sn) { (v - pb).max(0.0) } else { v.max(0.0) })
+    };
+    let min_w = limit("min-width", Some(cb.width), pb_h).unwrap_or(0.0);
+    let max_w = limit("max-width", Some(cb.width), pb_h).unwrap_or(f32::INFINITY).max(min_w);
+    let min_h = limit("min-height", cb.height, pb_v).unwrap_or(0.0);
+    let max_h = limit("max-height", cb.height, pb_v).unwrap_or(f32::INFINITY).max(min_h);
+    let clamp_w = |v: f32| if used_border_w.is_some() { v } else { v.min(max_w).max(min_w) };
+    let clamp_h = |v: f32| v.min(max_h).max(min_h);
+    let spec_w = w.map(|w| (w - pb_h).max(0.0));
+    let spec_h = h.map(|h| (h - pb_v).max(0.0));
+    let (cw, ch) = match (spec_w, spec_h) {
+        (Some(w), Some(h)) => (clamp_w(w), clamp_h(h)),
         (Some(w), None) => {
-            let cw = (w - bm.pb_h()).max(0.0);
-            (w, cw * if tag == "img" { 0.667 } else { ratio } + bm.pb_v())
+            let w = clamp_w(w);
+            let h = ratio.map(|r| w / r).or(nat_h).unwrap_or(if tag == "img" { w * 0.667 } else { default_h });
+            (w, clamp_h(h))
         }
         (None, Some(h)) => {
-            let ch = (h - bm.pb_v()).max(0.0);
-            (ch / if tag == "img" { 0.667 } else { ratio } + bm.pb_h(), h)
+            let h = clamp_h(h);
+            let w = ratio.map(|r| h * r).or(nat_w).unwrap_or(if tag == "img" { h / 0.667 } else { default_w });
+            (clamp_w(w), h)
         }
-        (None, None) => {
-            let w = if tag == "img" { default_w.min(cb.width.max(1.0)) } else { default_w };
-            let h = if tag == "img" { w * 0.667 } else { default_h };
-            (w + bm.pb_h(), h + bm.pb_v())
-        }
+        (None, None) => match (nat_w, nat_h, ratio) {
+            (Some(nw), Some(nh), Some(r)) => {
+                let nh = if nat_ratio == Some(r) { nh } else { nw / r };
+                constrain_replaced(nw, nh, min_w, max_w, min_h, max_h)
+            }
+            (Some(nw), Some(nh), None) => (clamp_w(nw), clamp_h(nh)),
+            (Some(nw), None, r) => {
+                let w = clamp_w(nw);
+                (w, clamp_h(r.map_or(default_h, |r| w / r)))
+            }
+            (None, Some(nh), r) => {
+                let h = clamp_h(nh);
+                (clamp_w(r.map_or(default_w, |r| h * r)), h)
+            }
+            (None, None, Some(r)) => {
+                let w = if tag == "img" { default_w.min(cb.width.max(1.0)) } else { default_w };
+                constrain_replaced(w, w / r, min_w, max_w, min_h, max_h)
+            }
+            (None, None, None) => {
+                let w = if tag == "img" { default_w.min(cb.width.max(1.0)) } else { default_w };
+                let h = if tag == "img" { w * 0.667 } else { default_h };
+                (clamp_w(w), clamp_h(h))
+            }
+        },
     };
-    let w = clamp_border_width(sn, w, Some(cb.width), bm, ctx);
-    let h = clamp_border_height(sn, h, cb.height, bm, ctx);
-    (w, h.max(if tag == "img" { 1.0 } else { 0.0 }))
+    (cw + pb_h, (ch + pb_v).max(if tag == "img" { 1.0 } else { 0.0 }))
+}
+
+/// Lay out the generated `::placeholder` box of an empty text control inside
+/// its content box. A single-line `<input>` centers it vertically, like the
+/// inner editor of Chromium; a `<textarea>` keeps it at the top.
+fn layout_placeholder<'a>(
+    lb: &mut LayoutBox<'a>,
+    sn: &'a StyledNode,
+    content_x: f32,
+    content_y: f32,
+    content_w: f32,
+    content_h: f32,
+    ctx: &mut Ctx,
+) {
+    let Some(ph) = sn.children.iter().find(|c| is_tag(c, "::placeholder")) else { return };
+    let cb = Cb { width: content_w, height: Some(content_h) };
+    let Some(out) = layout_block_level(ph, content_x, content_y, cb, None, BlockOpts::default(), ctx) else { return };
+    let mut child = out.lb;
+    if is_tag(sn, "input") {
+        let dy = (content_h - child.dimensions.height) / 2.0;
+        offset_layout_box(&mut child, 0.0, dy);
+    }
+    lb.children.push(child);
+}
+
+/// CSS 2.1 §10.4 table: resolve min/max constraints for a replaced element
+/// whose width and height are both `auto`, preserving the aspect ratio.
+fn constrain_replaced(w: f32, h: f32, min_w: f32, max_w: f32, min_h: f32, max_h: f32) -> (f32, f32) {
+    if w <= 0.0 || h <= 0.0 {
+        return (w.min(max_w).max(min_w), h.min(max_h).max(min_h));
+    }
+    let (over_w, under_w) = (w > max_w, w < min_w);
+    let (over_h, under_h) = (h > max_h, h < min_h);
+    match (over_w, under_w, over_h, under_h) {
+        (true, _, true, _) => {
+            if max_w / w <= max_h / h {
+                (max_w, (max_w * h / w).max(min_h))
+            } else {
+                ((max_h * w / h).max(min_w), max_h)
+            }
+        }
+        (_, true, _, true) => {
+            if min_w / w <= min_h / h {
+                ((min_h * w / h).min(max_w), min_h)
+            } else {
+                (min_w, (min_w * h / w).min(max_h))
+            }
+        }
+        (_, true, true, _) => (min_w, max_h),
+        (true, _, _, true) => (max_w, min_h),
+        (true, _, _, _) => (max_w, (max_w * h / w).max(min_h)),
+        (_, true, _, _) => (min_w, (min_w * h / w).min(max_h)),
+        (_, _, true, _) => ((max_h * w / h).max(min_w), max_h),
+        (_, _, _, true) => ((min_h * w / h).min(max_w), min_h),
+        _ => (w, h),
+    }
+}
+
+/// Natural width, height and aspect ratio (width / height) of a replaced
+/// element. Images use the decoded size when loaded; otherwise the
+/// `width`/`height` attributes still give the ratio (HTML maps them to
+/// `aspect-ratio: auto w / h`).
+fn natural_dimensions(sn: &StyledNode, tag: &str, ctx: &Ctx) -> (Option<f32>, Option<f32>, Option<f32>) {
+    let attr_px = |name: &str| attr(sn, name).and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok()).filter(|v| *v > 0.0);
+    match tag {
+        "img" => {
+            if let Some((w, h)) = attr(sn, "src").and_then(|src| ctx.images.get(&src)) {
+                let r = if w > 0.0 && h > 0.0 { Some(w / h) } else { None };
+                return (Some(w), Some(h), r);
+            }
+            let r = match (attr_px("width"), attr_px("height")) {
+                (Some(w), Some(h)) => Some(w / h),
+                _ => None,
+            };
+            (None, None, r)
+        }
+        "canvas" => {
+            let w = attr_px("width").unwrap_or(300.0);
+            let h = attr_px("height").unwrap_or(150.0);
+            (Some(w), Some(h), Some(w / h))
+        }
+        "video" | "iframe" | "embed" | "object" => (Some(300.0), Some(150.0), if tag == "video" { Some(2.0) } else { None }),
+        "svg" => (None, None, svg_view_box(sn).map(|(w, h)| w / h)),
+        _ => (None, None, None),
+    }
+}
+
+/// Parsed `aspect-ratio`: `(has auto, ratio)`, or `None` when it is `auto`/unset.
+fn aspect_ratio(sn: &StyledNode) -> Option<(bool, Option<f32>)> {
+    let text = match sval(sn, "aspect-ratio")? {
+        Value::Number(n) => return if *n > 0.0 { Some((false, Some(*n))) } else { None },
+        Value::Keyword(k) => k.to_string(),
+        Value::Length(n, Unit::Px) if *n > 0.0 => return Some((false, Some(*n))),
+        _ => return None,
+    };
+    let has_auto = text.split_whitespace().any(|t| t == "auto");
+    let rest: String = text.split_whitespace().filter(|t| *t != "auto").collect::<Vec<_>>().join(" ");
+    if rest.is_empty() {
+        return None;
+    }
+    let mut parts = rest.split('/').map(|p| p.trim().parse::<f32>().ok());
+    let r = match (parts.next().flatten(), parts.next()) {
+        (Some(a), None) => Some(a),
+        (Some(a), Some(Some(b))) if b > 0.0 => Some(a / b),
+        _ => None,
+    }
+    .filter(|r| *r > 0.0 && r.is_finite());
+    Some((has_auto, r))
 }
 
 /// `viewBox="minx miny w h"` of an svg element, as (w, h).
@@ -1963,8 +2203,11 @@ fn white_space_of(sn: &StyledNode) -> WhiteSpace {
 
 /// Convert flattened inline items into measured pieces with break opportunities.
 /// Atomic pieces get width 0 here; callers fill them in.
-fn make_pieces<'a>(items: &[Item<'a>]) -> Vec<Piece<'a>> {
+fn make_pieces<'a>(items: &[Item<'a>], container: &StyledNode) -> Vec<Piece<'a>> {
     let mut pieces: Vec<Piece<'a>> = Vec::new();
+    // Inline boxes currently open; the innermost one (or the block container)
+    // is the parent whose `white-space` governs breaks around atomic inlines.
+    let mut open: Vec<&StyledNode> = Vec::new();
     let mut prev_space = true; // leading collapsible spaces are removed
     let mut break_next = false;
     let mut atomic_idx = 0usize;
@@ -2059,6 +2302,7 @@ fn make_pieces<'a>(items: &[Item<'a>]) -> Vec<Piece<'a>> {
                 flush(&mut word, &mut pieces, &mut break_next);
             }
             Item::Open(node) => {
+                open.push(node);
                 let edge = open_edge(node);
                 if edge > 0.0 {
                     prev_space = false;
@@ -2066,6 +2310,7 @@ fn make_pieces<'a>(items: &[Item<'a>]) -> Vec<Piece<'a>> {
                 pieces.push(Piece { kind: PieceKind::Open(node), width: edge, break_before: false, collapsible: false, break_anywhere: false });
             }
             Item::Close(node) => {
+                open.pop();
                 let edge = close_edge(node);
                 if edge > 0.0 {
                     prev_space = false;
@@ -2073,7 +2318,9 @@ fn make_pieces<'a>(items: &[Item<'a>]) -> Vec<Piece<'a>> {
                 pieces.push(Piece { kind: PieceKind::Close(node), width: edge, break_before: false, collapsible: false, break_anywhere: false });
             }
             Item::Atomic(node) => {
-                let wrap = white_space_of(node).wrap || parent_allows_wrap(&pieces);
+                // The atomic box's own `white-space` applies inside it, not to
+                // the break opportunities around it.
+                let wrap = white_space_of(open.last().copied().unwrap_or(container)).wrap;
                 pieces.push(Piece {
                     kind: PieceKind::Atomic(atomic_idx, node),
                     width: 0.0,
@@ -2101,17 +2348,6 @@ fn make_pieces<'a>(items: &[Item<'a>]) -> Vec<Piece<'a>> {
     pieces
 }
 
-/// Whether the context before an atomic inline allows wrapping (uses the most
-/// recent text piece's white-space, defaulting to wrap).
-fn parent_allows_wrap(pieces: &[Piece]) -> bool {
-    for p in pieces.iter().rev() {
-        match p.kind {
-            PieceKind::Text(n, _) | PieceKind::Space(n, _) => return white_space_of(n).wrap,
-            _ => {}
-        }
-    }
-    true
-}
 
 fn inline_edges(node: &StyledNode) -> (f32, f32) {
     // Percentages on inline boxes resolve against the containing block; use 0.
@@ -2266,7 +2502,7 @@ fn layout_inline_run_clamped<'a>(
 ) -> IfcOut {
     let mut items = Vec::new();
     flatten_inline(run, &mut items);
-    let mut pieces = make_pieces(&items);
+    let mut pieces = make_pieces(&items, container);
 
     // Lay out atomic inlines up front (their size does not depend on the line).
     let mut atomics: Vec<AtomicBox<'a>> = Vec::new();
@@ -2700,7 +2936,18 @@ fn build_line<'a>(
     };
     let mut pending_text: Option<(LayoutBox<'a>, String)> = None;
     let flush_text = |pending_text: &mut Option<(LayoutBox<'a>, String)>, frag_stack: &mut Vec<LayoutBox<'a>>, out: &mut Vec<LayoutBox<'a>>| {
-        if let Some((mut b, t)) = pending_text.take() {
+        if let Some((mut b, mut t)) = pending_text.take() {
+            // A fragment that starts with a space (e.g. " more" after an inline
+            // element) starts its glyphs after that space: move the space out of
+            // the fragment so the rect begins at the first glyph.
+            let body = t.trim_start();
+            if body.len() != t.len() && !body.is_empty() {
+                let lead = &t[..t.len() - body.len()];
+                let lead_w = text_width(b.style_node, lead, font_size(b.style_node), letter_spacing(b.style_node));
+                b.dimensions.x += lead_w;
+                b.dimensions.width = (b.dimensions.width - lead_w).max(0.0);
+                t = body.to_string();
+            }
             // The painter wraps words that overflow the rect and ignores
             // letter-spacing; make sure the rect is wide enough for its own
             // measurement so a line fragment is never re-wrapped.
@@ -4278,10 +4525,9 @@ fn block_intrinsic(sn: &StyledNode, ctx: &mut Ctx) -> (f32, f32) {
 
 /// (min, max) content widths of an inline formatting context.
 fn inline_intrinsic(run: &[&StyledNode], container: &StyledNode, ctx: &mut Ctx) -> (f32, f32) {
-    let _ = container;
     let mut items = Vec::new();
     flatten_inline(run, &mut items);
-    let pieces = make_pieces(&items);
+    let pieces = make_pieces(&items, container);
     // Atomic contributions.
     let mut atomic_min: HashMap<usize, f32> = HashMap::new();
     let mut atomic_max: HashMap<usize, f32> = HashMap::new();
@@ -7545,5 +7791,181 @@ mod tests {
             600.0,
         );
         assert_eq!(by_id(&root, "c").dimensions.height, 70.0);
+    }
+}
+
+#[cfg(test)]
+mod replaced_sizing_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn find<'a, 'b>(lb: &'b LayoutBox<'a>, tag: &str) -> Option<&'b LayoutBox<'a>> {
+        if is_tag(lb.style_node, tag) {
+            return Some(lb);
+        }
+        lb.children.iter().find_map(|c| find(c, tag))
+    }
+
+    fn with_layout(html: &str, css: &str, focused: Option<&str>, images: ImageSizes, check: impl FnOnce(&LayoutBox)) {
+        let dom = crate::dom::parse_html(html);
+        let sheet = crate::css::parse_css(css);
+        let st = crate::style::build_style_tree(&dom.document, &sheet, None, &HashMap::new(), None, focused, None);
+        let (lb, _, _) = build_layout_tree_with_images(&st, 0.0, 0.0, 800.0, 800.0, 600.0, None, images);
+        check(&lb.unwrap());
+    }
+
+    fn img_rect(html: &str, images: ImageSizes) -> (f32, f32) {
+        let mut out = (0.0, 0.0);
+        with_layout(html, "", None, images, |lb| {
+            let img = find(lb, "img").expect("img box");
+            out = (img.dimensions.width, img.dimensions.height);
+        });
+        out
+    }
+
+    fn sizes(url: &str, w: f32, h: f32) -> ImageSizes {
+        let mut s = ImageSizes::default();
+        s.insert(url, w, h);
+        s
+    }
+
+    #[test]
+    fn height_attribute_scales_width_by_natural_ratio() {
+        let r = img_rect(r#"<img height="20" src="https://x/logo.png">"#, sizes("https://x/logo.png", 150.0, 40.0));
+        assert_eq!(r, (75.0, 20.0));
+    }
+
+    #[test]
+    fn auto_size_uses_natural_size() {
+        let r = img_rect(r#"<img src="https://x/a.png">"#, sizes("https://x/a.png", 64.0, 32.0));
+        assert_eq!(r, (64.0, 32.0));
+    }
+
+    #[test]
+    fn relative_src_resolves_against_base() {
+        let mut s = ImageSizes::from_cache(&HashMap::new(), url::Url::parse("https://x/dir/page.html").ok().as_ref());
+        s.insert("https://x/dir/a.png", 30.0, 10.0);
+        let r = img_rect(r#"<img height="20" src="a.png">"#, s);
+        assert_eq!(r, (60.0, 20.0));
+    }
+
+    #[test]
+    fn width_and_height_attributes_give_ratio_before_load() {
+        let r = img_rect(
+            r#"<div style="width:300px"><img width="400" height="200" style="width:100%;height:auto" src="https://x/none.png"></div>"#,
+            ImageSizes::default(),
+        );
+        assert_eq!(r, (300.0, 150.0));
+    }
+
+    #[test]
+    fn max_width_keeps_ratio_when_both_auto() {
+        let r = img_rect(r#"<img style="max-width:100px" src="https://x/a.png">"#, sizes("https://x/a.png", 400.0, 200.0));
+        assert_eq!(r, (100.0, 50.0));
+        let r = img_rect(r#"<img style="min-height:100px" src="https://x/a.png">"#, sizes("https://x/a.png", 40.0, 20.0));
+        assert_eq!(r, (200.0, 100.0));
+    }
+
+    #[test]
+    fn aspect_ratio_property_sets_auto_height() {
+        let r = img_rect(r#"<img style="width:200px;aspect-ratio:2 / 1" src="https://x/none.png">"#, ImageSizes::default());
+        assert_eq!(r, (200.0, 100.0));
+        // `auto && <ratio>` prefers the natural ratio once the image is known.
+        let r = img_rect(
+            r#"<img style="width:200px;aspect-ratio:auto 2 / 1" src="https://x/a.png">"#,
+            sizes("https://x/a.png", 100.0, 100.0),
+        );
+        assert_eq!(r, (200.0, 200.0));
+    }
+
+    #[test]
+    fn constraint_table_cases() {
+        assert_eq!(constrain_replaced(400.0, 200.0, 0.0, 100.0, 0.0, f32::INFINITY), (100.0, 50.0));
+        assert_eq!(constrain_replaced(400.0, 200.0, 0.0, 200.0, 0.0, 50.0), (100.0, 50.0));
+        assert_eq!(constrain_replaced(10.0, 20.0, 50.0, f32::INFINITY, 0.0, 60.0), (50.0, 60.0));
+        assert_eq!(constrain_replaced(30.0, 30.0, 0.0, f32::INFINITY, 0.0, f32::INFINITY), (30.0, 30.0));
+    }
+
+    fn placeholder_box<'a, 'b>(lb: &'b LayoutBox<'a>) -> Option<&'b LayoutBox<'a>> {
+        find(lb, "::placeholder")
+    }
+
+    fn collect_text(b: &LayoutBox, out: &mut String) {
+        if let Some(t) = &b.text_fragment {
+            out.push_str(t);
+        }
+        for c in &b.children {
+            collect_text(c, out);
+        }
+    }
+
+    #[test]
+    fn empty_input_shows_placeholder_styled_by_pseudo_element() {
+        let css = "#q::placeholder{color:transparent} #q:focus::placeholder{color:#123456}";
+        let html = r#"<input id="q" type="search" placeholder="Search here" style="width:200px;height:40px;padding:0;border:0">"#;
+        with_layout(html, css, None, ImageSizes::default(), |lb| {
+            let ph = placeholder_box(lb).expect("placeholder box");
+            assert!(matches!(ph.style_node.specified_values.get("color"), Some(Value::Color(c)) if c.a == 0));
+        });
+        with_layout(html, css, Some("q"), ImageSizes::default(), |lb| {
+            let input = find(lb, "input").unwrap();
+            let ph = placeholder_box(lb).expect("placeholder box");
+            assert!(matches!(ph.style_node.specified_values.get("color"), Some(Value::Color(c)) if c.r == 0x12 && c.b == 0x56));
+            let mut text = String::new();
+            collect_text(ph, &mut text);
+            assert_eq!(text, "Search here");
+            // Vertically centered in the 40px input.
+            let mid = ph.dimensions.y + ph.dimensions.height / 2.0;
+            assert!((mid - (input.dimensions.y + 20.0)).abs() < 1.0, "placeholder mid {mid}");
+        });
+    }
+
+    #[test]
+    fn nowrap_parent_keeps_inline_blocks_on_one_line_despite_their_own_white_space() {
+        let html = r#"<div id="w" style="width:400px;white-space:nowrap;overflow:hidden"><div class="g" style="display:inline-block;width:300px;white-space:normal;vertical-align:top">a b</div><div class="g" style="display:inline-block;width:300px;white-space:normal;vertical-align:top">c d</div></div>"#;
+        with_layout(html, "body{margin:0}", None, ImageSizes::default(), |lb| {
+            let mut groups = Vec::new();
+            fn collect<'a, 'b>(b: &'b LayoutBox<'a>, out: &mut Vec<(f32, f32)>) {
+                if matches!(attr(b.style_node, "class").as_deref(), Some("g")) {
+                    out.push((b.dimensions.x, b.dimensions.y));
+                }
+                for c in &b.children {
+                    collect(c, out);
+                }
+            }
+            collect(lb, &mut groups);
+            assert_eq!(groups.len(), 2);
+            assert_eq!(groups[0].1, groups[1].1, "inline-blocks must share a line: {groups:?}");
+            assert!(groups[1].0 >= groups[0].0 + 300.0);
+        });
+    }
+
+    #[test]
+    fn text_fragment_after_inline_element_starts_at_its_first_glyph() {
+        let html = r#"<p style="margin:0"><span>AB</span> CD</p>"#;
+        with_layout(html, "body{margin:0}", None, ImageSizes::default(), |lb| {
+            let mut frags = Vec::new();
+            fn collect(b: &LayoutBox, out: &mut Vec<(String, f32, f32)>) {
+                if let Some(t) = &b.text_fragment {
+                    out.push((t.clone(), b.dimensions.x, b.dimensions.width));
+                }
+                for c in &b.children {
+                    collect(c, out);
+                }
+            }
+            collect(lb, &mut frags);
+            let ab = frags.iter().find(|f| f.0 == "AB").expect("AB fragment");
+            let cd = frags.iter().find(|f| f.0.trim() == "CD").expect("CD fragment");
+            assert_eq!(cd.0, "CD", "leading space moved out of the fragment");
+            assert!(cd.1 > ab.1 + ab.2 + 1.0, "CD starts after the space: {frags:?}");
+        });
+    }
+
+    #[test]
+    fn input_with_value_has_no_placeholder() {
+        let html = r#"<input type="text" value="typed" placeholder="Search here">"#;
+        with_layout(html, "", None, ImageSizes::default(), |lb| {
+            assert!(placeholder_box(lb).is_none());
+        });
     }
 }

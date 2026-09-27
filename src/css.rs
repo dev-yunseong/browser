@@ -254,7 +254,19 @@ pub enum AtRule {
         query: String,
         rules: Vec<Rule>,
     },
+    /// `@keyframes name { ... }`: each frame's offsets (0.0..=1.0) and declarations.
+    Keyframes {
+        name: String,
+        frames: Vec<Keyframe>,
+    },
     Unknown(String),
+}
+
+/// One keyframe block (`from`, `to`, `50%`, or a comma list of them).
+#[derive(Debug, Clone)]
+pub struct Keyframe {
+    pub offsets: Vec<f32>,
+    pub declarations: Vec<Declaration>,
 }
 
 #[derive(Debug, Clone)]
@@ -283,6 +295,151 @@ impl Stylesheet {
         }
         rules
     }
+
+    /// `@keyframes` rules by name; a later rule with the same name wins.
+    pub fn keyframes(&self) -> HashMap<&str, &[Keyframe]> {
+        let mut out = HashMap::new();
+        for item in &self.items {
+            if let RuleOrAtRule::AtRule(AtRule::Keyframes { name, frames }) = item {
+                out.insert(name.as_str(), frames.as_slice());
+            }
+        }
+        out
+    }
+}
+
+/// Parse the body of an `@keyframes` rule.
+fn parse_keyframes_body(src: &str) -> Vec<Keyframe> {
+    let b = src.as_bytes();
+    let mut frames = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let Some((open, ch)) = find_top_level(b, i, &[b'{', b'}']) else { break };
+        if ch != b'{' {
+            i = open + 1;
+            continue;
+        }
+        let close = matching_brace(b, open);
+        let offsets: Vec<f32> = src[i..open]
+            .split(',')
+            .filter_map(|sel| match sel.trim().to_ascii_lowercase().as_str() {
+                "from" => Some(0.0),
+                "to" => Some(1.0),
+                t => t.strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()).map(|n| n / 100.0),
+            })
+            .filter(|o| (0.0..=1.0).contains(o))
+            .collect();
+        if !offsets.is_empty() {
+            let declarations = parse_declaration_block(&src[open + 1..close.min(src.len())])
+                .into_iter()
+                .filter(|d| !d.important) // !important is ignored inside keyframes
+                .collect();
+            frames.push(Keyframe { offsets, declarations });
+        }
+        i = close + 1;
+    }
+    frames
+}
+
+/// Longhands of the `animation` shorthand, in the order they are stored.
+pub const ANIMATION_LONGHANDS: [&str; 8] = [
+    "animation-name",
+    "animation-duration",
+    "animation-timing-function",
+    "animation-delay",
+    "animation-iteration-count",
+    "animation-direction",
+    "animation-fill-mode",
+    "animation-play-state",
+];
+
+/// Expand one `animation` shorthand value into its longhands. Each longhand
+/// is a comma-separated list with one entry per animation layer.
+fn expand_animation_shorthand(raw: &str) -> Vec<(&'static str, String)> {
+    let mut lists: Vec<Vec<String>> = vec![Vec::new(); ANIMATION_LONGHANDS.len()];
+    for layer in split_top_level_commas(raw) {
+        let mut vals: [Option<String>; 8] = Default::default();
+        let mut times = 0;
+        for tok in split_top_level_spaces(&layer) {
+            let t = tok.to_ascii_lowercase();
+            let is_time = (t.ends_with("ms") && t[..t.len() - 2].parse::<f32>().is_ok())
+                || (t.ends_with('s') && t[..t.len() - 1].parse::<f32>().is_ok());
+            let slot = if is_time {
+                times += 1;
+                if times == 1 { 1 } else { 3 }
+            } else if matches!(t.as_str(), "linear" | "ease" | "ease-in" | "ease-out" | "ease-in-out" | "step-start" | "step-end")
+                || t.starts_with("cubic-bezier(")
+                || t.starts_with("steps(")
+                || t.starts_with("linear(")
+            {
+                2
+            } else if t == "infinite" || t.parse::<f32>().is_ok() {
+                4
+            } else if matches!(t.as_str(), "normal" | "reverse" | "alternate" | "alternate-reverse") && vals[5].is_none() {
+                5
+            } else if matches!(t.as_str(), "forwards" | "backwards" | "both") || (t == "none" && vals[6].is_none() && vals[0].is_some()) {
+                6
+            } else if matches!(t.as_str(), "running" | "paused") {
+                7
+            } else {
+                0
+            };
+            if vals[slot].is_none() {
+                vals[slot] = Some(tok.to_string());
+            }
+        }
+        let defaults = ["none", "0s", "ease", "0s", "1", "normal", "none", "running"];
+        for (k, v) in vals.into_iter().enumerate() {
+            lists[k].push(v.unwrap_or_else(|| defaults[k].to_string()));
+        }
+    }
+    ANIMATION_LONGHANDS.iter().zip(lists).map(|(n, l)| (*n, l.join(", "))).collect()
+}
+
+fn split_top_level_commas(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    for c in s.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(std::mem::take(&mut cur).trim().to_string());
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out
+}
+
+fn split_top_level_spaces(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    for c in s.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            c if c.is_whitespace() && depth == 0 => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 // ── Stylesheet parsing ────────────────────────────────────────────────────────
@@ -481,6 +638,12 @@ fn parse_rule_list(src: &str, out: &mut Vec<RuleOrAtRule>) {
                 }
                 "layer" | "document" | "-moz-document" | "scope" | "starting-style" => {
                     parse_rule_list(inner, out);
+                }
+                "keyframes" | "-webkit-keyframes" | "-moz-keyframes" => {
+                    let name = prelude.trim_matches(|c| c == '"' || c == '\'').to_string();
+                    if !name.is_empty() {
+                        out.push(RuleOrAtRule::AtRule(AtRule::Keyframes { name, frames: parse_keyframes_body(inner) }));
+                    }
                 }
                 _ => {}
             }
@@ -772,6 +935,7 @@ pub fn shorthand_longhands(name: &str) -> &'static [&'static str] {
             "background-repeat", "background-origin", "background-clip",
         ],
         "overflow" => &["overflow-x", "overflow-y"],
+        "animation" | "-webkit-animation" => &ANIMATION_LONGHANDS,
         "box-shadow" => &["box-shadow-layers"],
         "list-style" => &["list-style-type"],
         "place-items" => &["align-items", "justify-items"],
@@ -890,8 +1054,10 @@ pub fn parse_declaration(name: &str, raw: &str, important: bool, out: &mut Vec<D
                 .into_iter()
                 .filter_map(|layer| parse_box_shadow(layer.trim()))
                 .collect();
-            if let Some(first) = layers.first() {
-                push_decl(out, name, Value::BoxShadow(first.clone()), important);
+            match layers.first() {
+                Some(first) => push_decl(out, name, Value::BoxShadow(first.clone()), important),
+                // `none` must also replace an earlier single-layer value.
+                None => push_decl(out, name, Value::Keyword(intern("none")), important),
             }
             push_decl(out, "box-shadow-layers", Value::BoxShadowList(layers), important);
         }
@@ -1045,7 +1211,12 @@ pub fn parse_declaration(name: &str, raw: &str, important: bool, out: &mut Vec<D
         "grid-template-columns" | "grid-template-rows" => {
             push_decl(out, name, Value::Keyword(intern(raw)), important);
         }
-        "font-family" | "content" | "transition" | "animation" | "grid-template-areas" | "grid-area"
+        "animation" | "-webkit-animation" => {
+            for (lh, v) in expand_animation_shorthand(raw) {
+                push_decl(out, lh, Value::Keyword(intern(&v)), important);
+            }
+        }
+        "font-family" | "content" | "transition" | "animation-name" | "grid-template-areas" | "grid-area"
         | "quotes" | "will-change" | "font-feature-settings"
         | "clip" | "clip-path" | "mask" | "filter" | "backdrop-filter" | "counter-reset" | "counter-increment" => {
             push_decl(out, name, Value::Keyword(intern(raw)), important);
@@ -1558,6 +1729,8 @@ fn parse_compound(p: &mut SelParser) -> Option<Selector> {
                 if double || legacy_element {
                     if name == "before" || name == "after" {
                         sel.pseudo_element = Some(name);
+                    } else if matches!(name.as_str(), "placeholder" | "-webkit-input-placeholder" | "-moz-placeholder") {
+                        sel.pseudo_element = Some("placeholder".to_string());
                     } else {
                         sel.pseudo_element = Some(name);
                         sel.never_matches = true;
@@ -2504,18 +2677,19 @@ mod tests {
         assert!(has_shadow, "box-shadow property must produce Value::BoxShadow");
     }
 
-    /// `box-shadow: none` in a stylesheet must produce NO `Value::BoxShadow` declaration.
+    /// `box-shadow: none` produces no `Value::BoxShadow`, but still declares
+    /// `box-shadow` so it overrides an earlier shadow in the cascade.
     #[test]
-    fn test_css_box_shadow_none_produces_no_declaration() {
+    fn test_css_box_shadow_none_overrides_without_shadow_value() {
         let ss = parse_css("div { box-shadow: none; }");
         let rule = match &ss.items[0] {
             RuleOrAtRule::Rule(r) => r,
             _ => panic!("expected rule"),
         };
-        let has_shadow = rule.declarations.iter().any(|d| {
-            d.name.as_ref() == "box-shadow"
-        });
-        assert!(!has_shadow, "box-shadow: none must not produce a box-shadow declaration");
+        assert!(!rule.declarations.iter().any(|d| matches!(d.value, Value::BoxShadow(_))));
+        assert!(rule.declarations.iter().any(|d| {
+            d.name.as_ref() == "box-shadow" && matches!(&d.value, Value::Keyword(k) if k.as_ref() == "none")
+        }));
     }
 
     #[test]

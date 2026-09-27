@@ -4,7 +4,7 @@ use tiny_skia::{Pixmap, Paint, Transform, Stroke, PathBuilder, PixmapPaint, Mask
 use ab_glyph::{Font, PxScale, point};
 use crate::layout::{LayoutBox, Rect as LayoutRect};
 use crate::css::{Color, CssColorStop, LinearDirection};
-use crate::layer_tree::{LayerTree, LayerTreeBuilder, PaintCommand, ObjectFit, BorderStyle};
+use crate::layer_tree::{ClipRegion, LayerTree, LayerTreeBuilder, PaintCommand, ObjectFit, BorderStyle};
 use crate::matrix::Matrix4x4;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -115,7 +115,7 @@ pub fn render_layout_tree(
     let layer_gen_elapsed = start.elapsed();
 
     let start_render = Instant::now();
-    composite_layer_to_surface(0, &tree, pixmap, viewport, image_cache, base_url);
+    composite_layer_to_surface(0, &tree, pixmap, viewport, image_cache, base_url, &[]);
 
     let render_elapsed = start_render.elapsed();
     println!("[Perf] render_layout_tree (Surface): Layer gen: {:?}, Actual render: {:?}", layer_gen_elapsed, render_elapsed);
@@ -128,17 +128,28 @@ fn composite_layer_to_surface(
     surface_rect: LayoutRect,
     image_cache: &HashMap<String, Vec<u8>>,
     base_url: &Url,
+    applied_clips: &[ClipRegion],
 ) {
     let layer = &tree.layers[layer_id];
     if layer.opacity <= 0.0 {
         return;
     }
+    // Clips an enclosing effect layer applies when compositing its surface
+    // are not re-applied inside that surface (they would land before its
+    // transform).
+    let clips: Vec<ClipRegion> = layer
+        .ancestor_clips
+        .iter()
+        .filter(|c| !applied_clips.contains(c))
+        .copied()
+        .collect();
 
-    let has_effect = layer.opacity < 1.0 || layer.transform != Matrix4x4::identity();
+    let has_transform = layer.transform != Matrix4x4::identity();
+    let has_effect = layer.opacity < 1.0 || has_transform;
     // An effect layer paints into its own surface covering everything the
     // layer and its descendants draw (overflowing children included), not
     // just its border box.
-    let effect_rect = if has_effect { layer_paint_extent(tree, layer_id) } else { layer.bounds };
+    let effect_rect = if has_effect { layer_paint_extent(tree, layer_id, has_transform) } else { layer.bounds };
     let mut effect_pixmap = if has_effect {
         let width = effect_rect.width.max(1.0).ceil() as u32;
         let height = effect_rect.height.max(1.0).ceil() as u32;
@@ -153,34 +164,33 @@ fn composite_layer_to_surface(
     let (negative, zero, positive) = tree.categorize_children(layer_id);
 
     if let Some(ref mut pixmap) = effect_pixmap {
-        execute_commands_with_clips(&layer.background_commands, pixmap, effect_rect, image_cache, base_url, &layer.ancestor_clips);
+        // Ancestor clips are applied when the surface is composited, after
+        // the layer transform.
+        let mut inner_applied = applied_clips.to_vec();
+        inner_applied.extend(clips.iter().copied());
+
+        execute_commands_with_clips(&layer.background_commands, pixmap, effect_rect, image_cache, base_url, &[]);
 
         for &child_id in &negative {
-            composite_layer_to_surface(child_id, tree, pixmap, effect_rect, image_cache, base_url);
+            composite_layer_to_surface(child_id, tree, pixmap, effect_rect, image_cache, base_url, &inner_applied);
         }
 
-        execute_commands_with_clips(&layer.content_commands, pixmap, effect_rect, image_cache, base_url, &layer.ancestor_clips);
+        execute_commands_with_clips(&layer.content_commands, pixmap, effect_rect, image_cache, base_url, &[]);
 
-        for &child_id in &zero {
-            composite_layer_to_surface(child_id, tree, pixmap, effect_rect, image_cache, base_url);
-        }
-        for &child_id in &positive {
-            composite_layer_to_surface(child_id, tree, pixmap, effect_rect, image_cache, base_url);
+        for &child_id in zero.iter().chain(positive.iter()) {
+            composite_layer_to_surface(child_id, tree, pixmap, effect_rect, image_cache, base_url, &inner_applied);
         }
     } else {
-        execute_commands_with_clips(&layer.background_commands, target, surface_rect, image_cache, base_url, &layer.ancestor_clips);
+        execute_commands_with_clips(&layer.background_commands, target, surface_rect, image_cache, base_url, &clips);
 
         for &child_id in &negative {
-            composite_layer_to_surface(child_id, tree, target, surface_rect, image_cache, base_url);
+            composite_layer_to_surface(child_id, tree, target, surface_rect, image_cache, base_url, applied_clips);
         }
 
-        execute_commands_with_clips(&layer.content_commands, target, surface_rect, image_cache, base_url, &layer.ancestor_clips);
+        execute_commands_with_clips(&layer.content_commands, target, surface_rect, image_cache, base_url, &clips);
 
-        for &child_id in &zero {
-            composite_layer_to_surface(child_id, tree, target, surface_rect, image_cache, base_url);
-        }
-        for &child_id in &positive {
-            composite_layer_to_surface(child_id, tree, target, surface_rect, image_cache, base_url);
+        for &child_id in zero.iter().chain(positive.iter()) {
+            composite_layer_to_surface(child_id, tree, target, surface_rect, image_cache, base_url, applied_clips);
         }
     }
 
@@ -195,7 +205,26 @@ fn composite_layer_to_surface(
             .pre_concat(layer.transform.to_skia())
             .pre_translate(effect_rect.x - layer.bounds.x, effect_rect.y - layer.bounds.y);
 
-        target.draw_pixmap(0, 0, pixmap.as_ref(), &paint, transform, None);
+        // Accumulate the ancestor clips in target space.
+        let mut mask: Option<Mask> = None;
+        for region in &clips {
+            if region.rect.width <= 0.0 || region.rect.height <= 0.0 {
+                return; // Fully clipped away.
+            }
+            mask = build_clip_mask(
+                region.rect,
+                region.radius,
+                -surface_rect.x,
+                -surface_rect.y,
+                target.width(),
+                target.height(),
+                mask.as_ref(),
+            );
+            if mask.is_none() {
+                return;
+            }
+        }
+        target.draw_pixmap(0, 0, pixmap.as_ref(), &paint, transform, mask.as_ref());
     }
 }
 
@@ -206,7 +235,7 @@ const MAX_EFFECT_SURFACE_SIDE: f32 = 8192.0;
 /// Union of the rects painted by `layer_id` and its descendant layers (page
 /// coordinates, ignoring descendant transforms), including the border box.
 /// Ancestor clips of the layer bound the result.
-fn layer_paint_extent(tree: &LayerTree, layer_id: usize) -> LayoutRect {
+fn layer_paint_extent(tree: &LayerTree, layer_id: usize, transformed: bool) -> LayoutRect {
     let layer = &tree.layers[layer_id];
     let (mut x0, mut y0) = (layer.bounds.x, layer.bounds.y);
     let (mut x1, mut y1) = (layer.bounds.x + layer.bounds.width, layer.bounds.y + layer.bounds.height);
@@ -244,8 +273,9 @@ fn layer_paint_extent(tree: &LayerTree, layer_id: usize) -> LayoutRect {
         }
         stack.extend(l.child_layer_ids.iter().copied());
     }
-    // Ancestor clips cut everything outside them anyway.
-    for c in &layer.ancestor_clips {
+    // Ancestor clips cut everything outside them anyway — unless a transform
+    // moves the content into (or out of) them after painting.
+    for c in layer.ancestor_clips.iter().filter(|_| !transformed) {
         x0 = x0.max(c.rect.x);
         y0 = y0.max(c.rect.y);
         x1 = x1.min(c.rect.x + c.rect.width);
@@ -2543,5 +2573,20 @@ mod tests {
         render_layout_tree(&layout.unwrap(), &mut p, &HashMap::new(), &url::Url::parse("https://e.com/").unwrap());
         let c = px(&p, 25, 5);
         assert!(c[0] > 100 && c[0] < 160, "half-transparent black child, got {c:?}");
+    }
+
+    /// An ancestor overflow clip applies after a layer's transform: a list
+    /// translated up by one row shows its second row inside the clip box.
+    #[test]
+    fn test_ancestor_clip_applies_after_layer_transform() {
+        let html = r#"<html><body style="margin:0"><div style="position:relative;width:20px;height:10px;overflow:hidden"><div style="transform:translateY(-10px)"><div style="height:10px;background:#f00"></div><div style="height:10px;background:#0f0"></div></div></div></body></html>"#;
+        let dom = crate::dom::parse_html(html);
+        let sheet = crate::css::parse_css("");
+        let styled = crate::style::build_style_tree(&dom.document, &sheet, None, &HashMap::new(), None, None, None);
+        let (layout, _, _) = crate::layout::build_layout_tree(&styled, 0.0, 0.0, 0.0, 40.0, 40.0, 40.0);
+        let mut p = white_pixmap(40, 40);
+        render_layout_tree(&layout.unwrap(), &mut p, &HashMap::new(), &url::Url::parse("https://e.com/").unwrap());
+        assert_eq!(px(&p, 5, 5), [0, 255, 0, 255], "second row moved into the clip");
+        assert_eq!(px(&p, 5, 15), [255, 255, 255, 255], "nothing painted below the clip");
     }
 }
