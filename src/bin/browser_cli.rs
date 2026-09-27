@@ -6,7 +6,7 @@
 //!   browser-cli click <N>                # Click link by index
 //!   browser-cli click "<text>"           # Click link by text
 //!   browser-cli type <field> <value>     # Type into focused field
-//!   browser-cli screenshot [<file>]      # Save screenshot
+//!   browser-cli screenshot [--viewport|--full-page] [<file>]  # Save screenshot
 //!   browser-cli back                     # Navigate back
 //!   browser-cli forward                  # Navigate forward
 //!   browser-cli js <script>              # Evaluate JavaScript and print result
@@ -216,10 +216,10 @@ impl DaemonClient {
         Ok(())
     }
 
-    fn screenshot_bytes(&self) -> Result<Vec<u8>, CliError> {
+    fn screenshot_bytes(&self, mode: ScreenshotMode) -> Result<Vec<u8>, CliError> {
         let resp = self
             .client
-            .get(format!("{}/screenshot", self.base_url))
+            .get(format!("{}/screenshot?mode={}", self.base_url, mode.query_value()))
             .send()
             .map_err(Self::check_error)?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -471,8 +471,8 @@ impl CliState {
         Ok(())
     }
 
-    fn screenshot(&self, output: Option<&str>) -> Result<(), CliError> {
-        let bytes = self.client.screenshot_bytes()?;
+    fn screenshot(&self, output: Option<&str>, mode: ScreenshotMode) -> Result<(), CliError> {
+        let bytes = self.client.screenshot_bytes(mode)?;
         let filename = output.unwrap_or("screenshot.png");
         std::fs::write(filename, &bytes).map_err(|e| CliError::Io(e.to_string()))?;
         println!("Screenshot saved to {}", filename);
@@ -539,6 +539,24 @@ enum ClickTarget {
     Text(String),
 }
 
+/// What `screenshot` captures: the whole page from the document origin
+/// (default), or the viewport at the current scroll offset (`--viewport`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ScreenshotMode {
+    #[default]
+    FullPage,
+    Viewport,
+}
+
+impl ScreenshotMode {
+    fn query_value(self) -> &'static str {
+        match self {
+            ScreenshotMode::FullPage => "full",
+            ScreenshotMode::Viewport => "viewport",
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum Command {
     Navigate(String),
@@ -554,7 +572,7 @@ enum Command {
     Submit,
     Back,
     Forward,
-    Screenshot(Option<String>),
+    Screenshot(Option<String>, ScreenshotMode),
     Js(String),
     /// Evaluate JS via the DevTools console REPL — result/error is echoed into the console buffer.
     Console(String),
@@ -633,10 +651,19 @@ fn parse_command(line: &str) -> Command {
         "back" | "b" => Command::Back,
         "forward" | "fwd" | "f" => Command::Forward,
         "screenshot" | "ss" => {
-            if rest.is_empty() {
-                Command::Screenshot(None)
+            let mut mode = ScreenshotMode::FullPage;
+            let mut path: Vec<&str> = Vec::new();
+            for token in rest.split_whitespace() {
+                match token {
+                    "--viewport" => mode = ScreenshotMode::Viewport,
+                    "--full-page" => mode = ScreenshotMode::FullPage,
+                    _ => path.push(token),
+                }
+            }
+            if path.is_empty() {
+                Command::Screenshot(None, mode)
             } else {
-                Command::Screenshot(Some(rest.to_string()))
+                Command::Screenshot(Some(path.join(" ")), mode)
             }
         }
         "js" => {
@@ -687,7 +714,10 @@ fn print_help() {
     println!("  submit                  Submit the current form");
     println!("  back                    Go back in history");
     println!("  forward                 Go forward in history");
-    println!("  screenshot [<file>]     Save a PNG screenshot (default: screenshot.png)");
+    println!("  screenshot [--viewport|--full-page] [<file>]");
+    println!("                          Save a PNG screenshot (default: screenshot.png). The");
+    println!("                          default --full-page is the whole page from the origin;");
+    println!("                          --viewport is the viewport at the current scroll offset");
     println!("  js <script>             Evaluate JavaScript and print the result");
     println!("  console <expr>          Evaluate JS via DevTools console REPL (echoes in console buffer)");
     println!(
@@ -766,8 +796,8 @@ fn dispatch_command(cmd: Command, state: &mut CliState) -> bool {
                 eprintln!("Error: {}", e);
             }
         }
-        Command::Screenshot(path) => {
-            if let Err(e) = state.screenshot(path.as_deref()) {
+        Command::Screenshot(path, mode) => {
+            if let Err(e) = state.screenshot(path.as_deref(), mode) {
                 eprintln!("Error: {}", e);
             }
         }
@@ -1090,13 +1120,35 @@ mod tests {
 
     #[test]
     fn test_parse_command_screenshot_no_file() {
-        assert_eq!(parse_command("screenshot"), Command::Screenshot(None));
+        assert_eq!(
+            parse_command("screenshot"),
+            Command::Screenshot(None, ScreenshotMode::FullPage)
+        );
     }
 
     #[test]
     fn test_parse_command_screenshot_with_file() {
         let cmd = parse_command("screenshot out.png");
-        assert_eq!(cmd, Command::Screenshot(Some("out.png".to_string())));
+        assert_eq!(
+            cmd,
+            Command::Screenshot(Some("out.png".to_string()), ScreenshotMode::FullPage)
+        );
+    }
+
+    #[test]
+    fn test_parse_command_screenshot_viewport_flag() {
+        assert_eq!(
+            parse_command("screenshot --viewport out.png"),
+            Command::Screenshot(Some("out.png".to_string()), ScreenshotMode::Viewport)
+        );
+        assert_eq!(
+            parse_command("ss out.png --viewport"),
+            Command::Screenshot(Some("out.png".to_string()), ScreenshotMode::Viewport)
+        );
+        assert_eq!(
+            parse_command("screenshot --full-page"),
+            Command::Screenshot(None, ScreenshotMode::FullPage)
+        );
     }
 
     #[test]

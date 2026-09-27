@@ -148,6 +148,8 @@ fn test_module_tick_timer() {
         engine.evaluate_js("document.getElementById('timer-target').textContent"),
         "waiting"
     );
+    // Timers honour their delay, so let the 10ms timer come due first.
+    std::thread::sleep(std::time::Duration::from_millis(20));
     engine.tick_js(Some(20.0), None);
     assert_eq!(engine.evaluate_js("globalThis.__timer_fired"), "true");
     assert_eq!(

@@ -4,6 +4,7 @@
 //!   browser-daemon              # GUI window + HTTP server on :7070
 //!   browser-daemon --no-gui     # headless HTTP server only
 //!   browser-daemon --port 7071  # custom port
+//!   browser-daemon --viewport-height 1200  # viewport height in CSS px (default 768)
 
 use std::collections::HashMap;
 
@@ -18,11 +19,13 @@ use poll_promise::Promise;
 struct DaemonArgs {
     no_gui: bool,
     port: u16,
+    viewport_height: Option<f32>,
 }
 
 fn parse_args_from(args: &[&str]) -> DaemonArgs {
     let mut no_gui = false;
     let mut port = 7070u16;
+    let mut viewport_height = None;
     let mut i = 0;
     while i < args.len() {
         match args[i] {
@@ -33,11 +36,15 @@ fn parse_args_from(args: &[&str]) -> DaemonArgs {
                     port = p.parse().unwrap_or(7070);
                 }
             }
+            "--viewport-height" => {
+                i += 1;
+                viewport_height = args.get(i).and_then(|h| h.parse().ok());
+            }
             _ => {}
         }
         i += 1;
     }
-    DaemonArgs { no_gui, port }
+    DaemonArgs { no_gui, port, viewport_height }
 }
 
 fn parse_args() -> DaemonArgs {
@@ -86,6 +93,15 @@ struct ConsoleEvalRequest {
 struct TickRequest {
     count: Option<u32>,
     width: Option<f32>,
+}
+
+/// `GET /screenshot?mode=viewport|full`. `full` (the default) is the whole
+/// page from the document origin; `viewport` is the `width` x
+/// `--viewport-height` rectangle at the current document scroll offset, as a
+/// Chromium page screenshot.
+#[derive(serde::Deserialize, Default)]
+struct ScreenshotQuery {
+    mode: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -247,8 +263,26 @@ async fn console_eval_handler(
         .into_response()
 }
 
-async fn screenshot_handler(State(handle): State<EngineHandle>) -> impl IntoResponse {
-    let png_opt = blocking!(move || handle.send_screenshot_control());
+async fn screenshot_handler(
+    State(handle): State<EngineHandle>,
+    Query(query): Query<ScreenshotQuery>,
+) -> impl IntoResponse {
+    let viewport = match query.mode.as_deref() {
+        None | Some("") | Some("full") | Some("full-page") | Some("full_page") => false,
+        Some("viewport") => true,
+        Some(other) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("unknown screenshot mode '{}' (expected viewport or full)", other),
+            )
+                .into_response()
+        }
+    };
+    let png_opt = blocking!(move || if viewport {
+        handle.send_screenshot_viewport_control()
+    } else {
+        handle.send_screenshot_control()
+    });
     match png_opt {
         Ok(Some(bytes)) => (
             StatusCode::OK,
@@ -419,7 +453,7 @@ impl DaemonBrowserApp {
     fn new(cc: &eframe::CreationContext<'_>, handle: EngineHandle) -> Self {
         // Load Korean font (same as BrowserApp)
         let mut fonts = egui::FontDefinitions::default();
-        let nanum_data = include_bytes!("../../assets/fonts/NanumGothic.ttf");
+        let nanum_data = browser::fonts::EMBEDDED_FALLBACK;
         fonts
             .font_data
             .insert("nanum".to_owned(), egui::FontData::from_static(nanum_data));
@@ -1165,6 +1199,9 @@ fn render_console_panel(
 
 fn main() {
     let args = parse_args();
+    if let Some(height) = args.viewport_height {
+        engine::set_viewport_height(height);
+    }
 
     // Spawn the engine actor thread and get a cloneable handle to it.
     let handle = EngineHandle::spawn();
@@ -1222,6 +1259,14 @@ mod tests {
         let args = parse_args_from(&[]);
         assert!(!args.no_gui);
         assert_eq!(args.port, 7070);
+    }
+
+    #[test]
+    fn test_parse_args_viewport_height() {
+        assert_eq!(parse_args_from(&[]).viewport_height, None);
+        let args = parse_args_from(&["--no-gui", "--viewport-height", "1200"]);
+        assert_eq!(args.viewport_height, Some(1200.0));
+        assert!(args.no_gui);
     }
 
     #[test]
@@ -1387,6 +1432,24 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_http_screenshot_modes() {
+        for (uri, expected) in [
+            ("/screenshot?mode=viewport", StatusCode::NOT_FOUND),
+            ("/screenshot?mode=full", StatusCode::NOT_FOUND),
+            ("/screenshot?mode=sideways", StatusCode::BAD_REQUEST),
+        ] {
+            let app = build_router(make_test_handle());
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), expected, "{uri}");
+        }
     }
 
     #[tokio::test]
