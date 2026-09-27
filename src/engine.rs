@@ -1,6 +1,7 @@
 use markup5ever_rcdom;
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use url::Url;
 
@@ -595,7 +596,7 @@ pub fn fetch_and_process(
     focused_id: Option<&str>,
     width: f32,
 ) -> Result<(PageResult, css::Stylesheet), Box<dyn std::error::Error + Send + Sync>> {
-    let response = reqwest::blocking::get(url_str)?;
+    let response = http_client().get(url_str).send()?;
     let base_url = response.url().clone();
     let csp_header = response
         .headers()
@@ -648,29 +649,31 @@ pub fn process_html_with_cache(
         println!("  - CSS collect metadata: {:?}", start_collect.elapsed());
 
         // 2. Fetch all remote sources in parallel
-        let fetched_contents: Vec<(String, Option<String>)> = sources
-            .into_par_iter()
-            .map(|src| match src {
-                CssSource::Inline(text) => (text, None),
-                CssSource::Remote(url) => {
-                    let start_fetch = Instant::now();
-                    match reqwest::blocking::get(&url).and_then(|resp| resp.text()) {
-                        Ok(text) => {
-                            println!(
-                                "[Perf] Parallel Fetch (CSS): {} in {:?}",
-                                url,
-                                start_fetch.elapsed()
-                            );
-                            (text, Some(url))
-                        }
-                        Err(e) => {
-                            println!("[Error] Parallel Fetch (CSS): {} failed: {}", url, e);
-                            (String::new(), None)
+        let fetched_contents: Vec<(String, Option<String>)> = with_network_pool(|| {
+            sources
+                .into_par_iter()
+                .map(|src| match src {
+                    CssSource::Inline(text) => (text, None),
+                    CssSource::Remote(url) => {
+                        let start_fetch = Instant::now();
+                        match http_client().get(&url).send().and_then(|resp| resp.text()) {
+                            Ok(text) => {
+                                println!(
+                                    "[Perf] Parallel Fetch (CSS): {} in {:?}",
+                                    url,
+                                    start_fetch.elapsed()
+                                );
+                                (text, Some(url))
+                            }
+                            Err(e) => {
+                                println!("[Error] Parallel Fetch (CSS): {} failed: {}", url, e);
+                                (String::new(), None)
+                            }
                         }
                     }
-                }
-            })
-            .collect();
+                })
+                .collect()
+        });
 
         // 3. Assemble and update cache
         let mut final_css = String::new();
@@ -844,13 +847,84 @@ pub fn process_html_with_cache(
     ))
 }
 
+/// Default timeout for subresource fetches (CSS, images), matching
+/// `reqwest::blocking::get`.
+const SUBRESOURCE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Timeout for script fetches, which block page initialization.
+const SCRIPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Process-wide HTTP client. Sharing one client keeps a connection pool, so
+/// subresources on the same origin reuse TCP/TLS connections instead of
+/// paying a fresh handshake per request.
+pub fn http_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(SUBRESOURCE_TIMEOUT)
+            .build()
+            .expect("failed to build HTTP client")
+    })
+}
+
+/// Max concurrent subresource fetches. Fetches are I/O-bound, so this is
+/// deliberately independent of the CPU-sized global rayon pool.
+const NETWORK_CONCURRENCY: usize = 16;
+
+/// Run `f` on a dedicated thread pool sized for network I/O. Parallel
+/// iterators inside `f` use this pool instead of the global one.
+fn with_network_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(NETWORK_CONCURRENCY)
+            .thread_name(|i| format!("net-fetch-{i}"))
+            .build()
+            .expect("failed to build network thread pool")
+    })
+    .install(f)
+}
+
 fn fetch_text_with_timeout(url: &Url) -> Result<String, reqwest::Error> {
-    reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()?
+    http_client()
         .get(url.as_str())
+        .timeout(SCRIPT_TIMEOUT)
         .send()?
         .text()
+}
+
+/// Fetch several script URLs concurrently. Results are keyed by URL so callers
+/// can still execute scripts in document order.
+fn prefetch_scripts(urls: Vec<Url>) -> HashMap<Url, Result<String, String>> {
+    let start = Instant::now();
+    let count = urls.len();
+    let fetched: HashMap<Url, Result<String, String>> = with_network_pool(|| {
+        urls.into_par_iter()
+            .map(|url| {
+                let result = fetch_text_with_timeout(&url).map_err(|e| e.to_string());
+                (url, result)
+            })
+            .collect()
+    });
+    if count > 0 {
+        println!(
+            "[Perf] Parallel Fetch (JS): {} scripts in {:?}",
+            count,
+            start.elapsed()
+        );
+    }
+    fetched
+}
+
+/// Look up a prefetched script source. Falls back to a direct fetch only
+/// defensively; every CSP-allowed URL is normally in the map already.
+fn prefetched_or_fetch(
+    prefetched: &HashMap<Url, Result<String, String>>,
+    url: &Url,
+) -> Result<String, String> {
+    match prefetched.get(url) {
+        Some(result) => result.clone(),
+        None => fetch_text_with_timeout(url).map_err(|e| e.to_string()),
+    }
 }
 
 fn collect_layout_metrics(
@@ -1083,26 +1157,42 @@ impl BrowserEngine {
         self.js_runtime.execute(&code);
     }
 
-    fn cache_missing_images_with<F>(&mut self, image_urls: &[String], mut fetch: F) -> bool
+    fn cache_missing_images_with<F>(&mut self, image_urls: &[String], fetch: F) -> bool
     where
-        F: FnMut(&str) -> Result<Vec<u8>, String>,
+        F: Fn(&str) -> Result<Vec<u8>, String> + Sync,
     {
-        let mut loaded_any = false;
-        for url in image_urls {
-            if self.image_cache.contains_key(url) {
-                continue;
-            }
-            if let Ok(bytes) = fetch(url) {
-                self.image_cache.insert(url.clone(), bytes);
-                loaded_any = true;
-            }
+        let mut missing: Vec<&String> = image_urls
+            .iter()
+            .filter(|url| !self.image_cache.contains_key(*url))
+            .collect();
+        missing.sort();
+        missing.dedup();
+        if missing.is_empty() {
+            return false;
         }
+
+        let start = Instant::now();
+        let count = missing.len();
+        let fetched: Vec<(String, Vec<u8>)> = with_network_pool(|| {
+            missing
+                .into_par_iter()
+                .filter_map(|url| fetch(url).ok().map(|bytes| (url.clone(), bytes)))
+                .collect()
+        });
+        println!(
+            "[Perf] Parallel Fetch (images): {} images in {:?}",
+            count,
+            start.elapsed()
+        );
+
+        let loaded_any = !fetched.is_empty();
+        self.image_cache.extend(fetched);
         loaded_any
     }
 
     fn cache_missing_images(&mut self, image_urls: &[String]) -> bool {
         self.cache_missing_images_with(image_urls, |url| {
-            let response = reqwest::blocking::get(url).map_err(|e| e.to_string())?;
+            let response = http_client().get(url).send().map_err(|e| e.to_string())?;
             let bytes = response.bytes().map_err(|e| e.to_string())?;
             Ok(bytes.to_vec())
         })
@@ -1288,6 +1378,28 @@ impl BrowserEngine {
 
         let scripts = js::extract_script_sources_from_dom(&dom.document, Some(&page.base_url));
 
+        // Fetch every external script up front and in parallel (like a
+        // browser's preload scanner). Execution below still happens in
+        // document order; only the network waits overlap.
+        let prefetch_urls: Vec<Url> = scripts
+            .iter()
+            .filter_map(|script| match script {
+                js::ScriptSource::ExternalClassic { url, .. }
+                | js::ScriptSource::ExternalModule { url, .. } => Some(url.clone()),
+                _ => None,
+            })
+            .filter(|url| {
+                self.current_csp_policy
+                    .as_ref()
+                    .map(|p| p.is_allowed("script-src", url, Some(&page.base_url)))
+                    .unwrap_or(true)
+            })
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        let prefetched = prefetch_scripts(prefetch_urls);
+        let fetch_script = |url: &Url| prefetched_or_fetch(&prefetched, url);
+
         // ── Phase-bucketed collections ──────────────────────────────────────
         let mut deferred_classics: Vec<String> = Vec::new();
         let mut async_classics: Vec<String> = Vec::new();
@@ -1307,7 +1419,7 @@ impl BrowserEngine {
                 println!("[CSP] Blocked external script execution: {}", url);
                 return None;
             }
-            match fetch_text_with_timeout(url) {
+            match fetch_script(url) {
                 Ok(source) => Some(source),
                 Err(err) => {
                     println!("[JS] Failed to load external script {}: {}", url, err);
@@ -1401,11 +1513,8 @@ impl BrowserEngine {
                     is_async,
                 } => {
                     eprintln!("[JS DEBUG] Loading external module: {}", url);
-                    let outcome = self.load_external_module_with(
-                        url.clone(),
-                        &page.base_url,
-                        fetch_text_with_timeout,
-                    );
+                    let outcome =
+                        self.load_external_module_with(url.clone(), &page.base_url, fetch_script);
                     eprintln!("[JS DEBUG] External module loaded");
                     if let Some(error) = &outcome.error {
                         println!("[JS] Failed to load external module {}: {}", url, error);
@@ -1545,27 +1654,43 @@ impl BrowserEngine {
                 .map(|r| r.to_vec())
                 .unwrap_or_default();
 
+            let mut pending: Vec<Url> = Vec::new();
             for specifier in &requests {
                 let resolved = match page_base.join(specifier).or_else(|_| url.join(specifier)) {
                     Ok(r) => r,
                     Err(_) => continue,
                 };
+                if !root_urls.contains(&resolved) && !pending.contains(&resolved) {
+                    pending.push(resolved);
+                }
+            }
 
-                if !root_urls.contains(&resolved) {
-                    let outcome = self.load_external_module_with(
-                        resolved.clone(),
-                        page_base,
-                        fetch_text_with_timeout,
+            // Fetch this module's missing imports concurrently, then compile
+            // them in import order.
+            let allowed: Vec<Url> = pending
+                .iter()
+                .filter(|u| {
+                    self.current_csp_policy
+                        .as_ref()
+                        .map(|p| p.is_allowed("script-src", u, Some(page_base)))
+                        .unwrap_or(true)
+                })
+                .cloned()
+                .collect();
+            let prefetched = prefetch_scripts(allowed);
+
+            for resolved in pending {
+                let outcome = self.load_external_module_with(resolved.clone(), page_base, |u| {
+                    prefetched_or_fetch(&prefetched, u)
+                });
+                if outcome.error.is_none() {
+                    root_urls.push(resolved);
+                } else if let Some(error) = outcome.error {
+                    println!("[JS] Failed to load module dependency {resolved}: {error}");
+                    js::push_console_entry(
+                        js::ConsoleLevel::Error,
+                        format!("Failed to load module dependency {resolved}: {error}"),
                     );
-                    if outcome.error.is_none() {
-                        root_urls.push(resolved);
-                    } else if let Some(error) = outcome.error {
-                        println!("[JS] Failed to load module dependency {resolved}: {error}");
-                        js::push_console_entry(
-                            js::ConsoleLevel::Error,
-                            format!("Failed to load module dependency {resolved}: {error}"),
-                        );
-                    }
                 }
             }
 
@@ -2062,6 +2187,7 @@ impl EngineHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn test_browser_engine_new() {
@@ -2086,14 +2212,17 @@ mod tests {
             "https://example.com/new.png".to_string(),
         ];
 
-        let mut fetched = Vec::new();
+        let fetched = Mutex::new(Vec::new());
         let loaded = engine.cache_missing_images_with(&urls, |url| {
-            fetched.push(url.to_string());
+            fetched.lock().unwrap().push(url.to_string());
             Ok(vec![9, 9, 9])
         });
 
         assert!(loaded);
-        assert_eq!(fetched, vec!["https://example.com/new.png".to_string()]);
+        assert_eq!(
+            fetched.into_inner().unwrap(),
+            vec!["https://example.com/new.png".to_string()]
+        );
         assert_eq!(
             engine.image_cache.get("https://example.com/already.png"),
             Some(&vec![1, 2, 3])

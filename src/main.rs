@@ -449,7 +449,7 @@ impl eframe::App for BrowserApp {
                                 if !self.image_promises.contains_key(url) {
                                     let url_clone = url.clone();
                                     self.image_promises.insert(url.clone(), Promise::spawn_thread("img_fetcher", move || {
-                                        match reqwest::blocking::get(&url_clone) {
+                                        match crate::engine::http_client().get(&url_clone).send() {
                                             Ok(resp) => match resp.bytes() {
                                                 Ok(bytes) => Ok((url_clone, bytes.to_vec())),
                                                 Err(e) => Err(e.to_string()),
