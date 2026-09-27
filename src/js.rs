@@ -5094,6 +5094,52 @@ mod tests {
     }
 
     #[test]
+    fn test_element_style_is_backed_by_style_attribute() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><div id='d' style="width:10px; background:url(data:image/png;base64,AA==)"></div></body></html>"#,
+            "https://example.com/",
+        );
+        let out = eval_str(
+            &mut rt,
+            "var d = document.getElementById('d'); \
+             var before = d.style.width + '|' + d.style.backgroundImage + d.style.background; \
+             d.style.display = 'block'; d.style.width = ''; \
+             var mid = d.getAttribute('style'); \
+             d.setAttribute('style', 'color: red'); \
+             [before, mid, d.style.color, d.style.length].join('|')",
+        );
+        assert_eq!(
+            out,
+            "10px|url(data:image/png;base64,AA==)|background: url(data:image/png;base64,AA==); display: block;|red|1"
+        );
+        let html = eval_str(
+            &mut rt,
+            "var e = document.createElement('span'); e.style = 'margin-top: 2px'; e.style.zIndex = 3; e.outerHTML",
+        );
+        assert_eq!(html, r#"<span style="margin-top: 2px; z-index: 3;"></span>"#);
+    }
+
+    #[test]
+    fn test_element_interfaces_and_svg_serialization() {
+        let mut rt = make_dom_runtime(
+            r#"<html><head><link rel='x'></head><body><ul><li id='li'>a</li></ul><svg id='s' xmlns="http://www.w3.org/2000/svg"><path d="M0"></path></svg></body></html>"#,
+            "https://example.com/",
+        );
+        let out = eval_str(
+            &mut rt,
+            "[document.getElementById('li') instanceof HTMLLIElement, \
+              document.querySelector('link') instanceof HTMLLinkElement, \
+              document.querySelector('path') instanceof SVGElement, \
+              document.defaultView === window, \
+              document.getElementById('s').outerHTML].join('|')",
+        );
+        assert_eq!(
+            out,
+            r#"true|true|true|true|<svg id="s" xmlns="http://www.w3.org/2000/svg"><path d="M0"></path></svg>"#
+        );
+    }
+
+    #[test]
     fn test_canvas_context_references_canvas() {
         let mut rt = make_dom_runtime(r#"<html><body></body></html>"#, "https://example.com/");
         let out = eval_str(
@@ -5379,7 +5425,7 @@ fn serialize_node(node: &Handle, out: &mut String, parent_tag: Option<&str>) {
                 out.push(' ');
                 // Keep namespace prefixes such as `xlink:href` (HTML spec
                 // fragment serialization).
-                if let Some(prefix) = attr.name.prefix.as_ref() {
+                if let Some(prefix) = attr.name.prefix.as_ref().filter(|p| !p.is_empty()) {
                     out.push_str(prefix);
                     out.push(':');
                 }

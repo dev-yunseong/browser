@@ -199,8 +199,12 @@ function __get_or_create_node(id, tag, string_id, kind) {
         } else {
             // HTMLElement is declared later in this file; fall back to Element
             // if a node is wrapped while the bootstrap is still evaluating.
-            let ElementClass;
-            try { ElementClass = HTMLElement; } catch (e) { ElementClass = Element; }
+            let ElementClass = typeof __aura_tag_classes !== 'undefined' && __aura_tag_classes
+                ? __aura_tag_classes[tagLower] || __aura_tag_classes[descriptor.tag]
+                : null;
+            if (!ElementClass) {
+                try { ElementClass = HTMLElement; } catch (e) { ElementClass = Element; }
+            }
             node = new ElementClass(id, descriptor.tag, descriptor.id);
         }
     } else {
@@ -1274,17 +1278,49 @@ function __aura_css_kebab_to_camel(name) {
     return String(name).replace(/-([a-z])/g, function(_, ch) { return ch.toUpperCase(); });
 }
 
+// Split a declaration block on ';' outside parentheses and quotes, so values
+// such as url(data:image/png;base64,...) stay intact.
+function __aura_split_declarations(text) {
+    let parts = [];
+    let depth = 0;
+    let quote = null;
+    let start = 0;
+    for (let i = 0; i < text.length; i++) {
+        let ch = text[i];
+        if (quote) {
+            if (ch === '\\') i++;
+            else if (ch === quote) quote = null;
+        } else if (ch === '"' || ch === "'") {
+            quote = ch;
+        } else if (ch === '(') {
+            depth++;
+        } else if (ch === ')') {
+            if (depth > 0) depth--;
+        } else if (ch === ';' && depth === 0) {
+            parts.push(text.slice(start, i));
+            start = i + 1;
+        }
+    }
+    parts.push(text.slice(start));
+    return parts;
+}
+
+// An element's CSSStyleDeclaration is backed by its `style` attribute (CSSOM
+// spec): reads parse the current attribute and writes serialize back to it,
+// so script style changes survive DOM serialization and re-rendering.
 class CSSStyleDeclaration {
     constructor(ownerId = null, readonly = false, initial = null) {
         this._ownerId = ownerId;
         this._readonly = readonly;
         this._props = [];
+        this._syncedAttr = null;
+        this._updating = false;
         if (initial) {
             Object.keys(initial).forEach(name => this.setProperty(name, initial[name]));
         }
         return new Proxy(this, {
             get(target, prop, receiver) {
-                if (prop === 'length') return target._props.length;
+                if (prop === 'length') return target.length;
                 if (typeof prop === 'string' && /^(0|[1-9]\d*)$/.test(prop)) return target.item(Number(prop));
                 if (typeof prop === 'string' && !(prop in target)) return target.getPropertyValue(__aura_css_camel_to_kebab(prop));
                 let value = Reflect.get(target, prop, receiver);
@@ -1299,7 +1335,52 @@ class CSSStyleDeclaration {
             }
         });
     }
+    _sync() {
+        if (this._ownerId === null || this._updating || this._batching) return;
+        let attr = __aura_get_attribute(this._ownerId, 'style');
+        if (attr === this._syncedAttr) return;
+        this._syncedAttr = attr;
+        this._props = [];
+        __aura_split_declarations(String(attr || '')).forEach(part => {
+            let idx = part.indexOf(':');
+            if (idx <= 0) return;
+            let name = part.slice(0, idx).trim().toLowerCase();
+            let value = part.slice(idx + 1).trim();
+            let priority = '';
+            if (/!\s*important$/i.test(value)) {
+                value = value.replace(/!\s*important$/i, '').trim();
+                priority = 'important';
+            }
+            if (!name || value === '') return;
+            let existing = this._props.find(entry => entry.name === name);
+            if (existing) {
+                existing.value = value;
+                existing.priority = priority;
+            } else {
+                this._props.push({ name, value, priority });
+            }
+        });
+    }
+    _writeBack() {
+        if (this._ownerId === null) return;
+        let text = this.cssText;
+        let oldValue = __aura_get_attribute(this._ownerId, 'style');
+        if (oldValue === text) {
+            this._syncedAttr = text;
+            return;
+        }
+        this._updating = true;
+        try {
+            __aura_set_attribute(this._ownerId, 'style', text);
+        } finally {
+            this._updating = false;
+        }
+        this._syncedAttr = text;
+        let owner = __node_registry.get(this._ownerId);
+        if (owner) __aura_attribute_mutation(owner, 'style', oldValue);
+    }
     _find(name) {
+        this._sync();
         name = String(name).toLowerCase();
         return this._props.find(entry => entry.name === name);
     }
@@ -1307,12 +1388,15 @@ class CSSStyleDeclaration {
         if (this._readonly) throw new Error('CSSStyleDeclaration is read-only');
     }
     get cssText() {
+        this._sync();
         return this._props.map(entry => entry.name + ': ' + entry.value + (entry.priority ? ' !' + entry.priority : '') + ';').join(' ');
     }
     set cssText(value) {
         this._assertWritable();
         this._props = [];
-        String(value || '').split(';').forEach(part => {
+        this._batching = true;
+        try {
+        __aura_split_declarations(String(value || '')).forEach(part => {
             let idx = part.indexOf(':');
             if (idx <= 0) return;
             let name = part.slice(0, idx).trim();
@@ -1324,6 +1408,10 @@ class CSSStyleDeclaration {
             }
             this.setProperty(name, rawValue, priority);
         });
+        } finally {
+            this._batching = false;
+        }
+        this._writeBack();
     }
     getPropertyValue(name) {
         let entry = this._find(name);
@@ -1340,25 +1428,37 @@ class CSSStyleDeclaration {
         value = String(value == null ? '' : value).trim();
         priority = String(priority || '').toLowerCase();
         if (priority && priority !== 'important') return;
-        let entry = this._find(name);
+        // Setting an empty value removes the declaration (CSSOM).
+        if (value === '') {
+            this.removeProperty(name);
+            return;
+        }
+        let entry = this._batching ? this._props.find(e => e.name === name) : this._find(name);
         if (!entry) {
             entry = { name, value: '', priority: '' };
             this._props.push(entry);
         }
         entry.value = value;
         entry.priority = priority;
-        this[__aura_css_kebab_to_camel(name)] = value;
         if (this._ownerId !== null) __aura_set_style(this._ownerId, name, value);
+        if (!this._batching) this._writeBack();
     }
     removeProperty(name) {
         this._assertWritable();
         name = String(name).trim().toLowerCase();
         let old = this.getPropertyValue(name);
+        let had = this._props.length;
         this._props = this._props.filter(entry => entry.name !== name);
         if (this._ownerId !== null) __aura_set_style(this._ownerId, name, '');
+        if (!this._batching && this._props.length !== had) this._writeBack();
         return old;
     }
+    get length() {
+        this._sync();
+        return this._props.length;
+    }
     item(index) {
+        this._sync();
         let entry = this._props[index];
         return entry ? entry.name : '';
     }
@@ -1555,7 +1655,14 @@ class Element extends Node {
         super(id, 'element');
         this.tagName = (tag || '').toUpperCase();
         this._classList = null;
-        this.style = new CSSStyleDeclaration(id);
+        this._style = null;
+    }
+    get style() {
+        if (!this._style) this._style = new CSSStyleDeclaration(this._id);
+        return this._style;
+    }
+    set style(value) {
+        this.style.cssText = String(value);
     }
     get classList() {
         if (!this._classList) this._classList = new DOMTokenList(this._id);
@@ -2327,6 +2434,7 @@ var document = {
         el.textContent = String(value);
     },
     readyState: 'complete',
+    get defaultView() { return window; },
     referrer: '',
     characterSet: 'UTF-8',
     charset: 'UTF-8',
@@ -4552,6 +4660,94 @@ class HTMLCanvasElement extends HTMLElement {
     toBlob(callback) { callback(new Blob()); }
 }
 window.HTMLCanvasElement = HTMLCanvasElement;
+
+// Element interfaces without extra behaviour, so `instanceof` checks and
+// `window.HTMLxxxElement` lookups work like in a browser.
+class HTMLLinkElement extends HTMLElement {
+    get rel() { return this.getAttribute('rel') || ''; }
+    set rel(v) { this.setAttribute('rel', String(v)); }
+}
+class HTMLMetaElement extends HTMLElement {
+    get content() { return this.getAttribute('content') || ''; }
+    set content(v) { this.setAttribute('content', String(v)); }
+}
+class HTMLHeadElement extends HTMLElement {}
+class HTMLBodyElement extends HTMLElement {}
+class HTMLHtmlElement extends HTMLElement {}
+class HTMLTitleElement extends HTMLElement {
+    get text() { return this.textContent; }
+    set text(v) { this.textContent = String(v); }
+}
+class HTMLBRElement extends HTMLElement {}
+class HTMLHRElement extends HTMLElement {}
+class HTMLPreElement extends HTMLElement {}
+class HTMLPictureElement extends HTMLElement {}
+class HTMLSourceElement extends HTMLElement {}
+class HTMLMediaElement extends HTMLElement {
+    play() { return Promise.resolve(); }
+    pause() {}
+    load() {}
+    canPlayType() { return ''; }
+    get paused() { return true; }
+    get muted() { return this.hasAttribute('muted'); }
+    set muted(v) { if (v) this.setAttribute('muted', ''); else this.removeAttribute('muted'); }
+}
+class HTMLVideoElement extends HTMLMediaElement {}
+class HTMLAudioElement extends HTMLMediaElement {}
+class HTMLTableSectionElement extends HTMLElement {}
+class HTMLFieldSetElement extends HTMLElement {}
+class HTMLLegendElement extends HTMLElement {}
+class HTMLDListElement extends HTMLElement {}
+class HTMLTemplateElement extends HTMLElement {}
+class SVGElement extends Element {
+    get ownerSVGElement() {
+        let node = this.parentNode;
+        while (node && node.nodeType === 1) {
+            if (node.tagName === 'SVG') return node;
+            node = node.parentNode;
+        }
+        return null;
+    }
+    getBBox() {
+        let m = this._layoutMetrics();
+        return { x: 0, y: 0, width: m.width, height: m.height };
+    }
+}
+class SVGSVGElement extends SVGElement {}
+class SVGGraphicsElement extends SVGElement {}
+[
+    HTMLLinkElement, HTMLMetaElement, HTMLHeadElement, HTMLBodyElement, HTMLHtmlElement,
+    HTMLTitleElement, HTMLBRElement, HTMLHRElement, HTMLPreElement, HTMLPictureElement,
+    HTMLSourceElement, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement,
+    HTMLTableSectionElement, HTMLFieldSetElement, HTMLLegendElement, HTMLDListElement,
+    HTMLTemplateElement, SVGElement, SVGSVGElement, SVGGraphicsElement,
+].forEach(cls => { window[cls.name] = cls; });
+
+// Tag name -> wrapper class used by __get_or_create_node for tags without a
+// dedicated branch there. <select>, <option> and <textarea> stay generic
+// because their classes above are stubs that would shadow Element's working
+// value/options handling.
+var __aura_tag_classes = {
+    link: HTMLLinkElement, meta: HTMLMetaElement, head: HTMLHeadElement,
+    body: HTMLBodyElement, html: HTMLHtmlElement, title: HTMLTitleElement,
+    br: HTMLBRElement, hr: HTMLHRElement, pre: HTMLPreElement,
+    picture: HTMLPictureElement, source: HTMLSourceElement,
+    video: HTMLVideoElement, audio: HTMLAudioElement,
+    p: HTMLParagraphElement, label: HTMLLabelElement,
+    h1: HTMLHeadingElement, h2: HTMLHeadingElement, h3: HTMLHeadingElement,
+    h4: HTMLHeadingElement, h5: HTMLHeadingElement, h6: HTMLHeadingElement,
+    table: HTMLTableElement, thead: HTMLTableSectionElement,
+    tbody: HTMLTableSectionElement, tfoot: HTMLTableSectionElement,
+    tr: HTMLTableRowElement, td: HTMLTableCellElement, th: HTMLTableCellElement,
+    ul: HTMLUListElement, ol: HTMLOListElement, li: HTMLLIElement,
+    dl: HTMLDListElement, fieldset: HTMLFieldSetElement, legend: HTMLLegendElement,
+    template: HTMLTemplateElement,
+    svg: SVGSVGElement,
+};
+['g', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'ellipse', 'use',
+ 'text', 'tspan', 'image', 'foreignObject'].forEach(tag => { __aura_tag_classes[tag] = SVGGraphicsElement; });
+['defs', 'symbol', 'linearGradient', 'radialGradient', 'stop', 'clipPath', 'mask',
+ 'filter', 'feGaussianBlur', 'pattern', 'marker'].forEach(tag => { __aura_tag_classes[tag] = SVGElement; });
 
 
 // -- atob / btoa stubs -------------------------------------------------------
