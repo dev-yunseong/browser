@@ -135,12 +135,17 @@ fn composite_layer_to_surface(
     }
 
     let has_effect = layer.opacity < 1.0 || layer.transform != Matrix4x4::identity();
+    // An effect layer paints into its own surface covering everything the
+    // layer and its descendants draw (overflowing children included), not
+    // just its border box.
+    let effect_rect = if has_effect { layer_paint_extent(tree, layer_id) } else { layer.bounds };
     let mut effect_pixmap = if has_effect {
-        let width = layer.bounds.width.max(1.0).ceil() as u32;
-        let height = layer.bounds.height.max(1.0).ceil() as u32;
-        let mut pixmap = Pixmap::new(width, height).expect("Failed to allocate layer pixmap");
-        pixmap.fill(tiny_skia::Color::TRANSPARENT);
-        Some(pixmap)
+        let width = effect_rect.width.max(1.0).ceil() as u32;
+        let height = effect_rect.height.max(1.0).ceil() as u32;
+        match Pixmap::new(width, height) {
+            Some(p) => Some(p),
+            None => return,
+        }
     } else {
         None
     };
@@ -148,19 +153,19 @@ fn composite_layer_to_surface(
     let (negative, zero, positive) = tree.categorize_children(layer_id);
 
     if let Some(ref mut pixmap) = effect_pixmap {
-        execute_commands_with_clips(&layer.background_commands, pixmap, layer.bounds, image_cache, base_url, &layer.ancestor_clips);
+        execute_commands_with_clips(&layer.background_commands, pixmap, effect_rect, image_cache, base_url, &layer.ancestor_clips);
 
         for &child_id in &negative {
-            composite_layer_to_surface(child_id, tree, pixmap, layer.bounds, image_cache, base_url);
+            composite_layer_to_surface(child_id, tree, pixmap, effect_rect, image_cache, base_url);
         }
 
-        execute_commands_with_clips(&layer.content_commands, pixmap, layer.bounds, image_cache, base_url, &layer.ancestor_clips);
+        execute_commands_with_clips(&layer.content_commands, pixmap, effect_rect, image_cache, base_url, &layer.ancestor_clips);
 
         for &child_id in &zero {
-            composite_layer_to_surface(child_id, tree, pixmap, layer.bounds, image_cache, base_url);
+            composite_layer_to_surface(child_id, tree, pixmap, effect_rect, image_cache, base_url);
         }
         for &child_id in &positive {
-            composite_layer_to_surface(child_id, tree, pixmap, layer.bounds, image_cache, base_url);
+            composite_layer_to_surface(child_id, tree, pixmap, effect_rect, image_cache, base_url);
         }
     } else {
         execute_commands_with_clips(&layer.background_commands, target, surface_rect, image_cache, base_url, &layer.ancestor_clips);
@@ -183,12 +188,79 @@ fn composite_layer_to_surface(
         let mut paint = PixmapPaint::default();
         paint.opacity = layer.opacity;
 
+        // The layer transform is relative to its border box origin.
         let local_x = layer.bounds.x - surface_rect.x;
         let local_y = layer.bounds.y - surface_rect.y;
-        let transform = Transform::from_translate(local_x, local_y).pre_concat(layer.transform.to_skia());
+        let transform = Transform::from_translate(local_x, local_y)
+            .pre_concat(layer.transform.to_skia())
+            .pre_translate(effect_rect.x - layer.bounds.x, effect_rect.y - layer.bounds.y);
 
         target.draw_pixmap(0, 0, pixmap.as_ref(), &paint, transform, None);
     }
+}
+
+/// Largest effect-layer surface side, in px; bigger extents are cropped
+/// around the layer's border box.
+const MAX_EFFECT_SURFACE_SIDE: f32 = 8192.0;
+
+/// Union of the rects painted by `layer_id` and its descendant layers (page
+/// coordinates, ignoring descendant transforms), including the border box.
+/// Ancestor clips of the layer bound the result.
+fn layer_paint_extent(tree: &LayerTree, layer_id: usize) -> LayoutRect {
+    let layer = &tree.layers[layer_id];
+    let (mut x0, mut y0) = (layer.bounds.x, layer.bounds.y);
+    let (mut x1, mut y1) = (layer.bounds.x + layer.bounds.width, layer.bounds.y + layer.bounds.height);
+    let mut stack = vec![layer_id];
+    while let Some(id) = stack.pop() {
+        let l = &tree.layers[id];
+        for cmd in l.background_commands.iter().chain(l.content_commands.iter()) {
+            let r = match cmd {
+                PaintCommand::Rect(r, ..) | PaintCommand::Border(r, ..) => *r,
+                PaintCommand::BorderSides { rect, .. }
+                | PaintCommand::Image { rect, .. }
+                | PaintCommand::Svg { rect, .. }
+                | PaintCommand::LinearGradient { rect, .. }
+                | PaintCommand::RadialGradient { rect, .. } => *rect,
+                PaintCommand::Text { rect, .. } => LayoutRect { x: rect.x - 2.0, y: rect.y - 2.0, width: rect.width + 4.0, height: rect.height + 4.0 },
+                PaintCommand::BackgroundImage { clip, .. } => *clip,
+                PaintCommand::Shadow(r, s, _) => {
+                    let grow = (*s.blur).max(0.0) * 1.5 + (*s.spread).max(0.0) + 2.0;
+                    LayoutRect {
+                        x: r.x + *s.offset_x - grow,
+                        y: r.y + *s.offset_y - grow,
+                        width: r.width + 2.0 * grow,
+                        height: r.height + 2.0 * grow,
+                    }
+                }
+                PaintCommand::PushClip { .. } | PaintCommand::PopClip => continue,
+            };
+            if !(r.width > 0.0 && r.height > 0.0) || !r.x.is_finite() || !r.y.is_finite() {
+                continue;
+            }
+            x0 = x0.min(r.x);
+            y0 = y0.min(r.y);
+            x1 = x1.max(r.x + r.width);
+            y1 = y1.max(r.y + r.height);
+        }
+        stack.extend(l.child_layer_ids.iter().copied());
+    }
+    // Ancestor clips cut everything outside them anyway.
+    for c in &layer.ancestor_clips {
+        x0 = x0.max(c.rect.x);
+        y0 = y0.max(c.rect.y);
+        x1 = x1.min(c.rect.x + c.rect.width);
+        y1 = y1.min(c.rect.y + c.rect.height);
+    }
+    let b = layer.bounds;
+    let half = MAX_EFFECT_SURFACE_SIDE / 2.0;
+    x0 = x0.max(b.x + b.width / 2.0 - half).floor();
+    y0 = y0.max(b.y + b.height / 2.0 - half).floor();
+    x1 = x1.min(b.x + b.width / 2.0 + half);
+    y1 = y1.min(b.y + b.height / 2.0 + half);
+    if x1 <= x0 || y1 <= y0 {
+        return LayoutRect { x: b.x, y: b.y, width: 1.0, height: 1.0 };
+    }
+    LayoutRect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }
 }
 
 /// Build a `Mask` (sized to the tile pixmap) for an overflow clip region.
@@ -359,8 +431,32 @@ fn execute_commands_with_clips(
                         stroke.dash = StrokeDash::new(vec![0.01, gap_len], 0.0);
                     }
                 }
-                if *radius > 0.0 {
-                    if let Some(path) = create_rounded_rect_path(*r, *radius) {
+                if *radius > 0.0 && *style == BorderStyle::Solid {
+                    // Fill the ring between the outer and inner border edges.
+                    let inner = LayoutRect {
+                        x: r.x + w,
+                        y: r.y + w,
+                        width: (r.width - 2.0 * w).max(0.0),
+                        height: (r.height - 2.0 * w).max(0.0),
+                    };
+                    let mut pb = PathBuilder::new();
+                    if push_rounded_rect(&mut pb, *r, *radius).is_some() {
+                        let _ = push_rounded_rect(&mut pb, inner, (*radius - w).max(0.0));
+                        if let Some(path) = pb.finish() {
+                            paint.anti_alias = true;
+                            pixmap.fill_path(&path, &paint, FillRule::EvenOdd, transform, active_mask!());
+                        }
+                    }
+                } else if *radius > 0.0 {
+                    // The stroke is centred on its path, so inset it by half
+                    // the width to keep the border inside the border box.
+                    let centre = LayoutRect {
+                        x: r.x + w / 2.0,
+                        y: r.y + w / 2.0,
+                        width: (r.width - w).max(0.0),
+                        height: (r.height - w).max(0.0),
+                    };
+                    if let Some(path) = create_rounded_rect_path(centre, (*radius - w / 2.0).max(0.0)) {
                         pixmap.stroke_path(&path, &paint, &stroke, transform, active_mask!());
                     }
                 } else if let Some(tr) = tiny_skia::Rect::from_xywh(r.x + w/2.0, r.y + w/2.0, (r.width - w).max(0.0), (r.height - w).max(0.0)) {
@@ -370,6 +466,9 @@ fn execute_commands_with_clips(
                         pixmap.stroke_path(&path, &paint, &stroke, transform, active_mask!());
                     }
                 }
+            }
+            PaintCommand::BorderSides { rect, sides, radius } => {
+                paint_border_sides(pixmap, *rect, sides, *radius, transform, tx, ty, active_mask!());
             }
             PaintCommand::BackgroundImage { url, clip, radius, area, position, size, repeat_x, repeat_y } => {
                 let rounded_mask;
@@ -390,85 +489,32 @@ fn execute_commands_with_clips(
                     repeat_x: *repeat_x,
                     repeat_y: *repeat_y,
                 };
-                if let Some((key, data)) = lookup_image_bytes(image_cache, base_url, url) {
-                    paint_background_image(pixmap, key, data, &layer, transform, mask);
+                if let Some((key, data)) = resolve_image_bytes(image_cache, base_url, url) {
+                    paint_background_image(pixmap, &key, &data, &layer, transform, mask);
                 }
             }
-            PaintCommand::Image { rect: r, url, object_fit, alt } => {
-                let resolved_url = if image_cache.contains_key(url) {
-                    None
+            PaintCommand::Image { rect: r, url, object_fit, alt, radius } => {
+                let rounded_mask;
+                let mask = if *radius > 0.0 {
+                    rounded_mask = build_clip_mask(*r, *radius, tx, ty, pixmap.width(), pixmap.height(), active_mask!());
+                    rounded_mask.as_ref()
                 } else {
-                    base_url.join(url).ok().map(|u| u.to_string())
+                    active_mask!()
                 };
-                let drawn = if let Some(data) = image_cache
-                    .get(url)
-                    .or_else(|| resolved_url.as_ref().and_then(|u| image_cache.get(u)))
-                {
-                    if let Ok(img) = image::load_from_memory(data) {
-                        let rgba = img.to_rgba8();
-                        let img_w = rgba.width() as f32;
-                        let img_h = rgba.height() as f32;
-                        if let Some(mut img_pixmap) = Pixmap::new(rgba.width(), rgba.height()) {
-                            img_pixmap.data_mut().copy_from_slice(&rgba);
-                            // `image` decodes straight alpha; tiny-skia expects premultiplied.
-                            crate::background::premultiply_rgba_in_place(img_pixmap.data_mut());
-                            match object_fit {
-                                ObjectFit::Fill => {
-                                    // Stretch to fill — existing behavior
-                                    // Translate before scaling: draw_pixmap's x/y would be scaled too.
-                                    pixmap.draw_pixmap(0, 0, img_pixmap.as_ref(),
-                                        &PixmapPaint::default(),
-                                        transform.pre_translate(r.x, r.y).pre_scale(r.width / img_w, r.height / img_h), active_mask!());
-                                }
-                                ObjectFit::Contain => {
-                                    // Scale uniformly to fit inside rect; letterbox with transparency
-                                    let s = (r.width / img_w).min(r.height / img_h);
-                                    let sw = img_w * s;
-                                    let sh = img_h * s;
-                                    let ox = r.x + (r.width - sw) / 2.0;
-                                    let oy = r.y + (r.height - sh) / 2.0;
-                                    pixmap.draw_pixmap(0, 0, img_pixmap.as_ref(),
-                                        &PixmapPaint::default(),
-                                        transform.pre_translate(ox, oy).pre_scale(s, s), active_mask!());
-                                }
-                                ObjectFit::Cover => {
-                                    // Scale uniformly to fill rect; draw into a temp pixmap to clip overflow
-                                    let s = (r.width / img_w).max(r.height / img_h);
-                                    let sw = img_w * s;
-                                    let sh = img_h * s;
-                                    let rw = r.width as u32;
-                                    let rh = r.height as u32;
-                                    if let Some(mut tmp) = Pixmap::new(rw.max(1), rh.max(1)) {
-                                        let local_ox = (r.width - sw) / 2.0;
-                                        let local_oy = (r.height - sh) / 2.0;
-                                        tmp.draw_pixmap(0, 0,
-                                            img_pixmap.as_ref(), &PixmapPaint::default(),
-                                            Transform::from_translate(local_ox, local_oy).pre_scale(s, s), None);
-                                        pixmap.draw_pixmap(r.x as i32, r.y as i32, tmp.as_ref(),
-                                            &PixmapPaint::default(), transform, active_mask!());
-                                    }
-                                }
-                                ObjectFit::None => {
-                                    // Intrinsic size (1:1 scale), clip to rect using a temp pixmap
-                                    let rw = r.width as u32;
-                                    let rh = r.height as u32;
-                                    if let Some(mut tmp) = Pixmap::new(rw.max(1), rh.max(1)) {
-                                        let ox = (r.width - img_w) / 2.0;
-                                        let oy = (r.height - img_h) / 2.0;
-                                        tmp.draw_pixmap(ox as i32, oy as i32, img_pixmap.as_ref(),
-                                            &PixmapPaint::default(), Transform::identity(), None);
-                                        pixmap.draw_pixmap(r.x as i32, r.y as i32, tmp.as_ref(),
-                                            &PixmapPaint::default(), transform, active_mask!());
-                                    }
-                                }
-                            }
-                            true
-                        } else { false }
-                    } else { false }
-                } else { false };
-
-                if !drawn {
+                let drawn = match resolve_image_bytes(image_cache, base_url, url) {
+                    Some((key, bytes)) => {
+                        draw_replaced_image(pixmap, &key, &bytes, *r, object_fit, transform, mask, tx, ty)
+                    }
+                    None => false,
+                };
+                // A frame whose document is not rendered (yet) paints nothing.
+                if !drawn && crate::layer_tree::parse_iframe_frame_key(url).is_none() {
                     draw_broken_image(pixmap, *r, alt, transform);
+                }
+            }
+            PaintCommand::Svg { rect, source } => {
+                if let Some(tree) = crate::svg::parse_inline(source) {
+                    paint_svg_tree(pixmap, &tree, *rect, tx, ty, active_mask!());
                 }
             }
             PaintCommand::Text { rect, text, font_size, color, clip, italic, text_decoration, font_family, font_weight, line_height, letter_spacing, .. } => {
@@ -530,7 +576,8 @@ fn paint_box_shadow(
     // The blur "spreads" the shape by roughly `blur` pixels in each direction,
     // so the temp pixmap needs extra padding around the shape equal to the
     // blur radius so the falloff has room.
-    let pad = if blur > 0.0 { blur.ceil() as i32 + 1 } else { 0 };
+    // Three box-blur passes reach about 1.5x the blur radius.
+    let pad = if blur > 0.0 { (blur * 1.5).ceil() as i32 + 2 } else { 0 };
     let pad_f = pad as f32;
 
     if s.inset {
@@ -580,13 +627,21 @@ fn paint_box_shadow(
         let Some(mut shape_px) = Pixmap::new(tmp_w.max(1), tmp_h.max(1)) else { return; };
 
         let shape_local = LayoutRect { x: pad_f, y: pad_f, width: sw, height: sh };
-        let shape_radius = (radius + spread).max(0.0);
+        // Sharp corners stay sharp; rounded ones grow with the spread.
+        let shape_radius = if radius > 0.0 { (radius + spread).max(0.0) } else { 0.0 };
         fill_shape(&mut shape_px, shape_local, shape_radius, 255);
+
+        // An outset shadow is never drawn under its own border box (it shows
+        // only outside it, even when the box has no background).
+        let Some(mut outside_box) = Pixmap::new(tmp_w.max(1), tmp_h.max(1)) else { return; };
+        outside_box.fill(tiny_skia::Color::WHITE);
+        let box_local = LayoutRect { x: r.x - (sx - pad_f), y: r.y - (sy - pad_f), width: r.width, height: r.height };
+        clear_shape(&mut outside_box, box_local, radius);
 
         apply_blur_and_composite(
             pixmap, &mut shape_px, blur,
             sx - pad_f + tx, sy - pad_f + ty,
-            &s.color, clip_mask, None,
+            &s.color, clip_mask, Some(&outside_box),
         );
     }
 }
@@ -727,48 +782,32 @@ fn box_blur_alpha(pixmap: &mut Pixmap, radius: usize) {
     let w = pixmap.width() as usize;
     let h = pixmap.height() as usize;
     let data = pixmap.data_mut();
-    let k = 2 * radius + 1;
+    let k = (2 * radius + 1) as u32;
 
-    // Horizontal pass — blur each row independently.
+    // Centred running-sum blur of one line of `len` samples (`at(i)` is the
+    // byte index of sample `i`); samples outside the line count as 0.
+    let mut line = Vec::new();
+    let mut blur_line = |data: &mut [u8], len: usize, at: &dyn Fn(usize) -> usize| {
+        line.clear();
+        line.extend((0..len).map(|i| data[at(i)] as u32));
+        // Window [i - radius, i + radius].
+        let mut acc: u32 = line.iter().take(radius.min(len)).sum();
+        for i in 0..len {
+            if i + radius < len {
+                acc += line[i + radius];
+            }
+            data[at(i)] = ((acc + k / 2) / k) as u8;
+            if i >= radius {
+                acc -= line[i - radius];
+            }
+        }
+    };
+
     for row in 0..h {
-        let base = row * w * 4;
-        // Accumulate the first window.
-        let mut acc = 0u32;
-        for x in 0..k.min(w) {
-            acc += data[base + x * 4 + 3] as u32;
-        }
-
-        let mut tmp = vec![0u8; w];
-        for x in 0..w {
-            tmp[x] = (acc / k as u32) as u8;
-            // Slide window: add leading edge, remove trailing edge.
-            let lead = x + radius + 1;
-            let trail = if x >= radius { x - radius } else { w }; // sentinel: skip
-            if lead < w { acc += data[base + lead * 4 + 3] as u32; }
-            if x >= radius { acc = acc.saturating_sub(data[base + trail * 4 + 3] as u32); }
-        }
-        for x in 0..w {
-            data[base + x * 4 + 3] = tmp[x];
-        }
+        blur_line(data, w, &|x| (row * w + x) * 4 + 3);
     }
-
-    // Vertical pass — blur each column independently.
     for col in 0..w {
-        let mut acc = 0u32;
-        for y in 0..k.min(h) {
-            acc += data[(y * w + col) * 4 + 3] as u32;
-        }
-
-        let mut tmp = vec![0u8; h];
-        for y in 0..h {
-            tmp[y] = (acc / k as u32) as u8;
-            let lead = y + radius + 1;
-            if lead < h { acc += data[(lead * w + col) * 4 + 3] as u32; }
-            if y >= radius { acc = acc.saturating_sub(data[((y - radius) * w + col) * 4 + 3] as u32); }
-        }
-        for y in 0..h {
-            data[(y * w + col) * 4 + 3] = tmp[y];
-        }
+        blur_line(data, h, &|y| (y * w + col) * 4 + 3);
     }
 }
 
@@ -784,6 +823,159 @@ fn lookup_image_bytes<'c>(
     }
     let resolved = base_url.join(url).ok()?.to_string();
     image_cache.get_key_value(&resolved).map(|(k, v)| (k.as_str(), v.as_slice()))
+}
+
+/// Encoded image bytes, borrowed from the image cache or decoded from a
+/// `data:` URL.
+enum ImageBytes<'c> {
+    Cached(&'c [u8]),
+    Data(std::sync::Arc<Vec<u8>>),
+}
+
+impl std::ops::Deref for ImageBytes<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            ImageBytes::Cached(b) => b,
+            ImageBytes::Data(b) => b.as_slice(),
+        }
+    }
+}
+
+/// Bytes of the image at `url`: decoded in place for `data:` URLs, otherwise
+/// looked up in the image cache. Returns the key used by the decoded-image
+/// caches along with the bytes.
+fn resolve_image_bytes<'c>(
+    image_cache: &'c HashMap<String, Vec<u8>>,
+    base_url: &Url,
+    url: &str,
+) -> Option<(std::borrow::Cow<'c, str>, ImageBytes<'c>)> {
+    if url.trim_start().get(..5).is_some_and(|p| p.eq_ignore_ascii_case("data:")) {
+        let bytes = crate::svg::decode_data_url(url)?;
+        return Some((std::borrow::Cow::Owned(url.to_string()), ImageBytes::Data(bytes)));
+    }
+    if let Some((w, h, src)) = crate::layer_tree::parse_iframe_frame_key(url) {
+        // Frame documents are cached under the absolute frame URL.
+        if let Some((k, v)) = image_cache.get_key_value(url) {
+            return Some((std::borrow::Cow::Borrowed(k.as_str()), ImageBytes::Cached(v.as_slice())));
+        }
+        let abs = base_url.join(src).ok()?;
+        let key = crate::layer_tree::iframe_frame_key(abs.as_str(), w, h);
+        let (k, v) = image_cache.get_key_value(&key)?;
+        return Some((std::borrow::Cow::Borrowed(k.as_str()), ImageBytes::Cached(v.as_slice())));
+    }
+    let (key, data) = lookup_image_bytes(image_cache, base_url, url)?;
+    Some((std::borrow::Cow::Borrowed(key), ImageBytes::Cached(data)))
+}
+
+/// Draw `img` scaled to `dest` (page coordinates) under `mask`.
+fn draw_scaled_pixmap(
+    pixmap: &mut Pixmap,
+    img: tiny_skia::PixmapRef,
+    dest: LayoutRect,
+    transform: Transform,
+    mask: Option<&Mask>,
+) {
+    let sx = dest.width / img.width() as f32;
+    let sy = dest.height / img.height() as f32;
+    let exact = (sx - 1.0).abs() < 1e-3
+        && (sy - 1.0).abs() < 1e-3
+        && (dest.x + transform.tx).fract().abs() < 1e-3
+        && (dest.y + transform.ty).fract().abs() < 1e-3;
+    let paint = PixmapPaint {
+        quality: if exact { tiny_skia::FilterQuality::Nearest } else { tiny_skia::FilterQuality::Bilinear },
+        ..PixmapPaint::default()
+    };
+    pixmap.draw_pixmap(0, 0, img, &paint, transform.pre_translate(dest.x, dest.y).pre_scale(sx, sy), mask);
+}
+
+/// Destination rect of a replaced image with intrinsic size `(iw, ih)` placed
+/// in the content box `r` per `object-fit` (centered, as `object-position`
+/// defaults to 50% 50%).
+fn object_fit_rect(r: LayoutRect, iw: f32, ih: f32, fit: &ObjectFit) -> LayoutRect {
+    let (w, h) = match fit {
+        ObjectFit::Fill => return r,
+        ObjectFit::Contain => {
+            let s = (r.width / iw).min(r.height / ih);
+            (iw * s, ih * s)
+        }
+        ObjectFit::Cover => {
+            let s = (r.width / iw).max(r.height / ih);
+            (iw * s, ih * s)
+        }
+        ObjectFit::None => (iw, ih),
+    };
+    LayoutRect { x: r.x + (r.width - w) / 2.0, y: r.y + (r.height - h) / 2.0, width: w, height: h }
+}
+
+/// Paint an `<img>`'s encoded image (raster or SVG) into its content box `r`.
+/// Returns `false` when the bytes cannot be decoded.
+#[allow(clippy::too_many_arguments)]
+fn draw_replaced_image(
+    pixmap: &mut Pixmap,
+    key: &str,
+    bytes: &[u8],
+    r: LayoutRect,
+    fit: &ObjectFit,
+    transform: Transform,
+    mask: Option<&Mask>,
+    tx: f32,
+    ty: f32,
+) -> bool {
+    let is_svg = crate::svg::is_svg(bytes);
+    let intrinsic = if is_svg {
+        crate::svg::intrinsic_size(bytes)
+    } else {
+        crate::background::intrinsic_size(key, bytes).map(|(w, h)| (w as f32, h as f32))
+    };
+    let Some((iw, ih)) = intrinsic else { return false };
+    if !(iw > 0.0 && ih > 0.0) || !(r.width > 0.0 && r.height > 0.0) {
+        return true;
+    }
+    let dest = object_fit_rect(r, iw, ih, fit);
+    // Content overflowing the box (cover / none) is clipped to it.
+    let overflow_mask;
+    let overflows = dest.x < r.x - 0.01
+        || dest.y < r.y - 0.01
+        || dest.x + dest.width > r.x + r.width + 0.01
+        || dest.y + dest.height > r.y + r.height + 0.01;
+    let mask = if overflows {
+        overflow_mask = build_clip_mask(r, 0.0, tx, ty, pixmap.width(), pixmap.height(), mask);
+        overflow_mask.as_ref()
+    } else {
+        mask
+    };
+    let (tw, th) = (dest.width.round().max(1.0) as u32, dest.height.round().max(1.0) as u32);
+    if is_svg {
+        // Rasterize at the drawn size, not the natural size, for crisp edges.
+        let Some(img) = crate::svg::rasterize(bytes, tw, th) else { return false };
+        draw_scaled_pixmap(pixmap, img.as_ref().as_ref(), dest, transform, mask);
+        return true;
+    }
+    // Downscales are pre-resampled with an area filter (close to Chromium's
+    // high-quality downscaling); upscales use bilinear filtering.
+    let prescale = tw < iw as u32 && th < ih as u32 && (tw as f32) * (th as f32) <= MAX_PRESCALED_TILE_PIXELS;
+    let target = if prescale { Some((tw, th)) } else { None };
+    let Some(img) = crate::background::decoded_image(key, bytes, target) else { return false };
+    draw_scaled_pixmap(pixmap, img.as_ref().as_ref(), dest, transform, mask);
+    true
+}
+
+/// Paint an inline SVG document into its content box `rect` (page
+/// coordinates; `tx`/`ty` map page to pixmap space).
+fn paint_svg_tree(
+    pixmap: &mut Pixmap,
+    tree: &resvg::usvg::Tree,
+    rect: LayoutRect,
+    tx: f32,
+    ty: f32,
+    mask: Option<&Mask>,
+) {
+    let x = rect.x + tx;
+    let y = rect.y + ty;
+    let (ix, iy) = (x.floor(), y.floor());
+    let Some(img) = crate::svg::rasterize_tree(tree, rect.width, rect.height, x - ix, y - iy) else { return };
+    pixmap.draw_pixmap(ix as i32, iy as i32, img.as_ref(), &PixmapPaint::default(), Transform::identity(), mask);
 }
 
 /// Geometry of one `background-image` layer, as carried by
@@ -813,8 +1005,14 @@ fn paint_background_image(
     mask: Option<&Mask>,
 ) {
     use crate::background::{anchor_tile, decoded_image, intrinsic_size, tile_size};
-    let Some((iw, ih)) = intrinsic_size(key, data) else { return };
-    let (tw, th) = tile_size(layer.size, iw as f32, ih as f32, layer.area.width, layer.area.height);
+    let is_svg = crate::svg::is_svg(data);
+    let intrinsic = if is_svg {
+        crate::svg::intrinsic_size(data)
+    } else {
+        intrinsic_size(key, data).map(|(w, h)| (w as f32, h as f32))
+    };
+    let Some((iw, ih)) = intrinsic else { return };
+    let (tw, th) = tile_size(layer.size, iw, ih, layer.area.width, layer.area.height);
     if !(tw > 0.0 && th > 0.0) {
         return;
     }
@@ -836,12 +1034,23 @@ fn paint_background_image(
     let (rw, rh) = (tw.round().max(1.0), th.round().max(1.0));
     // Downscales are pre-resampled with an area filter; upscales use the
     // pattern's bilinear filter.
-    let prescale = (rw as u32 != iw || rh as u32 != ih)
-        && rw as u32 <= iw
-        && rh as u32 <= ih
-        && rw * rh <= MAX_PRESCALED_TILE_PIXELS;
-    let target = if prescale { Some((rw as u32, rh as u32)) } else { None };
-    let Some(img) = decoded_image(key, data, target) else { return };
+    let img = if is_svg {
+        // Vector tiles are rasterized at the tile size.
+        if rw * rh > MAX_PRESCALED_TILE_PIXELS {
+            return;
+        }
+        let Some(img) = crate::svg::rasterize(data, rw as u32, rh as u32) else { return };
+        img
+    } else {
+        let (iw, ih) = (iw as u32, ih as u32);
+        let prescale = (rw as u32 != iw || rh as u32 != ih)
+            && rw as u32 <= iw
+            && rh as u32 <= ih
+            && rw * rh <= MAX_PRESCALED_TILE_PIXELS;
+        let target = if prescale { Some((rw as u32, rh as u32)) } else { None };
+        let Some(img) = decoded_image(key, data, target) else { return };
+        img
+    };
     let sx = tw / img.width() as f32;
     let sy = th / img.height() as f32;
     let exact = (sx - 1.0).abs() < 1e-3 && (sy - 1.0).abs() < 1e-3;
@@ -904,21 +1113,120 @@ fn draw_broken_image(pixmap: &mut Pixmap, r: LayoutRect, alt: &str, transform: T
 
 fn create_rounded_rect_path(r: LayoutRect, radius: f32) -> Option<tiny_skia::Path> {
     let mut pb = PathBuilder::new();
-    let rect = tiny_skia::Rect::from_xywh(r.x, r.y, r.width, r.height)?;
-    let radius = radius
-        .max(0.0)
-        .min(rect.width().min(rect.height()) / 2.0);
-    pb.move_to(rect.left() + radius, rect.top());
-    pb.line_to(rect.right() - radius, rect.top());
-    pb.quad_to(rect.right(), rect.top(), rect.right(), rect.top() + radius);
-    pb.line_to(rect.right(), rect.bottom() - radius);
-    pb.quad_to(rect.right(), rect.bottom(), rect.right() - radius, rect.bottom());
-    pb.line_to(rect.left() + radius, rect.bottom());
-    pb.quad_to(rect.left(), rect.bottom(), rect.left(), rect.bottom() - radius);
-    pb.line_to(rect.left(), rect.top() + radius);
-    pb.quad_to(rect.left(), rect.top(), rect.left() + radius, rect.top());
-    pb.close();
+    push_rounded_rect(&mut pb, r, radius)?;
     pb.finish()
+}
+
+/// Append a rounded rectangle subpath (circular corners drawn as cubic
+/// Béziers) to `pb`. Returns `None` for an empty rect.
+fn push_rounded_rect(pb: &mut PathBuilder, r: LayoutRect, radius: f32) -> Option<()> {
+    let rect = tiny_skia::Rect::from_xywh(r.x, r.y, r.width, r.height)?;
+    let radius = radius.max(0.0).min(rect.width().min(rect.height()) / 2.0);
+    if radius <= 0.0 {
+        pb.push_rect(rect);
+        return Some(());
+    }
+    // Control-point distance for a quarter circle.
+    let k = radius * (1.0 - 0.552_284_8);
+    let (l, t, rt, b) = (rect.left(), rect.top(), rect.right(), rect.bottom());
+    pb.move_to(l + radius, t);
+    pb.line_to(rt - radius, t);
+    pb.cubic_to(rt - k, t, rt, t + k, rt, t + radius);
+    pb.line_to(rt, b - radius);
+    pb.cubic_to(rt, b - k, rt - k, b, rt - radius, b);
+    pb.line_to(l + radius, b);
+    pb.cubic_to(l + k, b, l, b - k, l, b - radius);
+    pb.line_to(l, t + radius);
+    pb.cubic_to(l, t + k, l + k, t, l + radius, t);
+    pb.close();
+    Some(())
+}
+
+/// Paint a border whose sides differ: each side is the trapezoid between the
+/// outer and inner border edges (meeting its neighbours on the corner
+/// diagonals), clipped to the rounded ring when `radius > 0`.
+#[allow(clippy::too_many_arguments)]
+fn paint_border_sides(
+    pixmap: &mut Pixmap,
+    r: LayoutRect,
+    sides: &crate::layer_tree::BorderSides,
+    radius: f32,
+    transform: Transform,
+    tx: f32,
+    ty: f32,
+    mask: Option<&Mask>,
+) {
+    let [wt, wr, wb, wl] = sides.widths;
+    let (x0, y0, x1, y1) = (r.x, r.y, r.x + r.width, r.y + r.height);
+    let (ix0, iy0, ix1, iy1) = (x0 + wl, y0 + wt, x1 - wr, y1 - wb);
+
+    let ring_mask;
+    let mask = if radius > 0.0 {
+        let mut pb = PathBuilder::new();
+        if push_rounded_rect(&mut pb, r, radius).is_none() {
+            return;
+        }
+        let inner = LayoutRect { x: ix0, y: iy0, width: (ix1 - ix0).max(0.0), height: (iy1 - iy0).max(0.0) };
+        let _ = push_rounded_rect(&mut pb, inner, (radius - wt.max(wl)).max(0.0));
+        let Some(path) = pb.finish() else { return };
+        let Some(mut m) = Mask::new(pixmap.width(), pixmap.height()) else { return };
+        m.fill_path(&path, FillRule::EvenOdd, true, Transform::from_translate(tx, ty));
+        if let Some(parent) = mask {
+            for (d, s) in m.data_mut().iter_mut().zip(parent.data().iter()) {
+                *d = ((*d as u32 * *s as u32) / 255) as u8;
+            }
+        }
+        ring_mask = m;
+        Some(&ring_mask)
+    } else {
+        mask
+    };
+
+    // (trapezoid corners, centre line of the side, width) per side.
+    let quads = [
+        ([(x0, y0), (x1, y0), (ix1, iy0), (ix0, iy0)], ((x0, y0 + wt / 2.0), (x1, y0 + wt / 2.0))),
+        ([(x1, y0), (x1, y1), (ix1, iy1), (ix1, iy0)], ((x1 - wr / 2.0, y0), (x1 - wr / 2.0, y1))),
+        ([(x1, y1), (x0, y1), (ix0, iy1), (ix1, iy1)], ((x1, y1 - wb / 2.0), (x0, y1 - wb / 2.0))),
+        ([(x0, y1), (x0, y0), (ix0, iy0), (ix0, iy1)], ((x0 + wl / 2.0, y1), (x0 + wl / 2.0, y0))),
+    ];
+    for (i, (quad, (from, to))) in quads.iter().enumerate() {
+        let w = sides.widths[i];
+        let c = &sides.colors[i];
+        if w <= 0.0 || c.a == 0 {
+            continue;
+        }
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(c.r, c.g, c.b, c.a);
+        paint.anti_alias = true;
+        match sides.styles[i] {
+            BorderStyle::Solid => {
+                let mut pb = PathBuilder::new();
+                pb.move_to(quad[0].0, quad[0].1);
+                for p in &quad[1..] {
+                    pb.line_to(p.0, p.1);
+                }
+                pb.close();
+                if let Some(path) = pb.finish() {
+                    pixmap.fill_path(&path, &paint, FillRule::Winding, transform, mask);
+                }
+            }
+            style => {
+                let mut stroke = Stroke { width: w, ..Stroke::default() };
+                if style == BorderStyle::Dotted {
+                    stroke.line_cap = LineCap::Round;
+                    stroke.dash = StrokeDash::new(vec![0.01, (w * 2.0).max(1.0)], 0.0);
+                } else {
+                    stroke.dash = StrokeDash::new(vec![(w * 3.0).max(1.0), (w * 2.0).max(1.0)], 0.0);
+                }
+                let mut pb = PathBuilder::new();
+                pb.move_to(from.0, from.1);
+                pb.line_to(to.0, to.1);
+                if let Some(path) = pb.finish() {
+                    pixmap.stroke_path(&path, &paint, &stroke, transform, mask);
+                }
+            }
+        }
+    }
 }
 
 /// Font selection for one text run (see `crate::fonts`).
@@ -1810,11 +2118,12 @@ mod tests {
             offset_x: OrderedFloat(0.0),
             offset_y: OrderedFloat(0.0),
             blur:     OrderedFloat(0.0),
-            spread:   OrderedFloat(0.0),
+            spread:   OrderedFloat(4.0),
             color:    Color { r: 0, g: 0, b: 0, a: 255 },
             inset:    false,
         };
-        let rect = LayoutRect { x: 0.0, y: 0.0, width: 40.0, height: 40.0 };
+        // A 32x32 box spread by 4px: the shadow shape covers 0..40.
+        let rect = LayoutRect { x: 4.0, y: 4.0, width: 32.0, height: 32.0 };
         let tile_rect = LayoutRect { x: 0.0, y: 0.0, width: 40.0, height: 40.0 };
         let base_url = Url::parse("https://example.com/").unwrap();
 
@@ -1825,10 +2134,10 @@ mod tests {
         let square_corner_alpha = square.data()[(1 * 40 + 1) * 4 + 3];
         assert!(square_corner_alpha > 0, "square shadow must cover its corner");
 
-        // radius = 18 on a 40x40 box: the same corner pixel falls outside the
+        // radius = 14 (+4 spread = 18) on the 40x40 shape: the same corner pixel falls outside the
         // rounded shape and must be unpainted.
         let mut rounded = Pixmap::new(40, 40).unwrap();
-        let cmds_rounded = vec![PaintCommand::Shadow(rect, shadow, 18.0)];
+        let cmds_rounded = vec![PaintCommand::Shadow(rect, shadow, 14.0)];
         execute_commands_on_tile(&cmds_rounded, &mut rounded, tile_rect, &HashMap::new(), &base_url);
         let rounded_corner_alpha = rounded.data()[(1 * 40 + 1) * 4 + 3];
         assert_eq!(rounded_corner_alpha, 0, "rounded shadow must not paint past its rounded corner, got alpha {}", rounded_corner_alpha);
@@ -1919,6 +2228,7 @@ mod tests {
             url: "/tiny.png".to_string(),
             object_fit: ObjectFit::Fill,
             alt: String::new(),
+            radius: 0.0,
         }];
         let base_url = Url::parse("https://example.com/path").unwrap();
         let mut image_cache = HashMap::new();
@@ -1948,6 +2258,7 @@ mod tests {
                 url: "https://example.com/red.png".to_string(),
                 object_fit: fit.clone(),
                 alt: String::new(),
+                radius: 0.0,
             }];
             let mut image_cache = HashMap::new();
             image_cache.insert("https://example.com/red.png".to_string(), red.clone());
@@ -2108,5 +2419,129 @@ mod tests {
             100.0,
         );
         assert!(path.is_some(), "large border radius should still produce a valid path");
+    }
+
+    /// Blurring is centred: a symmetric shape stays symmetric.
+    #[test]
+    fn test_box_blur_alpha_is_centred() {
+        let mut p = Pixmap::new(21, 1).unwrap();
+        p.data_mut()[10 * 4 + 3] = 255;
+        box_blur_alpha(&mut p, 3);
+        let a = |x: usize| p.data()[x * 4 + 3];
+        assert_eq!(a(7), a(13));
+        assert!(a(7) > 0 && a(6) == 0 && a(14) == 0);
+    }
+
+    /// An outset shadow shows only outside the border box.
+    #[test]
+    fn test_outset_shadow_is_not_painted_under_the_box() {
+        use crate::css::{BoxShadow, OrderedFloat};
+        let shadow = BoxShadow {
+            offset_x: OrderedFloat(0.0),
+            offset_y: OrderedFloat(0.0),
+            blur: OrderedFloat(0.0),
+            spread: OrderedFloat(2.0),
+            color: Color { r: 0, g: 0, b: 0, a: 255 },
+            inset: false,
+        };
+        let mut p = Pixmap::new(40, 40).unwrap();
+        let rect = LayoutRect { x: 10.0, y: 10.0, width: 20.0, height: 20.0 };
+        let cmds = vec![PaintCommand::Shadow(rect, shadow, 0.0)];
+        execute_commands_on_tile(&cmds, &mut p, full_rect(40.0, 40.0), &HashMap::new(), &url::Url::parse("https://e.com/").unwrap());
+        assert_eq!(px(&p, 20, 20)[3], 0, "inside the box");
+        assert_eq!(px(&p, 9, 20)[3], 255, "inside the spread ring");
+        assert_eq!(px(&p, 8, 8)[3], 255, "sharp box keeps a sharp shadow corner");
+    }
+
+    #[test]
+    fn test_svg_data_url_image_is_rasterized_into_rect() {
+        let url = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 2 1'%3E%3Crect width='1' height='1' fill='%230000ff'/%3E%3C/svg%3E";
+        let mut p = white_pixmap(40, 20);
+        let cmds = vec![PaintCommand::Image {
+            rect: LayoutRect { x: 0.0, y: 0.0, width: 40.0, height: 20.0 },
+            url: url.to_string(),
+            object_fit: ObjectFit::Fill,
+            alt: String::new(),
+            radius: 0.0,
+        }];
+        execute_commands_on_tile(&cmds, &mut p, full_rect(40.0, 20.0), &HashMap::new(), &url::Url::parse("https://e.com/").unwrap());
+        assert_eq!(px(&p, 5, 10), [0, 0, 255, 255], "left half is the blue rect");
+        assert_eq!(px(&p, 35, 10), [255, 255, 255, 255], "right half is transparent");
+    }
+
+    #[test]
+    fn test_rounded_image_is_clipped_to_its_radius() {
+        let red = encode_png(&image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255])));
+        let mut cache = HashMap::new();
+        cache.insert("https://e.com/r.png".to_string(), red);
+        let mut p = white_pixmap(40, 40);
+        let cmds = vec![PaintCommand::Image {
+            rect: full_rect(40.0, 40.0),
+            url: "https://e.com/r.png".to_string(),
+            object_fit: ObjectFit::Fill,
+            alt: String::new(),
+            radius: 20.0,
+        }];
+        execute_commands_on_tile(&cmds, &mut p, full_rect(40.0, 40.0), &cache, &url::Url::parse("https://e.com/").unwrap());
+        assert_eq!(px(&p, 1, 1), [255, 255, 255, 255], "corner is clipped");
+        assert_eq!(px(&p, 20, 20), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn test_inline_svg_command_paints_at_rect() {
+        let source = r##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 1 1"><rect width="1" height="1" fill="#00ff00"/></svg>"##;
+        let mut p = white_pixmap(30, 30);
+        let cmds = vec![PaintCommand::Svg { rect: LayoutRect { x: 10.0, y: 10.0, width: 10.0, height: 10.0 }, source: source.into() }];
+        execute_commands_on_tile(&cmds, &mut p, full_rect(30.0, 30.0), &HashMap::new(), &url::Url::parse("https://e.com/").unwrap());
+        assert_eq!(px(&p, 15, 15), [0, 255, 0, 255]);
+        assert_eq!(px(&p, 5, 5), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn test_border_sides_paint_each_side_in_its_color() {
+        use crate::layer_tree::BorderSides;
+        let blue = Color { r: 0, g: 0, b: 255, a: 255 };
+        let sides = BorderSides {
+            widths: [0.0, 0.0, 2.0, 4.0],
+            colors: [black(), black(), red(), blue],
+            styles: [BorderStyle::Solid; 4],
+        };
+        let mut p = white_pixmap(20, 20);
+        let cmds = vec![PaintCommand::BorderSides { rect: full_rect(20.0, 20.0), sides: Box::new(sides), radius: 0.0 }];
+        execute_commands_on_tile(&cmds, &mut p, full_rect(20.0, 20.0), &HashMap::new(), &url::Url::parse("https://e.com/").unwrap());
+        assert_eq!(px(&p, 1, 10), [0, 0, 255, 255], "left side");
+        assert_eq!(px(&p, 10, 19), [255, 0, 0, 255], "bottom side");
+        assert_eq!(px(&p, 10, 1), [255, 255, 255, 255], "no top side");
+        assert_eq!(px(&p, 10, 10), [255, 255, 255, 255], "interior");
+    }
+
+    #[test]
+    fn test_iframe_frame_image_uses_absolute_key_or_paints_nothing() {
+        let url = crate::layer_tree::iframe_frame_key("/ad", 4, 4);
+        let cmds = vec![PaintCommand::Image { rect: full_rect(4.0, 4.0), url, object_fit: ObjectFit::Fill, alt: String::new(), radius: 0.0 }];
+        let base = url::Url::parse("https://e.com/page").unwrap();
+        let mut p = white_pixmap(4, 4);
+        execute_commands_on_tile(&cmds, &mut p, full_rect(4.0, 4.0), &HashMap::new(), &base);
+        assert!(p.data().iter().all(|b| *b == 255), "missing frame paints nothing");
+        let mut cache = HashMap::new();
+        let green = encode_png(&image::RgbaImage::from_pixel(4, 4, image::Rgba([0, 255, 0, 255])));
+        cache.insert(crate::layer_tree::iframe_frame_key("https://e.com/ad", 4, 4), green);
+        execute_commands_on_tile(&cmds, &mut p, full_rect(4.0, 4.0), &cache, &base);
+        assert_eq!(px(&p, 2, 2), [0, 255, 0, 255]);
+    }
+
+    /// Children overflowing an opacity layer's border box are still painted
+    /// (the layer surface covers the painted extent, not just the box).
+    #[test]
+    fn test_opacity_layer_paints_overflowing_children() {
+        let html = r#"<html><body style="margin:0"><div style="position:relative;width:10px;height:10px;opacity:0.5"><div style="position:absolute;left:20px;top:0;width:10px;height:10px;background:#000"></div></div></body></html>"#;
+        let dom = crate::dom::parse_html(html);
+        let sheet = crate::css::parse_css("");
+        let styled = crate::style::build_style_tree(&dom.document, &sheet, None, &HashMap::new(), None, None, None);
+        let (layout, _, _) = crate::layout::build_layout_tree(&styled, 0.0, 0.0, 0.0, 40.0, 40.0, 40.0);
+        let mut p = white_pixmap(40, 40);
+        render_layout_tree(&layout.unwrap(), &mut p, &HashMap::new(), &url::Url::parse("https://e.com/").unwrap());
+        let c = px(&p, 25, 5);
+        assert!(c[0] > 100 && c[0] < 160, "half-transparent black child, got {c:?}");
     }
 }
