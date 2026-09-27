@@ -70,12 +70,79 @@ pub struct WideCanvas {
 /// Widest canvas rendered for horizontally overflowing documents.
 const MAX_CANVAS_WIDTH: f32 = 4096.0;
 
+/// Most documents one script-driven navigation may chain through (a page
+/// whose script sends it on to another page, and so on).
+const MAX_SCRIPT_NAVIGATIONS: usize = 5;
+
+/// Session history: the URLs of top-level documents loaded, in order, and
+/// which one is shown.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionHistory {
+    entries: Vec<String>,
+    index: usize,
+}
+
+impl SessionHistory {
+    /// Add `url` after the current entry, dropping the forward entries. A
+    /// load of the current URL again adds nothing.
+    pub fn push(&mut self, url: String) {
+        if self.current() == Some(url.as_str()) {
+            return;
+        }
+        if !self.entries.is_empty() {
+            self.entries.truncate(self.index + 1);
+        }
+        self.entries.push(url);
+        self.index = self.entries.len() - 1;
+    }
+
+    /// Replace the current entry with `url` (or add it to an empty history).
+    pub fn replace(&mut self, url: String) {
+        match self.entries.get_mut(self.index) {
+            Some(entry) => *entry = url,
+            None => self.push(url),
+        }
+    }
+
+    pub fn current(&self) -> Option<&str> {
+        self.entries.get(self.index).map(String::as_str)
+    }
+
+    pub fn can_go_back(&self) -> bool {
+        !self.entries.is_empty() && self.index > 0
+    }
+
+    pub fn can_go_forward(&self) -> bool {
+        self.index + 1 < self.entries.len()
+    }
+
+    /// Index and URL of the entry `delta` steps from the current one.
+    fn entry_at(&self, delta: isize) -> Option<(usize, String)> {
+        let index = self.index.checked_add_signed(delta)?;
+        self.entries.get(index).map(|url| (index, url.clone()))
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Session history shared between the engine actor and GUI threads.
+pub type SharedHistory = std::sync::Arc<std::sync::Mutex<SessionHistory>>;
+
 /// Result of a click action in headless mode.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type")]
 pub enum ClickResult {
-    /// A link was clicked; contains the absolute URL.
+    /// A link was clicked; contains the absolute URL. The caller loads it.
     Navigate { url: String },
+    /// Page script started a navigation (`location.href = …`,
+    /// `form.submit()`) and the engine already loaded `url`.
+    Navigated { url: String },
     /// An `onclick` script handler was executed.
     ScriptExecuted,
     /// A focusable element received focus; contains its ID.
@@ -1165,6 +1232,8 @@ pub struct BrowserEngine {
     pub js_style_overrides: HashMap<String, HashMap<String, String>>,
     /// The most recently rendered page result.
     pub last_page: Option<PageResult>,
+    /// Session history of top-level documents.
+    pub history: SharedHistory,
 }
 
 impl BrowserEngine {
@@ -1179,6 +1248,7 @@ impl BrowserEngine {
             current_csp_policy: None,
             js_style_overrides: HashMap::new(),
             last_page: None,
+            history: SharedHistory::default(),
         }
     }
 
@@ -1186,9 +1256,81 @@ impl BrowserEngine {
         Self::new_with_console(js::new_console_buffer())
     }
 
-    /// Synchronously navigate to a URL.
-    /// Stores the resulting `PageResult` and calls `init_js_for_page`.
+    /// Synchronously navigate to a URL and add it to session history.
+    /// Follows navigations the page's scripts start while it loads.
     pub fn navigate(&mut self, url_str: &str, width: f32) -> Result<PageResult, String> {
+        let page = self.load_document(url_str, width)?;
+        self.record_history(&page, false);
+        Ok(self.run_script_navigation(width, true)?.unwrap_or(page))
+    }
+
+    /// Load the session history entry `delta` steps from the current one
+    /// (`-1` is back, `1` is forward). `Ok(None)` when there is no such entry.
+    pub fn traverse_history(
+        &mut self,
+        delta: isize,
+        width: f32,
+    ) -> Result<Option<PageResult>, String> {
+        let target = self.lock_history().entry_at(delta);
+        let Some((index, url)) = target else {
+            return Ok(None);
+        };
+        self.lock_history().index = index;
+        let page = self.load_document(&url, width)?;
+        self.record_history(&page, true);
+        Ok(Some(self.run_script_navigation(width, true)?.unwrap_or(page)))
+    }
+
+    /// Load the document page script asked for, if any, and the ones that
+    /// document's scripts ask for in turn (at most `MAX_SCRIPT_NAVIGATIONS`).
+    /// A navigation started while a document loads replaces its history
+    /// entry, as Chromium does for client redirects. `Ok(None)` when no
+    /// script asked to navigate.
+    pub fn run_script_navigation(
+        &mut self,
+        width: f32,
+        during_load: bool,
+    ) -> Result<Option<PageResult>, String> {
+        let mut replace = during_load;
+        let mut loaded = None;
+        for _ in 0..MAX_SCRIPT_NAVIGATIONS {
+            let Some(request) = self.js_runtime.take_navigation_request() else {
+                return Ok(loaded);
+            };
+            let page = self.load_document(&request.url, width)?;
+            self.record_history(&page, replace || request.replace);
+            replace = true;
+            loaded = Some(page);
+        }
+        if let Some(request) = self.js_runtime.take_navigation_request() {
+            eprintln!("[navigate] dropped script navigation to {} after {} redirects", request.url, MAX_SCRIPT_NAVIGATIONS);
+        }
+        Ok(loaded)
+    }
+
+    /// Width the current page was laid out at, for navigations that page
+    /// script starts.
+    fn current_width(&self) -> f32 {
+        self.last_page.as_ref().map_or(800.0, |page| page.width as f32)
+    }
+
+    fn lock_history(&self) -> std::sync::MutexGuard<'_, SessionHistory> {
+        self.history.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn record_history(&self, page: &PageResult, replace: bool) {
+        let url = page.base_url.to_string();
+        let mut history = self.lock_history();
+        if replace {
+            history.replace(url);
+        } else {
+            history.push(url);
+        }
+    }
+
+    /// Fetch `url_str`, run its scripts and render it. Session history is
+    /// left to the caller.
+    fn load_document(&mut self, url_str: &str, width: f32) -> Result<PageResult, String> {
         self.clear_for_new_url();
         let result = fetch_and_process(
             url_str,
@@ -1334,6 +1476,22 @@ impl BrowserEngine {
         if !overrides.is_empty() {
             for (id, props) in overrides {
                 self.js_style_overrides.entry(id).or_default().extend(props);
+            }
+        }
+
+        // A handler that set `location.href` or submitted a form replaces
+        // the link's own navigation.
+        match self.run_script_navigation(page.width as f32, false) {
+            Ok(Some(loaded)) => {
+                results.push(ClickResult::Navigated {
+                    url: loaded.base_url.to_string(),
+                });
+                return results;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("[navigate] script navigation failed: {}", error);
+                return results;
             }
         }
 
@@ -2002,6 +2160,12 @@ pub enum EngineCmd {
         width: f32,
         reply: mpsc::Sender<Result<PageResult, String>>,
     },
+    /// Load the session history entry `delta` steps from the current one.
+    Traverse {
+        delta: isize,
+        width: f32,
+        reply: mpsc::Sender<Result<Option<PageResult>, String>>,
+    },
     ReRender {
         hovered_id: Option<String>,
         focused_id: Option<String>,
@@ -2083,6 +2247,10 @@ fn run_engine_actor_with_engine(rx: mpsc::Receiver<EngineCmd>, eng: &mut Browser
                 let result = eng.navigate(&url, width);
                 let _ = reply.send(result);
             }
+            EngineCmd::Traverse { delta, width, reply } => {
+                let result = eng.traverse_history(delta, width);
+                let _ = reply.send(result);
+            }
             EngineCmd::ReRender {
                 hovered_id,
                 focused_id,
@@ -2101,10 +2269,12 @@ fn run_engine_actor_with_engine(rx: mpsc::Receiver<EngineCmd>, eng: &mut Browser
             }
             EngineCmd::EvaluateJs { script, reply } => {
                 let result = eng.evaluate_js(&script);
+                follow_script_navigation(eng);
                 let _ = reply.send(result);
             }
             EngineCmd::EvaluateConsole { script, reply } => {
                 let outcome = eng.evaluate_console_repl(&script);
+                follow_script_navigation(eng);
                 let _ = reply.send(outcome);
             }
             EngineCmd::Screenshot { reply } => {
@@ -2147,7 +2317,7 @@ fn run_engine_actor_with_engine(rx: mpsc::Receiver<EngineCmd>, eng: &mut Browser
                 deadline,
                 reply,
             } => {
-                let needs = eng.tick_js(Some(timestamp), deadline);
+                let needs = eng.tick_js(Some(timestamp), deadline) | follow_script_navigation(eng);
                 let overrides = eng.get_style_overrides();
                 for (id, props) in overrides {
                     eng.js_style_overrides.entry(id).or_default().extend(props);
@@ -2162,11 +2332,26 @@ fn run_engine_actor_with_engine(rx: mpsc::Receiver<EngineCmd>, eng: &mut Browser
     }
 }
 
+/// Load the document a script asked for while the actor ran a command that
+/// has no page to return. Returns whether a document was loaded.
+fn follow_script_navigation(eng: &mut BrowserEngine) -> bool {
+    let width = eng.current_width();
+    match eng.run_script_navigation(width, false) {
+        Ok(loaded) => loaded.is_some(),
+        Err(error) => {
+            eprintln!("[navigate] script navigation failed: {}", error);
+            true
+        }
+    }
+}
+
 /// Cloneable handle used by GUI and HTTP threads to send commands to the engine actor.
 #[derive(Clone)]
 pub struct EngineHandle {
     pub tx: mpsc::SyncSender<EngineCmd>,
     pub console_buffer: js::ConsoleBuffer,
+    /// The engine's session history, for back/forward button state.
+    pub history: SharedHistory,
 }
 
 const ENGINE_CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
@@ -2185,15 +2370,46 @@ impl EngineHandle {
         let (tx, rx) = mpsc::sync_channel::<EngineCmd>(64);
         let console_buffer = js::new_console_buffer();
         let actor_console = console_buffer.clone();
+        let history = SharedHistory::default();
+        let actor_history = history.clone();
         std::thread::Builder::new()
             .name("engine-actor".into())
             .stack_size(8 * 1024 * 1024)
             .spawn(move || {
                 let mut eng = BrowserEngine::new_with_console(actor_console);
+                eng.history = actor_history;
                 run_engine_actor_with_engine(rx, &mut eng);
             })
             .expect("failed to start engine actor thread");
-        Self { tx, console_buffer }
+        Self {
+            tx,
+            console_buffer,
+            history,
+        }
+    }
+
+    /// A copy of the engine's session history.
+    pub fn history(&self) -> SessionHistory {
+        self.history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Load the session history entry `delta` steps away (`-1` back, `1`
+    /// forward). `Ok(None)` when there is no such entry.
+    pub fn send_traverse(&self, delta: isize, width: f32) -> Result<Option<PageResult>, String> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .send(EngineCmd::Traverse {
+                delta,
+                width,
+                reply: reply_tx,
+            })
+            .map_err(|_| "engine disconnected".to_string())?;
+        reply_rx
+            .recv()
+            .map_err(|_| "engine disconnected".to_string())?
     }
 
     pub fn send_navigate(&self, url: String, width: f32) -> Result<PageResult, String> {
@@ -2446,6 +2662,65 @@ impl EngineHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_session_history_push_back_forward() {
+        let mut history = SessionHistory::default();
+        assert!(!history.can_go_back() && !history.can_go_forward());
+        assert_eq!(history.entry_at(-1), None);
+        history.push("https://a.com/".into());
+        history.push("https://b.com/".into());
+        assert!(history.can_go_back());
+        assert_eq!(history.entry_at(-1), Some((0, "https://a.com/".to_string())));
+        history.index = 0;
+        assert!(history.can_go_forward());
+        assert_eq!(history.entry_at(1), Some((1, "https://b.com/".to_string())));
+        assert_eq!(history.entry_at(2), None);
+    }
+
+    #[test]
+    fn test_session_history_push_drops_forward_entries_and_skips_reload() {
+        let mut history = SessionHistory::default();
+        history.push("https://a.com/".into());
+        history.push("https://b.com/".into());
+        history.index = 0;
+        history.push("https://c.com/".into());
+        assert_eq!(history.len(), 2);
+        assert_eq!(history.current(), Some("https://c.com/"));
+        assert!(!history.can_go_forward());
+        history.push("https://c.com/".into());
+        assert_eq!(history.len(), 2);
+    }
+
+    #[test]
+    fn test_session_history_replace_keeps_length() {
+        let mut history = SessionHistory::default();
+        history.replace("https://a.com/".into());
+        assert_eq!(history.current(), Some("https://a.com/"));
+        history.push("https://b.com/".into());
+        history.replace("https://c.com/".into());
+        assert_eq!(history.len(), 2);
+        assert_eq!(history.current(), Some("https://c.com/"));
+    }
+
+    #[test]
+    fn test_location_fragment_change_stays_in_document() {
+        let mut engine = engine_with_page_html("<html><body></body></html>");
+        let result = engine.evaluate_js(
+            "var fired = 0; window.addEventListener('hashchange', function() { fired++; });\
+             location.hash = 'top'; String(fired) + ' ' + location.hash + ' ' + history.length",
+        );
+        assert_eq!(result, "1 #top 2");
+        assert_eq!(engine.js_runtime.take_navigation_request(), None);
+        engine.evaluate_js("location.href = 'https://example.com/other'");
+        assert_eq!(
+            engine.js_runtime.take_navigation_request(),
+            Some(js::NavigationRequest {
+                url: "https://example.com/other".to_string(),
+                replace: false,
+            })
+        );
+    }
 
     #[test]
     fn test_browser_engine_new() {

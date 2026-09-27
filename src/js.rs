@@ -82,8 +82,19 @@ thread_local! {
     /// Prevents re-compilation of the same module in cyclic import graphs.
     static RESOLVED_MODULES: RefCell<HashMap<String, v8::Global<v8::Module>>> =
         RefCell::new(HashMap::new());
-    /// Pending form submission requests from JS — checked by engine.
-    static FORM_SUBMIT_REQUESTS: RefCell<Vec<u32>> = RefCell::new(Vec::new());
+    /// Document navigation requested by page script (`location.href = …`,
+    /// `location.assign/replace/reload`, `form.submit()`). The last request
+    /// wins; the engine takes it after running script.
+    static NAVIGATION_REQUEST: RefCell<Option<NavigationRequest>> = const { RefCell::new(None) };
+}
+
+/// A document navigation requested by page script.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NavigationRequest {
+    /// Absolute URL to load.
+    pub url: String,
+    /// Replace the current session history entry instead of adding one.
+    pub replace: bool,
 }
 
 unsafe extern "C" fn import_meta_callback(
@@ -755,6 +766,7 @@ impl JsRuntime {
         LAYOUT_METRICS.with(|metrics| *metrics.borrow_mut() = layout_metrics.unwrap_or_default());
         SCROLL_STATE.with(|state| *state.borrow_mut() = ScrollState::default());
         CONSOLE_BUFFER.with(|cell| *cell.borrow_mut() = Some(console_buffer));
+        NAVIGATION_REQUEST.with(|request| *request.borrow_mut() = None);
 
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| {
@@ -1696,8 +1708,9 @@ impl JsRuntime {
         FOCUSED_NODE.with(|f| *f.borrow_mut() = id);
     }
 
-    pub fn take_form_submit_requests(&mut self) -> Vec<u32> {
-        FORM_SUBMIT_REQUESTS.with(|r| r.borrow_mut().drain(..).collect())
+    /// Take the navigation page script requested since the last call.
+    pub fn take_navigation_request(&mut self) -> Option<NavigationRequest> {
+        NAVIGATION_REQUEST.with(|request| request.borrow_mut().take())
     }
 }
 
@@ -1876,7 +1889,7 @@ fn register_native_functions(
     register_fn(scope, global, "requestAnimationFrame", raf_cb);
     register_fn(scope, global, "requestIdleCallback", ric_cb);
     register_fn(scope, global, "cancelIdleCallback", cic_cb);
-    register_fn(scope, global, "__aura_submit_form", submit_form_cb);
+    register_fn(scope, global, "__aura_navigate", navigate_cb);
     register_fn(
         scope,
         global,
@@ -3019,15 +3032,27 @@ fn set_focus_cb(
         FOCUSED_NODE.with(|f| *f.borrow_mut() = Some(id));
     }
 }
-fn submit_form_cb(
+/// `__aura_navigate(url, replace)`: record a document navigation for the
+/// engine. Only http(s) and file URLs load a new document.
+fn navigate_cb(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
-    let nid = args.get(0).uint32_value(scope).unwrap_or(0);
-    if nid > 0 {
-        FORM_SUBMIT_REQUESTS.with(|r| r.borrow_mut().push(nid));
+    let url = args.get(0).to_rust_string_lossy(scope);
+    let replace = args.get(1).boolean_value(scope);
+    let Ok(parsed) = Url::parse(&url) else {
+        return;
+    };
+    if !matches!(parsed.scheme(), "http" | "https" | "file") {
+        return;
     }
+    NAVIGATION_REQUEST.with(|request| {
+        *request.borrow_mut() = Some(NavigationRequest {
+            url: parsed.to_string(),
+            replace,
+        })
+    });
 }
 fn queue_task_cb(
     scope: &mut v8::PinScope,
@@ -4499,7 +4524,7 @@ mod tests {
         );
         let outcome = rt.execute_with_result(
             "document.search.onsubmit = function(e) { e.preventDefault(); window.__documentSearchSubmit = true; }; \
-             document.search.submit(); \
+             document.search.requestSubmit(); \
              window.__documentSearchSubmit",
         );
         assert_eq!(outcome.error, None);
@@ -4514,7 +4539,7 @@ mod tests {
         );
         let outcome = rt.execute_with_result(
             "window.search.onsubmit = function(e) { e.preventDefault(); window.__windowSearchSubmit = true; }; \
-             window.search.submit(); \
+             window.search.requestSubmit(); \
              window.__windowSearchSubmit",
         );
         assert_eq!(outcome.error, None);
@@ -4567,11 +4592,59 @@ mod tests {
         rt.execute(
             "var form = document.getElementById('f'); \
              form.onsubmit = function(e) { e.preventDefault(); window.__formSubmitted = true; }; \
-             form.submit();",
+             form.requestSubmit();",
         );
         let outcome = rt.execute_with_result("window.__formSubmitted");
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.result.as_deref(), Some("true"));
+        // The handler cancelled the submission.
+        assert_eq!(rt.take_navigation_request(), None);
+    }
+
+    #[test]
+    fn test_form_submit_skips_submit_event_and_navigates() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><form id='f' action='/find'><input name='q' value='a b'>
+               <input type='checkbox' name='c'><input type='checkbox' name='d' checked>
+               <input name='off' disabled value='x'><button name='go' value='1'>Go</button></form></body></html>"#,
+            "https://example.com/start",
+        );
+        let outcome = rt.execute_with_result(
+            "var form = document.getElementById('f'); window.__fired = false; \
+             form.onsubmit = function() { window.__fired = true; }; \
+             form.submit(); window.__fired",
+        );
+        assert_eq!(outcome.result.as_deref(), Some("false"));
+        assert_eq!(
+            rt.take_navigation_request(),
+            Some(NavigationRequest {
+                url: "https://example.com/find?q=a+b&d=on".to_string(),
+                replace: false,
+            })
+        );
+    }
+
+    #[test]
+    fn test_location_assign_and_replace_request_navigation() {
+        let mut rt = make_dom_runtime("<html><body></body></html>", "https://example.com/a/b");
+        rt.execute("location.assign('c?x=1')");
+        assert_eq!(
+            rt.take_navigation_request(),
+            Some(NavigationRequest {
+                url: "https://example.com/a/c?x=1".to_string(),
+                replace: false,
+            })
+        );
+        rt.execute("location.replace('https://other.test/')");
+        assert_eq!(
+            rt.take_navigation_request().map(|r| (r.url, r.replace)),
+            Some(("https://other.test/".to_string(), true))
+        );
+        // The document's own URL does not change until the engine loads it.
+        let outcome = rt.execute_with_result("location.href");
+        assert_eq!(outcome.result.as_deref(), Some("https://example.com/a/b"));
+        rt.execute("location.href = 'javascript:void(0)'");
+        assert_eq!(rt.take_navigation_request(), None);
     }
 
     #[test]
