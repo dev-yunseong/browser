@@ -1031,6 +1031,9 @@ fn shift_fixed_boxes(root: &mut layout::LayoutBox, dx: f32, dy: f32) {
     }
 }
 
+/// Move `root` and every descendant box by `(dx, dy)`. Same job as
+/// `layout::offset_layout_box`, without `unsafe`; one of the two goes when
+/// that function is made safe.
 fn translate_subtree(root: &mut layout::LayoutBox, dx: f32, dy: f32) {
     let mut stack: Vec<&mut layout::LayoutBox> = vec![root];
     while let Some(node) = stack.pop() {
@@ -2105,6 +2108,8 @@ impl BrowserEngine {
         self.last_stylesheet = None;
         self.last_page = None;
         self.css_cache.clear();
+        // TODO: also clear the decoded-image caches in render.rs, svg.rs and
+        // background.rs once they expose clear functions.
     }
 
     /// Advance the JS event loop by one tick.

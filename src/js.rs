@@ -1656,12 +1656,6 @@ impl JsRuntime {
         }
     }
 
-    /// Scroll the document as `window.scrollTo(x, y)` would (clamped, and
-    /// queues a `scroll` event when the position changes).
-    pub fn scroll_to(&mut self, x: f32, y: f32) {
-        self.execute(&format!("window.scrollTo({}, {});", x, y));
-    }
-
     pub fn get_focused_node_id(&self) -> Option<String> {
         FOCUSED_NODE.with(|f| (*f.borrow()).clone())
     }
