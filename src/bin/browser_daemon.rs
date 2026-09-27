@@ -1241,12 +1241,12 @@ fn render_console_panel(
 
 fn main() {
     let args = parse_args();
-    if let Some(height) = args.viewport_height {
-        engine::set_viewport_height(height);
-    }
 
     // Spawn the engine actor thread and get a cloneable handle to it.
-    let handle = EngineHandle::spawn();
+    let handle = EngineHandle::spawn_with_viewport_height(
+        args.viewport_height
+            .unwrap_or(engine::DEFAULT_VIEWPORT_HEIGHT),
+    );
 
     // HTTP server thread — runs its own tokio runtime
     let handle_for_http = handle.clone();

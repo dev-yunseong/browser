@@ -669,6 +669,7 @@ pub fn fetch_and_process(
     hovered_id: Option<&str>,
     focused_id: Option<&str>,
     width: f32,
+    viewport_height: f32,
 ) -> Result<(PageResult, css::Stylesheet), Box<dyn std::error::Error + Send + Sync>> {
     let response = reqwest::blocking::get(url_str)?;
     let base_url = response.url().clone();
@@ -679,7 +680,7 @@ pub fn fetch_and_process(
         .map(|s| js::CspPolicy::parse(s));
 
     let body = response.text()?;
-    process_html_with_cache(
+    process_html_with_scroll(
         &body,
         &base_url,
         &HashMap::new(),
@@ -690,24 +691,19 @@ pub fn fetch_and_process(
         focused_id,
         csp_header,
         width,
+        viewport_height,
+        (0.0, 0.0),
     )
 }
 
+/// Viewport height in CSS px when none is configured (`browser-daemon
+/// --viewport-height` overrides it). Used for `vh` units, fixed-position
+/// boxes, `window.innerHeight` and viewport screen captures.
+pub const DEFAULT_VIEWPORT_HEIGHT: f32 = 768.0;
+
 /// Run the full pipeline on pre-fetched HTML, returning a `PageResult`.
-/// Viewport height in CSS px used for `vh` units, fixed-position boxes and
-/// `window.innerHeight`. Process-wide because one daemon drives one viewport;
-/// width is still passed per render.
-static VIEWPORT_HEIGHT_BITS: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(768.0f32.to_bits());
-
-pub fn set_viewport_height(height: f32) {
-    VIEWPORT_HEIGHT_BITS.store(height.max(1.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
-}
-
-pub fn viewport_height() -> f32 {
-    f32::from_bits(VIEWPORT_HEIGHT_BITS.load(std::sync::atomic::Ordering::Relaxed))
-}
-
+/// The viewport is `width` x `DEFAULT_VIEWPORT_HEIGHT`.
+#[allow(clippy::too_many_arguments)]
 pub fn process_html_with_cache(
     body: &str,
     base_url: &Url,
@@ -731,12 +727,14 @@ pub fn process_html_with_cache(
         focused_id,
         csp_policy,
         width,
+        DEFAULT_VIEWPORT_HEIGHT,
         (0.0, 0.0),
     )
 }
 
-/// `process_html_with_cache` for a document scrolled to `scroll` (x, y):
-/// `position: fixed` boxes are moved to the viewport at that offset.
+/// `process_html_with_cache` for a `width` x `viewport_height` viewport
+/// scrolled to `scroll` (x, y): `position: fixed` boxes are moved to the
+/// viewport at that offset.
 #[allow(clippy::too_many_arguments)]
 pub fn process_html_with_scroll(
     body: &str,
@@ -749,6 +747,7 @@ pub fn process_html_with_scroll(
     focused_id: Option<&str>,
     csp_policy: Option<js::CspPolicy>,
     width: f32,
+    viewport_height: f32,
     scroll: (f32, f32),
 ) -> Result<(PageResult, css::Stylesheet), Box<dyn std::error::Error + Send + Sync>> {
     let start_total = Instant::now();
@@ -823,7 +822,7 @@ pub fn process_html_with_scroll(
     let start = Instant::now();
     let image_sizes = layout::ImageSizes::from_cache(image_cache, Some(base_url));
     let (layout_tree_opt, _, final_y) = layout::build_layout_tree_with_images(
-        &style_tree, 0.0, 0.0, width, width, viewport_height(), None, image_sizes,
+        &style_tree, 0.0, 0.0, width, width, viewport_height, None, image_sizes,
     );
     let mut layout_tree = layout_tree_opt.ok_or("Failed to build layout tree")?;
     let layout_elapsed = start.elapsed();
@@ -1265,6 +1264,8 @@ pub struct BrowserEngine {
     pub last_page: Option<PageResult>,
     /// Session history of top-level documents.
     pub history: SharedHistory,
+    /// Viewport height in CSS px; the width is passed per render.
+    pub viewport_height: f32,
 }
 
 impl BrowserEngine {
@@ -1280,6 +1281,7 @@ impl BrowserEngine {
             js_style_overrides: HashMap::new(),
             last_page: None,
             history: SharedHistory::default(),
+            viewport_height: DEFAULT_VIEWPORT_HEIGHT,
         }
     }
 
@@ -1370,6 +1372,7 @@ impl BrowserEngine {
             None,
             None,
             width,
+            self.viewport_height,
         )
         .map_err(|e| e.to_string())?;
 
@@ -1450,6 +1453,7 @@ impl BrowserEngine {
             focused_id,
             self.current_csp_policy.clone(),
             width,
+            self.viewport_height,
             self.js_runtime.scroll_position(),
         )
         .map_err(|e| e.to_string())?;
@@ -1464,7 +1468,7 @@ impl BrowserEngine {
             page.scroll_width,
             page.scroll_height,
             page.width as f32,
-            viewport_height(),
+            self.viewport_height,
         );
         self.refresh_after_image_loads(page, width)
     }
@@ -1663,7 +1667,7 @@ impl BrowserEngine {
         self.js_runtime.scroll_position()
     }
 
-    /// Capture the viewport (`width` x `viewport_height()`) at the current
+    /// Capture the viewport (`width` x `viewport_height`) at the current
     /// document scroll offset, as Chromium's page screenshot does. Re-renders
     /// first when the page scrolled since the last render, so fixed boxes
     /// sit at the new offset.
@@ -1680,7 +1684,7 @@ impl BrowserEngine {
         }
         let page = self.last_page.as_ref()?;
         let (sx, sy) = (page.scroll_x.max(0.0).round(), page.scroll_y.max(0.0).round());
-        let vh = viewport_height().round().max(1.0) as u32;
+        let vh = self.viewport_height.round().max(1.0) as u32;
         // The full-page render already holds the viewport unless the page is
         // scrolled horizontally or the viewport reaches past its bottom.
         if sx > 0.0 || sy as u32 + vh > page.height {
@@ -1824,7 +1828,7 @@ impl BrowserEngine {
             )
         });
 
-        let viewport_h = viewport_height();
+        let viewport_h = self.viewport_height;
         self.js_runtime.execute(&format!(
             "window.innerHeight = window.outerHeight = screen.height = screen.availHeight = {viewport_h};"
         ));
@@ -2410,8 +2414,14 @@ fn recv_control<T>(reply_rx: mpsc::Receiver<T>) -> Result<T, EngineRequestError>
 }
 
 impl EngineHandle {
-    /// Create a new engine actor and return a handle to it.
+    /// Create a new engine actor with the default viewport height.
     pub fn spawn() -> Self {
+        Self::spawn_with_viewport_height(DEFAULT_VIEWPORT_HEIGHT)
+    }
+
+    /// Create a new engine actor whose viewport is `viewport_height` CSS px
+    /// tall, and return a handle to it.
+    pub fn spawn_with_viewport_height(viewport_height: f32) -> Self {
         let (tx, rx) = mpsc::sync_channel::<EngineCmd>(64);
         let console_buffer = js::new_console_buffer();
         let actor_console = console_buffer.clone();
@@ -2423,6 +2433,7 @@ impl EngineHandle {
             .spawn(move || {
                 let mut eng = BrowserEngine::new_with_console(actor_console);
                 eng.history = actor_history;
+                eng.viewport_height = viewport_height.max(1.0);
                 run_engine_actor_with_engine(rx, &mut eng);
             })
             .expect("failed to start engine actor thread");
@@ -3751,6 +3762,18 @@ mod tests {
     }
 
     #[test]
+    fn test_engine_viewport_height_drives_js_and_screen_capture() {
+        let mut engine = engine_with_rendered_page("<html><body><div style='height:100vh'></div></body></html>");
+        engine.viewport_height = 500.0;
+        let page = engine.last_page.clone().unwrap();
+        engine.init_js_for_page(&page);
+        engine.re_render(None, None, 800.0).unwrap();
+        assert_eq!(engine.evaluate_js("String(innerHeight)"), "500");
+        assert_eq!(engine.screenshot_viewport().unwrap().height(), 500);
+        assert_eq!(engine.last_page.as_ref().unwrap().scroll_height, 500.0);
+    }
+
+    #[test]
     fn test_wide_page_renders_viewport_width_only() {
         let mut engine = engine_with_rendered_page(
             r#"<html><body style="margin:0">
@@ -3763,7 +3786,7 @@ mod tests {
         assert_eq!(page.pixmap_bytes.len(), 800 * page.height as usize * 4);
         engine.evaluate_js("window.scrollTo(1450, 0)");
         let viewport = engine.screenshot_viewport().unwrap();
-        assert_eq!((viewport.width(), viewport.height()), (800, viewport_height().round() as u32));
+        assert_eq!((viewport.width(), viewport.height()), (800, DEFAULT_VIEWPORT_HEIGHT.round() as u32));
         assert_eq!(pixel(&viewport, 55, 15), (0, 0, 255));
         assert_eq!(pixel(&viewport, 45, 15), (255, 255, 255));
     }
@@ -3771,7 +3794,7 @@ mod tests {
     #[test]
     fn test_window_scroll_to_clamps_to_scrollable_range() {
         let mut engine = engine_with_rendered_page(WIDE_PAGE);
-        let max_y = 3050.0 - viewport_height();
+        let max_y = 3050.0 - DEFAULT_VIEWPORT_HEIGHT;
         engine.evaluate_js("window.scrollTo(5000, 99999)");
         assert_eq!(
             scroll_json(&mut engine),
@@ -3816,12 +3839,12 @@ mod tests {
         engine.evaluate_js("document.getElementById('low').scrollIntoView()");
         assert_eq!(scroll_json(&mut engine), "[0,2070,0,2070]");
         engine.evaluate_js("window.scrollTo(0, 0); document.getElementById('low').scrollIntoView(false)");
-        let end = 2110.0 - viewport_height();
+        let end = 2110.0 - DEFAULT_VIEWPORT_HEIGHT;
         assert_eq!(scroll_json(&mut engine), format!("[0,{end},0,{end}]"));
         engine.evaluate_js(
             "window.scrollTo(0, 0); document.getElementById('target').scrollIntoView({ block: 'center', inline: 'center' })",
         );
-        let center_y = 60.0 - viewport_height() / 2.0;
+        let center_y = 60.0 - DEFAULT_VIEWPORT_HEIGHT / 2.0;
         let (x, y) = engine.scroll_position();
         assert_eq!(x, 550.0);
         assert_eq!(y, center_y.max(0.0));
@@ -3910,7 +3933,7 @@ mod tests {
         let viewport = engine.screenshot_viewport().unwrap();
         assert_eq!(full.width(), 800);
         assert_eq!(viewport.width(), 800);
-        assert_eq!(viewport.height(), viewport_height().round() as u32);
+        assert_eq!(viewport.height(), DEFAULT_VIEWPORT_HEIGHT.round() as u32);
         assert_eq!(pixel(&viewport, 10, 10), (255, 0, 0));
         assert_eq!(pixel(&full, 10, 10), (255, 0, 0));
     }

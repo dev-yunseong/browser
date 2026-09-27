@@ -513,7 +513,7 @@ impl Default for ScrollState {
             document_width: 0.0,
             document_height: 0.0,
             viewport_width: 800.0,
-            viewport_height: 600.0,
+            viewport_height: crate::engine::DEFAULT_VIEWPORT_HEIGHT as f64,
         }
     }
 }
