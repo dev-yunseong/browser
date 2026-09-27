@@ -94,6 +94,27 @@ pub enum Value {
     /// (first layer on top). Stored under the `box-shadow-layers` key; the
     /// `box-shadow` key keeps only the first layer for older readers.
     BoxShadowList(Vec<BoxShadow>),
+    /// All custom properties (`--name`) in effect on an element, stored once under
+    /// the reserved key `--` and shared (via `Arc`) with descendants that do not
+    /// declare their own.
+    CustomProps(CustomProps),
+}
+
+/// Shared custom-property map. Equality and hashing use the `Arc` identity so
+/// that comparing or hashing style maps stays cheap with thousands of variables.
+#[derive(Debug, Clone)]
+pub struct CustomProps(pub Arc<HashMap<Arc<str>, Value>>);
+
+impl PartialEq for CustomProps {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Hash for CustomProps {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (Arc::as_ptr(&self.0) as usize).hash(state);
+    }
 }
 
 impl Eq for Value {}
@@ -119,6 +140,7 @@ impl Hash for Value {
             Value::RawCustomProp(s) => s.hash(state),
             Value::Gradient(g) => g.hash(state),
             Value::BoxShadowList(list) => list.hash(state),
+            Value::CustomProps(p) => p.hash(state),
         }
     }
 }

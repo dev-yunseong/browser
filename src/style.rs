@@ -714,6 +714,9 @@ fn is_inherited(prop: &str) -> bool {
     INHERITED_PROPERTIES.contains(&prop)
 }
 
+/// Reserved key under which an element's custom properties are stored.
+pub const CUSTOM_PROPS_KEY: &str = "--";
+
 /// Maximum recursion depth for `var()` resolution, to prevent infinite loops from
 /// cyclic custom property references (e.g. `--a: var(--b); --b: var(--a)`).
 const VAR_RESOLVE_MAX_DEPTH: u32 = 32;
@@ -893,49 +896,53 @@ fn compute_values(
     is_text: bool,
 ) -> HashMap<Arc<str>, Value> {
     // --- Step 1: custom properties (inherited) ---
-    let mut custom_props: HashMap<Arc<str>, Value> = HashMap::new();
-    if let Some(p) = parent_pm {
-        for (k, v) in p.iter() {
-            if k.starts_with("--") {
-                custom_props.insert(k.clone(), v.clone());
-            }
-        }
-    }
+    // All custom properties live in one shared map under the `--` key; an
+    // element that declares none reuses its parent's map.
+    let parent_custom: Option<Arc<HashMap<Arc<str>, Value>>> = parent_pm.and_then(|p| match p.get(CUSTOM_PROPS_KEY) {
+        Some(Value::CustomProps(cp)) => Some(cp.0.clone()),
+        _ => None,
+    });
     let own_custom: Vec<(Arc<str>, Value)> = specified_values
         .iter()
-        .filter(|(k, _)| k.starts_with("--"))
+        .filter(|(k, _)| k.starts_with("--") && k.as_ref() != CUSTOM_PROPS_KEY)
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    for (k, v) in &own_custom {
-        custom_props.insert(k.clone(), v.clone());
+    for (k, _) in &own_custom {
+        specified_values.remove(k);
     }
-    // Resolve var() references inside this element's own custom properties.
-    for (k, v) in &own_custom {
-        if let Value::RawCustomProp(raw) = v {
-            if raw.contains("var(") {
-                match substitute_vars(raw, &custom_props, 0) {
-                    Some(text) => {
-                        let resolved = Value::RawCustomProp(intern(&text));
-                        custom_props.insert(k.clone(), resolved.clone());
-                        specified_values.insert(k.clone(), resolved);
-                    }
-                    None => {
-                        specified_values.remove(k);
-                        match parent_pm.and_then(|p| p.get(k)) {
-                            Some(pv) => { custom_props.insert(k.clone(), pv.clone()); }
-                            None => { custom_props.remove(k); }
+    let custom_arc: Option<Arc<HashMap<Arc<str>, Value>>> = if own_custom.is_empty() {
+        parent_custom.clone()
+    } else {
+        let mut custom_props: HashMap<Arc<str>, Value> = parent_custom.as_deref().cloned().unwrap_or_default();
+        for (k, v) in &own_custom {
+            custom_props.insert(k.clone(), v.clone());
+        }
+        // Resolve var() references inside this element's own custom properties.
+        for (k, v) in &own_custom {
+            if let Value::RawCustomProp(raw) = v {
+                if raw.contains("var(") {
+                    match substitute_vars(raw, &custom_props, 0) {
+                        Some(text) => {
+                            custom_props.insert(k.clone(), Value::RawCustomProp(intern(&text)));
                         }
+                        None => match parent_custom.as_ref().and_then(|p| p.get(k)) {
+                            Some(pv) => {
+                                custom_props.insert(k.clone(), pv.clone());
+                            }
+                            None => {
+                                custom_props.remove(k);
+                            }
+                        },
                     }
                 }
             }
         }
-    }
-    if let Some(p) = parent_pm {
-        for (k, v) in p.iter() {
-            if k.starts_with("--") {
-                specified_values.entry(k.clone()).or_insert_with(|| v.clone());
-            }
-        }
+        Some(Arc::new(custom_props))
+    };
+    let empty_custom: HashMap<Arc<str>, Value> = HashMap::new();
+    let custom_props: &HashMap<Arc<str>, Value> = custom_arc.as_deref().unwrap_or(&empty_custom);
+    if let Some(ref arc) = custom_arc {
+        specified_values.insert(intern(CUSTOM_PROPS_KEY), Value::CustomProps(crate::css::CustomProps(arc.clone())));
     }
 
     // --- Step 2: substitute var() in ordinary declarations ---
@@ -948,7 +955,7 @@ fn compute_values(
         specified_values.remove(&k);
         match v {
             Value::RawCustomProp(raw) => {
-                if let Some(text) = substitute_vars(&raw, &custom_props, 0) {
+                if let Some(text) = substitute_vars(&raw, custom_props, 0) {
                     let mut decls = Vec::new();
                     crate::css::parse_declaration(&k, &text, false, &mut decls);
                     for d in decls {
@@ -959,7 +966,7 @@ fn compute_values(
                 }
             }
             v @ Value::CssVar { .. } => {
-                if let Some(r) = resolve_var(&v, &custom_props, 0) {
+                if let Some(r) = resolve_var(&v, custom_props, 0) {
                     specified_values.insert(k, r);
                 }
             }
