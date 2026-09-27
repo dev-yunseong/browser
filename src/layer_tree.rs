@@ -437,10 +437,7 @@ impl LayerTreeBuilder {
 
                     // Check if this box clips its overflow.
                     let overflow_hidden = Self::has_overflow_hidden(frame_layout);
-                    let border_radius = match frame_layout.style_node.specified_values.get(&crate::css::intern("border-radius")) {
-                        Some(Value::Length(v, _)) => *v,
-                        _ => 0.0,
-                    };
+                    let border_radius = border_radius_px(frame_layout);
 
                     let (triggers, matrix) = Self::detect_triggers(frame_layout);
 
@@ -637,10 +634,7 @@ impl LayerTreeBuilder {
         let mut children = own.as_ref().clone();
         children.push(ClipRegion {
             rect: crate::background::box_rect(layout, crate::background::BoxArea::Padding),
-            radius: match layout.style_node.specified_values.get(&crate::css::intern("border-radius")) {
-                Some(Value::Length(v, _)) => *v,
-                _ => 0.0,
-            },
+            radius: border_radius_px(layout),
             clips_absolute: positioned,
         });
         (own, Rc::new(children))
@@ -760,10 +754,7 @@ impl LayerTreeBuilder {
         let d = layout.dimensions;
         let sv = &layout.style_node.specified_values;
 
-        let radius = match sv.get(&crate::css::intern("border-radius")) {
-            Some(Value::Length(v, _)) => *v,
-            _ => 0.0,
-        };
+        let radius = border_radius_px(layout);
 
         let mut commands = Vec::new();
 
@@ -1049,6 +1040,20 @@ impl LayerTreeBuilder {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// Used `border-radius` in px. A percentage resolves against the smaller
+/// border-box side (exact for the common `50%` circle on square boxes; the
+/// painter has one circular radius per box, so ellipses become pills).
+fn border_radius_px(layout: &LayoutBox) -> f32 {
+    match layout.style_node.specified_values.get(&crate::css::intern("border-radius")) {
+        Some(Value::Length(v, crate::css::Unit::Percent)) => {
+            let d = layout.dimensions;
+            (*v / 100.0 * d.width.min(d.height)).max(0.0)
+        }
+        Some(Value::Length(v, _)) => v.max(0.0),
+        _ => 0.0,
+    }
+}
 
 /// Image-cache key under which the rendered document of an `<iframe>` with
 /// `src` and a `width` x `height` px content box is stored (as PNG bytes).
@@ -2015,5 +2020,15 @@ mod tests {
         let tree = build_tree_from_html(r#"<div style="width:1px;height:15px;transform:skew(-15deg)"></div>"#, "");
         let (x, _) = map_point(&transformed_layer(&tree).transform, 0.5, 0.0);
         assert!((x - (0.5 + 7.5 * 15f32.to_radians().tan())).abs() < 0.01, "top edge leans right: {x}");
+    }
+
+    #[test]
+    fn test_percent_border_radius_resolves_against_box_size() {
+        let tree = build_tree_from_html(r#"<div style="width:120px;height:120px;border-radius:50%;background:#000"></div>"#, "");
+        let radius = all_commands(&tree).iter().find_map(|c| match c {
+            PaintCommand::Rect(_, _, r) => Some(*r),
+            _ => None,
+        }).expect("background rect");
+        assert!((radius - 60.0).abs() < 0.01, "got {radius}");
     }
 }
