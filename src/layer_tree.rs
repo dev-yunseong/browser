@@ -2,6 +2,7 @@ use crate::layout::{LayoutBox, DisplayType, PositionType, Rect as LayoutRect};
 use crate::css::{Value, Color, BoxShadow, TransformOp, GradientValue, CssColorStop, LinearDirection};
 use crate::matrix::{Matrix3x3, Matrix4x4};
 use markup5ever_rcdom::NodeData;
+use std::rc::Rc;
 
 // ── Object-Fit ────────────────────────────────────────────────────────────────
 
@@ -179,6 +180,21 @@ pub struct Layer {
     /// Retained for use by the future compositor (issue #33); not used during
     /// the flat z-index sorted rendering pass implemented in this issue.
     pub child_layer_ids: Vec<usize>,
+    /// Clip regions from ancestors (`overflow` other than visible, CSS `clip`)
+    /// that apply to this layer. Each layer paints with a fresh clip stack, so
+    /// these must be re-applied before its commands run.
+    pub ancestor_clips: Vec<ClipRegion>,
+}
+
+/// A clip region inherited from an ancestor box, in page coordinates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClipRegion {
+    pub rect: LayoutRect,
+    pub radius: f32,
+    /// Whether `position: absolute` descendants are clipped too. True once the
+    /// clipping box or a box between it and the descendant is positioned, i.e.
+    /// the absolute box's containing block lies inside the clipping box.
+    clips_absolute: bool,
 }
 
 impl Layer {
@@ -223,6 +239,7 @@ impl Layer {
             background_commands: Vec::new(),
             content_commands: Vec::new(),
             child_layer_ids: Vec::new(),
+            ancestor_clips: Vec::new(),
         }
     }
 }
@@ -320,6 +337,7 @@ impl LayerTreeBuilder {
                 layout: &'f LayoutBox<'f>,
                 layer_id: usize,
                 clip: LayoutRect,
+                clips: Rc<Vec<ClipRegion>>,
             },
             /// Emit a PopClip command into the given layer after children are done.
             PopClip {
@@ -328,7 +346,12 @@ impl LayerTreeBuilder {
             },
         }
 
-        let mut stack: Vec<Frame> = vec![Frame::Process { layout, layer_id: current_layer_id, clip }];
+        let mut stack: Vec<Frame> = vec![Frame::Process {
+            layout,
+            layer_id: current_layer_id,
+            clip,
+            clips: Rc::new(Vec::new()),
+        }];
 
         while let Some(frame) = stack.pop() {
             match frame {
@@ -350,8 +373,9 @@ impl LayerTreeBuilder {
                     }
                 }
 
-                Frame::Process { layout: frame_layout, layer_id: frame_layer_id, clip: frame_clip } => {
+                Frame::Process { layout: frame_layout, layer_id: frame_layer_id, clip: frame_clip, clips: frame_clips } => {
                     let d = frame_layout.dimensions;
+                    let (clips, child_clips) = Self::clip_regions_for(frame_layout, frame_clips);
 
                     // Per CSS spec, the default `overflow: visible` means content (in particular
                     // text) must NOT be clipped to its ancestors' content boxes. Only boxes with
@@ -365,9 +389,19 @@ impl LayerTreeBuilder {
 
                     // Skip zero-sized boxes but still visit children.
                     if d.width < 0.1 || d.height < 0.1 {
+                        // An empty clipping box still hides its in-flow children.
+                        if Self::has_overflow_hidden(frame_layout) && !frame_layout.children.is_empty() {
+                            let push_cmd = PaintCommand::PushClip { rect: d, radius: 0.0 };
+                            tree.layers[frame_layer_id].content_commands.push(push_cmd.clone());
+                            for tile in &mut tree.layers[frame_layer_id].tiles {
+                                tile.content_commands.push(push_cmd.clone());
+                                tile.dirty = true;
+                            }
+                            stack.push(Frame::PopClip { layer_id: frame_layer_id, is_background: false });
+                        }
                         // Push children in reverse order so the first child is processed first.
                         for child in frame_layout.children.iter().rev() {
-                            stack.push(Frame::Process { layout: child, layer_id: frame_layer_id, clip: next_clip });
+                            stack.push(Frame::Process { layout: child, layer_id: frame_layer_id, clip: next_clip, clips: child_clips.clone() });
                         }
                         continue;
                     }
@@ -385,7 +419,8 @@ impl LayerTreeBuilder {
                         // This box establishes a new compositing layer.
                         let new_id = tree.layers.len();
                         let opacity = frame_layout.get_opacity();
-                        let new_layer = Layer::new(new_id, frame_layout.z_index, opacity, d, triggers, matrix);
+                        let mut new_layer = Layer::new(new_id, frame_layout.z_index, opacity, d, triggers, matrix);
+                        new_layer.ancestor_clips = clips.as_ref().clone();
                         tree.add_layer(new_layer);
 
                         // Record parent → child relationship: access parent index first,
@@ -396,21 +431,22 @@ impl LayerTreeBuilder {
                         Self::collect_paint_commands(frame_layout, &mut tree.layers[new_id], frame_clip, true);
 
                         // If overflow:hidden, emit PushClip before children and schedule PopClip after.
+                        // Non-layer children paint into content_commands, so the clip goes there.
                         if overflow_hidden && !frame_layout.children.is_empty() {
-                            let clip_rect = frame_layout.dimensions;
+                            let clip_rect = crate::background::box_rect(frame_layout, crate::background::BoxArea::Padding);
                             let push_cmd = PaintCommand::PushClip { rect: clip_rect, radius: border_radius };
-                            tree.layers[new_id].background_commands.push(push_cmd.clone());
+                            tree.layers[new_id].content_commands.push(push_cmd.clone());
                             for tile in &mut tree.layers[new_id].tiles {
-                                tile.background_commands.push(push_cmd.clone());
+                                tile.content_commands.push(push_cmd.clone());
                                 tile.dirty = true;
                             }
                             // Schedule PopClip to be emitted after all children finish.
-                            stack.push(Frame::PopClip { layer_id: new_id, is_background: true });
+                            stack.push(Frame::PopClip { layer_id: new_id, is_background: false });
                         }
 
                         // All children belong to the new layer's stacking context.
                         for child in frame_layout.children.iter().rev() {
-                            stack.push(Frame::Process { layout: child, layer_id: new_id, clip: next_clip });
+                            stack.push(Frame::Process { layout: child, layer_id: new_id, clip: next_clip, clips: child_clips.clone() });
                         }
                     } else {
                         // No trigger — paint into the current ancestor layer as CONTENT.
@@ -418,7 +454,7 @@ impl LayerTreeBuilder {
 
                         // If overflow:hidden, emit PushClip before children and schedule PopClip after.
                         if overflow_hidden && !frame_layout.children.is_empty() {
-                            let clip_rect = frame_layout.dimensions;
+                            let clip_rect = crate::background::box_rect(frame_layout, crate::background::BoxArea::Padding);
                             let push_cmd = PaintCommand::PushClip { rect: clip_rect, radius: border_radius };
                             tree.layers[frame_layer_id].content_commands.push(push_cmd.clone());
                             for tile in &mut tree.layers[frame_layer_id].tiles {
@@ -430,7 +466,7 @@ impl LayerTreeBuilder {
                         }
 
                         for child in frame_layout.children.iter().rev() {
-                            stack.push(Frame::Process { layout: child, layer_id: frame_layer_id, clip: next_clip });
+                            stack.push(Frame::Process { layout: child, layer_id: frame_layer_id, clip: next_clip, clips: child_clips.clone() });
                         }
                     }
                 }
@@ -440,10 +476,93 @@ impl LayerTreeBuilder {
 
     /// Returns `true` if this box has `overflow: hidden` set.
     fn has_overflow_hidden(layout: &LayoutBox) -> bool {
-        match layout.style_node.specified_values.get(&crate::css::intern("overflow")) {
-            Some(Value::Keyword(k)) => **k == *"hidden",
-            _ => false,
+        // We do not scroll, so auto/scroll clip like hidden. A single clipped
+        // axis still clips the box (Chromium turns the other axis into auto).
+        ["overflow", "overflow-x", "overflow-y"].iter().any(|prop| {
+            match layout.style_node.specified_values.get(&crate::css::intern(prop)) {
+                Some(Value::Keyword(k)) => matches!(k.as_ref(), "hidden" | "clip" | "auto" | "scroll"),
+                _ => false,
+            }
+        })
+    }
+
+    /// Clip regions that apply to `layout` itself and to its children.
+    ///
+    /// Absolute boxes escape clips whose box does not contain their containing
+    /// block; fixed boxes escape all of them. The CSS `clip` property (absolute
+    /// and fixed boxes only) clips the box itself and its descendants; an
+    /// `overflow` clip applies to descendants only.
+    fn clip_regions_for(
+        layout: &LayoutBox,
+        inherited: Rc<Vec<ClipRegion>>,
+    ) -> (Rc<Vec<ClipRegion>>, Rc<Vec<ClipRegion>>) {
+        let positioned = !matches!(layout.position, PositionType::Static);
+        let mut own: Vec<ClipRegion> = match layout.position {
+            PositionType::Fixed => Vec::new(),
+            PositionType::Absolute => inherited.iter().copied().filter(|c| c.clips_absolute).collect(),
+            _ => inherited.as_ref().clone(),
+        };
+        if positioned {
+            // This box becomes the containing block of absolute descendants.
+            for c in &mut own {
+                c.clips_absolute = true;
+            }
         }
+        if matches!(layout.position, PositionType::Absolute | PositionType::Fixed) {
+            if let Some(rect) = Self::css_clip_rect(layout) {
+                own.push(ClipRegion { rect, radius: 0.0, clips_absolute: true });
+            }
+        }
+        let own = if own == *inherited { inherited } else { Rc::new(own) };
+
+        if !Self::has_overflow_hidden(layout) {
+            return (own.clone(), own);
+        }
+        let mut children = own.as_ref().clone();
+        children.push(ClipRegion {
+            rect: crate::background::box_rect(layout, crate::background::BoxArea::Padding),
+            radius: match layout.style_node.specified_values.get(&crate::css::intern("border-radius")) {
+                Some(Value::Length(v, _)) => *v,
+                _ => 0.0,
+            },
+            clips_absolute: positioned,
+        });
+        (own, Rc::new(children))
+    }
+
+    /// Resolve CSS `clip: rect(top right bottom left)` against the border box.
+    /// `auto` edges keep the border edge.
+    fn css_clip_rect(layout: &LayoutBox) -> Option<LayoutRect> {
+        let raw = match layout.style_node.specified_values.get(&crate::css::intern("clip"))? {
+            Value::Keyword(k) => k.to_string(),
+            _ => return None,
+        };
+        let raw = raw.trim().to_ascii_lowercase();
+        let inner = raw.strip_prefix("rect(")?.strip_suffix(')')?;
+        let parts: Vec<&str> = inner
+            .split(|ch: char| ch == ',' || ch.is_whitespace())
+            .filter(|p| !p.is_empty())
+            .collect();
+        if parts.len() != 4 {
+            return None;
+        }
+        let d = layout.dimensions;
+        let edge = |part: &str, auto: f32| -> Option<f32> {
+            if part == "auto" {
+                return Some(auto);
+            }
+            part.trim_end_matches("px").parse::<f32>().ok()
+        };
+        let top = edge(parts[0], 0.0)?;
+        let right = edge(parts[1], d.width)?;
+        let bottom = edge(parts[2], d.height)?;
+        let left = edge(parts[3], 0.0)?;
+        Some(LayoutRect {
+            x: d.x + left,
+            y: d.y + top,
+            width: (right - left).max(0.0),
+            height: (bottom - top).max(0.0),
+        })
     }
 
     /// Inspect a `LayoutBox`'s CSS properties and return the list of
@@ -1480,5 +1599,46 @@ mod tests {
             .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
             .any(|cmd| matches!(cmd, PaintCommand::Border(..)));
         assert!(!has_border, "border-style:none must suppress the Border paint command");
+    }
+
+    fn layer_clips_for_text(tree: &LayerTree, marker: &str) -> Vec<ClipRegion> {
+        tree.layers
+            .iter()
+            .find(|l| {
+                l.content_commands.iter().chain(l.background_commands.iter()).any(|c| {
+                    matches!(c, PaintCommand::Text { text, .. } if text.contains(marker))
+                })
+            })
+            .map(|l| l.ancestor_clips.clone())
+            .expect("layer painting the marker text")
+    }
+
+    /// An absolute child whose containing block is inside an overflow:hidden
+    /// box inherits that clip; one whose containing block is outside does not.
+    #[test]
+    fn test_absolute_child_inherits_clip_only_through_its_containing_block() {
+        let tree = build_tree_from_html(
+            r#"<div style="position:relative;width:100px;height:30px;overflow:hidden"><div style="position:absolute;width:300px;height:80px">inside</div></div>
+               <div style="width:100px;height:30px;overflow:hidden"><div style="position:absolute;width:300px;height:80px">escapes</div></div>
+               <div style="position:relative;width:100px;height:30px;overflow:hidden"><div style="position:fixed;width:300px;height:80px">fixed</div></div>"#,
+            "",
+        );
+        let inside = layer_clips_for_text(&tree, "inside");
+        assert_eq!(inside.len(), 1, "absolute child of a positioned clipping box is clipped");
+        assert!((inside[0].rect.width - 100.0).abs() < 0.5 && (inside[0].rect.height - 30.0).abs() < 0.5);
+        assert!(layer_clips_for_text(&tree, "escapes").is_empty(), "containing block outside the clip");
+        assert!(layer_clips_for_text(&tree, "fixed").is_empty(), "fixed boxes escape overflow clips");
+    }
+
+    /// `clip: rect(0 0 0 0)` (the `.blind` pattern) yields an empty clip region
+    /// for the box itself.
+    #[test]
+    fn test_css_clip_rect_on_absolute_box_clips_itself() {
+        let tree = build_tree_from_html(
+            r#"<div style="position:relative"><span style="position:absolute;clip:rect(0 0 0 0);width:1px;height:1px;overflow:hidden">blind label</span></div>"#,
+            "",
+        );
+        let clips = layer_clips_for_text(&tree, "blind");
+        assert!(clips.iter().any(|c| c.rect.width == 0.0 && c.rect.height == 0.0), "{clips:?}");
     }
 }

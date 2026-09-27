@@ -148,13 +148,13 @@ fn composite_layer_to_surface(
     let (negative, zero, positive) = tree.categorize_children(layer_id);
 
     if let Some(ref mut pixmap) = effect_pixmap {
-        execute_commands_on_tile(&layer.background_commands, pixmap, layer.bounds, image_cache, base_url);
+        execute_commands_with_clips(&layer.background_commands, pixmap, layer.bounds, image_cache, base_url, &layer.ancestor_clips);
 
         for &child_id in &negative {
             composite_layer_to_surface(child_id, tree, pixmap, layer.bounds, image_cache, base_url);
         }
 
-        execute_commands_on_tile(&layer.content_commands, pixmap, layer.bounds, image_cache, base_url);
+        execute_commands_with_clips(&layer.content_commands, pixmap, layer.bounds, image_cache, base_url, &layer.ancestor_clips);
 
         for &child_id in &zero {
             composite_layer_to_surface(child_id, tree, pixmap, layer.bounds, image_cache, base_url);
@@ -163,13 +163,13 @@ fn composite_layer_to_surface(
             composite_layer_to_surface(child_id, tree, pixmap, layer.bounds, image_cache, base_url);
         }
     } else {
-        execute_commands_on_tile(&layer.background_commands, target, surface_rect, image_cache, base_url);
+        execute_commands_with_clips(&layer.background_commands, target, surface_rect, image_cache, base_url, &layer.ancestor_clips);
 
         for &child_id in &negative {
             composite_layer_to_surface(child_id, tree, target, surface_rect, image_cache, base_url);
         }
 
-        execute_commands_on_tile(&layer.content_commands, target, surface_rect, image_cache, base_url);
+        execute_commands_with_clips(&layer.content_commands, target, surface_rect, image_cache, base_url, &layer.ancestor_clips);
 
         for &child_id in &zero {
             composite_layer_to_surface(child_id, tree, target, surface_rect, image_cache, base_url);
@@ -207,6 +207,10 @@ fn build_clip_mask(
 ) -> Option<Mask> {
     if pw == 0 || ph == 0 { return None; }
     let mut m = Mask::new(pw, ph)?;
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        // An empty clip hides everything; a `None` mask would mean "unclipped".
+        return Some(m);
+    }
 
     let local_rect = LayoutRect { x: rect.x + tx, y: rect.y + ty, width: rect.width, height: rect.height };
     let path = if radius > 0.0 {
@@ -235,6 +239,22 @@ fn execute_commands_on_tile(
     image_cache: &HashMap<String, Vec<u8>>,
     base_url: &Url,
 ) {
+    execute_commands_with_clips(commands, pixmap, tile_rect, image_cache, base_url, &[]);
+}
+
+/// Like `execute_commands_on_tile`, but starts from the clip regions a layer
+/// inherits from its ancestors.
+fn execute_commands_with_clips(
+    commands: &[PaintCommand],
+    pixmap: &mut Pixmap,
+    tile_rect: LayoutRect,
+    image_cache: &HashMap<String, Vec<u8>>,
+    base_url: &Url,
+    ancestor_clips: &[crate::layer_tree::ClipRegion],
+) {
+    if commands.is_empty() {
+        return;
+    }
     let tx = -tile_rect.x;
     let ty = -tile_rect.y;
     let transform = Transform::from_translate(tx, ty);
@@ -242,6 +262,14 @@ fn execute_commands_on_tile(
     // Clip mask stack: each entry is the accumulated mask for that clip level.
     // `None` means the clip region did not intersect this tile or allocation failed.
     let mut clip_stack: Vec<Option<Mask>> = Vec::new();
+    for region in ancestor_clips {
+        if region.rect.width <= 0.0 || region.rect.height <= 0.0 {
+            return; // Fully clipped away.
+        }
+        let parent = clip_stack.last().and_then(|m| m.as_ref());
+        let mask = build_clip_mask(region.rect, region.radius, tx, ty, pixmap.width(), pixmap.height(), parent);
+        clip_stack.push(mask);
+    }
 
     // Returns the top active mask (or `None` if the stack is empty / top is None).
     macro_rules! active_mask {
@@ -387,9 +415,10 @@ fn execute_commands_on_tile(
                             match object_fit {
                                 ObjectFit::Fill => {
                                     // Stretch to fill — existing behavior
-                                    pixmap.draw_pixmap(r.x as i32, r.y as i32, img_pixmap.as_ref(),
+                                    // Translate before scaling: draw_pixmap's x/y would be scaled too.
+                                    pixmap.draw_pixmap(0, 0, img_pixmap.as_ref(),
                                         &PixmapPaint::default(),
-                                        transform.post_scale(r.width / img_w, r.height / img_h), active_mask!());
+                                        transform.pre_translate(r.x, r.y).pre_scale(r.width / img_w, r.height / img_h), active_mask!());
                                 }
                                 ObjectFit::Contain => {
                                     // Scale uniformly to fit inside rect; letterbox with transparency
@@ -398,9 +427,9 @@ fn execute_commands_on_tile(
                                     let sh = img_h * s;
                                     let ox = r.x + (r.width - sw) / 2.0;
                                     let oy = r.y + (r.height - sh) / 2.0;
-                                    pixmap.draw_pixmap(ox as i32, oy as i32, img_pixmap.as_ref(),
+                                    pixmap.draw_pixmap(0, 0, img_pixmap.as_ref(),
                                         &PixmapPaint::default(),
-                                        transform.post_scale(s, s), active_mask!());
+                                        transform.pre_translate(ox, oy).pre_scale(s, s), active_mask!());
                                 }
                                 ObjectFit::Cover => {
                                     // Scale uniformly to fill rect; draw into a temp pixmap to clip overflow
@@ -412,9 +441,9 @@ fn execute_commands_on_tile(
                                     if let Some(mut tmp) = Pixmap::new(rw.max(1), rh.max(1)) {
                                         let local_ox = (r.width - sw) / 2.0;
                                         let local_oy = (r.height - sh) / 2.0;
-                                        tmp.draw_pixmap(local_ox as i32, local_oy as i32,
+                                        tmp.draw_pixmap(0, 0,
                                             img_pixmap.as_ref(), &PixmapPaint::default(),
-                                            Transform::from_scale(s, s), None);
+                                            Transform::from_translate(local_ox, local_oy).pre_scale(s, s), None);
                                         pixmap.draw_pixmap(r.x as i32, r.y as i32, tmp.as_ref(),
                                             &PixmapPaint::default(), transform, active_mask!());
                                     }
@@ -1870,6 +1899,35 @@ mod tests {
             pixmap.data().chunks_exact(4).any(|px| px[0] != 0 || px[1] != 0 || px[2] != 0 || px[3] != 0),
             "relative image paint command should render using absolute cached bytes"
         );
+    }
+
+    /// A scaled image must land at its layout rect, not at (x * scale, y * scale).
+    #[test]
+    fn test_scaled_image_is_drawn_at_its_rect() {
+        use crate::layer_tree::{ObjectFit, PaintCommand};
+        use url::Url;
+
+        let red = encode_png(&image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255])));
+        for fit in [ObjectFit::Fill, ObjectFit::Contain, ObjectFit::Cover] {
+            let mut pixmap = Pixmap::new(40, 40).unwrap();
+            pixmap.fill(tiny_skia::Color::WHITE);
+            let tile_rect = LayoutRect { x: 0.0, y: 0.0, width: 40.0, height: 40.0 };
+            let cmds = vec![PaintCommand::Image {
+                rect: LayoutRect { x: 20.0, y: 20.0, width: 10.0, height: 10.0 },
+                url: "https://example.com/red.png".to_string(),
+                object_fit: fit.clone(),
+                alt: String::new(),
+            }];
+            let mut image_cache = HashMap::new();
+            image_cache.insert("https://example.com/red.png".to_string(), red.clone());
+            let base_url = Url::parse("https://example.com/").unwrap();
+
+            execute_commands_on_tile(&cmds, &mut pixmap, tile_rect, &image_cache, &base_url);
+
+            let at = |x: u32, y: u32| pixmap.pixel(x, y).unwrap();
+            assert_eq!((at(25, 25).red(), at(25, 25).green()), (255, 0), "{fit:?}: rect centre must be red");
+            assert_eq!(at(5, 5).green(), 255, "{fit:?}: nothing may be drawn at the scaled origin");
+        }
     }
 
     fn encode_png(img: &image::RgbaImage) -> Vec<u8> {

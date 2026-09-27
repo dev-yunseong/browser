@@ -19,7 +19,7 @@ timeout 90s npx --yes playwright screenshot \
 Start the daemon in one terminal:
 
 ```bash
-timeout 180s ./target/debug/browser-daemon --no-gui --port 7071
+timeout 180s ./target/debug/browser-daemon --no-gui --port 7071 --viewport-height 1200
 ```
 
 Then run:
