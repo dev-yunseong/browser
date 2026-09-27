@@ -549,6 +549,19 @@ pub fn build_style_tree(
     focused_id: Option<&str>,
     _csp_policy: Option<&crate::js::CspPolicy>,
 ) -> StyledNode {
+    // Quirks-mode detection: a document with no doctype (the common real-world
+    // trigger — e.g. Hacker News ships no `<!DOCTYPE>`) renders in quirks
+    // mode. `root` is the document node here, so a `Doctype` child means
+    // standards/almost-standards mode. This does not attempt to replicate the
+    // full legacy-doctype quirks list (html5ever already computes that
+    // authoritatively on `RcDom::quirks_mode`, see `dom.rs`/`RcDom`), but the
+    // no-doctype case is what matters for the quirks-only style resets below.
+    let quirks_mode = !root
+        .children
+        .borrow()
+        .iter()
+        .any(|c| matches!(c.data, NodeData::Doctype { .. }));
+
     let mut arena = Vec::new();
     flatten_dom(root, &mut arena, None);
 
@@ -593,7 +606,7 @@ pub fn build_style_tree(
         arena.par_iter().enumerate().map(|(idx, node)| {
         if !node.is_element { return (HashMap::new(), None, None, None); }
         let mut map = HashMap::new();
-        apply_default_styles(&node.tag, node, &mut map);
+        apply_default_styles(&node.tag, node, &mut map, quirks_mode);
         apply_attribute_styles_arena(node, &mut map);
 
         let rule_matches = collect_matches(node, idx, &sel_index, &sig_cache, &all_rules, &ctx, PseudoTarget::None);
@@ -843,9 +856,18 @@ pub const CUSTOM_PROPS_KEY: &str = "--";
 /// cyclic custom property references (e.g. `--a: var(--b); --b: var(--a)`).
 const VAR_RESOLVE_MAX_DEPTH: u32 = 32;
 
+/// Maximum total length (in bytes) a single `var()`-substituted value may grow
+/// to. Without this, a chain like `--a: var(--b) var(--b); --b: var(--c)
+/// var(--c); ...` doubles in size at every level and can exhaust memory well
+/// before `VAR_RESOLVE_MAX_DEPTH` is reached. Exceeding it makes the
+/// declaration invalid at computed-value time, matching how an unresolvable
+/// `var()` is already handled.
+const VAR_SUBSTITUTE_MAX_LEN: usize = 64 * 1024;
+
 /// Substitute every `var(--name[, fallback])` in `text` using `custom`.
 /// Returns `None` when a referenced property is missing and has no fallback
-/// (the declaration is then invalid at computed-value time).
+/// (the declaration is then invalid at computed-value time), or when the
+/// substituted result would exceed `VAR_SUBSTITUTE_MAX_LEN`.
 fn substitute_vars(text: &str, custom: &HashMap<Arc<str>, Value>, depth: u32) -> Option<String> {
     if depth > VAR_RESOLVE_MAX_DEPTH {
         return None;
@@ -886,17 +908,21 @@ fn substitute_vars(text: &str, custom: &HashMap<Arc<str>, Value>, depth: u32) ->
             }
             [] => (String::new(), None),
         };
+        // A custom property that is *registered* (present in `custom`, even with an
+        // empty value from `--x: ;`) always substitutes its own value; the fallback
+        // is only used when the property is not registered at all.
         let replacement = match custom.get(name.as_str()) {
-            Some(Value::RawCustomProp(raw)) if !raw.trim().is_empty() || fallback.is_none() => {
-                substitute_vars(raw, custom, depth + 1)
-            }
-            Some(other) if !matches!(other, Value::RawCustomProp(_)) => Some(value_to_css_text(other)),
-            _ => match fallback {
+            Some(Value::RawCustomProp(raw)) => substitute_vars(raw, custom, depth + 1),
+            Some(other) => Some(value_to_css_text(other)),
+            None => match fallback {
                 Some(fb) => substitute_vars(fb.trim(), custom, depth + 1),
                 None => None,
             },
         }?;
         out.push_str(&replacement);
+        if out.len() > VAR_SUBSTITUTE_MAX_LEN {
+            return None;
+        }
         rest = if j < rest.len() { &rest[j + 1..] } else { "" };
     }
     out.push_str(rest);
@@ -1381,7 +1407,7 @@ fn build_final_tree(
     results.pop().expect("build_final_tree: results stack should have exactly one element")
 }
 
-fn apply_default_styles(tag: &str, node: &NodeDataSend, map: &mut HashMap<Arc<str>, Value>) {
+fn apply_default_styles(tag: &str, node: &NodeDataSend, map: &mut HashMap<Arc<str>, Value>, quirks_mode: bool) {
     use crate::css::Unit::Px;
     let px = |v: f32| Value::Length(v, Px);
     let kw = |s: &str| Value::Keyword(intern(s));
@@ -1516,6 +1542,21 @@ fn apply_default_styles(tag: &str, node: &NodeDataSend, map: &mut HashMap<Arc<st
         }
         "table" => {
             set(map, "border-spacing", px(2.0));
+            // In quirks mode, Chromium's quirks UA sheet resets `table` so it
+            // does not inherit alignment/text properties from an ancestor
+            // like `<center>` (real-world case: Hacker News wraps its story
+            // table in `<center>` with no doctype). `color` is left alone —
+            // the spec's `-internal-quirk-inherit` for it means "still
+            // inherit normally", which is what happens if we don't set it.
+            if quirks_mode {
+                set(map, "text-align", kw("start"));
+                set(map, "white-space", kw("normal"));
+                set(map, "line-height", kw("normal"));
+                set(map, "font-weight", kw("normal"));
+                set(map, "font-size", kw("medium"));
+                set(map, "font-variant", kw("normal"));
+                set(map, "font-style", kw("normal"));
+            }
         }
         "hr" => {
             set_border(map, 1.0, "inset", crate::css::Color { r: 238, g: 238, b: 238, a: 255 });
@@ -1887,6 +1928,91 @@ mod tests {
         let p = find_node(&tree, "p").expect("p not found");
         let c = get_color(p, "color").expect("color not found");
         assert_eq!(c, Color { r: 0, g: 0, b: 255, a: 255 });
+    }
+
+    #[test]
+    fn test_var_empty_custom_property_does_not_use_fallback() {
+        // `--accent: ;` is a valid, explicitly-empty custom property. Per spec,
+        // `var(--accent, 999px)` must substitute the empty value, not the
+        // fallback `999px` — so `width` must NOT end up as 999px (it becomes
+        // an invalid, non-Length value instead, since `width: ` is empty).
+        let tree = make_tree(
+            r#"<html><body><p>text</p></body></html>"#,
+            "html { --accent: ; } p { width: var(--accent, 999px); }",
+        );
+        let p = find_node(&tree, "p").expect("p not found");
+        assert_ne!(
+            get_length_px(p, "width"),
+            Some(999.0),
+            "empty --accent must not fall back to 999px"
+        );
+    }
+
+    // --- quirks mode ---
+
+    #[test]
+    fn test_quirks_mode_table_does_not_inherit_center_alignment() {
+        // Hacker News has no doctype and wraps its story table in `<center>`.
+        // Chromium's quirks-mode UA sheet resets `table { text-align: start; ... }`
+        // so the table (and its cells) don't inherit the `<center>` alignment.
+        // Without a doctype, this document is in quirks mode.
+        let tree = make_tree(
+            r#"<center><table><tr><td id="cell">text</td></tr></table></center>"#,
+            "",
+        );
+        let table = find_node(&tree, "table").expect("table not found");
+        assert_eq!(
+            get_keyword(table, "text-align").as_deref(),
+            Some("start"),
+            "quirks-mode table must reset text-align to start, not inherit center"
+        );
+    }
+
+    #[test]
+    fn test_standards_mode_table_inherits_center_alignment() {
+        // The same markup, but with a doctype: standards mode. No reset
+        // applies, so the table inherits `text-align: center` from `<center>`
+        // normally.
+        let tree = make_tree(
+            r#"<!DOCTYPE html><html><body><center><table><tr><td id="cell">text</td></tr></table></center></body></html>"#,
+            "",
+        );
+        let table = find_node(&tree, "table").expect("table not found");
+        assert_eq!(
+            get_keyword(table, "text-align").as_deref(),
+            Some("center"),
+            "standards-mode table must inherit center alignment normally"
+        );
+    }
+
+    #[test]
+    fn test_var_fanout_length_is_capped() {
+        // `--a` doubles `--b` each level; without a total-length cap this
+        // explodes exponentially. It must resolve to invalid-at-computed-value
+        // (no color) instead of hanging or exhausting memory.
+        let css = "html { \
+            --z: red; \
+            --y: var(--z) var(--z) var(--z) var(--z) var(--z) var(--z) var(--z) var(--z); \
+            --x: var(--y) var(--y) var(--y) var(--y) var(--y) var(--y) var(--y) var(--y); \
+            --w: var(--x) var(--x) var(--x) var(--x) var(--x) var(--x) var(--x) var(--x); \
+            --v: var(--w) var(--w) var(--w) var(--w) var(--w) var(--w) var(--w) var(--w); \
+            --u: var(--v) var(--v) var(--v) var(--v) var(--v) var(--v) var(--v) var(--v); \
+            --t: var(--u) var(--u) var(--u) var(--u) var(--u) var(--u) var(--u) var(--u); \
+        } p { color: var(--t); }";
+        let tree = make_tree(r#"<html><body><p>text</p></body></html>"#, css);
+        let p = find_node(&tree, "p").expect("p not found");
+        // 8^6 = ~262144 "red " repetitions — far past the 64 KiB cap. If the cap
+        // did not kick in, `color` would resolve to `red`. Instead the
+        // declaration must be treated as invalid at computed-value time, which
+        // for the inherited `color` property means falling back to the
+        // inherited/initial value (black here, since there is no ancestor
+        // `color` declaration) rather than `red` — and this must not hang or
+        // blow the stack.
+        assert_ne!(
+            get_color(p, "color"),
+            Some(Color { r: 255, g: 0, b: 0, a: 255 }),
+            "fanned-out var() chain must be capped, not resolved to red"
+        );
     }
 
     #[test]

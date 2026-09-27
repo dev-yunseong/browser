@@ -98,6 +98,16 @@ pub enum Value {
     /// the reserved key `--` and shared (via `Arc`) with descendants that do not
     /// declare their own.
     CustomProps(CustomProps),
+    /// A CSS Grid `minmax(min, max)` track-sizing function. Each operand is one
+    /// of `Value::Length` (px/percent/fr), or `Value::Keyword` (`auto`,
+    /// `min-content`, `max-content`).
+    MinMax(Box<Value>, Box<Value>),
+    /// A CSS Grid `repeat(auto-fill | auto-fit, <track-list>)` whose count
+    /// depends on the available space, so it is not expanded at parse time
+    /// (unlike `repeat(<integer>, ...)`, which `parse_track_list` expands
+    /// eagerly). `auto_fit` distinguishes `auto-fit` (collapses empty
+    /// trailing tracks) from `auto-fill` (keeps them).
+    AutoRepeat { auto_fit: bool, tracks: Vec<Value> },
 }
 
 /// Shared custom-property map. Equality and hashing use the `Arc` identity so
@@ -141,6 +151,14 @@ impl Hash for Value {
             Value::Gradient(g) => g.hash(state),
             Value::BoxShadowList(list) => list.hash(state),
             Value::CustomProps(p) => p.hash(state),
+            Value::MinMax(min, max) => {
+                min.hash(state);
+                max.hash(state);
+            }
+            Value::AutoRepeat { auto_fit, tracks } => {
+                auto_fit.hash(state);
+                tracks.hash(state);
+            }
         }
     }
 }
@@ -3040,6 +3058,58 @@ mod tests {
         assert_eq!(tracks.len(), 1);
         assert!(matches!(&tracks[0], Value::Keyword(k) if k.as_ref() == "auto"));
     }
+
+    /// `132px minmax(0, 1fr)` — the yunseong.dev hero grid — must parse as a
+    /// fixed 132px track followed by a `MinMax(0px, 1fr)` track, not silently
+    /// break apart on the comma/space inside `minmax(...)`.
+    #[test]
+    fn test_parse_track_list_minmax() {
+        let tracks = parse_track_list("132px minmax(0, 1fr)");
+        assert_eq!(tracks.len(), 2, "got {:?}", tracks);
+        assert!(matches!(&tracks[0], Value::Length(v, Unit::Px) if (*v - 132.0).abs() < 1e-5));
+        match &tracks[1] {
+            Value::MinMax(min, max) => {
+                assert!(matches!(**min, Value::Length(v, Unit::Px) if v == 0.0), "min={:?}", min);
+                assert!(matches!(**max, Value::Length(v, Unit::Fr) if (v - 1.0).abs() < 1e-5), "max={:?}", max);
+            }
+            other => panic!("expected MinMax, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_track_list_fit_content() {
+        let tracks = parse_track_list("fit-content(300px)");
+        assert_eq!(tracks.len(), 1);
+        assert!(matches!(tracks[0], Value::FitContent(v) if (v - 300.0).abs() < 1e-5));
+    }
+
+    #[test]
+    fn test_parse_track_list_repeat_auto_fill() {
+        let tracks = parse_track_list("repeat(auto-fill, 100px)");
+        assert_eq!(tracks.len(), 1);
+        match &tracks[0] {
+            Value::AutoRepeat { auto_fit, tracks } => {
+                assert!(!auto_fit);
+                assert_eq!(tracks.len(), 1);
+                assert!(matches!(tracks[0], Value::Length(v, Unit::Px) if v == 100.0));
+            }
+            other => panic!("expected AutoRepeat, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_track_list_repeat_auto_fit_minmax() {
+        let tracks = parse_track_list("repeat(auto-fit, minmax(200px, 1fr))");
+        assert_eq!(tracks.len(), 1);
+        match &tracks[0] {
+            Value::AutoRepeat { auto_fit, tracks } => {
+                assert!(*auto_fit);
+                assert_eq!(tracks.len(), 1);
+                assert!(matches!(&tracks[0], Value::MinMax(..)));
+            }
+            other => panic!("expected AutoRepeat, got {:?}", other),
+        }
+    }
 }
 
 
@@ -3121,97 +3191,124 @@ fn parse_translate_length(s: &str) -> TranslateLength {
 }
 
 /// Parse a CSS grid track list string (e.g. `"1fr 1fr"`, `"200px 1fr"`,
-/// `"repeat(3, 1fr)"`, `"auto"`) into a `Vec<Value>`.
+/// `"repeat(3, 1fr)"`, `"minmax(0, 1fr)"`, `"fit-content(300px)"`,
+/// `"repeat(auto-fill, 100px)"`, `"auto"`) into a `Vec<Value>`.
 ///
 /// Each entry is one of:
 /// - `Value::Length(n, Unit::Px)`      — fixed pixel track
 /// - `Value::Length(n, Unit::Percent)` — percentage track
 /// - `Value::Length(n, Unit::Fr)`      — fractional unit
-/// - `Value::Keyword("auto")`          — auto-sized track
+/// - `Value::Keyword("auto" | "min-content" | "max-content")`
+/// - `Value::MinMax(min, max)`         — `minmax(min, max)`
+/// - `Value::FitContent(px)`           — `fit-content(<length>)`
+/// - `Value::AutoRepeat { .. }`        — `repeat(auto-fill | auto-fit, ...)`,
+///   left unexpanded since its count depends on layout-time available space
+///   (see `layout::layout_grid`, which expands it).
 pub fn parse_track_list(val: &str) -> Vec<Value> {
     let val = val.trim();
+    if val.is_empty() {
+        return Vec::new();
+    }
     let mut tracks: Vec<Value> = Vec::new();
-
-    // Expand repeat(...) before splitting on spaces.
-    let expanded = expand_repeat_tracks(val);
-
-    for token in expanded.split_whitespace() {
-        let token = token.trim();
-        if token.is_empty() { continue; }
-        tracks.push(parse_track_token(token));
+    for token in split_top_level_spaces(val) {
+        push_track_token(&token, &mut tracks);
     }
     tracks
 }
 
-/// Expand `repeat(N, <track-list>)` within a track value string.
-fn expand_repeat_tracks(val: &str) -> String {
-    let lower = val.to_ascii_lowercase();
-    if !lower.starts_with("repeat(") {
-        // No repeat() at the start — return as-is.
-        return val.to_string();
-    }
-
-    let mut result = String::with_capacity(val.len());
-
-    // Find matching closing paren for repeat(...)
-    let inner_start = "repeat(".len();
-    let inner_chars: Vec<char> = val[inner_start..].chars().collect();
-    let mut depth = 1i32;
-    let mut end = 0;
-    for (i, &c) in inner_chars.iter().enumerate() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 { end = i; break; }
-            }
-            _ => {}
+/// Parse one top-level track-list token (as split by `split_top_level_spaces`,
+/// so it may still be a whole `repeat(...)`/`minmax(...)` function call) and
+/// push the resulting track(s) onto `out`. `repeat(<integer>, ...)` expands
+/// eagerly into `n` copies; `repeat(auto-fill | auto-fit, ...)` becomes a
+/// single `Value::AutoRepeat` entry, expanded later at layout time.
+fn push_track_token(token: &str, out: &mut Vec<Value>) {
+    let t = token.trim();
+    let lower = t.to_ascii_lowercase();
+    if lower.starts_with("repeat(") && t.ends_with(')') {
+        let inner = &t["repeat(".len()..t.len() - 1];
+        let parts = split_top_level_commas(inner);
+        if parts.len() < 2 {
+            return;
         }
-    }
-    let inner: String = inner_chars[..end].iter().collect();
-    let rest: String = inner_chars[end + 1..].iter().collect();
-
-    // Parse count and track definition.
-    if let Some(comma_pos) = inner.find(',') {
-        let count_str = inner[..comma_pos].trim();
-        let track_def = inner[comma_pos + 1..].trim();
-        if let Ok(n) = count_str.parse::<usize>() {
-            for i in 0..n {
-                if i > 0 { result.push(' '); }
-                result.push_str(track_def);
+        let count_str = parts[0].trim();
+        // The track list itself may contain commas (e.g. inside `minmax(...)`
+        // already stripped by split_top_level_commas at the outer level, but
+        // repeat()'s own comma-separated track list is space-separated, not
+        // comma-separated) — rejoin any remaining parts just in case.
+        let track_list_str = parts[1..].join(", ");
+        let mut inner_tracks: Vec<Value> = Vec::new();
+        for inner_token in split_top_level_spaces(&track_list_str) {
+            push_track_token(&inner_token, &mut inner_tracks);
+        }
+        if count_str.eq_ignore_ascii_case("auto-fill") {
+            out.push(Value::AutoRepeat { auto_fit: false, tracks: inner_tracks });
+        } else if count_str.eq_ignore_ascii_case("auto-fit") {
+            out.push(Value::AutoRepeat { auto_fit: true, tracks: inner_tracks });
+        } else if let Ok(n) = count_str.parse::<usize>() {
+            for _ in 0..n {
+                out.extend(inner_tracks.iter().cloned());
             }
         }
+        return;
     }
-
-    // Recursively expand whatever comes after the closing paren.
-    let rest_expanded = expand_repeat_tracks(rest.trim());
-    if !rest_expanded.trim().is_empty() {
-        result.push(' ');
-        result.push_str(rest_expanded.trim());
-    }
-    result
+    out.push(parse_track_token(t));
 }
 
 fn parse_track_token(token: &str) -> Value {
-    let t = token.trim().to_ascii_lowercase();
-    if t == "auto" {
-        Value::Keyword(intern("auto"))
-    } else if t == "min-content" || t == "max-content" {
-        Value::Keyword(intern(&t))
-    } else if t.ends_with("fr") {
-        let n = t.trim_end_matches("fr").parse::<f32>().unwrap_or(1.0);
-        Value::Length(n, Unit::Fr)
-    } else if t.ends_with("px") {
-        let n = t.trim_end_matches("px").parse::<f32>().unwrap_or(0.0);
-        Value::Length(n, Unit::Px)
-    } else if t.ends_with('%') {
-        let n = t.trim_end_matches('%').parse::<f32>().unwrap_or(0.0);
-        Value::Length(n, Unit::Percent)
-    } else if t.ends_with("em") || t.ends_with("rem") {
-        let n = t.trim_end_matches("rem").trim_end_matches("em").parse::<f32>().unwrap_or(1.0);
-        Value::Length(n, Unit::Em)
-    } else {
-        // fallback: try as keyword
-        Value::Keyword(intern(token.trim()))
+    let t = token.trim();
+    let lower = t.to_ascii_lowercase();
+    if lower.starts_with("minmax(") && t.ends_with(')') {
+        let inner = &t["minmax(".len()..t.len() - 1];
+        let parts = split_top_level_commas(inner);
+        if parts.len() == 2 {
+            return Value::MinMax(
+                Box::new(parse_track_token(parts[0].trim())),
+                Box::new(parse_track_token(parts[1].trim())),
+            );
+        }
+        return Value::Keyword(intern("auto"));
     }
+    if lower.starts_with("fit-content(") && t.ends_with(')') {
+        let inner = &t["fit-content(".len()..t.len() - 1];
+        let inner = inner.trim();
+        let px_val = if let Some(pct) = inner.strip_suffix('%') {
+            // No container size is known at parse time; percentages are rare
+            // for fit-content() in practice, so approximate using the raw
+            // number as if it were px (still bounded, unlike leaving it 0).
+            pct.trim().parse::<f32>().unwrap_or(0.0)
+        } else {
+            inner.trim_end_matches("px").parse::<f32>().unwrap_or(0.0)
+        };
+        return Value::FitContent(px_val);
+    }
+    if lower == "auto" {
+        return Value::Keyword(intern("auto"));
+    }
+    if lower == "min-content" || lower == "max-content" {
+        return Value::Keyword(intern(&lower));
+    }
+    if lower.ends_with("fr") {
+        let n = lower.trim_end_matches("fr").parse::<f32>().unwrap_or(1.0);
+        return Value::Length(n, Unit::Fr);
+    }
+    if lower.ends_with("px") {
+        let n = lower.trim_end_matches("px").parse::<f32>().unwrap_or(0.0);
+        return Value::Length(n, Unit::Px);
+    }
+    if lower.ends_with('%') {
+        let n = lower.trim_end_matches('%').parse::<f32>().unwrap_or(0.0);
+        return Value::Length(n, Unit::Percent);
+    }
+    if lower.ends_with("em") || lower.ends_with("rem") {
+        let n = lower.trim_end_matches("rem").trim_end_matches("em").parse::<f32>().unwrap_or(1.0);
+        return Value::Length(n, Unit::Em);
+    }
+    // A bare unitless number (only valid for zero, e.g. `minmax(0, 1fr)`) —
+    // permissively accept any bare number here since this parser is only
+    // used for grid track lists.
+    if let Ok(n) = lower.parse::<f32>() {
+        return Value::Length(n, Unit::Px);
+    }
+    // fallback: try as keyword
+    Value::Keyword(intern(t))
 }
