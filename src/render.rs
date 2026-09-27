@@ -1,9 +1,10 @@
 use tiny_skia::{Pixmap, Paint, Transform, Stroke, PathBuilder, PixmapPaint, Mask, FillRule,
-    LinearGradient, RadialGradient, GradientStop, SpreadMode, Point as SkPoint};
+    LinearGradient, RadialGradient, GradientStop, SpreadMode, Point as SkPoint,
+    StrokeDash, LineCap};
 use ab_glyph::{Font, FontRef, PxScale, point};
 use crate::layout::{LayoutBox, Rect as LayoutRect};
 use crate::css::{Color, CssColorStop, LinearDirection};
-use crate::layer_tree::{LayerTree, LayerTreeBuilder, PaintCommand, ObjectFit};
+use crate::layer_tree::{LayerTree, LayerTreeBuilder, PaintCommand, ObjectFit, BorderStyle};
 use crate::matrix::Matrix4x4;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -311,11 +312,30 @@ fn execute_commands_on_tile(
                 }
             }
 
-            PaintCommand::Border(r, w, c, radius) => {
+            PaintCommand::Border(r, w, c, radius, style) => {
                 let mut paint = Paint::default();
                 paint.set_color_rgba8(c.r, c.g, c.b, c.a);
                 let mut stroke = Stroke::default();
                 stroke.width = *w;
+                match style {
+                    BorderStyle::Solid => {}
+                    BorderStyle::Dashed => {
+                        // Dash/gap length proportional to width, matching the
+                        // roughly 3:2 ratio common browsers render for
+                        // `border-style: dashed`.
+                        let dash_len = (*w * 3.0).max(1.0);
+                        let gap_len = (*w * 2.0).max(1.0);
+                        stroke.dash = StrokeDash::new(vec![dash_len, gap_len], 0.0);
+                    }
+                    BorderStyle::Dotted => {
+                        // Round caps + a near-zero dash length draws a row of
+                        // circular dots spaced `w * 2` apart (the dot itself is
+                        // the stroke width).
+                        stroke.line_cap = LineCap::Round;
+                        let gap_len = (*w * 2.0).max(1.0);
+                        stroke.dash = StrokeDash::new(vec![0.01, gap_len], 0.0);
+                    }
+                }
                 if *radius > 0.0 {
                     if let Some(path) = create_rounded_rect_path(*r, *radius) {
                         pixmap.stroke_path(&path, &paint, &stroke, transform, active_mask!());
@@ -411,109 +431,227 @@ fn execute_commands_on_tile(
                 adjusted_clip.y += ty;
                 render_text_raw(text.clone(), adjusted_rect, *font_size, color, adjusted_clip, pixmap, *bold, *italic, *text_decoration);
             }
-            PaintCommand::Shadow(r, s) => {
-                let blur = *s.blur;
-                let sx = r.x + *s.offset_x - *s.spread;
-                let sy = r.y + *s.offset_y - *s.spread;
-                let sw = (r.width + (*s.spread * 2.0)).max(1.0);
-                let sh = (r.height + (*s.spread * 2.0)).max(1.0);
-
-                if blur <= 0.0 {
-                    // No blur: draw a sharp shadow rect directly.
-                    let mut paint = Paint::default();
-                    paint.set_color_rgba8(s.color.r, s.color.g, s.color.b, s.color.a);
-                    if let Some(tr) = tiny_skia::Rect::from_xywh(sx, sy, sw, sh) {
-                        pixmap.fill_rect(tr, &paint, transform, active_mask!());
-                    }
-                } else {
-                    // Blurred shadow: render shape into temp pixmap, box-blur it,
-                    // then composite onto the main pixmap.
-                    //
-                    // The blur "spreads" the shadow by roughly `blur` pixels in each
-                    // direction, so the temp pixmap needs extra padding around the
-                    // shadow shape equal to the blur radius so the falloff has room.
-                    let pad = blur.ceil() as i32 + 1;
-                    let pad_f = pad as f32;
-
-                    let tmp_w = (sw + pad_f * 2.0).ceil() as u32;
-                    let tmp_h = (sh + pad_f * 2.0).ceil() as u32;
-
-                    if let Some(mut shadow_px) = Pixmap::new(tmp_w.max(1), tmp_h.max(1)) {
-                        // Fill the shadow shape (solid, full alpha) in the temp pixmap.
-                        // Shape is offset by `pad` so there is room for the blur halo.
-                        let local_x = pad_f;
-                        let local_y = pad_f;
-                        if let Some(tr) = tiny_skia::Rect::from_xywh(local_x, local_y, sw, sh) {
-                            let mut shape_paint = Paint::default();
-                            // Use full opacity here; we apply the shadow color alpha when compositing.
-                            shape_paint.set_color_rgba8(255, 255, 255, 255);
-                            shadow_px.fill_rect(tr, &shape_paint, Transform::identity(), None);
-                        }
-
-                        // Apply a 3-pass separable box-blur to approximate a Gaussian.
-                        // sigma ≈ blur / 2  →  box radius ≈ (blur / 2).round() as usize
-                        let sigma = (blur / 2.0).max(1.0);
-                        let radius = sigma.round() as usize;
-                        box_blur_alpha(&mut shadow_px, radius);
-                        box_blur_alpha(&mut shadow_px, radius);
-                        box_blur_alpha(&mut shadow_px, radius);
-
-                        // Composite the blurred shadow onto the target pixmap.
-                        // The top-left of the temp pixmap (in document space) is at
-                        // (sx - pad_f, sy - pad_f).  The tile transform shifts by tx/ty.
-                        let dest_x = (sx - pad_f + tx) as i32;
-                        let dest_y = (sy - pad_f + ty) as i32;
-
-                        let cr = s.color.r;
-                        let cg = s.color.g;
-                        let cb = s.color.b;
-                        let ca = s.color.a as f32 / 255.0;
-
-                        // Walk every pixel of the blurred shadow and composite with
-                        // the shadow color into the target pixmap.
-                        let pw = pixmap.width() as i32;
-                        let ph = pixmap.height() as i32;
-                        let tw = shadow_px.width() as i32;
-                        let th = shadow_px.height() as i32;
-                        let shadow_data = shadow_px.data().to_vec();
-
-                        for ty_off in 0..th {
-                            let py = dest_y + ty_off;
-                            if py < 0 || py >= ph { continue; }
-                            for tx_off in 0..tw {
-                                let px_coord = dest_x + tx_off;
-                                if px_coord < 0 || px_coord >= pw { continue; }
-
-                                // Each pixel in the shadow pixmap is RGBA premultiplied.
-                                // We stored white (255,255,255) and blurred — the
-                                // alpha channel holds the coverage.
-                                let src_base = ((ty_off * tw + tx_off) * 4) as usize;
-                                if src_base + 3 >= shadow_data.len() { continue; }
-                                // After blurring, the alpha channel encodes coverage.
-                                let coverage = shadow_data[src_base + 3] as f32 / 255.0;
-                                if coverage <= 0.0 { continue; }
-
-                                let alpha = (coverage * ca).clamp(0.0, 1.0);
-                                if alpha <= 0.0 { continue; }
-
-                                let dst_idx = (py as u32 * pixmap.width() + px_coord as u32) as usize;
-                                let pixel = &mut pixmap.pixels_mut()[dst_idx];
-                                let dst = pixel.demultiply();
-                                let blend = |src: u8, d: u8| -> u8 {
-                                    ((src as f32 * alpha) + (d as f32 * (1.0 - alpha))).round() as u8
-                                };
-                                let out_a = ((alpha + (dst.alpha() as f32 / 255.0) * (1.0 - alpha)) * 255.0).round() as u8;
-                                *pixel = tiny_skia::ColorU8::from_rgba(
-                                    blend(cr, dst.red()),
-                                    blend(cg, dst.green()),
-                                    blend(cb, dst.blue()),
-                                    out_a,
-                                ).premultiply();
-                            }
-                        }
-                    }
-                }
+            PaintCommand::Shadow(r, s, radius) => {
+                paint_box_shadow(pixmap, tx, ty, active_mask!(), *r, s, *radius);
             }
+        }
+    }
+}
+
+/// Paint a single `box-shadow` layer (outset or inset) onto `pixmap`.
+///
+/// Both variants are built the same way: rasterize a solid white shape into a
+/// small temporary pixmap (padded so a blur halo has room to spread), run the
+/// 3-pass box-blur approximation of a Gaussian over its alpha channel when
+/// `blur > 0`, then walk every pixel of that temporary pixmap and composite it
+/// onto `pixmap` using the shadow's color and alpha, further scaled by
+/// `clip_mask` (the active `overflow: hidden` clip for this tile) where
+/// present.
+///
+/// - **Outset**: the shape is the box rect expanded by `spread` and offset by
+///   `(offset_x, offset_y)`, rounded to `radius + spread` so it follows the
+///   box's own corner rounding.
+/// - **Inset**: the shape is the box's own padding rect (rounded to `radius`,
+///   so it can never paint outside the box), with a hole cut out of it for
+///   the un-shadowed interior — the box shrunk by `spread` and offset by
+///   `(offset_x, offset_y)`, rounded to `(radius - spread).max(0.0)`. A
+///   positive `spread` therefore shrinks that hole and grows the visible
+///   shadow ring, matching the CSS spec's description of `spread-radius` for
+///   inset shadows.
+fn paint_box_shadow(
+    pixmap: &mut Pixmap,
+    tx: f32,
+    ty: f32,
+    clip_mask: Option<&Mask>,
+    r: LayoutRect,
+    s: &crate::css::BoxShadow,
+    radius: f32,
+) {
+    let blur = (*s.blur).max(0.0);
+    let spread = *s.spread;
+    let radius = radius.max(0.0);
+
+    // The blur "spreads" the shape by roughly `blur` pixels in each direction,
+    // so the temp pixmap needs extra padding around the shape equal to the
+    // blur radius so the falloff has room.
+    let pad = if blur > 0.0 { blur.ceil() as i32 + 1 } else { 0 };
+    let pad_f = pad as f32;
+
+    if s.inset {
+        let tmp_w = (r.width + pad_f * 2.0).max(1.0).ceil() as u32;
+        let tmp_h = (r.height + pad_f * 2.0).max(1.0).ceil() as u32;
+        let Some(mut shape_px) = Pixmap::new(tmp_w.max(1), tmp_h.max(1)) else { return; };
+
+        // Fill the whole padding box, rounded to the box's own border-radius.
+        let box_local = LayoutRect { x: pad_f, y: pad_f, width: r.width, height: r.height };
+        fill_shape(&mut shape_px, box_local, radius, 255);
+
+        // Snapshot the (un-blurred) box shape now, before the hole is cut —
+        // this is used to hard-clip the blurred result back to the box below.
+        // An inset shadow's blur only softens the un-shadowed hole's edge; the
+        // box's own outer boundary is always a hard clip, never faded by blur.
+        let hard_mask = shape_px.clone();
+
+        // Cut the un-shadowed hole: the box shrunk by `spread` and offset by
+        // `(offset_x, offset_y)`.
+        let hole_w = (r.width - 2.0 * spread).max(0.0);
+        let hole_h = (r.height - 2.0 * spread).max(0.0);
+        if hole_w > 0.0 && hole_h > 0.0 {
+            let hole_local = LayoutRect {
+                x: pad_f + *s.offset_x + spread,
+                y: pad_f + *s.offset_y + spread,
+                width: hole_w,
+                height: hole_h,
+            };
+            let hole_radius = (radius - spread).max(0.0);
+            clear_shape(&mut shape_px, hole_local, hole_radius);
+        }
+
+        apply_blur_and_composite(
+            pixmap, &mut shape_px, blur,
+            r.x - pad_f + tx, r.y - pad_f + ty,
+            &s.color, clip_mask, Some(&hard_mask),
+        );
+    } else {
+        let sx = r.x + *s.offset_x - spread;
+        let sy = r.y + *s.offset_y - spread;
+        let sw = (r.width + spread * 2.0).max(0.0);
+        let sh = (r.height + spread * 2.0).max(0.0);
+        if sw <= 0.0 || sh <= 0.0 { return; }
+
+        let tmp_w = (sw + pad_f * 2.0).max(1.0).ceil() as u32;
+        let tmp_h = (sh + pad_f * 2.0).max(1.0).ceil() as u32;
+        let Some(mut shape_px) = Pixmap::new(tmp_w.max(1), tmp_h.max(1)) else { return; };
+
+        let shape_local = LayoutRect { x: pad_f, y: pad_f, width: sw, height: sh };
+        let shape_radius = (radius + spread).max(0.0);
+        fill_shape(&mut shape_px, shape_local, shape_radius, 255);
+
+        apply_blur_and_composite(
+            pixmap, &mut shape_px, blur,
+            sx - pad_f + tx, sy - pad_f + ty,
+            &s.color, clip_mask, None,
+        );
+    }
+}
+
+/// Fill `rect` (optionally rounded to `radius`) with opaque white — used as
+/// the alpha-coverage source shape for a shadow before blurring.
+fn fill_shape(pixmap: &mut Pixmap, rect: LayoutRect, radius: f32, alpha: u8) {
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(255, 255, 255, alpha);
+    if radius > 0.0 {
+        if let Some(path) = create_rounded_rect_path(rect, radius) {
+            pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        }
+    } else if let Some(tr) = tiny_skia::Rect::from_xywh(rect.x, rect.y, rect.width, rect.height) {
+        pixmap.fill_rect(tr, &paint, Transform::identity(), None);
+    }
+}
+
+/// Zero out `rect` (optionally rounded to `radius`) — cuts the un-shadowed
+/// "hole" out of an inset shadow's shape.
+fn clear_shape(pixmap: &mut Pixmap, rect: LayoutRect, radius: f32) {
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(0, 0, 0, 0);
+    paint.blend_mode = tiny_skia::BlendMode::Source;
+    if radius > 0.0 {
+        if let Some(path) = create_rounded_rect_path(rect, radius) {
+            pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        }
+    } else if let Some(tr) = tiny_skia::Rect::from_xywh(rect.x, rect.y, rect.width, rect.height) {
+        pixmap.fill_rect(tr, &paint, Transform::identity(), None);
+    }
+}
+
+/// Blur `shape_px`'s alpha channel (if `blur > 0`) using a 3-pass box-blur
+/// approximation of a Gaussian with `sigma ≈ blur / 2` (per the CSS spec's
+/// description of the box-shadow blur radius), then composite it onto
+/// `pixmap` at `(dest_x, dest_y)` using `color`'s RGB and alpha as the
+/// shadow's paint, scaled by each destination pixel's coverage and, if
+/// present, by `clip_mask`.
+///
+/// `hard_clip`, when given, is an un-blurred alpha mask the same size as
+/// `shape_px` that is multiplied in *after* blurring — used by inset shadows
+/// to hard-clip the blur halo back to the box's own boundary, which (unlike
+/// the un-shadowed hole's edge) is never itself softened by the blur.
+fn apply_blur_and_composite(
+    pixmap: &mut Pixmap,
+    shape_px: &mut Pixmap,
+    blur: f32,
+    dest_x_f: f32,
+    dest_y_f: f32,
+    color: &Color,
+    clip_mask: Option<&Mask>,
+    hard_clip: Option<&Pixmap>,
+) {
+    if blur > 0.0 {
+        let sigma = (blur / 2.0).max(1.0);
+        let box_radius = sigma.round() as usize;
+        box_blur_alpha(shape_px, box_radius);
+        box_blur_alpha(shape_px, box_radius);
+        box_blur_alpha(shape_px, box_radius);
+    }
+
+    if let Some(mask_px) = hard_clip {
+        let mask_data = mask_px.data();
+        for (i, chunk) in shape_px.data_mut().chunks_exact_mut(4).enumerate() {
+            let mask_alpha = mask_data.get(i * 4 + 3).copied().unwrap_or(0) as u32;
+            chunk[3] = ((chunk[3] as u32 * mask_alpha) / 255) as u8;
+        }
+    }
+
+    let dest_x = dest_x_f.round() as i32;
+    let dest_y = dest_y_f.round() as i32;
+
+    let cr = color.r;
+    let cg = color.g;
+    let cb = color.b;
+    let ca = color.a as f32 / 255.0;
+
+    let pw = pixmap.width() as i32;
+    let ph = pixmap.height() as i32;
+    let tw = shape_px.width() as i32;
+    let th = shape_px.height() as i32;
+    let shadow_data = shape_px.data().to_vec();
+    let mask_data = clip_mask.map(|m| m.data());
+
+    for ty_off in 0..th {
+        let py = dest_y + ty_off;
+        if py < 0 || py >= ph { continue; }
+        for tx_off in 0..tw {
+            let px_coord = dest_x + tx_off;
+            if px_coord < 0 || px_coord >= pw { continue; }
+
+            // Each pixel in the shape pixmap is RGBA premultiplied; we stored
+            // white so the alpha channel holds the coverage after blurring.
+            let src_base = ((ty_off * tw + tx_off) * 4) as usize;
+            if src_base + 3 >= shadow_data.len() { continue; }
+            let coverage = shadow_data[src_base + 3] as f32 / 255.0;
+            if coverage <= 0.0 { continue; }
+
+            let dst_idx = (py as u32 * pixmap.width() + px_coord as u32) as usize;
+
+            let mut alpha = (coverage * ca).clamp(0.0, 1.0);
+            if let Some(mdata) = mask_data {
+                let mval = mdata.get(dst_idx).copied().unwrap_or(0);
+                if mval == 0 { continue; }
+                alpha *= mval as f32 / 255.0;
+            }
+            if alpha <= 0.0 { continue; }
+
+            let pixel = &mut pixmap.pixels_mut()[dst_idx];
+            let dst = pixel.demultiply();
+            let blend = |src: u8, d: u8| -> u8 {
+                ((src as f32 * alpha) + (d as f32 * (1.0 - alpha))).round() as u8
+            };
+            let out_a = ((alpha + (dst.alpha() as f32 / 255.0) * (1.0 - alpha)) * 255.0).round() as u8;
+            *pixel = tiny_skia::ColorU8::from_rgba(
+                blend(cr, dst.red()),
+                blend(cg, dst.green()),
+                blend(cb, dst.blue()),
+                out_a,
+            ).premultiply();
         }
     }
 }
@@ -1223,7 +1361,7 @@ mod tests {
         let before = pixmap.data().to_vec();
 
         let tile_rect = LayoutRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
-        let cmds = vec![PaintCommand::Shadow(rect, shadow)];
+        let cmds = vec![PaintCommand::Shadow(rect, shadow, 0.0)];
         let base_url = Url::parse("https://example.com/").unwrap();
         execute_commands_on_tile(&cmds, &mut pixmap, tile_rect, &HashMap::new(), &base_url);
 
@@ -1250,7 +1388,7 @@ mod tests {
         let rect = LayoutRect { x: 40.0, y: 40.0, width: 20.0, height: 20.0 };
 
         let tile_rect = LayoutRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
-        let cmds = vec![PaintCommand::Shadow(rect, shadow)];
+        let cmds = vec![PaintCommand::Shadow(rect, shadow, 0.0)];
         let base_url = Url::parse("https://example.com/").unwrap();
         execute_commands_on_tile(&cmds, &mut pixmap, tile_rect, &HashMap::new(), &base_url);
 
@@ -1258,6 +1396,169 @@ mod tests {
         // due to the blur halo.  Shadow at (40,40) size (20,20); check pixel at (34,40).
         let halo_alpha = pixmap.data()[(40 * 100 + 34) * 4 + 3];
         assert!(halo_alpha > 0, "blurred shadow halo pixel should be non-zero alpha, got {}", halo_alpha);
+    }
+
+    /// An `inset` box-shadow must darken the ring between the box edge and the
+    /// shrunk-by-spread "hole", but must leave the hole itself (the box
+    /// interior, away from the edges) unpainted.
+    #[test]
+    fn test_inset_shadow_paints_ring_not_center() {
+        use crate::css::{BoxShadow, OrderedFloat};
+        use url::Url;
+
+        let mut pixmap = Pixmap::new(80, 80).unwrap();
+        let shadow = BoxShadow {
+            offset_x: OrderedFloat(0.0),
+            offset_y: OrderedFloat(0.0),
+            blur:     OrderedFloat(0.0),
+            spread:   OrderedFloat(10.0),
+            color:    Color { r: 0, g: 0, b: 0, a: 255 },
+            inset:    true,
+        };
+        let rect = LayoutRect { x: 10.0, y: 10.0, width: 60.0, height: 60.0 };
+        let tile_rect = LayoutRect { x: 0.0, y: 0.0, width: 80.0, height: 80.0 };
+        let cmds = vec![PaintCommand::Shadow(rect, shadow, 0.0)];
+        let base_url = Url::parse("https://example.com/").unwrap();
+        execute_commands_on_tile(&cmds, &mut pixmap, tile_rect, &HashMap::new(), &base_url);
+
+        // Center of the box (40, 40) is well inside the shrunk-by-10 hole
+        // (which spans 20..70 on both axes) and must remain untouched.
+        let center_alpha = pixmap.data()[(40 * 80 + 40) * 4 + 3];
+        assert_eq!(center_alpha, 0, "inset shadow must not paint the box's un-shadowed interior");
+
+        // A pixel just inside the box edge (12, 40) is in the shadowed ring
+        // (10..20) and must be painted.
+        let ring_alpha = pixmap.data()[(40 * 80 + 12) * 4 + 3];
+        assert!(ring_alpha > 0, "inset shadow must paint the ring near the box edge, got alpha {}", ring_alpha);
+    }
+
+    /// An `inset` box-shadow must never paint outside the box's own rect,
+    /// even with a large spread or blur.
+    #[test]
+    fn test_inset_shadow_does_not_paint_outside_box() {
+        use crate::css::{BoxShadow, OrderedFloat};
+        use url::Url;
+
+        let mut pixmap = Pixmap::new(80, 80).unwrap();
+        let shadow = BoxShadow {
+            offset_x: OrderedFloat(0.0),
+            offset_y: OrderedFloat(0.0),
+            blur:     OrderedFloat(6.0),
+            spread:   OrderedFloat(4.0),
+            color:    Color { r: 0, g: 0, b: 0, a: 255 },
+            inset:    true,
+        };
+        let rect = LayoutRect { x: 20.0, y: 20.0, width: 40.0, height: 40.0 };
+        let tile_rect = LayoutRect { x: 0.0, y: 0.0, width: 80.0, height: 80.0 };
+        let cmds = vec![PaintCommand::Shadow(rect, shadow, 0.0)];
+        let base_url = Url::parse("https://example.com/").unwrap();
+        execute_commands_on_tile(&cmds, &mut pixmap, tile_rect, &HashMap::new(), &base_url);
+
+        // A pixel just outside the box (18, 40) must stay fully transparent.
+        let outside_alpha = pixmap.data()[(40 * 80 + 18) * 4 + 3];
+        assert_eq!(outside_alpha, 0, "inset shadow must never paint outside the box rect, got alpha {}", outside_alpha);
+    }
+
+    /// An outset box-shadow on a rounded box must follow the box's own
+    /// border-radius: the far corner of a sharp (blur=0), zero-offset shadow
+    /// must be unpainted where the rounded shape excludes it, even though the
+    /// same point lies inside the plain bounding rect.
+    #[test]
+    fn test_outset_shadow_follows_border_radius() {
+        use crate::css::{BoxShadow, OrderedFloat};
+        use url::Url;
+
+        let shadow = BoxShadow {
+            offset_x: OrderedFloat(0.0),
+            offset_y: OrderedFloat(0.0),
+            blur:     OrderedFloat(0.0),
+            spread:   OrderedFloat(0.0),
+            color:    Color { r: 0, g: 0, b: 0, a: 255 },
+            inset:    false,
+        };
+        let rect = LayoutRect { x: 0.0, y: 0.0, width: 40.0, height: 40.0 };
+        let tile_rect = LayoutRect { x: 0.0, y: 0.0, width: 40.0, height: 40.0 };
+        let base_url = Url::parse("https://example.com/").unwrap();
+
+        // radius = 0: the extreme corner pixel is part of the (square) shadow.
+        let mut square = Pixmap::new(40, 40).unwrap();
+        let cmds_square = vec![PaintCommand::Shadow(rect, shadow.clone(), 0.0)];
+        execute_commands_on_tile(&cmds_square, &mut square, tile_rect, &HashMap::new(), &base_url);
+        let square_corner_alpha = square.data()[(1 * 40 + 1) * 4 + 3];
+        assert!(square_corner_alpha > 0, "square shadow must cover its corner");
+
+        // radius = 18 on a 40x40 box: the same corner pixel falls outside the
+        // rounded shape and must be unpainted.
+        let mut rounded = Pixmap::new(40, 40).unwrap();
+        let cmds_rounded = vec![PaintCommand::Shadow(rect, shadow, 18.0)];
+        execute_commands_on_tile(&cmds_rounded, &mut rounded, tile_rect, &HashMap::new(), &base_url);
+        let rounded_corner_alpha = rounded.data()[(1 * 40 + 1) * 4 + 3];
+        assert_eq!(rounded_corner_alpha, 0, "rounded shadow must not paint past its rounded corner, got alpha {}", rounded_corner_alpha);
+    }
+
+    /// A blurred shadow must respect an active `overflow: hidden` clip mask —
+    /// pixels outside the pushed clip rect must remain untouched even though
+    /// the blur halo would otherwise reach them.
+    #[test]
+    fn test_blurred_shadow_respects_push_clip() {
+        use crate::css::{BoxShadow, OrderedFloat};
+        use url::Url;
+
+        let mut pixmap = Pixmap::new(100, 100).unwrap();
+        let shadow = BoxShadow {
+            offset_x: OrderedFloat(0.0),
+            offset_y: OrderedFloat(0.0),
+            blur:     OrderedFloat(12.0),
+            spread:   OrderedFloat(0.0),
+            color:    Color { r: 0, g: 0, b: 0, a: 255 },
+            inset:    false,
+        };
+        let rect = LayoutRect { x: 40.0, y: 40.0, width: 20.0, height: 20.0 };
+        // Clip to a region that excludes the pixel we check.
+        let clip_rect = LayoutRect { x: 40.0, y: 40.0, width: 20.0, height: 20.0 };
+        let tile_rect = LayoutRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
+        let cmds = vec![
+            PaintCommand::PushClip { rect: clip_rect, radius: 0.0 },
+            PaintCommand::Shadow(rect, shadow, 0.0),
+            PaintCommand::PopClip,
+        ];
+        let base_url = Url::parse("https://example.com/").unwrap();
+        execute_commands_on_tile(&cmds, &mut pixmap, tile_rect, &HashMap::new(), &base_url);
+
+        // Without the clip, the blur halo reaches several pixels outside the
+        // shadow rect (as in test_shadow_with_blur_produces_halo); with the
+        // clip active, those pixels must stay untouched.
+        let halo_alpha = pixmap.data()[(40 * 100 + 34) * 4 + 3];
+        assert_eq!(halo_alpha, 0, "clip mask must suppress the blur halo outside the clip rect, got alpha {}", halo_alpha);
+    }
+
+    /// `border-style: dashed`/`dotted` must produce a stroke with visible gaps
+    /// (fewer painted pixels along the edge) compared to a solid border of the
+    /// same width and color — the whole point of a dash pattern.
+    #[test]
+    fn test_dashed_and_dotted_borders_paint_fewer_pixels_than_solid() {
+        use crate::layer_tree::BorderStyle;
+        use url::Url;
+
+        let tile_rect = LayoutRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
+        let rect = LayoutRect { x: 10.0, y: 10.0, width: 80.0, height: 80.0 };
+        let color = black();
+        let base_url = Url::parse("https://example.com/").unwrap();
+
+        let count_painted = |style: BorderStyle| -> usize {
+            let mut pixmap = white_pixmap(100, 100);
+            let cmds = vec![PaintCommand::Border(rect, 4.0, color.clone(), 0.0, style)];
+            execute_commands_on_tile(&cmds, &mut pixmap, tile_rect, &HashMap::new(), &base_url);
+            pixmap.data().chunks_exact(4).filter(|px| px != &[255, 255, 255, 255]).count()
+        };
+
+        let solid = count_painted(BorderStyle::Solid);
+        let dashed = count_painted(BorderStyle::Dashed);
+        let dotted = count_painted(BorderStyle::Dotted);
+
+        assert!(solid > 0, "solid border must paint some pixels");
+        assert!(dashed < solid, "dashed border ({dashed}) must paint fewer pixels than solid ({solid})");
+        assert!(dotted < solid, "dotted border ({dotted}) must paint fewer pixels than solid ({solid})");
     }
 
     #[test]
