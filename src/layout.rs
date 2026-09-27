@@ -2203,8 +2203,11 @@ fn white_space_of(sn: &StyledNode) -> WhiteSpace {
 
 /// Convert flattened inline items into measured pieces with break opportunities.
 /// Atomic pieces get width 0 here; callers fill them in.
-fn make_pieces<'a>(items: &[Item<'a>]) -> Vec<Piece<'a>> {
+fn make_pieces<'a>(items: &[Item<'a>], container: &StyledNode) -> Vec<Piece<'a>> {
     let mut pieces: Vec<Piece<'a>> = Vec::new();
+    // Inline boxes currently open; the innermost one (or the block container)
+    // is the parent whose `white-space` governs breaks around atomic inlines.
+    let mut open: Vec<&StyledNode> = Vec::new();
     let mut prev_space = true; // leading collapsible spaces are removed
     let mut break_next = false;
     let mut atomic_idx = 0usize;
@@ -2299,6 +2302,7 @@ fn make_pieces<'a>(items: &[Item<'a>]) -> Vec<Piece<'a>> {
                 flush(&mut word, &mut pieces, &mut break_next);
             }
             Item::Open(node) => {
+                open.push(node);
                 let edge = open_edge(node);
                 if edge > 0.0 {
                     prev_space = false;
@@ -2306,6 +2310,7 @@ fn make_pieces<'a>(items: &[Item<'a>]) -> Vec<Piece<'a>> {
                 pieces.push(Piece { kind: PieceKind::Open(node), width: edge, break_before: false, collapsible: false, break_anywhere: false });
             }
             Item::Close(node) => {
+                open.pop();
                 let edge = close_edge(node);
                 if edge > 0.0 {
                     prev_space = false;
@@ -2313,7 +2318,9 @@ fn make_pieces<'a>(items: &[Item<'a>]) -> Vec<Piece<'a>> {
                 pieces.push(Piece { kind: PieceKind::Close(node), width: edge, break_before: false, collapsible: false, break_anywhere: false });
             }
             Item::Atomic(node) => {
-                let wrap = white_space_of(node).wrap || parent_allows_wrap(&pieces);
+                // The atomic box's own `white-space` applies inside it, not to
+                // the break opportunities around it.
+                let wrap = white_space_of(open.last().copied().unwrap_or(container)).wrap;
                 pieces.push(Piece {
                     kind: PieceKind::Atomic(atomic_idx, node),
                     width: 0.0,
@@ -2341,17 +2348,6 @@ fn make_pieces<'a>(items: &[Item<'a>]) -> Vec<Piece<'a>> {
     pieces
 }
 
-/// Whether the context before an atomic inline allows wrapping (uses the most
-/// recent text piece's white-space, defaulting to wrap).
-fn parent_allows_wrap(pieces: &[Piece]) -> bool {
-    for p in pieces.iter().rev() {
-        match p.kind {
-            PieceKind::Text(n, _) | PieceKind::Space(n, _) => return white_space_of(n).wrap,
-            _ => {}
-        }
-    }
-    true
-}
 
 fn inline_edges(node: &StyledNode) -> (f32, f32) {
     // Percentages on inline boxes resolve against the containing block; use 0.
@@ -2506,7 +2502,7 @@ fn layout_inline_run_clamped<'a>(
 ) -> IfcOut {
     let mut items = Vec::new();
     flatten_inline(run, &mut items);
-    let mut pieces = make_pieces(&items);
+    let mut pieces = make_pieces(&items, container);
 
     // Lay out atomic inlines up front (their size does not depend on the line).
     let mut atomics: Vec<AtomicBox<'a>> = Vec::new();
@@ -4529,10 +4525,9 @@ fn block_intrinsic(sn: &StyledNode, ctx: &mut Ctx) -> (f32, f32) {
 
 /// (min, max) content widths of an inline formatting context.
 fn inline_intrinsic(run: &[&StyledNode], container: &StyledNode, ctx: &mut Ctx) -> (f32, f32) {
-    let _ = container;
     let mut items = Vec::new();
     flatten_inline(run, &mut items);
-    let pieces = make_pieces(&items);
+    let pieces = make_pieces(&items, container);
     // Atomic contributions.
     let mut atomic_min: HashMap<usize, f32> = HashMap::new();
     let mut atomic_max: HashMap<usize, f32> = HashMap::new();
@@ -7922,6 +7917,47 @@ mod replaced_sizing_tests {
             // Vertically centered in the 40px input.
             let mid = ph.dimensions.y + ph.dimensions.height / 2.0;
             assert!((mid - (input.dimensions.y + 20.0)).abs() < 1.0, "placeholder mid {mid}");
+        });
+    }
+
+    #[test]
+    fn nowrap_parent_keeps_inline_blocks_on_one_line_despite_their_own_white_space() {
+        let html = r#"<div id="w" style="width:400px;white-space:nowrap;overflow:hidden"><div class="g" style="display:inline-block;width:300px;white-space:normal;vertical-align:top">a b</div><div class="g" style="display:inline-block;width:300px;white-space:normal;vertical-align:top">c d</div></div>"#;
+        with_layout(html, "body{margin:0}", None, ImageSizes::default(), |lb| {
+            let mut groups = Vec::new();
+            fn collect<'a, 'b>(b: &'b LayoutBox<'a>, out: &mut Vec<(f32, f32)>) {
+                if matches!(attr(b.style_node, "class").as_deref(), Some("g")) {
+                    out.push((b.dimensions.x, b.dimensions.y));
+                }
+                for c in &b.children {
+                    collect(c, out);
+                }
+            }
+            collect(lb, &mut groups);
+            assert_eq!(groups.len(), 2);
+            assert_eq!(groups[0].1, groups[1].1, "inline-blocks must share a line: {groups:?}");
+            assert!(groups[1].0 >= groups[0].0 + 300.0);
+        });
+    }
+
+    #[test]
+    fn text_fragment_after_inline_element_starts_at_its_first_glyph() {
+        let html = r#"<p style="margin:0"><span>AB</span> CD</p>"#;
+        with_layout(html, "body{margin:0}", None, ImageSizes::default(), |lb| {
+            let mut frags = Vec::new();
+            fn collect(b: &LayoutBox, out: &mut Vec<(String, f32, f32)>) {
+                if let Some(t) = &b.text_fragment {
+                    out.push((t.clone(), b.dimensions.x, b.dimensions.width));
+                }
+                for c in &b.children {
+                    collect(c, out);
+                }
+            }
+            collect(lb, &mut frags);
+            let ab = frags.iter().find(|f| f.0 == "AB").expect("AB fragment");
+            let cd = frags.iter().find(|f| f.0.trim() == "CD").expect("CD fragment");
+            assert_eq!(cd.0, "CD", "leading space moved out of the fragment");
+            assert!(cd.1 > ab.1 + ab.2 + 1.0, "CD starts after the space: {frags:?}");
         });
     }
 
