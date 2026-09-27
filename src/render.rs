@@ -485,7 +485,7 @@ fn execute_commands_with_clips(
                     line_height: Some(*line_height),
                     letter_spacing: *letter_spacing,
                 };
-                render_text_run(text, adjusted_rect, *font_size, color, adjusted_clip, pixmap, &font, *text_decoration);
+                render_text_run(text, adjusted_rect, *font_size, color, adjusted_clip, pixmap, &font, *text_decoration, active_mask!());
             }
             PaintCommand::Shadow(r, s, radius) => {
                 paint_box_shadow(pixmap, tx, ty, active_mask!(), *r, s, *radius);
@@ -955,7 +955,7 @@ fn render_text_raw(
         line_height: None,
         letter_spacing: 0.0,
     };
-    render_text_run(&text, rect, font_size, color, clip, pixmap, &font, text_decoration);
+    render_text_run(&text, rect, font_size, color, clip, pixmap, &font, text_decoration, None);
 }
 
 /// Skia's synthetic italic skew (`SK_ScalarSkewX` = 1/4).
@@ -1086,6 +1086,9 @@ fn dilate(buf: &[f32], w: usize, h: usize, radius: f32, horizontal: bool) -> Vec
 ///
 /// Rasterized glyphs are cached in `GLYPH_CACHE` keyed by face, glyph, size,
 /// subpixel x position and synthesis flags.
+///
+/// `mask` is the active clip mask (same pixel grid as `pixmap`); glyph
+/// coverage is multiplied by it so overflow and CSS clips apply to text.
 pub fn render_text_run(
     text: &str,
     rect: LayoutRect,
@@ -1095,7 +1098,11 @@ pub fn render_text_run(
     pixmap: &mut Pixmap,
     font: &TextFont,
     text_decoration: u8,
+    mask: Option<&Mask>,
 ) {
+    let mask_data = mask
+        .filter(|m| m.width() == pixmap.width() && m.height() == pixmap.height())
+        .map(|m| m.data());
     let trimmed = text.trim();
     if trimmed.is_empty() || font_size <= 0.0 { return; }
     let chain = crate::fonts::db().chain(font.family, font.weight, font.italic);
@@ -1164,7 +1171,16 @@ pub fn render_text_run(
                     if px < 0 || px >= pw || (px as f32) < clip.x || (px as f32) >= clip.x + clip.width {
                         continue;
                     }
-                    let cov = cached.coverage[(row * cached.width as i32 + col) as usize];
+                    let mut cov = cached.coverage[(row * cached.width as i32 + col) as usize];
+                    if let Some(md) = mask_data {
+                        let m = md[(py * pw + px) as usize] as u32;
+                        if m == 0 {
+                            continue;
+                        }
+                        if m < 255 {
+                            cov = cov.map(|c| ((c as u32 * m + 127) / 255) as u8);
+                        }
+                    }
                     if cov != [0, 0, 0] {
                         blend_glyph_pixel_lcd(pixmap, px as u32, py as u32, cov, color);
                     }
@@ -1191,7 +1207,7 @@ pub fn render_text_run(
             let baseline_y = baseline_y.round();
             let mut draw = |y: f32| {
                 if let Some(r) = tiny_skia::Rect::from_xywh(seg_start_x, y, seg_w, line_thickness) {
-                    pixmap.fill_rect(r, &paint, Transform::identity(), None);
+                    pixmap.fill_rect(r, &paint, Transform::identity(), mask);
                 }
             };
             if text_decoration & 0b001 != 0 {
@@ -1562,7 +1578,7 @@ mod tests {
         let paint = |ls: f32| {
             let mut p = white_pixmap(300, 40);
             let font = TextFont { family: "sans-serif", weight: 400, italic: false, line_height: None, letter_spacing: ls };
-            render_text_run("IIII", rect, 16.0, &black(), rect, &mut p, &font, 0);
+            render_text_run("IIII", rect, 16.0, &black(), rect, &mut p, &font, 0, None);
             p
         };
         let plain = paint(0.0);
@@ -1579,7 +1595,7 @@ mod tests {
         let rect = full_rect(200.0, 40.0);
         let font = TextFont { family: "sans-serif", weight: 400, italic: false, line_height: None, letter_spacing: 0.0 };
         let mut opaque = white_pixmap(200, 40);
-        render_text_run("Wave", rect, 16.0, &black(), rect, &mut opaque, &font, 0);
+        render_text_run("Wave", rect, 16.0, &black(), rect, &mut opaque, &font, 0, None);
         let fringed = opaque.pixels().iter().any(|p| {
             let c = p.demultiply();
             c.red().abs_diff(c.blue()) > 30
@@ -1587,7 +1603,7 @@ mod tests {
         assert!(fringed, "LCD text should have coloured edges on white");
 
         let mut clear = Pixmap::new(200, 40).unwrap();
-        render_text_run("Wave", rect, 16.0, &black(), rect, &mut clear, &font, 0);
+        render_text_run("Wave", rect, 16.0, &black(), rect, &mut clear, &font, 0, None);
         assert!(clear.pixels().iter().any(|p| p.alpha() > 0));
         assert!(clear.pixels().iter().all(|p| {
             let c = p.demultiply();
@@ -1602,10 +1618,25 @@ mod tests {
         let bottom = |lh: f32| {
             let mut p = white_pixmap(200, 80);
             let font = TextFont { family: "sans-serif", weight: 400, italic: false, line_height: Some(lh), letter_spacing: 0.0 };
-            render_text_run("H", rect, 16.0, &black(), rect, &mut p, &font, 0);
+            render_text_run("H", rect, 16.0, &black(), rect, &mut p, &font, 0, None);
             (0..80).rev().find(|&y| (0..200).any(|x| p.pixel(x, y).unwrap().red() < 128)).unwrap()
         };
         assert_eq!(bottom(40.0) as i32 - bottom(20.0) as i32, 10);
+    }
+
+    /// The active clip mask must hide glyph pixels outside it.
+    #[test]
+    fn test_text_respects_clip_mask() {
+        let rect = full_rect(200.0, 40.0);
+        let font = TextFont { family: "sans-serif", weight: 400, italic: false, line_height: None, letter_spacing: 0.0 };
+        let mut mask = Mask::new(200, 40).unwrap();
+        let mut pb = PathBuilder::new();
+        pb.push_rect(tiny_skia::Rect::from_xywh(0.0, 0.0, 20.0, 40.0).unwrap());
+        mask.fill_path(&pb.finish().unwrap(), FillRule::Winding, false, Transform::identity());
+        let mut p = white_pixmap(200, 40);
+        render_text_run("MMMMMMMM", rect, 16.0, &black(), rect, &mut p, &font, 0b001, Some(&mask));
+        assert!(ink_left_edge(&p).is_some(), "text inside the mask must paint");
+        assert!(ink_right_edge(&p).unwrap() < 20, "no ink may pass the mask edge");
     }
 
     // ── Shadow blur ───────────────────────────────────────────────────────────

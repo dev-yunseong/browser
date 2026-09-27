@@ -399,13 +399,26 @@ pub fn db() -> &'static FontDb {
 
 /// Font chain for a styled node's `font-family`, `font-weight` and `font-style`.
 pub fn chain_for(values: &HashMap<Arc<str>, Value>) -> Arc<FontChain> {
-    let family = match values.get(&crate::css::intern("font-family")) {
+    thread_local! {
+        static LAST: std::cell::RefCell<Option<(Arc<str>, u16, bool, Arc<FontChain>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let family: &str = match values.get("font-family") {
         Some(Value::Keyword(k)) => k.as_ref(),
         _ => "serif",
     };
-    let weight = parse_weight(values.get(&crate::css::intern("font-weight")));
-    let italic = parse_italic(values.get(&crate::css::intern("font-style")));
-    db().chain(family, weight, italic)
+    let weight = parse_weight(values.get("font-weight"));
+    let italic = parse_italic(values.get("font-style"));
+    LAST.with(|last| {
+        if let Some((f, w, i, chain)) = last.borrow().as_ref() {
+            if *w == weight && *i == italic && f.as_ref() == family {
+                return chain.clone();
+            }
+        }
+        let chain = db().chain(family, weight, italic);
+        *last.borrow_mut() = Some((Arc::from(family), weight, italic, chain.clone()));
+        chain
+    })
 }
 
 /// A glyph chosen for one character.
@@ -561,7 +574,7 @@ impl FontChain {
 /// Resolve `line-height` for a node in px.  `normal` (or absent) uses the
 /// primary face metrics, like Chromium.
 pub fn line_height_px(values: &HashMap<Arc<str>, Value>, font_size: f32) -> f32 {
-    match values.get(&crate::css::intern("line-height")) {
+    match values.get("line-height") {
         Some(Value::Length(v, crate::css::Unit::Px)) => v.max(0.0),
         Some(Value::Length(v, crate::css::Unit::Em)) => (font_size * v).max(0.0),
         Some(Value::Length(v, crate::css::Unit::Percent)) => (font_size * v / 100.0).max(0.0),
@@ -572,7 +585,7 @@ pub fn line_height_px(values: &HashMap<Arc<str>, Value>, font_size: f32) -> f32 
 
 /// Resolve `letter-spacing` in px (`normal` is 0).
 pub fn letter_spacing_px(values: &HashMap<Arc<str>, Value>, font_size: f32) -> f32 {
-    match values.get(&crate::css::intern("letter-spacing")) {
+    match values.get("letter-spacing") {
         Some(Value::Length(v, crate::css::Unit::Px)) => *v,
         Some(Value::Length(v, crate::css::Unit::Em)) => font_size * v,
         Some(Value::Number(v)) if *v == 0.0 => 0.0,
