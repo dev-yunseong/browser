@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            exe: ""
+          - os: macos-latest
+            exe: ""
+          - os: windows-latest
+            exe: ".exe"
+    steps:
+      - uses: actions/checkout@v4
+
+      # eframe (winit + glow) links against X11/Wayland libraries on Linux.
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev libgl1-mesa-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --bins --locked
+
+      - name: Test
+        run: cargo test --lib --locked -- --test-threads=2
+        timeout-minutes: 20
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            target/release/browser${{ matrix.exe }}
+            target/release/browser-daemon${{ matrix.exe }}
+            target/release/browser-cli${{ matrix.exe }}
+          if-no-files-found: error
