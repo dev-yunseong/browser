@@ -51,7 +51,17 @@ enum PseudoTarget {
     None,
     Before,
     After,
+    Placeholder,
 }
+
+/// Cascaded declarations of an element and of its `::before`, `::after` and
+/// `::placeholder` pseudo-elements.
+type Cascaded = (
+    HashMap<Arc<str>, Value>,
+    Option<HashMap<Arc<str>, Value>>,
+    Option<HashMap<Arc<str>, Value>>,
+    Option<HashMap<Arc<str>, Value>>,
+);
 
 /// An entry in the selector index pointing to a specific selector within a rule.
 #[derive(Clone)]
@@ -90,6 +100,7 @@ impl SelectorIndex {
                     None => PseudoTarget::None,
                     Some("before") => PseudoTarget::Before,
                     Some("after") => PseudoTarget::After,
+                    Some("placeholder") => PseudoTarget::Placeholder,
                     Some(_) => continue,
                 };
                 let entry = IndexEntry {
@@ -545,6 +556,7 @@ pub fn build_style_tree(
     let all_rules: Vec<&crate::css::Rule> = stylesheet.all_rules();
     // Pre-build selector index: O(M) — done once before the parallel phase.
     let sel_index = SelectorIndex::build(&all_rules);
+    let keyframes = stylesheet.keyframes();
 
     let ctx = MatchCtx { arena: &arena, hovered_id, focused_id };
 
@@ -577,10 +589,9 @@ pub fn build_style_tree(
             .expect("CSS thread pool init failed")
     });
 
-    type Cascaded = (HashMap<Arc<str>, Value>, Option<HashMap<Arc<str>, Value>>, Option<HashMap<Arc<str>, Value>>);
     let mut raw_styles: Vec<Cascaded> = pool.install(|| {
         arena.par_iter().enumerate().map(|(idx, node)| {
-        if !node.is_element { return (HashMap::new(), None, None); }
+        if !node.is_element { return (HashMap::new(), None, None, None); }
         let mut map = HashMap::new();
         apply_default_styles(&node.tag, node, &mut map);
         apply_attribute_styles_arena(node, &mut map);
@@ -604,6 +615,8 @@ pub fn build_style_tree(
             }
         }
 
+        let important_names: HashSet<Arc<str>> =
+            important.iter().chain(inline_important.iter()).map(|(k, _)| k.clone()).collect();
         for (k, v) in important { apply_declaration(&mut map, &k, &v); }
         for (k, v) in inline_important { apply_declaration(&mut map, &k, &v); }
 
@@ -614,6 +627,15 @@ pub fn build_style_tree(
                     let (val, _) = crate::css::strip_important(v);
                     crate::css::parse_declaration(&k.to_ascii_lowercase(), val, false, &mut decls);
                     for d in decls { apply_declaration(&mut map, &d.name, &d.value); }
+                }
+            }
+        }
+
+        // Animations sit above normal declarations and below !important ones.
+        if !keyframes.is_empty() {
+            for d in animation_declarations(&map, &keyframes) {
+                if !important_names.contains(&d.name) {
+                    apply_declaration(&mut map, &d.name, &d.value);
                 }
             }
         }
@@ -632,7 +654,23 @@ pub fn build_style_tree(
             for (k, v) in imp { apply_declaration(&mut pmap, &k, &v); }
             Some(pmap)
         };
-        (map, pseudo(PseudoTarget::Before), pseudo(PseudoTarget::After))
+        let placeholder = if placeholder_text(node, &arena).is_some() {
+            // UA style (Chromium html.css); author rules override it.
+            let mut pmap = pseudo(PseudoTarget::Placeholder).unwrap_or_default();
+            for (k, v) in [
+                ("color", Value::Color(crate::css::Color { r: 0x75, g: 0x75, b: 0x75, a: 255 })),
+                ("display", Value::Keyword(intern("block"))),
+                ("white-space", Value::Keyword(intern("pre"))),
+                ("overflow-x", Value::Keyword(intern("hidden"))),
+                ("overflow-y", Value::Keyword(intern("hidden"))),
+            ] {
+                pmap.entry(intern(k)).or_insert(v);
+            }
+            Some(pmap)
+        } else {
+            None
+        };
+        (map, pseudo(PseudoTarget::Before), pseudo(PseudoTarget::After), placeholder)
     }).collect()
     });
 
@@ -640,6 +678,90 @@ pub fn build_style_tree(
     let mut store = StyleStore::default();
     let mut arena_idx = 0;
     build_final_tree(root, &mut arena_idx, &mut raw_styles, &arena, parent_style, &mut store)
+}
+
+/// Declarations that running CSS animations contribute when the page is
+/// rendered as a still frame. Every animation is treated as having run to
+/// completion: a finite animation keeps its end keyframe when
+/// `animation-fill-mode` is `forwards`/`both`; a paused one shows its start
+/// keyframe (during its delay only with `backwards`/`both`). Infinite
+/// animations and ones without a fill keep the base style. Only keyframes at
+/// the exact end offset contribute (no interpolation).
+fn animation_declarations(
+    map: &HashMap<Arc<str>, Value>,
+    keyframes: &HashMap<&str, &[crate::css::Keyframe]>,
+) -> Vec<crate::css::Declaration> {
+    let list = |name: &str| -> Vec<String> {
+        map.get(name)
+            .map(value_to_css_text)
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    let names: Vec<String> = map
+        .get("animation-name")
+        .map(value_to_css_text)
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+        .collect();
+    if names.iter().all(|n| n.is_empty() || n == "none") {
+        return Vec::new();
+    }
+    let counts = list("animation-iteration-count");
+    let directions = list("animation-direction");
+    let fills = list("animation-fill-mode");
+    let states = list("animation-play-state");
+    let delays = list("animation-delay");
+    let pick = |l: &Vec<String>, i: usize, d: &str| -> String {
+        if l.is_empty() { d.to_string() } else { l[i % l.len()].clone() }
+    };
+    let seconds = |t: &str| -> f32 {
+        if let Some(ms) = t.strip_suffix("ms") { ms.parse::<f32>().map(|v| v / 1000.0).unwrap_or(0.0) }
+        else { t.trim_end_matches('s').parse::<f32>().unwrap_or(0.0) }
+    };
+    let mut out = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        let Some(frames) = keyframes.get(name.as_str()) else { continue };
+        let fill = pick(&fills, i, "none");
+        let fills_forwards = matches!(fill.as_str(), "forwards" | "both");
+        let fills_backwards = matches!(fill.as_str(), "backwards" | "both");
+        let direction = pick(&directions, i, "normal");
+        let reversed_iteration = |iteration: u32| match direction.as_str() {
+            "reverse" => true,
+            "alternate" => iteration % 2 == 1,
+            "alternate-reverse" => iteration % 2 == 0,
+            _ => false,
+        };
+        let offset = if pick(&states, i, "running") == "paused" {
+            if !fills_backwards && seconds(&pick(&delays, i, "0s")) > 0.0 {
+                continue;
+            }
+            if reversed_iteration(0) { 1.0 } else { 0.0 }
+        } else {
+            let count = pick(&counts, i, "1");
+            let Ok(count) = count.parse::<f32>() else { continue }; // infinite
+            if !fills_forwards || count < 0.0 {
+                continue;
+            }
+            let (iteration, progress) = if count == 0.0 {
+                (0, 0.0)
+            } else if count.fract() == 0.0 {
+                (count as u32 - 1, 1.0)
+            } else {
+                (count.floor() as u32, count.fract())
+            };
+            if reversed_iteration(iteration) { 1.0 - progress } else { progress }
+        };
+        for frame in frames.iter() {
+            if frame.offsets.iter().any(|o| (o - offset).abs() < 1e-4) {
+                out.extend(frame.declarations.iter().cloned());
+            }
+        }
+    }
+    out
 }
 
 /// Returns the CSS initial value for a given property name, or `None` if not defined here.
@@ -1100,7 +1222,22 @@ fn compute_values(
         }
     }
 
-    // font-weight: compute to a keyword the painter understands (bold / normal).
+    // opacity: out-of-range values clamp to [0, 1] (percentages become numbers).
+    let op_key = intern("opacity");
+    match specified_values.get(&op_key) {
+        Some(Value::Number(n)) if !(0.0..=1.0).contains(n) => {
+            let n = n.clamp(0.0, 1.0);
+            specified_values.insert(op_key, Value::Number(n));
+        }
+        Some(Value::Length(n, Unit::Percent)) => {
+            let n = (n / 100.0).clamp(0.0, 1.0);
+            specified_values.insert(op_key, Value::Number(n));
+        }
+        _ => {}
+    }
+
+    // font-weight: compute to a number (CSS Fonts 4), resolving bolder/lighter
+    // against the parent; the font matcher picks the nearest face weight.
     let fw_key = intern("font-weight");
     if let Some(v) = specified_values.get(&fw_key).cloned() {
         let parent_w = parent_pm
@@ -1108,8 +1245,7 @@ fn compute_values(
             .and_then(|pv| font_weight_number(pv, 400.0))
             .unwrap_or(400.0);
         if let Some(w) = font_weight_number(&v, parent_w) {
-            let kw = if w >= 600.0 { "bold" } else { "normal" };
-            specified_values.insert(fw_key, Value::Keyword(intern(kw)));
+            specified_values.insert(fw_key, Value::Number(w.clamp(1.0, 1000.0)));
         }
     }
 
@@ -1119,7 +1255,7 @@ fn compute_values(
 fn build_final_tree(
     root: &Handle,
     arena_idx: &mut usize,
-    raw_styles: &mut [(HashMap<Arc<str>, Value>, Option<HashMap<Arc<str>, Value>>, Option<HashMap<Arc<str>, Value>>)],
+    raw_styles: &mut [Cascaded],
     arena: &[NodeDataSend],
     initial_parent_style: Option<&PropertyMap>,
     store: &mut StyleStore
@@ -1147,6 +1283,7 @@ fn build_final_tree(
             num_children: usize,
             before: Option<StyledNode>,
             after: Option<StyledNode>,
+            placeholder: Option<StyledNode>,
         },
     }
 
@@ -1164,7 +1301,7 @@ fn build_final_tree(
                 let current_idx = *arena_idx;
                 *arena_idx += 1;
 
-                let (declared, before_decl, after_decl) = std::mem::take(&mut raw_styles[current_idx]);
+                let (declared, before_decl, after_decl, placeholder_decl) = std::mem::take(&mut raw_styles[current_idx]);
                 let mut declared = declared;
                 if parent_pm.is_none() && current_idx == 0 {
                     declared.entry(intern("color")).or_insert_with(|| Value::Color(crate::css::Color { r: 0, g: 0, b: 0, a: 255 }));
@@ -1190,6 +1327,15 @@ fn build_final_tree(
                 };
                 let before = if matches!(handle.data, NodeData::Element { .. }) { make_pseudo(before_decl, "::before") } else { None };
                 let after = if matches!(handle.data, NodeData::Element { .. }) { make_pseudo(after_decl, "::after") } else { None };
+                // `::placeholder` is shown while the control's value is empty.
+                let placeholder = placeholder_decl.and_then(|decl| {
+                    let text = placeholder_text(&arena[current_idx], arena)?;
+                    let pmap = compute_values(decl, Some(&interned_map), root_fs, false);
+                    if matches!(pmap.get("display"), Some(Value::Keyword(k)) if k.as_ref() == "none") {
+                        return None;
+                    }
+                    Some(make_pseudo_styled_node(text, pmap, "::placeholder"))
+                });
 
                 let children_handles: Vec<Handle> = handle.children.borrow().iter().cloned().collect();
                 let num_children = children_handles.len();
@@ -1201,6 +1347,7 @@ fn build_final_tree(
                     num_children,
                     before,
                     after,
+                    placeholder,
                 });
 
                 // Push Pre frames for children in REVERSE order so the first child
@@ -1212,12 +1359,13 @@ fn build_final_tree(
                     });
                 }
             }
-            Frame::Post { handle, specified_values, num_children, before, after } => {
+            Frame::Post { handle, specified_values, num_children, before, after, placeholder } => {
                 // Children have all been processed and pushed onto `results`.
                 // Drain the last num_children entries — they are in forward order
                 // because children were pushed in reverse (LIFO gives forward order).
                 let start = results.len().saturating_sub(num_children);
-                let mut children: Vec<StyledNode> = Vec::with_capacity(num_children + 2);
+                let mut children: Vec<StyledNode> = Vec::with_capacity(num_children + 3);
+                if let Some(p) = placeholder { children.push(p); }
                 if let Some(b) = before { children.push(b); }
                 children.extend(results.drain(start..));
                 if let Some(a) = after { children.push(a); }
@@ -1540,6 +1688,32 @@ fn make_pseudo_styled_node(
     StyledNode { node: element, specified_values: values, children }
 }
 
+/// Placeholder text an `<input>`/`<textarea>` shows right now: its non-empty
+/// `placeholder` attribute while the value is empty (line breaks removed).
+fn placeholder_text(node: &NodeDataSend, arena: &[NodeDataSend]) -> Option<String> {
+    let text = attr_value(node, "placeholder")?;
+    match node.tag.as_str() {
+        "input" => {
+            let ty = attr_value(node, "type").unwrap_or("text").to_ascii_lowercase();
+            let text_like = matches!(
+                ty.as_str(),
+                "text" | "search" | "email" | "url" | "tel" | "password" | "number" | ""
+            );
+            if !text_like || attr_value(node, "value").is_some_and(|v| !v.is_empty()) {
+                return None;
+            }
+        }
+        "textarea" => {
+            if node.children_idx.iter().any(|&c| arena[c].has_text) {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    let text: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+    if text.is_empty() { None } else { Some(text) }
+}
+
 /// Returns true when this styled node is a generated `::before` / `::after` box.
 pub fn is_pseudo_element(node: &StyledNode) -> bool {
     matches!(&node.node.data, NodeData::Element { name, .. } if name.local.starts_with("::"))
@@ -1617,9 +1791,9 @@ mod tests {
             "",
         );
         let html = find_node(&tree, "html").expect("html not found");
-        // inherit on root → initial value for font-weight is "normal"
-        let kw = get_keyword(html, "font-weight");
-        assert!(kw.is_none() || kw.as_deref() == Some("normal"));
+        // inherit on root → initial value for font-weight is normal (400)
+        let fw = html.specified_values.get(&intern("font-weight"));
+        assert!(fw.is_none() || fw == Some(&Value::Number(400.0)), "got {:?}", fw);
     }
 
     // --- initial keyword ---
@@ -2083,10 +2257,28 @@ mod tests {
     }
 
     #[test]
-    fn test_numeric_font_weight_computes_to_bold() {
-        let tree = make_tree(r#"<html><body><p>x</p></body></html>"#, "p { font-weight: 800; }");
-        let p = find_node(&tree, "p").unwrap();
-        assert_eq!(get_keyword(p, "font-weight").as_deref(), Some("bold"));
+    fn test_opacity_computes_clamped_number() {
+        let tree = make_tree(
+            r#"<html><body><p style="opacity:-56.81">x</p><i style="opacity:40%">y</i></body></html>"#,
+            "",
+        );
+        let op = |tag: &str| find_node(&tree, tag).unwrap().specified_values.get(&intern("opacity")).cloned();
+        assert_eq!(op("p"), Some(Value::Number(0.0)));
+        assert_eq!(op("i"), Some(Value::Number(0.4)));
+    }
+
+    #[test]
+    fn test_font_weight_computes_to_number() {
+        let tree = make_tree(
+            r#"<html><body><p>x<b>y</b></p><i>z</i></body></html>"#,
+            "body { font-weight: 500 } p { font-weight: 800; } i { font-weight: bolder }",
+        );
+        let fw = |tag: &str| find_node(&tree, tag).unwrap().specified_values.get(&intern("font-weight")).cloned();
+        assert_eq!(fw("p"), Some(Value::Number(800.0)));
+        assert_eq!(fw("body"), Some(Value::Number(500.0)));
+        // UA `b { font-weight: bold }` is 700; `bolder` from 500 is 700.
+        assert_eq!(fw("b"), Some(Value::Number(700.0)));
+        assert_eq!(fw("i"), Some(Value::Number(700.0)));
     }
 
     #[test]
@@ -2097,5 +2289,41 @@ mod tests {
         assert_eq!(s.pseudo_class, Some("hover".to_string()));
         assert!(s.pseudo_element.is_none());
     }
-}
 
+    fn transform_of(node: &StyledNode) -> Option<Value> {
+        node.specified_values.get(&intern("transform")).cloned()
+    }
+
+    #[test]
+    fn test_finished_animation_with_fill_forwards_keeps_end_keyframe() {
+        // Keyframes names are case-sensitive (CSS Modules hashes mix case).
+        let css = ".r{width:100%;animation-fill-mode:forwards;animation-name:Roll___2LIf-}\
+                   @keyframes Roll___2LIf-{0%{transform:none}to{transform:translateY(-100%)}}";
+        let tree = make_tree(r#"<div class="r" style="animation-duration: .5s;">x</div>"#, css);
+        let div = find_node(&tree, "div").unwrap();
+        assert!(matches!(transform_of(div), Some(Value::Transform(_))), "got {:?}", transform_of(div));
+    }
+
+    #[test]
+    fn test_animation_without_fill_or_infinite_keeps_base_style() {
+        let css = "@keyframes fade{from{opacity:0}to{opacity:0.5}}\
+                   .a{animation:fade 1s} .b{animation:fade 1s infinite forwards} .c{animation:fade 1s forwards}";
+        let tree = make_tree(r#"<p class="a">a</p><span class="b">b</span><i class="c">c</i>"#, css);
+        let op = |tag: &str| find_node(&tree, tag).unwrap().specified_values.get(&intern("opacity")).cloned();
+        assert_eq!(op("p"), None);
+        assert_eq!(op("span"), None);
+        assert_eq!(op("i"), Some(Value::Number(0.5)));
+    }
+
+    #[test]
+    fn test_animation_direction_and_important() {
+        let css = "@keyframes m{from{opacity:0.25}to{opacity:0.75}}\
+                   .rev{animation:m 1s reverse forwards} .alt{animation:m 1s 2 alternate both}\
+                   .imp{animation:m 1s forwards; opacity:1 !important}";
+        let tree = make_tree(r#"<p class="rev">a</p><span class="alt">b</span><i class="imp">c</i>"#, css);
+        let op = |tag: &str| find_node(&tree, tag).unwrap().specified_values.get(&intern("opacity")).cloned();
+        assert_eq!(op("p"), Some(Value::Number(0.25)));
+        assert_eq!(op("span"), Some(Value::Number(0.25)));
+        assert_eq!(op("i"), Some(Value::Number(1.0)));
+    }
+}
