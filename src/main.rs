@@ -12,6 +12,7 @@ pub mod fonts;
 pub mod layer_tree;
 pub mod js;
 pub mod matrix;
+pub mod svg;
 pub mod engine;
 pub mod frames;
 
