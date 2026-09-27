@@ -619,6 +619,20 @@ pub fn fetch_and_process(
 }
 
 /// Run the full pipeline on pre-fetched HTML, returning a `PageResult`.
+/// Viewport height in CSS px used for `vh` units, fixed-position boxes and
+/// `window.innerHeight`. Process-wide because one daemon drives one viewport;
+/// width is still passed per render.
+static VIEWPORT_HEIGHT_BITS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(768.0f32.to_bits());
+
+pub fn set_viewport_height(height: f32) {
+    VIEWPORT_HEIGHT_BITS.store(height.max(1.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn viewport_height() -> f32 {
+    f32::from_bits(VIEWPORT_HEIGHT_BITS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 pub fn process_html_with_cache(
     body: &str,
     base_url: &Url,
@@ -702,7 +716,7 @@ pub fn process_html_with_cache(
 
     let start = Instant::now();
     let (layout_tree_opt, _, final_y) =
-        layout::build_layout_tree(&style_tree, 0.0, 0.0, 0.0, width, width, 768.0);
+        layout::build_layout_tree(&style_tree, 0.0, 0.0, 0.0, width, width, viewport_height());
     let layout_tree = layout_tree_opt.ok_or("Failed to build layout tree")?;
     let layout_elapsed = start.elapsed();
 
@@ -1303,6 +1317,11 @@ impl BrowserEngine {
                 console,
             )
         });
+
+        let viewport_h = viewport_height();
+        self.js_runtime.execute(&format!(
+            "window.innerHeight = window.outerHeight = screen.height = screen.availHeight = {viewport_h};"
+        ));
 
         let scripts = js::extract_script_sources_from_dom(&dom.document, Some(&page.base_url));
 

@@ -4,6 +4,7 @@
 //!   browser-daemon              # GUI window + HTTP server on :7070
 //!   browser-daemon --no-gui     # headless HTTP server only
 //!   browser-daemon --port 7071  # custom port
+//!   browser-daemon --viewport-height 1200  # viewport height in CSS px (default 768)
 
 use std::collections::HashMap;
 
@@ -18,11 +19,13 @@ use poll_promise::Promise;
 struct DaemonArgs {
     no_gui: bool,
     port: u16,
+    viewport_height: Option<f32>,
 }
 
 fn parse_args_from(args: &[&str]) -> DaemonArgs {
     let mut no_gui = false;
     let mut port = 7070u16;
+    let mut viewport_height = None;
     let mut i = 0;
     while i < args.len() {
         match args[i] {
@@ -33,11 +36,15 @@ fn parse_args_from(args: &[&str]) -> DaemonArgs {
                     port = p.parse().unwrap_or(7070);
                 }
             }
+            "--viewport-height" => {
+                i += 1;
+                viewport_height = args.get(i).and_then(|h| h.parse().ok());
+            }
             _ => {}
         }
         i += 1;
     }
-    DaemonArgs { no_gui, port }
+    DaemonArgs { no_gui, port, viewport_height }
 }
 
 fn parse_args() -> DaemonArgs {
@@ -1165,6 +1172,9 @@ fn render_console_panel(
 
 fn main() {
     let args = parse_args();
+    if let Some(height) = args.viewport_height {
+        engine::set_viewport_height(height);
+    }
 
     // Spawn the engine actor thread and get a cloneable handle to it.
     let handle = EngineHandle::spawn();
@@ -1222,6 +1232,14 @@ mod tests {
         let args = parse_args_from(&[]);
         assert!(!args.no_gui);
         assert_eq!(args.port, 7070);
+    }
+
+    #[test]
+    fn test_parse_args_viewport_height() {
+        assert_eq!(parse_args_from(&[]).viewport_height, None);
+        let args = parse_args_from(&["--no-gui", "--viewport-height", "1200"]);
+        assert_eq!(args.viewport_height, Some(1200.0));
+        assert!(args.no_gui);
     }
 
     #[test]
