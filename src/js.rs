@@ -1,4 +1,4 @@
-use crate::css::{parse_selector, AttributeMatch, Combinator, Selector};
+use crate::css::{parse_selector, AttributeMatch, Combinator, PseudoClass, Selector};
 use lazy_static::lazy_static;
 use markup5ever_rcdom::{Handle, NodeData};
 use serde::{Deserialize, Serialize};
@@ -84,6 +84,47 @@ thread_local! {
         RefCell::new(HashMap::new());
     /// Pending form submission requests from JS — checked by engine.
     static FORM_SUBMIT_REQUESTS: RefCell<Vec<u32>> = RefCell::new(Vec::new());
+}
+
+thread_local! {
+    /// Promises rejected with no handler yet, by identity hash, with the
+    /// rejection text. Reported to the console at the end of a tick unless a
+    /// handler was attached meanwhile (as Chromium reports them).
+    static UNHANDLED_REJECTIONS: RefCell<Vec<(i32, String)>> = const { RefCell::new(Vec::new()) };
+}
+
+unsafe extern "C" fn promise_reject_callback(message: v8::PromiseRejectMessage) {
+    let id = message.get_promise().get_identity_hash().get();
+    match message.get_event() {
+        v8::PromiseRejectEvent::PromiseRejectWithNoHandler => {
+            v8::callback_scope!(unsafe scope, &message);
+            let text = match message.get_value() {
+                Some(value) if value.is_object() => {
+                    let object = value.to_object(scope).unwrap();
+                    let stack_key = v8::String::new(scope, "stack").unwrap();
+                    object
+                        .get(scope, stack_key.into())
+                        .filter(|stack| stack.is_string())
+                        .unwrap_or(value)
+                        .to_rust_string_lossy(scope)
+                }
+                Some(value) => value.to_rust_string_lossy(scope),
+                None => String::new(),
+            };
+            UNHANDLED_REJECTIONS.with(|list| list.borrow_mut().push((id, text)));
+        }
+        v8::PromiseRejectEvent::PromiseHandlerAddedAfterReject => {
+            UNHANDLED_REJECTIONS.with(|list| list.borrow_mut().retain(|(pending, _)| *pending != id));
+        }
+        _ => {}
+    }
+}
+
+fn report_unhandled_rejections() {
+    for (_, text) in UNHANDLED_REJECTIONS.with(|list| std::mem::take(&mut *list.borrow_mut())) {
+        eprintln!("[JS] Uncaught (in promise) {}", text.chars().take(500).collect::<String>());
+        push_console_entry(ConsoleLevel::Error, format!("Uncaught (in promise) {text}"));
+    }
 }
 
 unsafe extern "C" fn import_meta_callback(
@@ -771,6 +812,8 @@ impl JsRuntime {
         let mut isolate = v8::Isolate::new(v8::CreateParams::default());
         isolate.set_host_initialize_import_meta_object_callback(import_meta_callback);
         isolate.set_host_import_module_dynamically_callback(host_import_module_dynamically);
+        isolate.set_promise_reject_callback(promise_reject_callback);
+        UNHANDLED_REJECTIONS.with(|list| list.borrow_mut().clear());
         let (task_sender, task_receiver) = std::sync::mpsc::channel();
         TASK_SENDER.with(|s| *s.borrow_mut() = Some(task_sender));
 
@@ -939,6 +982,7 @@ impl JsRuntime {
             self.run_microtasks();
         }
 
+        report_unhandled_rejections();
         did_work
     }
 
@@ -1121,6 +1165,14 @@ impl JsRuntime {
         })
     }
 
+
+    /// Run a parser-inserted classic script with `document.currentScript`
+    /// set to its `<script>` element (`node_id` from `ScriptSource`).
+    pub fn execute_classic_script(&mut self, source: &str, node_id: u32) {
+        self.execute(&format!("__aura_set_current_script_node({node_id});"));
+        self.execute(source);
+        self.execute("__aura_set_current_script_node(0);");
+    }
 
     pub fn execute(&mut self, source: &str) {
         let outcome = self.execute_with_result(source);
@@ -3555,6 +3607,7 @@ pub fn extract_scripts_from_dom(handle: &Handle) -> Vec<String> {
             ScriptSource::InlineClassic {
                 source,
                 is_defer: false,
+                ..
             } => Some(source),
             ScriptSource::InlineClassic { is_defer: true, .. }
             | ScriptSource::ExternalClassic { .. }
@@ -3568,11 +3621,13 @@ pub fn extract_scripts_from_dom(handle: &Handle) -> Vec<String> {
 pub enum ScriptSource {
     /// Inline classic scripts are always synchronous in the HTML spec (neither async nor defer
     /// should apply), but we track `is_defer` so that inline test cases can exercise defer semantics.
-    InlineClassic { source: String, is_defer: bool },
+    /// `node_id` names the `<script>` element for `document.currentScript`.
+    InlineClassic { source: String, is_defer: bool, node_id: u32 },
     ExternalClassic {
         url: Url,
         is_async: bool,
         is_defer: bool,
+        node_id: u32,
     },
     /// Modules are defer-by-default. `is_async` overrides; explicit `defer` attribute has no effect.
     InlineModule {
@@ -3654,6 +3709,7 @@ pub fn extract_script_sources_from_dom(
                                     url,
                                     is_async,
                                     is_defer,
+                                    node_id: register_node(handle.clone()),
                                 });
                             }
                         }
@@ -3686,6 +3742,7 @@ pub fn extract_script_sources_from_dom(
                             scripts.push(ScriptSource::InlineClassic {
                                 source: content,
                                 is_defer,
+                                node_id: register_node(handle.clone()),
                             });
                         }
                     }
@@ -3843,10 +3900,10 @@ mod tests {
         let sources = extract_script_sources_from_dom(&dom.document, Some(&base));
         assert_eq!(sources.len(), 3);
         assert!(
-            matches!(&sources[0], ScriptSource::InlineClassic { source: s, is_defer: false } if s == "window.a = 1;")
+            matches!(&sources[0], ScriptSource::InlineClassic { source: s, is_defer: false, .. } if s == "window.a = 1;")
         );
         assert!(
-            matches!(&sources[1], ScriptSource::ExternalClassic { url, is_async: false, is_defer: false } if url.as_str() == "https://example.com/bundle.js")
+            matches!(&sources[1], ScriptSource::ExternalClassic { url, is_async: false, is_defer: false, .. } if url.as_str() == "https://example.com/bundle.js")
         );
         assert!(
             matches!(&sources[2], ScriptSource::ExternalModule { url, is_async: false, .. } if url.as_str() == "https://example.com/module.js")
@@ -3874,13 +3931,11 @@ mod tests {
         let classic_dom =
             dom::parse_html(r#"<html><head><script>window.x=1</script></head></html>"#);
         let classic_sources = extract_script_sources_from_dom(&classic_dom.document, Some(&base));
-        assert_eq!(
-            classic_sources,
-            vec![ScriptSource::InlineClassic {
-                source: "window.x=1".to_string(),
-                is_defer: false
-            }]
-        );
+        assert_eq!(classic_sources.len(), 1);
+        assert!(matches!(
+            &classic_sources[0],
+            ScriptSource::InlineClassic { source, is_defer: false, .. } if source == "window.x=1"
+        ));
     }
 
     #[test]
@@ -5738,15 +5793,123 @@ fn split_selector_groups(selector: &str) -> Vec<&str> {
     groups
 }
 
-fn selector_is_supported_for_dom_queries(selector: &Selector) -> bool {
-    if selector.pseudo_class.is_some() || selector.pseudo_element.is_some() {
-        return false;
+fn element_tag_name(node: &Handle) -> Option<String> {
+    match node.data {
+        NodeData::Element { ref name, .. } => Some(name.local.to_string().to_lowercase()),
+        _ => None,
     }
-    selector
-        .ancestor
-        .as_deref()
-        .map(selector_is_supported_for_dom_queries)
-        .unwrap_or(true)
+}
+
+fn element_attr(node: &Handle, attr_name: &str) -> Option<String> {
+    let NodeData::Element { ref attrs, .. } = node.data else {
+        return None;
+    };
+    let value = attrs
+        .borrow()
+        .iter()
+        .find(|a| a.name.local.as_ref() == attr_name)
+        .map(|a| a.value.to_string());
+    value
+}
+
+/// Element siblings of `node` (itself included), in document order.
+fn element_siblings_with_self(node: &Handle) -> Vec<Handle> {
+    let Some(parent) = get_parent_handle(node) else {
+        return vec![node.clone()];
+    };
+    let siblings = parent
+        .children
+        .borrow()
+        .iter()
+        .filter(|child| matches!(child.data, NodeData::Element { .. }))
+        .cloned()
+        .collect();
+    siblings
+}
+
+fn position_in(list: &[Handle], node: &Handle) -> Option<usize> {
+    list.iter().position(|n| Rc::ptr_eq(n, node))
+}
+
+/// Structured pseudo-classes for DOM queries (`querySelector`, `matches`,
+/// `closest`), matching the style system's rules. Dynamic states that page
+/// script cannot observe here (`:hover`, `:focus`) never match.
+fn dom_pseudo_matches(pseudo: &PseudoClass, node: &Handle) -> bool {
+    let nth = |a: i32, b: i32, list: &[Handle]| {
+        position_in(list, node).is_some_and(|pos| crate::css::nth_matches(a, b, pos as i32 + 1))
+    };
+    let of_type = || {
+        let tag = element_tag_name(node);
+        element_siblings_with_self(node)
+            .into_iter()
+            .filter(|s| element_tag_name(s) == tag)
+            .collect::<Vec<_>>()
+    };
+    match pseudo {
+        PseudoClass::Not(list) => !list.iter().any(|s| selector_matches_parsed_handle(node, s)),
+        PseudoClass::Is(list) | PseudoClass::Where(list) => {
+            list.iter().any(|s| selector_matches_parsed_handle(node, s))
+        }
+        PseudoClass::FirstChild => position_in(&element_siblings_with_self(node), node) == Some(0),
+        PseudoClass::LastChild => {
+            let sibs = element_siblings_with_self(node);
+            position_in(&sibs, node) == Some(sibs.len().saturating_sub(1))
+        }
+        PseudoClass::OnlyChild => element_siblings_with_self(node).len() == 1,
+        PseudoClass::NthChild(a, b, of) | PseudoClass::NthLastChild(a, b, of) => {
+            let mut sibs = element_siblings_with_self(node);
+            if let Some(list) = of {
+                if !list.iter().any(|s| selector_matches_parsed_handle(node, s)) {
+                    return false;
+                }
+                sibs.retain(|sib| list.iter().any(|s| selector_matches_parsed_handle(sib, s)));
+            }
+            if matches!(pseudo, PseudoClass::NthLastChild(..)) {
+                sibs.reverse();
+            }
+            nth(*a, *b, &sibs)
+        }
+        PseudoClass::FirstOfType => position_in(&of_type(), node) == Some(0),
+        PseudoClass::LastOfType => {
+            let sibs = of_type();
+            position_in(&sibs, node) == Some(sibs.len().saturating_sub(1))
+        }
+        PseudoClass::OnlyOfType => of_type().len() == 1,
+        PseudoClass::NthOfType(a, b) => nth(*a, *b, &of_type()),
+        PseudoClass::NthLastOfType(a, b) => {
+            let mut sibs = of_type();
+            sibs.reverse();
+            nth(*a, *b, &sibs)
+        }
+        PseudoClass::Empty => node.children.borrow().iter().all(|child| match child.data {
+            NodeData::Element { .. } => false,
+            NodeData::Text { ref contents } => contents.borrow().is_empty(),
+            _ => true,
+        }),
+        PseudoClass::Root => element_tag_name(node).as_deref() == Some("html"),
+        PseudoClass::Link => {
+            matches!(element_tag_name(node).as_deref(), Some("a" | "area"))
+                && element_attr(node, "href").is_some()
+        }
+        PseudoClass::Checked => match element_tag_name(node).as_deref() {
+            Some("input") => element_attr(node, "checked").is_some(),
+            Some("option") => element_attr(node, "selected").is_some(),
+            _ => false,
+        },
+        PseudoClass::Disabled | PseudoClass::Enabled => {
+            let is_control = matches!(
+                element_tag_name(node).as_deref(),
+                Some("input" | "button" | "select" | "textarea" | "option" | "optgroup" | "fieldset")
+            );
+            let disabled = is_control && element_attr(node, "disabled").is_some();
+            if matches!(pseudo, PseudoClass::Disabled) {
+                disabled
+            } else {
+                is_control && !disabled
+            }
+        }
+        PseudoClass::Hover | PseudoClass::Focus | PseudoClass::Never(_) => false,
+    }
 }
 
 fn selector_subject_matches_handle(node: &Handle, selector: &Selector) -> bool {
@@ -5758,11 +5921,12 @@ fn selector_subject_matches_handle(node: &Handle, selector: &Selector) -> bool {
     else {
         return false;
     };
-    let has_constraint = selector.tag.is_some()
-        || selector.id.is_some()
-        || !selector.class.is_empty()
-        || !selector.attributes.is_empty();
-    if !has_constraint {
+    if selector.never_matches || selector.pseudo_element.is_some() || !selector.has_constraint() {
+        return false;
+    }
+    // Only the legacy string form of a pseudo-class, which the parser did not
+    // understand: never matches, as before.
+    if selector.pseudos.is_empty() && selector.pseudo_class.is_some() {
         return false;
     }
     let tag = name.local.to_string().to_lowercase();
@@ -5771,42 +5935,43 @@ fn selector_subject_matches_handle(node: &Handle, selector: &Selector) -> bool {
             return false;
         }
     }
-    let attrs_ref = attrs.borrow();
-    let id_val = attrs_ref
-        .iter()
-        .find(|a| a.name.local.to_string() == "id")
-        .map(|a| a.value.to_string());
-    if let Some(ref required_id) = selector.id {
-        if id_val.as_deref() != Some(required_id.as_str()) {
-            return false;
-        }
-    }
-    let class_val = attrs_ref
-        .iter()
-        .find(|a| a.name.local.to_string() == "class")
-        .map(|a| a.value.to_string())
-        .unwrap_or_default();
-    let classes: Vec<&str> = class_val.split_whitespace().collect();
-    for required_class in &selector.class {
-        if !classes.contains(&required_class.as_str()) {
-            return false;
-        }
-    }
-    for attr_sel in &selector.attributes {
-        let matched = attrs_ref.iter().any(|attr| {
-            if attr.name.local.to_string() != attr_sel.name {
+    {
+        let attrs_ref = attrs.borrow();
+        let attr = |wanted: &str| {
+            attrs_ref
+                .iter()
+                .find(|a| a.name.local.as_ref() == wanted)
+                .map(|a| a.value.to_string())
+        };
+        if let Some(ref required_id) = selector.id {
+            if attr("id").as_deref() != Some(required_id.as_str()) {
                 return false;
             }
-            match &attr_sel.value {
-                AttributeMatch::Exists => true,
-                AttributeMatch::Equals(expected) => attr.value.to_string() == *expected,
+        }
+        let class_val = attr("class").unwrap_or_default();
+        let classes: Vec<&str> = class_val.split_whitespace().collect();
+        for required_class in &selector.class {
+            if !classes.contains(&required_class.as_str()) {
+                return false;
             }
-        });
-        if !matched {
-            return false;
+        }
+        for attr_sel in &selector.attributes {
+            let matched = match (&attr_sel.value, attr(&attr_sel.name)) {
+                (_, None) => false,
+                (AttributeMatch::Exists, Some(_)) => true,
+                (AttributeMatch::Equals(expected), Some(actual)) => actual == *expected,
+            };
+            if !matched {
+                return false;
+            }
+        }
+        for op in &selector.attr_ops {
+            if !attr(&op.name).is_some_and(|actual| op.matches_value(&actual)) {
+                return false;
+            }
         }
     }
-    true
+    selector.pseudos.iter().all(|pseudo| dom_pseudo_matches(pseudo, node))
 }
 
 fn previous_element_siblings(node: &Handle) -> Vec<Handle> {
@@ -5827,9 +5992,7 @@ fn previous_element_siblings(node: &Handle) -> Vec<Handle> {
 }
 
 fn selector_matches_parsed_handle(node: &Handle, selector: &Selector) -> bool {
-    if !selector_is_supported_for_dom_queries(selector)
-        || !selector_subject_matches_handle(node, selector)
-    {
+    if !selector_subject_matches_handle(node, selector) {
         return false;
     }
     let Some(ref ancestor_sel) = selector.ancestor else {

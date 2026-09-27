@@ -39,12 +39,9 @@ pub const FRAME_BUDGET: Duration = Duration::from_secs(8);
 const FRAME_SETTLE: Duration = Duration::from_millis(1500);
 const FRAME_TICK_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Image-cache key of the rendered document of an `<iframe>` whose absolute
-/// `src` is `src` and whose content box is `width` x `height` px. Must match
-/// `layer_tree::iframe_frame_key`, which the paint side uses for the lookup.
-pub fn iframe_frame_key(src: &str, width: u32, height: u32) -> String {
-    format!("iframe:{width}x{height}:{src}")
-}
+/// Image-cache key of the rendered document of an `<iframe>` with absolute
+/// `src` and a `width` x `height` px content box (the paint side's key).
+pub use crate::layer_tree::iframe_frame_key;
 
 // ── Frame threads ─────────────────────────────────────────────────────────────
 
@@ -157,12 +154,9 @@ pub fn collect_frame_boxes(root: &layout::LayoutBox, base_url: &Url) -> Vec<Fram
     while let Some(layout_box) = stack.pop() {
         let node = &layout_box.style_node.node;
         if let Some((src, ordinal)) = ordinals.get(&(std::rc::Rc::as_ptr(node) as usize)) {
-            let d = &layout_box.dimensions;
-            let width = d.width - layout_box.padding.left - layout_box.padding.right
-                - layout_box.border.left - layout_box.border.right;
-            let height = d.height - layout_box.padding.top - layout_box.padding.bottom
-                - layout_box.border.top - layout_box.border.bottom;
-            let (width, height) = (width.round().max(0.0) as u32, height.round().max(0.0) as u32);
+            // Rounded like the paint side rounds the key it looks up.
+            let content = crate::background::box_rect(layout_box, crate::background::BoxArea::Content);
+            let (width, height) = (content.width.round() as u32, content.height.round() as u32);
             let name = iframe_attrs(node)
                 .and_then(|attrs| attrs.into_iter().find(|(n, _)| n == "name").map(|(_, v)| v))
                 .unwrap_or_default();

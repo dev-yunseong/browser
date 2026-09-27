@@ -1788,11 +1788,18 @@ impl BrowserEngine {
             viewport_h,
         );
 
+        // Debug hook: a script run before the page's own scripts.
+        if let Ok(path) = std::env::var("BROWSER_DEBUG_PRELUDE") {
+            if let Ok(prelude) = std::fs::read_to_string(&path) {
+                self.js_runtime.execute(&prelude);
+            }
+        }
+
         let scripts = js::extract_script_sources_from_dom(&dom.document, Some(&page.base_url));
 
         // ── Phase-bucketed collections ──────────────────────────────────────
-        let mut deferred_classics: Vec<String> = Vec::new();
-        let mut async_classics: Vec<String> = Vec::new();
+        let mut deferred_classics: Vec<(String, u32)> = Vec::new();
+        let mut async_classics: Vec<(String, u32)> = Vec::new();
         let mut deferred_module_urls: Vec<Url> = Vec::new();
         let mut deferred_module_targets: Vec<(Url, u32)> = Vec::new();
         let mut async_module_urls: Vec<Url> = Vec::new();
@@ -1821,7 +1828,7 @@ impl BrowserEngine {
         // ── Phase 1: execute synchronous classics, bucket the rest ─────────
         for script in scripts {
             match script {
-                js::ScriptSource::InlineClassic { source, is_defer } => {
+                js::ScriptSource::InlineClassic { source, is_defer, node_id } => {
                     let allowed = self
                         .current_csp_policy
                         .as_ref()
@@ -1832,10 +1839,10 @@ impl BrowserEngine {
                         continue;
                     }
                     if is_defer {
-                        deferred_classics.push(source);
+                        deferred_classics.push((source, node_id));
                     } else {
                         eprintln!("[JS DEBUG] Executing inline classic script (len={})", source.len());
-                        self.js_runtime.execute(&source);
+                        self.js_runtime.execute_classic_script(&source, node_id);
                         eprintln!("[JS DEBUG] Inline classic script finished");
                     }
                 }
@@ -1843,6 +1850,7 @@ impl BrowserEngine {
                     url,
                     is_async,
                     is_defer,
+                    node_id,
                 } => {
                     eprintln!("[JS DEBUG] Fetching external classic script: {}", url);
                     let source = fetch_classic_source(self, &url);
@@ -1850,12 +1858,12 @@ impl BrowserEngine {
                     if let Some(source) = source {
                         if is_async {
                             // async wins over defer per HTML spec
-                            async_classics.push(source);
+                            async_classics.push((source, node_id));
                         } else if is_defer {
-                            deferred_classics.push(source);
+                            deferred_classics.push((source, node_id));
                         } else {
                             eprintln!("[JS DEBUG] Executing external classic script: {}", url);
-                            self.js_runtime.execute(&source);
+                            self.js_runtime.execute_classic_script(&source, node_id);
                             eprintln!("[JS DEBUG] External classic script finished: {}", url);
                         }
                     }
@@ -1930,10 +1938,9 @@ impl BrowserEngine {
         }
 
         // ── Phase 2: execute deferred classics, then evaluate deferred modules ──
-        for (idx, script) in deferred_classics.iter().enumerate() {
-            let preview = if script.len() > 200 { &script[..200] } else { script };
-            eprintln!("[JS DEBUG] Executing deferred classic script #{} (len={}, preview={})", idx, script.len(), preview);
-            self.js_runtime.execute(script);
+        for (idx, (script, node_id)) in deferred_classics.iter().enumerate() {
+            eprintln!("[JS DEBUG] Executing deferred classic script #{} (len={})", idx, script.len());
+            self.js_runtime.execute_classic_script(script, *node_id);
             eprintln!("[JS DEBUG] Deferred classic script #{} finished", idx);
         }
 
@@ -1963,9 +1970,9 @@ impl BrowserEngine {
         }
 
         // ── Phase 3: execute async classics, then evaluate async modules ──
-        for (idx, script) in async_classics.iter().enumerate() {
+        for (idx, (script, node_id)) in async_classics.iter().enumerate() {
             eprintln!("[JS DEBUG] Executing async classic script #{}", idx);
-            self.js_runtime.execute(script);
+            self.js_runtime.execute_classic_script(script, *node_id);
             eprintln!("[JS DEBUG] Async classic script #{} finished", idx);
         }
 
