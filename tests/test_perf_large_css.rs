@@ -10,10 +10,9 @@ fn base_url() -> Url { Url::parse("https://test.com/").unwrap() }
 fn run(html: &str) -> browser::engine::PageResult {
     let image_cache = HashMap::new();
     let mut css_cache = HashMap::new();
-    let js_overrides = HashMap::new();
     let (result, _) = process_html_with_cache(
         html, &base_url(), &image_cache, &mut css_cache,
-        None, &js_overrides, None, None, None, 800.0,
+        None, None, None, None, 800.0,
     ).expect("pipeline should not fail");
     result
 }

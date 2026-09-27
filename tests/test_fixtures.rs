@@ -25,7 +25,6 @@ fn engine_with_fixture(name: &str) -> browser::engine::BrowserEngine {
         &HashMap::new(),
         &mut css_cache,
         None,
-        &HashMap::new(),
         None,
         None,
         None,
@@ -122,22 +121,11 @@ fn test_module_dom_mutations() {
 
 #[test]
 fn test_module_style_overrides() {
-    let engine = engine_with_fixture("module-style-override.html");
-    let color = engine
-        .js_style_overrides
-        .get("test")
-        .and_then(|p| p.get("color").cloned());
-    let font_size = engine
-        .js_style_overrides
-        .get("test")
-        .and_then(|p| p.get("font-size").cloned());
-    let display = engine
-        .js_style_overrides
-        .get("test")
-        .and_then(|p| p.get("display").cloned());
-    assert_eq!(color, Some("red".to_string()));
-    assert_eq!(font_size, Some("24px".to_string()));
-    assert_eq!(display, Some("none".to_string()));
+    let mut engine = engine_with_fixture("module-style-override.html");
+    assert_eq!(
+        engine.evaluate_js("document.getElementById('test').getAttribute('style')"),
+        "color: red; font-size: 24px; display: none;"
+    );
 }
 
 #[test]

@@ -12,6 +12,7 @@
 //!   browser-cli js <script>              # Evaluate JavaScript and print result
 //!   browser-cli style [<selector>]       # Print computed CSS styles
 //!   browser-cli layout                   # Print the layout tree
+//!   browser-cli dom [<file>]             # Print or save the rendered DOM as HTML
 //!   browser-cli logs                     # Print browser console entries
 //!   browser-cli tick [count]             # Advance daemon JS tasks
 //!   browser-cli --port 7071 <command>    # Custom daemon port
@@ -81,6 +82,11 @@ struct ApiTickResponse {
 #[serde(tag = "type")]
 enum ClickResult {
     Navigate { url: String },
+    /// Page script navigated; the daemon already loaded `url`.
+    Navigated {
+        #[allow(dead_code)]
+        url: String,
+    },
     ScriptExecuted,
     FocusChanged { id: String },
     Nothing,
@@ -153,6 +159,27 @@ impl DaemonClient {
                 resp.status()
             )));
         }
+        Self::parse_page(resp)
+    }
+
+    /// POST /back or /forward. `Ok(None)` when the daemon's session history
+    /// has no entry in that direction.
+    fn traverse(&self, path: &str) -> Result<Option<ApiPageResponse>, CliError> {
+        let resp = self
+            .client
+            .post(format!("{}/{}", self.base_url, path))
+            .send()
+            .map_err(Self::check_error)?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(CliError::Http(format!("{} returned {}", path, resp.status())));
+        }
+        Self::parse_page(resp).map(Some)
+    }
+
+    fn parse_page(resp: reqwest::blocking::Response) -> Result<ApiPageResponse, CliError> {
         // Read the raw body text first so we can include it in the error message if
         // deserialization fails (e.g. because the daemon panicked and sent garbage).
         let body = resp.text().map_err(|e| CliError::Parse(e.to_string()))?;
@@ -208,12 +235,19 @@ impl DaemonClient {
         Ok(())
     }
 
-    fn submit(&self) -> Result<(), CliError> {
-        self.client
+    /// POST /submit — the URL the current page's form submits to, or `None`
+    /// when the page has no form.
+    fn submit(&self) -> Result<Option<String>, CliError> {
+        let resp = self
+            .client
             .post(format!("{}/submit", self.base_url))
             .send()
             .map_err(Self::check_error)?;
-        Ok(())
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let v: serde_json::Value = resp.json().map_err(|e| CliError::Parse(e.to_string()))?;
+        Ok(v["url"].as_str().filter(|url| !url.is_empty()).map(str::to_string))
     }
 
     fn screenshot_bytes(&self, mode: ScreenshotMode) -> Result<Vec<u8>, CliError> {
@@ -269,6 +303,16 @@ impl DaemonClient {
         serde_json::to_string_pretty(&v).map_err(|e| CliError::Parse(e.to_string()))
     }
 
+    /// GET /dom — the serialized live DOM the last render laid out.
+    fn get_dom(&self) -> Result<String, CliError> {
+        let resp = self
+            .client
+            .get(format!("{}/dom", self.base_url))
+            .send()
+            .map_err(Self::check_error)?;
+        resp.text().map_err(|e| CliError::Http(e.to_string()))
+    }
+
     /// GET /layout — returns the plain-text layout tree.
     fn get_layout(&self) -> Result<String, CliError> {
         let resp = self
@@ -304,99 +348,52 @@ impl DaemonClient {
     }
 }
 
-// ── CliHistory ────────────────────────────────────────────────────────────────
-
-struct CliHistory {
-    entries: Vec<String>,
-    /// Index of the currently-active URL in `entries`. Only valid when entries is non-empty.
-    index: usize,
-}
-
-impl CliHistory {
-    fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-            index: 0,
-        }
-    }
-
-    /// Push a new URL onto the history stack. Discards any forward history.
-    fn push(&mut self, url: String) {
-        if !self.entries.is_empty() {
-            self.entries.truncate(self.index + 1);
-        }
-        self.entries.push(url);
-        self.index = self.entries.len() - 1;
-    }
-
-    /// Move back one step. Returns the URL to navigate to, or `None` if at the start.
-    fn go_back(&mut self) -> Option<String> {
-        if self.entries.is_empty() || self.index == 0 {
-            return None;
-        }
-        self.index -= 1;
-        Some(self.entries[self.index].clone())
-    }
-
-    /// Move forward one step. Returns the URL to navigate to, or `None` if at the end.
-    fn go_forward(&mut self) -> Option<String> {
-        if self.entries.is_empty() || self.index + 1 >= self.entries.len() {
-            return None;
-        }
-        self.index += 1;
-        Some(self.entries[self.index].clone())
-    }
-
-    fn current(&self) -> Option<&str> {
-        self.entries.get(self.index).map(|s| s.as_str())
-    }
-}
-
 // ── CLI state ─────────────────────────────────────────────────────────────────
 
+/// Session history lives in the daemon, so `back` and `forward` work across
+/// separate `browser-cli` invocations.
 struct CliState {
     client: DaemonClient,
-    history: CliHistory,
     last_page: Option<ApiPageResponse>,
 }
 
 impl CliState {
     fn navigate(&mut self, url: &str) -> Result<(), CliError> {
         let page = self.client.navigate(url)?;
-        self.history.push(url.to_string());
-        render_page(&page);
-        self.last_page = Some(page);
+        self.show(page);
         Ok(())
     }
 
+    fn show(&mut self, page: ApiPageResponse) {
+        render_page(&page);
+        self.last_page = Some(page);
+    }
+
     fn back(&mut self) -> Result<(), CliError> {
-        match self.history.go_back() {
-            None => {
-                eprintln!("Already at the beginning of history.");
-                Ok(())
-            }
-            Some(url) => {
-                let page = self.client.navigate(&url)?;
-                render_page(&page);
-                self.last_page = Some(page);
-                Ok(())
-            }
+        match self.client.traverse("back")? {
+            None => eprintln!("Already at the beginning of history."),
+            Some(page) => self.show(page),
         }
+        Ok(())
     }
 
     fn forward(&mut self) -> Result<(), CliError> {
-        match self.history.go_forward() {
-            None => {
-                eprintln!("Already at the end of history.");
-                Ok(())
-            }
+        match self.client.traverse("forward")? {
+            None => eprintln!("Already at the end of history."),
+            Some(page) => self.show(page),
+        }
+        Ok(())
+    }
+
+    fn submit(&mut self) -> Result<(), CliError> {
+        match self.client.submit()? {
+            None => eprintln!("No form on the page."),
             Some(url) => {
-                let page = self.client.navigate(&url)?;
-                render_page(&page);
-                self.last_page = Some(page);
-                Ok(())
+                eprintln!("[submit] Form submitted to {}", url);
+                self.navigate(&url)?;
             }
         }
+        Ok(())
     }
 
     fn click_by_index(&mut self, n: usize) -> Result<(), CliError> {
@@ -447,10 +444,11 @@ impl CliState {
             match result {
                 ClickResult::Navigate { url } => {
                     // Follow the navigation
-                    let page = self.client.navigate(&url)?;
-                    self.history.push(url);
-                    render_page(&page);
-                    self.last_page = Some(page);
+                    return self.navigate(&url);
+                }
+                ClickResult::Navigated { .. } => {
+                    let page = self.client.get_page()?;
+                    self.show(page);
                     return Ok(());
                 }
                 ClickResult::FocusChanged { id } => {
@@ -580,6 +578,8 @@ enum Command {
         selector: Option<String>,
     },
     Layout,
+    /// Print the rendered DOM, or save it to the given file.
+    Dom(Option<String>),
     Logs,
     Tick(u32),
     Help,
@@ -688,6 +688,11 @@ fn parse_command(line: &str) -> Command {
             },
         },
         "layout" => Command::Layout,
+        "dom" => Command::Dom(if rest.is_empty() {
+            None
+        } else {
+            Some(rest.to_string())
+        }),
         "logs" | "console-log" | "console-logs" => Command::Logs,
         "tick" => {
             let count = if rest.is_empty() {
@@ -724,6 +729,7 @@ fn print_help() {
         "  style [<selector>]      Print computed CSS styles (optionally filtered by selector)"
     );
     println!("  layout                  Print the current layout tree");
+    println!("  dom [<file>]            Print the DOM the last render used as HTML, or save it");
     println!("  logs                    Print browser console entries");
     println!("  tick [count]            Advance daemon JS tasks and re-render if needed");
     println!("  help                    Show this help");
@@ -780,10 +786,8 @@ fn dispatch_command(cmd: Command, state: &mut CliState) -> bool {
             }
         }
         Command::Submit => {
-            if let Err(e) = state.client.submit() {
+            if let Err(e) = state.submit() {
                 eprintln!("Error: {}", e);
-            } else {
-                eprintln!("[submit] Form submitted.");
             }
         }
         Command::Back => {
@@ -813,6 +817,16 @@ fn dispatch_command(cmd: Command, state: &mut CliState) -> bool {
         },
         Command::Style { selector } => match state.client.get_style(selector.as_deref()) {
             Ok(text) => println!("{}", text),
+            Err(e) => eprintln!("Error: {}", e),
+        },
+        Command::Dom(path) => match state.client.get_dom() {
+            Ok(html) => match path {
+                None => println!("{}", html),
+                Some(path) => match std::fs::write(&path, html) {
+                    Ok(()) => println!("DOM saved to {}", path),
+                    Err(e) => eprintln!("Error: {}", CliError::Io(e.to_string())),
+                },
+            },
             Err(e) => eprintln!("Error: {}", e),
         },
         Command::Layout => match state.client.get_layout() {
@@ -851,7 +865,7 @@ fn run_repl(state: &mut CliState) {
     };
 
     loop {
-        let prompt = if let Some(url) = state.history.current() {
+        let prompt = if let Some(url) = state.last_page.as_ref().map(|page| page.url.as_str()) {
             format!("\n[browser: {}] > ", shorten_url(url))
         } else {
             "\n[browser] > ".to_string()
@@ -947,7 +961,6 @@ fn main() {
 
     let mut state = CliState {
         client: DaemonClient::new(port),
-        history: CliHistory::new(),
         last_page: None,
     };
 
@@ -978,67 +991,6 @@ mod tests {
     fn test_daemon_client_custom_port() {
         let client = DaemonClient::new(8080);
         assert_eq!(client.base_url, "http://127.0.0.1:8080");
-    }
-
-    // -- CliHistory tests --
-
-    #[test]
-    fn test_cli_history_no_back_at_start() {
-        let mut h = CliHistory::new();
-        assert!(h.go_back().is_none());
-    }
-
-    #[test]
-    fn test_cli_history_no_forward_at_end() {
-        let mut h = CliHistory::new();
-        h.push("https://a.com".to_string());
-        assert!(h.go_forward().is_none());
-    }
-
-    #[test]
-    fn test_cli_history_push_and_back() {
-        let mut h = CliHistory::new();
-        h.push("https://a.com".to_string());
-        h.push("https://b.com".to_string());
-        let url = h.go_back().expect("should have back");
-        assert_eq!(url, "https://a.com");
-        assert_eq!(h.index, 0);
-    }
-
-    #[test]
-    fn test_cli_history_forward_after_back() {
-        let mut h = CliHistory::new();
-        h.push("https://a.com".to_string());
-        h.push("https://b.com".to_string());
-        h.go_back();
-        let url = h.go_forward().expect("should have forward");
-        assert_eq!(url, "https://b.com");
-        assert_eq!(h.index, 1);
-    }
-
-    #[test]
-    fn test_cli_history_push_clears_forward() {
-        let mut h = CliHistory::new();
-        h.push("https://a.com".to_string());
-        h.push("https://b.com".to_string());
-        h.go_back();
-        h.push("https://c.com".to_string()); // should discard b
-        assert_eq!(h.entries.len(), 2);
-        assert_eq!(h.entries[1], "https://c.com");
-        assert!(h.go_forward().is_none());
-    }
-
-    #[test]
-    fn test_cli_history_current_none_when_empty() {
-        let h = CliHistory::new();
-        assert!(h.current().is_none());
-    }
-
-    #[test]
-    fn test_cli_history_current_after_push() {
-        let mut h = CliHistory::new();
-        h.push("https://example.com".to_string());
-        assert_eq!(h.current(), Some("https://example.com"));
     }
 
     // -- Command parsing tests --
@@ -1103,6 +1055,15 @@ mod tests {
     #[test]
     fn test_parse_command_submit() {
         assert_eq!(parse_command("submit"), Command::Submit);
+    }
+
+    #[test]
+    fn test_parse_command_dom() {
+        assert_eq!(parse_command("dom"), Command::Dom(None));
+        assert_eq!(
+            parse_command("dom /tmp/page.html"),
+            Command::Dom(Some("/tmp/page.html".to_string()))
+        );
     }
 
     #[test]

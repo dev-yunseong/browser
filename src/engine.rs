@@ -54,28 +54,81 @@ pub struct PageResult {
     /// boxes are painted relative to the viewport at this offset.
     pub scroll_x: f32,
     pub scroll_y: f32,
-    /// The full rendering when the document is wider than the viewport.
-    /// `pixmap_bytes` keeps only the leftmost `width` columns of it.
-    pub wide_canvas: Option<std::sync::Arc<WideCanvas>>,
 }
 
-/// Premultiplied RGBA pixels of a rendering wider than the viewport.
-#[derive(Debug)]
-pub struct WideCanvas {
-    pub width: u32,
-    pub height: u32,
-    pub bytes: Vec<u8>,
+/// Most documents one script-driven navigation may chain through (a page
+/// whose script sends it on to another page, and so on).
+const MAX_SCRIPT_NAVIGATIONS: usize = 5;
+
+/// Session history: the URLs of top-level documents loaded, in order, and
+/// which one is shown.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionHistory {
+    entries: Vec<String>,
+    index: usize,
 }
 
-/// Widest canvas rendered for horizontally overflowing documents.
-const MAX_CANVAS_WIDTH: f32 = 4096.0;
+impl SessionHistory {
+    /// Add `url` after the current entry, dropping the forward entries. A
+    /// load of the current URL again adds nothing.
+    pub fn push(&mut self, url: String) {
+        if self.current() == Some(url.as_str()) {
+            return;
+        }
+        if !self.entries.is_empty() {
+            self.entries.truncate(self.index + 1);
+        }
+        self.entries.push(url);
+        self.index = self.entries.len() - 1;
+    }
+
+    /// Replace the current entry with `url` (or add it to an empty history).
+    pub fn replace(&mut self, url: String) {
+        match self.entries.get_mut(self.index) {
+            Some(entry) => *entry = url,
+            None => self.push(url),
+        }
+    }
+
+    pub fn current(&self) -> Option<&str> {
+        self.entries.get(self.index).map(String::as_str)
+    }
+
+    pub fn can_go_back(&self) -> bool {
+        !self.entries.is_empty() && self.index > 0
+    }
+
+    pub fn can_go_forward(&self) -> bool {
+        self.index + 1 < self.entries.len()
+    }
+
+    /// Index and URL of the entry `delta` steps from the current one.
+    fn entry_at(&self, delta: isize) -> Option<(usize, String)> {
+        let index = self.index.checked_add_signed(delta)?;
+        self.entries.get(index).map(|url| (index, url.clone()))
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Session history shared between the engine actor and GUI threads.
+pub type SharedHistory = std::sync::Arc<std::sync::Mutex<SessionHistory>>;
 
 /// Result of a click action in headless mode.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type")]
 pub enum ClickResult {
-    /// A link was clicked; contains the absolute URL.
+    /// A link was clicked; contains the absolute URL. The caller loads it.
     Navigate { url: String },
+    /// Page script started a navigation (`location.href = …`,
+    /// `form.submit()`) and the engine already loaded `url`.
+    Navigated { url: String },
     /// An `onclick` script handler was executed.
     ScriptExecuted,
     /// A focusable element received focus; contains its ID.
@@ -612,10 +665,10 @@ pub fn collect_css_in_order(
 pub fn fetch_and_process(
     url_str: &str,
     css_cache: &mut HashMap<String, String>,
-    js_overrides: &HashMap<String, HashMap<String, String>>,
     hovered_id: Option<&str>,
     focused_id: Option<&str>,
     width: f32,
+    viewport_height: f32,
 ) -> Result<(PageResult, css::Stylesheet), Box<dyn std::error::Error + Send + Sync>> {
     let response = reqwest::blocking::get(url_str)?;
     let base_url = response.url().clone();
@@ -626,42 +679,35 @@ pub fn fetch_and_process(
         .map(|s| js::CspPolicy::parse(s));
 
     let body = response.text()?;
-    process_html_with_cache(
+    process_html_with_scroll(
         &body,
         &base_url,
         &HashMap::new(),
         css_cache,
         None,
-        js_overrides,
         hovered_id,
         focused_id,
         csp_header,
         width,
+        viewport_height,
+        (0.0, 0.0),
     )
 }
 
+/// Viewport height in CSS px when none is configured (`browser-daemon
+/// --viewport-height` overrides it). Used for `vh` units, fixed-position
+/// boxes, `window.innerHeight` and viewport screen captures.
+pub const DEFAULT_VIEWPORT_HEIGHT: f32 = 768.0;
+
 /// Run the full pipeline on pre-fetched HTML, returning a `PageResult`.
-/// Viewport height in CSS px used for `vh` units, fixed-position boxes and
-/// `window.innerHeight`. Process-wide because one daemon drives one viewport;
-/// width is still passed per render.
-static VIEWPORT_HEIGHT_BITS: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(768.0f32.to_bits());
-
-pub fn set_viewport_height(height: f32) {
-    VIEWPORT_HEIGHT_BITS.store(height.max(1.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
-}
-
-pub fn viewport_height() -> f32 {
-    f32::from_bits(VIEWPORT_HEIGHT_BITS.load(std::sync::atomic::Ordering::Relaxed))
-}
-
+/// The viewport is `width` x `DEFAULT_VIEWPORT_HEIGHT`.
+#[allow(clippy::too_many_arguments)]
 pub fn process_html_with_cache(
     body: &str,
     base_url: &Url,
     image_cache: &HashMap<String, Vec<u8>>,
     css_cache: &mut HashMap<String, String>,
     cached_stylesheet: Option<css::Stylesheet>,
-    js_overrides: &HashMap<String, HashMap<String, String>>,
     hovered_id: Option<&str>,
     focused_id: Option<&str>,
     csp_policy: Option<js::CspPolicy>,
@@ -673,17 +719,18 @@ pub fn process_html_with_cache(
         image_cache,
         css_cache,
         cached_stylesheet,
-        js_overrides,
         hovered_id,
         focused_id,
         csp_policy,
         width,
+        DEFAULT_VIEWPORT_HEIGHT,
         (0.0, 0.0),
     )
 }
 
-/// `process_html_with_cache` for a document scrolled to `scroll` (x, y):
-/// `position: fixed` boxes are moved to the viewport at that offset.
+/// `process_html_with_cache` for a `width` x `viewport_height` viewport
+/// scrolled to `scroll` (x, y): `position: fixed` boxes are moved to the
+/// viewport at that offset.
 #[allow(clippy::too_many_arguments)]
 pub fn process_html_with_scroll(
     body: &str,
@@ -691,11 +738,11 @@ pub fn process_html_with_scroll(
     image_cache: &HashMap<String, Vec<u8>>,
     css_cache: &mut HashMap<String, String>,
     cached_stylesheet: Option<css::Stylesheet>,
-    js_overrides: &HashMap<String, HashMap<String, String>>,
     hovered_id: Option<&str>,
     focused_id: Option<&str>,
     csp_policy: Option<js::CspPolicy>,
     width: f32,
+    viewport_height: f32,
     scroll: (f32, f32),
 ) -> Result<(PageResult, css::Stylesheet), Box<dyn std::error::Error + Send + Sync>> {
     let start_total = Instant::now();
@@ -756,11 +803,13 @@ pub fn process_html_with_scroll(
     };
 
     let start = Instant::now();
+    // Inline styles written by script live in the DOM's style attributes;
+    // style.rs still takes a separate override map, which is always empty.
     let style_tree = style::build_style_tree(
         &dom_tree.document,
         &stylesheet,
         None,
-        js_overrides,
+        &HashMap::new(),
         hovered_id,
         focused_id,
         csp_policy.as_ref(),
@@ -770,7 +819,7 @@ pub fn process_html_with_scroll(
     let start = Instant::now();
     let image_sizes = layout::ImageSizes::from_cache(image_cache, Some(base_url));
     let (layout_tree_opt, _, final_y) = layout::build_layout_tree_with_images(
-        &style_tree, 0.0, 0.0, width, width, viewport_height(), None, image_sizes,
+        &style_tree, 0.0, 0.0, width, width, viewport_height, None, image_sizes,
     );
     let mut layout_tree = layout_tree_opt.ok_or("Failed to build layout tree")?;
     let layout_elapsed = start.elapsed();
@@ -783,13 +832,10 @@ pub fn process_html_with_scroll(
 
     let height = (final_y.ceil() as u32).clamp(600, 16384);
     let w_u32 = width as u32;
-    // Render the horizontal overflow too, so a viewport capture scrolled to
-    // the right has pixels to show.
-    let canvas_w = (scroll_width.min(MAX_CANVAS_WIDTH).ceil() as u32).max(w_u32);
 
     let start = Instant::now();
-    let mut pixmap = tiny_skia::Pixmap::new(canvas_w, height)
-        .ok_or_else(|| format!("Failed to create pixmap with size {}x{}", canvas_w, height))?;
+    let mut pixmap = tiny_skia::Pixmap::new(w_u32, height)
+        .ok_or_else(|| format!("Failed to create pixmap with size {}x{}", w_u32, height))?;
 
     pixmap.fill(tiny_skia::Color::WHITE);
 
@@ -889,18 +935,7 @@ pub fn process_html_with_scroll(
         })
         .collect();
 
-    let (pixmap_bytes, wide_canvas) = if canvas_w > w_u32 {
-        let wide = pixmap.data();
-        let (row_wide, row) = (canvas_w as usize * 4, w_u32 as usize * 4);
-        let mut bytes = Vec::with_capacity(row * height as usize);
-        for y in 0..height as usize {
-            bytes.extend_from_slice(&wide[y * row_wide..y * row_wide + row]);
-        }
-        let canvas = WideCanvas { width: canvas_w, height, bytes: pixmap.take() };
-        (bytes, Some(std::sync::Arc::new(canvas)))
-    } else {
-        (pixmap.data().to_vec(), None)
-    };
+    let pixmap_bytes = pixmap.take();
     let data_copy_elapsed = start.elapsed();
 
     let total_elapsed = start_total.elapsed();
@@ -934,10 +969,51 @@ pub fn process_html_with_scroll(
             scroll_height,
             scroll_x,
             scroll_y,
-            wide_canvas,
         },
         stylesheet,
     ))
+}
+
+/// Paint the `width` x `viewport_height` viewport of `body` scrolled to
+/// `scroll`: the document is laid out as for a full render, then moved by
+/// `-scroll` so only the visible rectangle is rasterized.
+#[allow(clippy::too_many_arguments)]
+fn render_viewport(
+    body: &str,
+    base_url: &Url,
+    image_cache: &HashMap<String, Vec<u8>>,
+    stylesheet: &css::Stylesheet,
+    focused_id: Option<&str>,
+    csp_policy: Option<&js::CspPolicy>,
+    width: f32,
+    viewport_height: f32,
+    scroll: (f32, f32),
+) -> Option<tiny_skia::Pixmap> {
+    let dom_tree = dom::parse_html(body);
+    let style_tree = style::build_style_tree(
+        &dom_tree.document,
+        stylesheet,
+        None,
+        &HashMap::new(),
+        None,
+        focused_id,
+        csp_policy,
+    );
+    let image_sizes = layout::ImageSizes::from_cache(image_cache, Some(base_url));
+    let (layout_tree, _, _) = layout::build_layout_tree_with_images(
+        &style_tree, 0.0, 0.0, width, width, viewport_height, None, image_sizes,
+    );
+    let mut layout_tree = layout_tree?;
+    let (scroll_x, scroll_y) = scroll;
+    shift_fixed_boxes(&mut layout_tree, scroll_x, scroll_y);
+    translate_subtree(&mut layout_tree, -scroll_x, -scroll_y);
+    let mut pixmap = tiny_skia::Pixmap::new(
+        width.max(1.0) as u32,
+        viewport_height.round().max(1.0) as u32,
+    )?;
+    pixmap.fill(tiny_skia::Color::WHITE);
+    render::render_layout_tree(&layout_tree, &mut pixmap, image_cache, base_url);
+    Some(pixmap)
 }
 
 /// Move every `position: fixed` box (with its subtree) by `(dx, dy)`.
@@ -955,6 +1031,9 @@ fn shift_fixed_boxes(root: &mut layout::LayoutBox, dx: f32, dy: f32) {
     }
 }
 
+/// Move `root` and every descendant box by `(dx, dy)`. Same job as
+/// `layout::offset_layout_box`, without `unsafe`; one of the two goes when
+/// that function is made safe.
 fn translate_subtree(root: &mut layout::LayoutBox, dx: f32, dy: f32) {
     let mut stack: Vec<&mut layout::LayoutBox> = vec![root];
     while let Some(node) = stack.pop() {
@@ -974,6 +1053,23 @@ fn overflow_clips(layout: &layout::LayoutBox, axis_prop: &str) -> bool {
     })
 }
 
+/// `opacity: 0`: the box and its subtree paint nothing.
+fn is_transparent(layout: &layout::LayoutBox) -> bool {
+    matches!(
+        layout.style_node.specified_values.get(&css::intern("opacity")),
+        Some(css::Value::Number(n)) if *n <= 0.0
+    )
+}
+
+/// `visibility: hidden` (or `collapse`) on the box itself; descendants may
+/// still be visible.
+fn is_visibility_hidden(layout: &layout::LayoutBox) -> bool {
+    matches!(
+        layout.style_node.specified_values.get(&css::intern("visibility")),
+        Some(css::Value::Keyword(k)) if matches!(k.as_ref(), "hidden" | "collapse")
+    )
+}
+
 fn element_tag(layout: &layout::LayoutBox) -> Option<String> {
     match &layout.style_node.node.data {
         markup5ever_rcdom::NodeData::Element { name, .. } => Some(name.local.to_string()),
@@ -982,8 +1078,9 @@ fn element_tag(layout: &layout::LayoutBox) -> Option<String> {
 }
 
 /// Scrollable size of the document: the union of border boxes that are not
-/// fixed and not inside a clipping (`overflow` other than visible) box, but at
-/// least `viewport_width` x `min_height`. An `overflow` clip on `<html>` or
+/// fixed, not inside a clipping (`overflow` other than visible) box, not
+/// `visibility: hidden` and not inside an `opacity: 0` subtree, but at least
+/// `viewport_width` x `min_height`. An `overflow` clip on `<html>` or
 /// `<body>` applies to the viewport and disables scrolling on that axis.
 fn document_scroll_extent(root: &layout::LayoutBox, viewport_width: f32, min_height: f32) -> (f32, f32) {
     let mut right = viewport_width;
@@ -992,11 +1089,11 @@ fn document_scroll_extent(root: &layout::LayoutBox, viewport_width: f32, min_hei
     let mut clip_y = false;
     let mut stack: Vec<&layout::LayoutBox> = vec![root];
     while let Some(node) = stack.pop() {
-        if node.position == layout::PositionType::Fixed {
+        if node.position == layout::PositionType::Fixed || is_transparent(node) {
             continue;
         }
         let d = &node.dimensions;
-        if d.width > 0.0 && d.height > 0.0 {
+        if d.width > 0.0 && d.height > 0.0 && !is_visibility_hidden(node) {
             right = right.max(d.x + d.width);
             bottom = bottom.max(d.y + d.height);
         }
@@ -1162,9 +1259,12 @@ pub struct BrowserEngine {
     pub js_runtime: js::JsRuntime,
     pub console_buffer: js::ConsoleBuffer,
     pub current_csp_policy: Option<js::CspPolicy>,
-    pub js_style_overrides: HashMap<String, HashMap<String, String>>,
     /// The most recently rendered page result.
     pub last_page: Option<PageResult>,
+    /// Session history of top-level documents.
+    pub history: SharedHistory,
+    /// Viewport height in CSS px; the width is passed per render.
+    pub viewport_height: f32,
 }
 
 impl BrowserEngine {
@@ -1177,8 +1277,9 @@ impl BrowserEngine {
             js_runtime: js::JsRuntime::new(None, None, None, None, console_buffer.clone()),
             console_buffer,
             current_csp_policy: None,
-            js_style_overrides: HashMap::new(),
             last_page: None,
+            history: SharedHistory::default(),
+            viewport_height: DEFAULT_VIEWPORT_HEIGHT,
         }
     }
 
@@ -1186,17 +1287,89 @@ impl BrowserEngine {
         Self::new_with_console(js::new_console_buffer())
     }
 
-    /// Synchronously navigate to a URL.
-    /// Stores the resulting `PageResult` and calls `init_js_for_page`.
+    /// Synchronously navigate to a URL and add it to session history.
+    /// Follows navigations the page's scripts start while it loads.
     pub fn navigate(&mut self, url_str: &str, width: f32) -> Result<PageResult, String> {
+        let page = self.load_document(url_str, width)?;
+        self.record_history(&page, false);
+        Ok(self.run_script_navigation(width, true)?.unwrap_or(page))
+    }
+
+    /// Load the session history entry `delta` steps from the current one
+    /// (`-1` is back, `1` is forward). `Ok(None)` when there is no such entry.
+    pub fn traverse_history(
+        &mut self,
+        delta: isize,
+        width: f32,
+    ) -> Result<Option<PageResult>, String> {
+        let target = self.lock_history().entry_at(delta);
+        let Some((index, url)) = target else {
+            return Ok(None);
+        };
+        self.lock_history().index = index;
+        let page = self.load_document(&url, width)?;
+        self.record_history(&page, true);
+        Ok(Some(self.run_script_navigation(width, true)?.unwrap_or(page)))
+    }
+
+    /// Load the document page script asked for, if any, and the ones that
+    /// document's scripts ask for in turn (at most `MAX_SCRIPT_NAVIGATIONS`).
+    /// A navigation started while a document loads replaces its history
+    /// entry, as Chromium does for client redirects. `Ok(None)` when no
+    /// script asked to navigate.
+    pub fn run_script_navigation(
+        &mut self,
+        width: f32,
+        during_load: bool,
+    ) -> Result<Option<PageResult>, String> {
+        let mut replace = during_load;
+        let mut loaded = None;
+        for _ in 0..MAX_SCRIPT_NAVIGATIONS {
+            let Some(request) = self.js_runtime.take_navigation_request() else {
+                return Ok(loaded);
+            };
+            let page = self.load_document(&request.url, width)?;
+            self.record_history(&page, replace || request.replace);
+            replace = true;
+            loaded = Some(page);
+        }
+        if let Some(request) = self.js_runtime.take_navigation_request() {
+            eprintln!("[navigate] dropped script navigation to {} after {} redirects", request.url, MAX_SCRIPT_NAVIGATIONS);
+        }
+        Ok(loaded)
+    }
+
+    /// Width the current page was laid out at, for navigations that page
+    /// script starts.
+    fn current_width(&self) -> f32 {
+        self.last_page.as_ref().map_or(800.0, |page| page.width as f32)
+    }
+
+    fn lock_history(&self) -> std::sync::MutexGuard<'_, SessionHistory> {
+        self.history.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn record_history(&self, page: &PageResult, replace: bool) {
+        let url = page.base_url.to_string();
+        let mut history = self.lock_history();
+        if replace {
+            history.replace(url);
+        } else {
+            history.push(url);
+        }
+    }
+
+    /// Fetch `url_str`, run its scripts and render it. Session history is
+    /// left to the caller.
+    fn load_document(&mut self, url_str: &str, width: f32) -> Result<PageResult, String> {
         self.clear_for_new_url();
         let result = fetch_and_process(
             url_str,
             &mut self.css_cache,
-            &self.js_style_overrides,
             None,
             None,
             width,
+            self.viewport_height,
         )
         .map_err(|e| e.to_string())?;
 
@@ -1259,11 +1432,6 @@ impl BrowserEngine {
         // made by page scripts so :focus styles match the live document.
         let js_focused_id = self.js_runtime.get_focused_node_id();
         let focused_id = focused_id.or(js_focused_id.as_deref());
-        if let Ok(path) = std::env::var("BROWSER_DEBUG_DUMP_HTML") {
-            if !path.is_empty() {
-                let _ = std::fs::write(path, &body);
-            }
-        }
 
         let mut css_cache = self.css_cache.clone();
         let result = process_html_with_scroll(
@@ -1272,11 +1440,11 @@ impl BrowserEngine {
             &self.image_cache,
             &mut css_cache,
             self.last_stylesheet.clone(),
-            &self.js_style_overrides,
             hovered_id,
             focused_id,
             self.current_csp_policy.clone(),
             width,
+            self.viewport_height,
             self.js_runtime.scroll_position(),
         )
         .map_err(|e| e.to_string())?;
@@ -1291,7 +1459,7 @@ impl BrowserEngine {
             page.scroll_width,
             page.scroll_height,
             page.width as f32,
-            viewport_height(),
+            self.viewport_height,
         );
         self.refresh_after_image_loads(page, width)
     }
@@ -1329,11 +1497,19 @@ impl BrowserEngine {
             }
         }
 
-        // Collect JS style overrides produced by onclick handlers
-        let overrides = self.js_runtime.get_style_overrides();
-        if !overrides.is_empty() {
-            for (id, props) in overrides {
-                self.js_style_overrides.entry(id).or_default().extend(props);
+        // A handler that set `location.href` or submitted a form replaces
+        // the link's own navigation.
+        match self.run_script_navigation(page.width as f32, false) {
+            Ok(Some(loaded)) => {
+                results.push(ClickResult::Navigated {
+                    url: loaded.base_url.to_string(),
+                });
+                return results;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("[navigate] script navigation failed: {}", error);
+                return results;
             }
         }
 
@@ -1418,14 +1594,7 @@ impl BrowserEngine {
 
     /// Execute JavaScript in the current page's runtime and return a result/error.
     pub fn evaluate_js_with_result(&mut self, script: &str) -> js::EvalOutcome {
-        let outcome = self.js_runtime.execute_with_result(script);
-        let overrides = self.js_runtime.get_style_overrides();
-        if !overrides.is_empty() {
-            for (id, props) in overrides {
-                self.js_style_overrides.entry(id).or_default().extend(props);
-            }
-        }
-        outcome
+        self.js_runtime.execute_with_result(script)
     }
 
     /// Execute JavaScript in the current page's runtime (fire-and-forget).
@@ -1474,7 +1643,7 @@ impl BrowserEngine {
         self.js_runtime.scroll_position()
     }
 
-    /// Capture the viewport (`width` x `viewport_height()`) at the current
+    /// Capture the viewport (`width` x `viewport_height`) at the current
     /// document scroll offset, as Chromium's page screenshot does. Re-renders
     /// first when the page scrolled since the last render, so fixed boxes
     /// sit at the new offset.
@@ -1490,26 +1659,40 @@ impl BrowserEngine {
             }
         }
         let page = self.last_page.as_ref()?;
-        let (sx, sy) = (page.scroll_x, page.scroll_y);
-        let (src_w, src_h, src) = match &page.wide_canvas {
-            Some(canvas) => (canvas.width, canvas.height, canvas.bytes.as_slice()),
-            None => (page.width, page.height, page.pixmap_bytes.as_slice()),
-        };
-        let vh = viewport_height().round().max(1.0) as u32;
+        let (sx, sy) = (page.scroll_x.max(0.0).round(), page.scroll_y.max(0.0).round());
+        let vh = self.viewport_height.round().max(1.0) as u32;
+        // The full-page render already holds the viewport unless the page is
+        // scrolled horizontally or the viewport reaches past its bottom.
+        if sx > 0.0 || sy as u32 + vh > page.height {
+            if let Some(stylesheet) = &self.last_stylesheet {
+                let focused_id = self.js_runtime.get_focused_node_id();
+                return render_viewport(
+                    &page.body,
+                    &page.base_url,
+                    &self.image_cache,
+                    stylesheet,
+                    focused_id.as_deref(),
+                    self.current_csp_policy.as_ref(),
+                    page.width as f32,
+                    vh as f32,
+                    (sx, sy),
+                );
+            }
+        }
         let bytes = crop_viewport(
-            src,
-            src_w,
-            src_h,
-            sx.max(0.0).round() as u32,
-            sy.max(0.0).round() as u32,
+            &page.pixmap_bytes,
+            page.width,
+            page.height,
+            0,
+            sy as u32,
             page.width,
             vh,
         );
         tiny_skia::Pixmap::from_vec(bytes, tiny_skia::IntSize::from_wh(page.width, vh)?)
     }
 
-    /// Return the raw HTML source of the last loaded page.
-    /// Full DOM serialization is deferred to a follow-up issue.
+    /// The serialized live DOM the last render laid out (the fetched HTML
+    /// until page script has run).
     pub fn dom_tree(&self) -> String {
         self.last_page
             .as_ref()
@@ -1621,7 +1804,7 @@ impl BrowserEngine {
             )
         });
 
-        let viewport_h = viewport_height();
+        let viewport_h = self.viewport_height;
         self.js_runtime.execute(&format!(
             "window.innerHeight = window.outerHeight = screen.height = screen.availHeight = {viewport_h};"
         ));
@@ -1838,12 +2021,6 @@ impl BrowserEngine {
             }
         }
 
-        let overrides = self.js_runtime.get_style_overrides();
-        if !overrides.is_empty() {
-            for (id, props) in overrides {
-                self.js_style_overrides.entry(id).or_default().extend(props);
-            }
-        }
     }
 
     pub fn load_external_module_with<F, E>(
@@ -1921,7 +2098,6 @@ impl BrowserEngine {
 
     /// Reset all state in preparation for navigating to a new URL.
     pub fn clear_for_new_url(&mut self) {
-        self.js_style_overrides.clear();
         self.clear_console();
         let console = self.console_buffer.clone();
         drop_js_runtime_before_create(&mut self.js_runtime, || {
@@ -1931,11 +2107,9 @@ impl BrowserEngine {
         self.last_stylesheet = None;
         self.last_page = None;
         self.css_cache.clear();
-    }
-
-    /// Drain JS style overrides produced since the last call.
-    pub fn get_style_overrides(&mut self) -> HashMap<String, HashMap<String, String>> {
-        self.js_runtime.get_style_overrides()
+        // Decoded raster and SVG images of the previous page.
+        crate::background::clear_decoded_image_cache();
+        crate::svg::clear_svg_caches();
     }
 
     /// Advance the JS event loop by one tick.
@@ -2002,6 +2176,12 @@ pub enum EngineCmd {
         width: f32,
         reply: mpsc::Sender<Result<PageResult, String>>,
     },
+    /// Load the session history entry `delta` steps from the current one.
+    Traverse {
+        delta: isize,
+        width: f32,
+        reply: mpsc::Sender<Result<Option<PageResult>, String>>,
+    },
     ReRender {
         hovered_id: Option<String>,
         focused_id: Option<String>,
@@ -2055,7 +2235,7 @@ pub enum EngineCmd {
     Tick {
         timestamp: f64,
         deadline: Option<f64>,
-        reply: mpsc::Sender<bool>,
+        reply: mpsc::Sender<TickOutcome>,
     },
     /// Submit the current page's form. Constructs the navigation URL from form
     /// metadata (action/method) and current DOM field values.
@@ -2083,6 +2263,10 @@ fn run_engine_actor_with_engine(rx: mpsc::Receiver<EngineCmd>, eng: &mut Browser
                 let result = eng.navigate(&url, width);
                 let _ = reply.send(result);
             }
+            EngineCmd::Traverse { delta, width, reply } => {
+                let result = eng.traverse_history(delta, width);
+                let _ = reply.send(result);
+            }
             EngineCmd::ReRender {
                 hovered_id,
                 focused_id,
@@ -2101,10 +2285,12 @@ fn run_engine_actor_with_engine(rx: mpsc::Receiver<EngineCmd>, eng: &mut Browser
             }
             EngineCmd::EvaluateJs { script, reply } => {
                 let result = eng.evaluate_js(&script);
+                follow_script_navigation(eng);
                 let _ = reply.send(result);
             }
             EngineCmd::EvaluateConsole { script, reply } => {
                 let outcome = eng.evaluate_console_repl(&script);
+                follow_script_navigation(eng);
                 let _ = reply.send(outcome);
             }
             EngineCmd::Screenshot { reply } => {
@@ -2147,12 +2333,9 @@ fn run_engine_actor_with_engine(rx: mpsc::Receiver<EngineCmd>, eng: &mut Browser
                 deadline,
                 reply,
             } => {
-                let needs = eng.tick_js(Some(timestamp), deadline);
-                let overrides = eng.get_style_overrides();
-                for (id, props) in overrides {
-                    eng.js_style_overrides.entry(id).or_default().extend(props);
-                }
-                let _ = reply.send(needs);
+                let worked = eng.tick_js(Some(timestamp), deadline) | follow_script_navigation(eng);
+                let wake_after = eng.js_runtime.next_wake();
+                let _ = reply.send(TickOutcome { worked, wake_after });
             }
             EngineCmd::Submit { reply } => {
                 let _ = reply.send(eng.submit_form());
@@ -2162,11 +2345,36 @@ fn run_engine_actor_with_engine(rx: mpsc::Receiver<EngineCmd>, eng: &mut Browser
     }
 }
 
+/// What one event-loop tick did and when the next one is needed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TickOutcome {
+    /// Script ran (the page may need a re-render).
+    pub worked: bool,
+    /// Tick again after this long (a timer comes due or a fetch is in
+    /// flight); `None` when nothing is pending.
+    pub wake_after: Option<Duration>,
+}
+
+/// Load the document a script asked for while the actor ran a command that
+/// has no page to return. Returns whether a document was loaded.
+fn follow_script_navigation(eng: &mut BrowserEngine) -> bool {
+    let width = eng.current_width();
+    match eng.run_script_navigation(width, false) {
+        Ok(loaded) => loaded.is_some(),
+        Err(error) => {
+            eprintln!("[navigate] script navigation failed: {}", error);
+            true
+        }
+    }
+}
+
 /// Cloneable handle used by GUI and HTTP threads to send commands to the engine actor.
 #[derive(Clone)]
 pub struct EngineHandle {
     pub tx: mpsc::SyncSender<EngineCmd>,
     pub console_buffer: js::ConsoleBuffer,
+    /// The engine's session history, for back/forward button state.
+    pub history: SharedHistory,
 }
 
 const ENGINE_CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
@@ -2180,20 +2388,58 @@ fn recv_control<T>(reply_rx: mpsc::Receiver<T>) -> Result<T, EngineRequestError>
 }
 
 impl EngineHandle {
-    /// Create a new engine actor and return a handle to it.
+    /// Create a new engine actor with the default viewport height.
     pub fn spawn() -> Self {
+        Self::spawn_with_viewport_height(DEFAULT_VIEWPORT_HEIGHT)
+    }
+
+    /// Create a new engine actor whose viewport is `viewport_height` CSS px
+    /// tall, and return a handle to it.
+    pub fn spawn_with_viewport_height(viewport_height: f32) -> Self {
         let (tx, rx) = mpsc::sync_channel::<EngineCmd>(64);
         let console_buffer = js::new_console_buffer();
         let actor_console = console_buffer.clone();
+        let history = SharedHistory::default();
+        let actor_history = history.clone();
         std::thread::Builder::new()
             .name("engine-actor".into())
             .stack_size(8 * 1024 * 1024)
             .spawn(move || {
                 let mut eng = BrowserEngine::new_with_console(actor_console);
+                eng.history = actor_history;
+                eng.viewport_height = viewport_height.max(1.0);
                 run_engine_actor_with_engine(rx, &mut eng);
             })
             .expect("failed to start engine actor thread");
-        Self { tx, console_buffer }
+        Self {
+            tx,
+            console_buffer,
+            history,
+        }
+    }
+
+    /// A copy of the engine's session history.
+    pub fn history(&self) -> SessionHistory {
+        self.history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Load the session history entry `delta` steps away (`-1` back, `1`
+    /// forward). `Ok(None)` when there is no such entry.
+    pub fn send_traverse(&self, delta: isize, width: f32) -> Result<Option<PageResult>, String> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .send(EngineCmd::Traverse {
+                delta,
+                width,
+                reply: reply_tx,
+            })
+            .map_err(|_| "engine disconnected".to_string())?;
+        reply_rx
+            .recv()
+            .map_err(|_| "engine disconnected".to_string())?
     }
 
     pub fn send_navigate(&self, url: String, width: f32) -> Result<PageResult, String> {
@@ -2400,7 +2646,7 @@ impl EngineHandle {
         reply_rx.recv().unwrap_or_default()
     }
 
-    pub fn send_tick(&self, timestamp: f64, deadline: Option<f64>) -> bool {
+    pub fn send_tick(&self, timestamp: f64, deadline: Option<f64>) -> TickOutcome {
         let (reply_tx, reply_rx) = mpsc::channel();
         if self
             .tx
@@ -2411,9 +2657,9 @@ impl EngineHandle {
             })
             .is_err()
         {
-            return false;
+            return TickOutcome::default();
         }
-        reply_rx.recv().unwrap_or(false)
+        reply_rx.recv().unwrap_or_default()
     }
 
     pub fn send_tick_control(
@@ -2429,7 +2675,7 @@ impl EngineHandle {
                 reply: reply_tx,
             })
             .map_err(|_| EngineRequestError::Disconnected)?;
-        recv_control(reply_rx)
+        recv_control(reply_rx).map(|outcome| outcome.worked)
     }
 
     pub fn send_submit(&self) -> Option<String> {
@@ -2448,12 +2694,84 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_session_history_push_back_forward() {
+        let mut history = SessionHistory::default();
+        assert!(!history.can_go_back() && !history.can_go_forward());
+        assert_eq!(history.entry_at(-1), None);
+        history.push("https://a.com/".into());
+        history.push("https://b.com/".into());
+        assert!(history.can_go_back());
+        assert_eq!(history.entry_at(-1), Some((0, "https://a.com/".to_string())));
+        history.index = 0;
+        assert!(history.can_go_forward());
+        assert_eq!(history.entry_at(1), Some((1, "https://b.com/".to_string())));
+        assert_eq!(history.entry_at(2), None);
+    }
+
+    #[test]
+    fn test_session_history_push_drops_forward_entries_and_skips_reload() {
+        let mut history = SessionHistory::default();
+        history.push("https://a.com/".into());
+        history.push("https://b.com/".into());
+        history.index = 0;
+        history.push("https://c.com/".into());
+        assert_eq!(history.len(), 2);
+        assert_eq!(history.current(), Some("https://c.com/"));
+        assert!(!history.can_go_forward());
+        history.push("https://c.com/".into());
+        assert_eq!(history.len(), 2);
+    }
+
+    #[test]
+    fn test_session_history_replace_keeps_length() {
+        let mut history = SessionHistory::default();
+        history.replace("https://a.com/".into());
+        assert_eq!(history.current(), Some("https://a.com/"));
+        history.push("https://b.com/".into());
+        history.replace("https://c.com/".into());
+        assert_eq!(history.len(), 2);
+        assert_eq!(history.current(), Some("https://c.com/"));
+    }
+
+    #[test]
+    fn test_location_fragment_change_stays_in_document() {
+        let mut engine = engine_with_page_html("<html><body></body></html>");
+        let result = engine.evaluate_js(
+            "var fired = 0; window.addEventListener('hashchange', function() { fired++; });\
+             location.hash = 'top'; String(fired) + ' ' + location.hash + ' ' + history.length",
+        );
+        assert_eq!(result, "1 #top 2");
+        assert_eq!(engine.js_runtime.take_navigation_request(), None);
+        engine.evaluate_js("location.href = 'https://example.com/other'");
+        assert_eq!(
+            engine.js_runtime.take_navigation_request(),
+            Some(js::NavigationRequest {
+                url: "https://example.com/other".to_string(),
+                replace: false,
+            })
+        );
+    }
+
+    #[test]
+    fn test_next_wake_waits_for_the_earliest_timer() {
+        let mut engine = engine_with_page_html("<html><body></body></html>");
+        while engine.tick_js(Some(0.0), None) {}
+        assert_eq!(engine.js_runtime.next_wake(), None);
+        engine.evaluate_js("setInterval(function() {}, 10000); setTimeout(function() {}, 5000);");
+        assert!(!engine.tick_js(Some(0.0), None));
+        let wake = engine.js_runtime.next_wake().expect("timers pending");
+        assert!(
+            wake > Duration::from_secs(4) && wake <= Duration::from_secs(5),
+            "{wake:?}"
+        );
+    }
+
+    #[test]
     fn test_browser_engine_new() {
         let engine = BrowserEngine::new();
         assert!(engine.last_page.is_none());
         assert!(engine.image_cache.is_empty());
         assert!(engine.css_cache.is_empty());
-        assert!(engine.js_style_overrides.is_empty());
         assert!(engine.last_stylesheet.is_none());
         assert!(engine.current_csp_policy.is_none());
         assert!(engine.console_entries().is_empty());
@@ -2803,7 +3121,6 @@ mod tests {
             &HashMap::new(),
             &mut cache,
             None,
-            &HashMap::new(),
             None,
             None,
             None,
@@ -2823,7 +3140,6 @@ mod tests {
             &HashMap::new(),
             &mut cache,
             None,
-            &HashMap::new(),
             None,
             None,
             None,
@@ -2857,7 +3173,6 @@ mod tests {
             &HashMap::new(),
             &mut cache,
             None,
-            &HashMap::new(),
             None,
             None,
             None,
@@ -2871,7 +3186,6 @@ mod tests {
             &HashMap::new(),
             &mut cache,
             None,
-            &HashMap::new(),
             None,
             None,
             None,
@@ -2899,7 +3213,6 @@ mod tests {
             &HashMap::new(),
             &mut cache,
             None,
-            &HashMap::new(),
             None,
             None,
             None,
@@ -2930,7 +3243,6 @@ mod tests {
             &HashMap::new(),
             &mut cache,
             None,
-            &HashMap::new(),
             None,
             None,
             None,
@@ -2952,7 +3264,6 @@ mod tests {
             &HashMap::new(),
             &mut cache,
             None,
-            &HashMap::new(),
             None,
             None,
             None,
@@ -3006,7 +3317,6 @@ mod tests {
             &HashMap::new(),
             &mut cache,
             None,
-            &HashMap::new(),
             None,
             None,
             None,
@@ -3089,7 +3399,6 @@ mod tests {
             &HashMap::new(),
             &mut css_cache,
             None,
-            &HashMap::new(),
             None,
             None,
             None,
@@ -3261,18 +3570,17 @@ mod tests {
     }
 
     #[test]
-    fn test_module_style_override_captured() {
+    fn test_module_style_write_lands_in_style_attribute() {
         let mut engine = engine_with_page_html(
             r#"<html><body>
                 <div id='test'>text</div>
-                <script type="module">__aura_set_style('test', 'color', 'red');</script>
+                <script type="module">document.getElementById('test').style.color = 'red';</script>
             </body></html>"#,
         );
-        let color = engine
-            .js_style_overrides
-            .get("test")
-            .and_then(|props| props.get("color").cloned());
-        assert_eq!(color, Some("red".to_string()));
+        assert_eq!(
+            engine.evaluate_js("document.getElementById('test').getAttribute('style')"),
+            "color: red;"
+        );
     }
 
     #[test]
@@ -3316,7 +3624,7 @@ mod tests {
                 <script type="module">
                     document.getElementById('a').textContent = 'new-a';
                     document.getElementById('b').setAttribute('data-x', 'y');
-                    __aura_set_style('c', 'font-size', '20px');
+                    document.getElementById('c').style.fontSize = '20px';
                 </script>
             </body></html>"#,
         );
@@ -3329,11 +3637,8 @@ mod tests {
             "y"
         );
         assert_eq!(
-            engine
-                .js_style_overrides
-                .get("c")
-                .and_then(|p| p.get("font-size").cloned()),
-            Some("20px".to_string())
+            engine.evaluate_js("document.getElementById('c').style.fontSize"),
+            "20px"
         );
     }
 
@@ -3368,7 +3673,6 @@ mod tests {
             &HashMap::new(),
             &mut css_cache,
             None,
-            &HashMap::new(),
             None,
             None,
             None,
@@ -3419,9 +3723,51 @@ mod tests {
     }
 
     #[test]
+    fn test_scroll_extent_ignores_invisible_boxes() {
+        let engine = engine_with_rendered_page(
+            r#"<html><body style="margin:0">
+                <div style="opacity:0"><div style="width:5000px;height:10px"></div></div>
+                <div style="visibility:hidden;width:4000px;height:10px"></div>
+                <div style="visibility:hidden"><div style="visibility:visible;width:900px;height:10px"></div></div>
+            </body></html>"#,
+        );
+        assert_eq!(engine.last_page.as_ref().unwrap().scroll_width, 900.0);
+    }
+
+    #[test]
+    fn test_engine_viewport_height_drives_js_and_screen_capture() {
+        let mut engine = engine_with_rendered_page("<html><body><div style='height:100vh'></div></body></html>");
+        engine.viewport_height = 500.0;
+        let page = engine.last_page.clone().unwrap();
+        engine.init_js_for_page(&page);
+        engine.re_render(None, None, 800.0).unwrap();
+        assert_eq!(engine.evaluate_js("String(innerHeight)"), "500");
+        assert_eq!(engine.screenshot_viewport().unwrap().height(), 500);
+        assert_eq!(engine.last_page.as_ref().unwrap().scroll_height, 500.0);
+    }
+
+    #[test]
+    fn test_wide_page_renders_viewport_width_only() {
+        let mut engine = engine_with_rendered_page(
+            r#"<html><body style="margin:0">
+                <div style="width:5000px;height:50px"></div>
+                <div style="position:absolute;left:1500px;top:10px;width:20px;height:20px;background:#0000ff"></div>
+            </body></html>"#,
+        );
+        let page = engine.last_page.as_ref().unwrap();
+        assert_eq!(page.scroll_width, 5000.0);
+        assert_eq!(page.pixmap_bytes.len(), 800 * page.height as usize * 4);
+        engine.evaluate_js("window.scrollTo(1450, 0)");
+        let viewport = engine.screenshot_viewport().unwrap();
+        assert_eq!((viewport.width(), viewport.height()), (800, DEFAULT_VIEWPORT_HEIGHT.round() as u32));
+        assert_eq!(pixel(&viewport, 55, 15), (0, 0, 255));
+        assert_eq!(pixel(&viewport, 45, 15), (255, 255, 255));
+    }
+
+    #[test]
     fn test_window_scroll_to_clamps_to_scrollable_range() {
         let mut engine = engine_with_rendered_page(WIDE_PAGE);
-        let max_y = 3050.0 - viewport_height();
+        let max_y = 3050.0 - DEFAULT_VIEWPORT_HEIGHT;
         engine.evaluate_js("window.scrollTo(5000, 99999)");
         assert_eq!(
             scroll_json(&mut engine),
@@ -3466,12 +3812,12 @@ mod tests {
         engine.evaluate_js("document.getElementById('low').scrollIntoView()");
         assert_eq!(scroll_json(&mut engine), "[0,2070,0,2070]");
         engine.evaluate_js("window.scrollTo(0, 0); document.getElementById('low').scrollIntoView(false)");
-        let end = 2110.0 - viewport_height();
+        let end = 2110.0 - DEFAULT_VIEWPORT_HEIGHT;
         assert_eq!(scroll_json(&mut engine), format!("[0,{end},0,{end}]"));
         engine.evaluate_js(
             "window.scrollTo(0, 0); document.getElementById('target').scrollIntoView({ block: 'center', inline: 'center' })",
         );
-        let center_y = 60.0 - viewport_height() / 2.0;
+        let center_y = 60.0 - DEFAULT_VIEWPORT_HEIGHT / 2.0;
         let (x, y) = engine.scroll_position();
         assert_eq!(x, 550.0);
         assert_eq!(y, center_y.max(0.0));
@@ -3560,7 +3906,7 @@ mod tests {
         let viewport = engine.screenshot_viewport().unwrap();
         assert_eq!(full.width(), 800);
         assert_eq!(viewport.width(), 800);
-        assert_eq!(viewport.height(), viewport_height().round() as u32);
+        assert_eq!(viewport.height(), DEFAULT_VIEWPORT_HEIGHT.round() as u32);
         assert_eq!(pixel(&viewport, 10, 10), (255, 0, 0));
         assert_eq!(pixel(&full, 10, 10), (255, 0, 0));
     }

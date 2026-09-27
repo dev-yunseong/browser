@@ -17,8 +17,6 @@ pub mod engine;
 
 struct BrowserApp {
     url: String,
-    history: Vec<String>,
-    history_index: usize,
     content_promise: Option<Promise<Result<engine::PageResult, String>>>,
     re_render_promise: Option<Promise<Result<engine::PageResult, String>>>,
     /// Bounded JS tick promise — prevents unbounded thread spawns per frame.
@@ -88,8 +86,6 @@ impl BrowserApp {
 
         Self {
             url: "https://yunseong.dev".to_string(),
-            history: vec![],
-            history_index: 0,
             content_promise: None,
             re_render_promise: None,
             tick_promise: None,
@@ -122,40 +118,42 @@ impl BrowserApp {
         }
     }
 
+    /// Load `url`; the engine adds it to session history.
     fn load_url(&mut self, url: String) {
         let resolved = engine::resolve_url(&url);
-        if self.history.is_empty() || self.history[self.history_index] != resolved {
-            self.history.truncate(self.history_index + 1);
-            self.history.push(resolved.clone());
-            self.history_index = self.history.len() - 1;
-        }
-        self.load_url_direct(resolved);
+        self.url = resolved.clone();
+        let handle = self.engine.clone();
+        self.start_load(move |width| handle.send_navigate(resolved, width));
     }
 
-    fn navigate_back(&mut self) {
-        if self.history_index > 0 {
-            self.history_index -= 1;
-            let url = self.history[self.history_index].clone();
-            self.load_url_direct(url);
+    /// Load the session history entry `delta` steps away.
+    fn traverse_history(&mut self, delta: isize) {
+        let handle = self.engine.clone();
+        self.start_load(move |width| {
+            handle
+                .send_traverse(delta, width)?
+                .ok_or_else(|| "no session history entry there".to_string())
+        });
+    }
+
+    /// Show the engine's current URL, which script navigations, redirects
+    /// and history traversal change engine-side.
+    fn sync_url_from_history(&mut self) {
+        if let Some(url) = self.engine.history().current() {
+            self.url = url.to_string();
         }
     }
 
-    fn navigate_forward(&mut self) {
-        if self.history_index + 1 < self.history.len() {
-            self.history_index += 1;
-            let url = self.history[self.history_index].clone();
-            self.load_url_direct(url);
-        }
-    }
-
-    fn load_url_direct(&mut self, url: String) {
+    fn start_load(
+        &mut self,
+        load: impl FnOnce(f32) -> Result<engine::PageResult, String> + Send + 'static,
+    ) {
         // Fix viewport_width at 800.0 on every navigation so all subsequent
         // re-renders (hover, focus, image-load, JS eval) use the exact same width
         // and never cause layout jitter.
         self.viewport_width = 800.0;
         println!("[Viewport] navigate width={:.1}", self.viewport_width);
 
-        self.url = url.clone();
         self.error = None;
         self.image_promises.clear();
         self.hovered_id = None;
@@ -167,10 +165,7 @@ impl BrowserApp {
         render::clear_glyph_cache();
 
         let width = self.viewport_width;
-        let handle = self.engine.clone();
-        self.content_promise = Some(Promise::spawn_thread("fetcher", move || {
-            handle.send_navigate(url, width)
-        }));
+        self.content_promise = Some(Promise::spawn_thread("fetcher", move || load(width)));
     }
 
     /// Re-render the current page (e.g. after hover/focus state change).
@@ -213,22 +208,29 @@ impl eframe::App for BrowserApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // JS tick — at most one in-flight at a time to prevent unbounded thread spawns.
         let timestamp = self.start_time.elapsed().as_secs_f64() * 1000.0;
+        if let Some(tick_p) = &self.tick_promise {
+            if tick_p.ready().is_some() {
+                self.tick_promise = None;
+            }
+        }
+        // The tick thread wakes the UI again only when the page has work: at
+        // once after script ran, when the next timer is due, or to poll an
+        // in-flight fetch. With nothing pending the UI sleeps until input.
         if self.tick_promise.is_none()
             && self.content_promise.is_none()
             && self.re_render_promise.is_none()
         {
             let handle = self.engine.clone();
+            let ctx = ctx.clone();
             self.tick_promise = Some(Promise::spawn_thread("tick", move || {
-                handle.send_tick(timestamp, None)
-            }));
-        }
-        if let Some(tick_p) = &self.tick_promise {
-            if let Some(needs) = tick_p.ready() {
-                if *needs {
+                let outcome = handle.send_tick(timestamp, None);
+                if outcome.worked {
                     ctx.request_repaint();
+                } else if let Some(wake) = outcome.wake_after {
+                    ctx.request_repaint_after(wake);
                 }
-                self.tick_promise = None;
-            }
+                outcome.worked
+            }));
         }
 
         self.console_entries = self.engine.send_get_console();
@@ -301,15 +303,16 @@ impl eframe::App for BrowserApp {
                         )
                     };
 
-                    if btn_style(ui, "←", self.history_index > 0).clicked() {
-                        self.navigate_back();
+                    let history = self.engine.history();
+                    if btn_style(ui, "←", history.can_go_back()).clicked() {
+                        self.traverse_history(-1);
                     }
-                    if btn_style(ui, "→", self.history_index + 1 < self.history.len()).clicked() {
-                        self.navigate_forward();
+                    if btn_style(ui, "→", history.can_go_forward()).clicked() {
+                        self.traverse_history(1);
                     }
                     if btn_style(ui, "⟳", true).clicked() {
                         let url = self.url.clone();
-                        self.load_url_direct(url);
+                        self.load_url(url);
                     }
 
                     ui.spacing_mut().item_spacing.x = 8.0;
@@ -382,8 +385,17 @@ impl eframe::App for BrowserApp {
                 // Poll click promise — trigger re-render if onclick fired JS style changes
                 if let Some(click_p) = &self.click_promise {
                     if let Some(results) = click_p.ready() {
-                        let had_script = results.iter().any(|r| matches!(r, engine::ClickResult::ScriptExecuted));
+                        let navigated = results
+                            .iter()
+                            .any(|r| matches!(r, engine::ClickResult::Navigated { .. }));
+                        let had_script = navigated
+                            || results
+                                .iter()
+                                .any(|r| matches!(r, engine::ClickResult::ScriptExecuted));
                         self.click_promise = None;
+                        if navigated {
+                            self.sync_url_from_history();
+                        }
                         if had_script {
                             self.trigger_re_render(ctx, "click-script");
                         }
@@ -438,6 +450,7 @@ impl eframe::App for BrowserApp {
                             let image_urls = page_data.image_urls.clone();
 
                             self.is_loading = false;
+                            self.sync_url_from_history();
                             self.content_promise = None;
 
                             // Update stored GUI state
