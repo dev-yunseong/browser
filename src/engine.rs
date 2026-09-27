@@ -54,21 +54,7 @@ pub struct PageResult {
     /// boxes are painted relative to the viewport at this offset.
     pub scroll_x: f32,
     pub scroll_y: f32,
-    /// The full rendering when the document is wider than the viewport.
-    /// `pixmap_bytes` keeps only the leftmost `width` columns of it.
-    pub wide_canvas: Option<std::sync::Arc<WideCanvas>>,
 }
-
-/// Premultiplied RGBA pixels of a rendering wider than the viewport.
-#[derive(Debug)]
-pub struct WideCanvas {
-    pub width: u32,
-    pub height: u32,
-    pub bytes: Vec<u8>,
-}
-
-/// Widest canvas rendered for horizontally overflowing documents.
-const MAX_CANVAS_WIDTH: f32 = 4096.0;
 
 /// Most documents one script-driven navigation may chain through (a page
 /// whose script sends it on to another page, and so on).
@@ -850,13 +836,10 @@ pub fn process_html_with_scroll(
 
     let height = (final_y.ceil() as u32).clamp(600, 16384);
     let w_u32 = width as u32;
-    // Render the horizontal overflow too, so a viewport capture scrolled to
-    // the right has pixels to show.
-    let canvas_w = (scroll_width.min(MAX_CANVAS_WIDTH).ceil() as u32).max(w_u32);
 
     let start = Instant::now();
-    let mut pixmap = tiny_skia::Pixmap::new(canvas_w, height)
-        .ok_or_else(|| format!("Failed to create pixmap with size {}x{}", canvas_w, height))?;
+    let mut pixmap = tiny_skia::Pixmap::new(w_u32, height)
+        .ok_or_else(|| format!("Failed to create pixmap with size {}x{}", w_u32, height))?;
 
     pixmap.fill(tiny_skia::Color::WHITE);
 
@@ -956,18 +939,7 @@ pub fn process_html_with_scroll(
         })
         .collect();
 
-    let (pixmap_bytes, wide_canvas) = if canvas_w > w_u32 {
-        let wide = pixmap.data();
-        let (row_wide, row) = (canvas_w as usize * 4, w_u32 as usize * 4);
-        let mut bytes = Vec::with_capacity(row * height as usize);
-        for y in 0..height as usize {
-            bytes.extend_from_slice(&wide[y * row_wide..y * row_wide + row]);
-        }
-        let canvas = WideCanvas { width: canvas_w, height, bytes: pixmap.take() };
-        (bytes, Some(std::sync::Arc::new(canvas)))
-    } else {
-        (pixmap.data().to_vec(), None)
-    };
+    let pixmap_bytes = pixmap.take();
     let data_copy_elapsed = start.elapsed();
 
     let total_elapsed = start_total.elapsed();
@@ -1001,10 +973,51 @@ pub fn process_html_with_scroll(
             scroll_height,
             scroll_x,
             scroll_y,
-            wide_canvas,
         },
         stylesheet,
     ))
+}
+
+/// Paint the `width` x `viewport_height` viewport of `body` scrolled to
+/// `scroll`: the document is laid out as for a full render, then moved by
+/// `-scroll` so only the visible rectangle is rasterized.
+#[allow(clippy::too_many_arguments)]
+fn render_viewport(
+    body: &str,
+    base_url: &Url,
+    image_cache: &HashMap<String, Vec<u8>>,
+    stylesheet: &css::Stylesheet,
+    focused_id: Option<&str>,
+    csp_policy: Option<&js::CspPolicy>,
+    width: f32,
+    viewport_height: f32,
+    scroll: (f32, f32),
+) -> Option<tiny_skia::Pixmap> {
+    let dom_tree = dom::parse_html(body);
+    let style_tree = style::build_style_tree(
+        &dom_tree.document,
+        stylesheet,
+        None,
+        &HashMap::new(),
+        None,
+        focused_id,
+        csp_policy,
+    );
+    let image_sizes = layout::ImageSizes::from_cache(image_cache, Some(base_url));
+    let (layout_tree, _, _) = layout::build_layout_tree_with_images(
+        &style_tree, 0.0, 0.0, width, width, viewport_height, None, image_sizes,
+    );
+    let mut layout_tree = layout_tree?;
+    let (scroll_x, scroll_y) = scroll;
+    shift_fixed_boxes(&mut layout_tree, scroll_x, scroll_y);
+    translate_subtree(&mut layout_tree, -scroll_x, -scroll_y);
+    let mut pixmap = tiny_skia::Pixmap::new(
+        width.max(1.0) as u32,
+        viewport_height.round().max(1.0) as u32,
+    )?;
+    pixmap.fill(tiny_skia::Color::WHITE);
+    render::render_layout_tree(&layout_tree, &mut pixmap, image_cache, base_url);
+    Some(pixmap)
 }
 
 /// Move every `position: fixed` box (with its subtree) by `(dx, dy)`.
@@ -1041,6 +1054,23 @@ fn overflow_clips(layout: &layout::LayoutBox, axis_prop: &str) -> bool {
     })
 }
 
+/// `opacity: 0`: the box and its subtree paint nothing.
+fn is_transparent(layout: &layout::LayoutBox) -> bool {
+    matches!(
+        layout.style_node.specified_values.get(&css::intern("opacity")),
+        Some(css::Value::Number(n)) if *n <= 0.0
+    )
+}
+
+/// `visibility: hidden` (or `collapse`) on the box itself; descendants may
+/// still be visible.
+fn is_visibility_hidden(layout: &layout::LayoutBox) -> bool {
+    matches!(
+        layout.style_node.specified_values.get(&css::intern("visibility")),
+        Some(css::Value::Keyword(k)) if matches!(k.as_ref(), "hidden" | "collapse")
+    )
+}
+
 fn element_tag(layout: &layout::LayoutBox) -> Option<String> {
     match &layout.style_node.node.data {
         markup5ever_rcdom::NodeData::Element { name, .. } => Some(name.local.to_string()),
@@ -1049,8 +1079,9 @@ fn element_tag(layout: &layout::LayoutBox) -> Option<String> {
 }
 
 /// Scrollable size of the document: the union of border boxes that are not
-/// fixed and not inside a clipping (`overflow` other than visible) box, but at
-/// least `viewport_width` x `min_height`. An `overflow` clip on `<html>` or
+/// fixed, not inside a clipping (`overflow` other than visible) box, not
+/// `visibility: hidden` and not inside an `opacity: 0` subtree, but at least
+/// `viewport_width` x `min_height`. An `overflow` clip on `<html>` or
 /// `<body>` applies to the viewport and disables scrolling on that axis.
 fn document_scroll_extent(root: &layout::LayoutBox, viewport_width: f32, min_height: f32) -> (f32, f32) {
     let mut right = viewport_width;
@@ -1059,11 +1090,11 @@ fn document_scroll_extent(root: &layout::LayoutBox, viewport_width: f32, min_hei
     let mut clip_y = false;
     let mut stack: Vec<&layout::LayoutBox> = vec![root];
     while let Some(node) = stack.pop() {
-        if node.position == layout::PositionType::Fixed {
+        if node.position == layout::PositionType::Fixed || is_transparent(node) {
             continue;
         }
         let d = &node.dimensions;
-        if d.width > 0.0 && d.height > 0.0 {
+        if d.width > 0.0 && d.height > 0.0 && !is_visibility_hidden(node) {
             right = right.max(d.x + d.width);
             bottom = bottom.max(d.y + d.height);
         }
@@ -1648,18 +1679,32 @@ impl BrowserEngine {
             }
         }
         let page = self.last_page.as_ref()?;
-        let (sx, sy) = (page.scroll_x, page.scroll_y);
-        let (src_w, src_h, src) = match &page.wide_canvas {
-            Some(canvas) => (canvas.width, canvas.height, canvas.bytes.as_slice()),
-            None => (page.width, page.height, page.pixmap_bytes.as_slice()),
-        };
+        let (sx, sy) = (page.scroll_x.max(0.0).round(), page.scroll_y.max(0.0).round());
         let vh = viewport_height().round().max(1.0) as u32;
+        // The full-page render already holds the viewport unless the page is
+        // scrolled horizontally or the viewport reaches past its bottom.
+        if sx > 0.0 || sy as u32 + vh > page.height {
+            if let Some(stylesheet) = &self.last_stylesheet {
+                let focused_id = self.js_runtime.get_focused_node_id();
+                return render_viewport(
+                    &page.body,
+                    &page.base_url,
+                    &self.image_cache,
+                    stylesheet,
+                    focused_id.as_deref(),
+                    self.current_csp_policy.as_ref(),
+                    page.width as f32,
+                    vh as f32,
+                    (sx, sy),
+                );
+            }
+        }
         let bytes = crop_viewport(
-            src,
-            src_w,
-            src_h,
-            sx.max(0.0).round() as u32,
-            sy.max(0.0).round() as u32,
+            &page.pixmap_bytes,
+            page.width,
+            page.height,
+            0,
+            sy as u32,
             page.width,
             vh,
         );
@@ -3691,6 +3736,36 @@ mod tests {
             </body></html>"#,
         );
         assert_eq!(engine.last_page.as_ref().unwrap().scroll_width, 800.0);
+    }
+
+    #[test]
+    fn test_scroll_extent_ignores_invisible_boxes() {
+        let engine = engine_with_rendered_page(
+            r#"<html><body style="margin:0">
+                <div style="opacity:0"><div style="width:5000px;height:10px"></div></div>
+                <div style="visibility:hidden;width:4000px;height:10px"></div>
+                <div style="visibility:hidden"><div style="visibility:visible;width:900px;height:10px"></div></div>
+            </body></html>"#,
+        );
+        assert_eq!(engine.last_page.as_ref().unwrap().scroll_width, 900.0);
+    }
+
+    #[test]
+    fn test_wide_page_renders_viewport_width_only() {
+        let mut engine = engine_with_rendered_page(
+            r#"<html><body style="margin:0">
+                <div style="width:5000px;height:50px"></div>
+                <div style="position:absolute;left:1500px;top:10px;width:20px;height:20px;background:#0000ff"></div>
+            </body></html>"#,
+        );
+        let page = engine.last_page.as_ref().unwrap();
+        assert_eq!(page.scroll_width, 5000.0);
+        assert_eq!(page.pixmap_bytes.len(), 800 * page.height as usize * 4);
+        engine.evaluate_js("window.scrollTo(1450, 0)");
+        let viewport = engine.screenshot_viewport().unwrap();
+        assert_eq!((viewport.width(), viewport.height()), (800, viewport_height().round() as u32));
+        assert_eq!(pixel(&viewport, 55, 15), (0, 0, 255));
+        assert_eq!(pixel(&viewport, 45, 15), (255, 255, 255));
     }
 
     #[test]
