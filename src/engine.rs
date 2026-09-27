@@ -972,6 +972,13 @@ impl BrowserEngine {
         focused_id: Option<&str>,
         width: f32,
     ) -> Result<PageResult, String> {
+        // Pick up DOM mutations made by JS since the last render (timers,
+        // requestAnimationFrame, event handlers) so re-renders are not stale.
+        if let Some(live_html) = self.js_runtime.get_document_html() {
+            if let Some(ref mut last) = self.last_page {
+                last.body = live_html;
+            }
+        }
         let (body, base_url) = match &self.last_page {
             Some(p) => (p.body.clone(), p.base_url.clone()),
             None => return Err("No page loaded".into()),
@@ -1546,7 +1553,7 @@ impl BrowserEngine {
                 .unwrap_or_default();
 
             for specifier in &requests {
-                let resolved = match page_base.join(specifier).or_else(|_| url.join(specifier)) {
+                let resolved = match self.js_runtime.resolve_module_specifier(specifier, &url) {
                     Ok(r) => r,
                     Err(_) => continue,
                 };

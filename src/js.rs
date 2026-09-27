@@ -104,7 +104,7 @@ unsafe extern "C" fn import_meta_callback(
 fn host_import_module_dynamically<'s, 'i>(
     scope: &mut v8::PinScope<'s, 'i>,
     _host_defined_options: v8::Local<'s, v8::Data>,
-    _resource_name: v8::Local<'s, v8::Value>,
+    resource_name: v8::Local<'s, v8::Value>,
     specifier: v8::Local<'s, v8::String>,
     _import_attributes: v8::Local<'s, v8::FixedArray>,
 ) -> Option<v8::Local<'s, v8::Promise>> {
@@ -121,13 +121,15 @@ fn host_import_module_dynamically<'s, 'i>(
         }};
     }
 
-    let resolved_url = CURRENT_ORIGIN.with(|origin| {
-        origin
-            .borrow()
-            .as_ref()
-            .and_then(|base| base.join(&spec_str).ok())
-            .map(|u| u.to_string())
-    });
+    // Relative specifiers resolve against the importing script's URL; inline
+    // scripts have no URL resource name and fall back to the document base.
+    let referrer = Url::parse(&resource_name.to_rust_string_lossy(scope))
+        .ok()
+        .filter(|u| matches!(u.scheme(), "http" | "https" | "file"))
+        .or_else(|| CURRENT_ORIGIN.with(|origin| origin.borrow().clone()));
+    let resolved_url = referrer
+        .and_then(|base| base.join(&spec_str).ok())
+        .map(|u| u.to_string());
 
     let resolved_str = match resolved_url {
         Some(url) => url,
