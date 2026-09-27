@@ -1538,9 +1538,14 @@ fn layout_block_level_inner<'a>(
         collapsed_through = false;
     }
     lb.dimensions.height = border_h;
-    // A form control's text label is centered by the painter; keep text inside.
-    if matches!(lb.display, DisplayType::Input) && inner != Inner::Replaced {
-        center_button_contents(&mut lb);
+    // Buttons center their contents vertically when the box is taller than them.
+    if matches!(lb.display, DisplayType::Input) && inner == Inner::Flow {
+        let extra = (border_h - bm.pb_v()) - content_h;
+        if extra > 0.01 {
+            for c in lb.children.iter_mut() {
+                offset_layout_box(c, 0.0, extra / 2.0);
+            }
+        }
     }
 
     if lb.display == DisplayType::ListItem {
@@ -1556,23 +1561,6 @@ fn layout_block_level_inner<'a>(
     Some(BlockOut { lb, bottom_strut, collapsed_through, first_baseline, last_baseline })
 }
 
-/// Vertically center the in-flow contents of a button-like box.
-fn center_button_contents(lb: &mut LayoutBox) {
-    if lb.children.is_empty() {
-        return;
-    }
-    let top = lb.children.iter().map(|c| c.dimensions.y - c.margin.top).fold(f32::INFINITY, f32::min);
-    let bottom = lb.children.iter().map(|c| c.dimensions.y + c.dimensions.height + c.margin.bottom).fold(f32::NEG_INFINITY, f32::max);
-    let inner_top = lb.content_y();
-    let inner_h = (lb.dimensions.height - lb.border.vertical() - lb.padding.vertical()).max(0.0);
-    let used = bottom - top;
-    let dy = inner_top + (inner_h - used) / 2.0 - top;
-    if dy.abs() > 0.01 {
-        for c in &mut lb.children {
-            offset_layout_box(c, 0.0, dy);
-        }
-    }
-}
 
 /// Border-box size of a replaced element.
 fn replaced_size(sn: &StyledNode, bm: &BoxModel, cb: Cb, ctx: &Ctx) -> (f32, f32) {
@@ -2845,7 +2833,9 @@ fn build_line<'a>(
             }
             PieceKind::Abs(node) => {
                 flush_text(&mut pending_text, &mut frag_stack, out);
-                let ph = make_abs_placeholder(node, x, span.y, ctx);
+                // A block-level box's static position is the start of the line.
+                let ph_x = if is_inline_level_display(node) { x } else { span.left };
+                let ph = make_abs_placeholder(node, ph_x, span.y, ctx);
                 push_child(&mut frag_stack, out, ph);
             }
             PieceKind::Break(node) => {
