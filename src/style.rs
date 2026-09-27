@@ -545,6 +545,7 @@ pub fn build_style_tree(
     let all_rules: Vec<&crate::css::Rule> = stylesheet.all_rules();
     // Pre-build selector index: O(M) — done once before the parallel phase.
     let sel_index = SelectorIndex::build(&all_rules);
+    let keyframes = stylesheet.keyframes();
 
     let ctx = MatchCtx { arena: &arena, hovered_id, focused_id };
 
@@ -604,6 +605,8 @@ pub fn build_style_tree(
             }
         }
 
+        let important_names: HashSet<Arc<str>> =
+            important.iter().chain(inline_important.iter()).map(|(k, _)| k.clone()).collect();
         for (k, v) in important { apply_declaration(&mut map, &k, &v); }
         for (k, v) in inline_important { apply_declaration(&mut map, &k, &v); }
 
@@ -614,6 +617,15 @@ pub fn build_style_tree(
                     let (val, _) = crate::css::strip_important(v);
                     crate::css::parse_declaration(&k.to_ascii_lowercase(), val, false, &mut decls);
                     for d in decls { apply_declaration(&mut map, &d.name, &d.value); }
+                }
+            }
+        }
+
+        // Animations sit above normal declarations and below !important ones.
+        if !keyframes.is_empty() {
+            for d in animation_declarations(&map, &keyframes) {
+                if !important_names.contains(&d.name) {
+                    apply_declaration(&mut map, &d.name, &d.value);
                 }
             }
         }
@@ -640,6 +652,90 @@ pub fn build_style_tree(
     let mut store = StyleStore::default();
     let mut arena_idx = 0;
     build_final_tree(root, &mut arena_idx, &mut raw_styles, &arena, parent_style, &mut store)
+}
+
+/// Declarations that running CSS animations contribute when the page is
+/// rendered as a still frame. Every animation is treated as having run to
+/// completion: a finite animation keeps its end keyframe when
+/// `animation-fill-mode` is `forwards`/`both`; a paused one shows its start
+/// keyframe (during its delay only with `backwards`/`both`). Infinite
+/// animations and ones without a fill keep the base style. Only keyframes at
+/// the exact end offset contribute (no interpolation).
+fn animation_declarations(
+    map: &HashMap<Arc<str>, Value>,
+    keyframes: &HashMap<&str, &[crate::css::Keyframe]>,
+) -> Vec<crate::css::Declaration> {
+    let list = |name: &str| -> Vec<String> {
+        map.get(name)
+            .map(value_to_css_text)
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    let names: Vec<String> = map
+        .get("animation-name")
+        .map(value_to_css_text)
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+        .collect();
+    if names.iter().all(|n| n.is_empty() || n == "none") {
+        return Vec::new();
+    }
+    let counts = list("animation-iteration-count");
+    let directions = list("animation-direction");
+    let fills = list("animation-fill-mode");
+    let states = list("animation-play-state");
+    let delays = list("animation-delay");
+    let pick = |l: &Vec<String>, i: usize, d: &str| -> String {
+        if l.is_empty() { d.to_string() } else { l[i % l.len()].clone() }
+    };
+    let seconds = |t: &str| -> f32 {
+        if let Some(ms) = t.strip_suffix("ms") { ms.parse::<f32>().map(|v| v / 1000.0).unwrap_or(0.0) }
+        else { t.trim_end_matches('s').parse::<f32>().unwrap_or(0.0) }
+    };
+    let mut out = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        let Some(frames) = keyframes.get(name.as_str()) else { continue };
+        let fill = pick(&fills, i, "none");
+        let fills_forwards = matches!(fill.as_str(), "forwards" | "both");
+        let fills_backwards = matches!(fill.as_str(), "backwards" | "both");
+        let direction = pick(&directions, i, "normal");
+        let reversed_iteration = |iteration: u32| match direction.as_str() {
+            "reverse" => true,
+            "alternate" => iteration % 2 == 1,
+            "alternate-reverse" => iteration % 2 == 0,
+            _ => false,
+        };
+        let offset = if pick(&states, i, "running") == "paused" {
+            if !fills_backwards && seconds(&pick(&delays, i, "0s")) > 0.0 {
+                continue;
+            }
+            if reversed_iteration(0) { 1.0 } else { 0.0 }
+        } else {
+            let count = pick(&counts, i, "1");
+            let Ok(count) = count.parse::<f32>() else { continue }; // infinite
+            if !fills_forwards || count < 0.0 {
+                continue;
+            }
+            let (iteration, progress) = if count == 0.0 {
+                (0, 0.0)
+            } else if count.fract() == 0.0 {
+                (count as u32 - 1, 1.0)
+            } else {
+                (count.floor() as u32, count.fract())
+            };
+            if reversed_iteration(iteration) { 1.0 - progress } else { progress }
+        };
+        for frame in frames.iter() {
+            if frame.offsets.iter().any(|o| (o - offset).abs() < 1e-4) {
+                out.extend(frame.declarations.iter().cloned());
+            }
+        }
+    }
+    out
 }
 
 /// Returns the CSS initial value for a given property name, or `None` if not defined here.
@@ -2097,5 +2193,41 @@ mod tests {
         assert_eq!(s.pseudo_class, Some("hover".to_string()));
         assert!(s.pseudo_element.is_none());
     }
-}
 
+    fn transform_of(node: &StyledNode) -> Option<Value> {
+        node.specified_values.get(&intern("transform")).cloned()
+    }
+
+    #[test]
+    fn test_finished_animation_with_fill_forwards_keeps_end_keyframe() {
+        // Keyframes names are case-sensitive (CSS Modules hashes mix case).
+        let css = ".r{width:100%;animation-fill-mode:forwards;animation-name:Roll___2LIf-}\
+                   @keyframes Roll___2LIf-{0%{transform:none}to{transform:translateY(-100%)}}";
+        let tree = make_tree(r#"<div class="r" style="animation-duration: .5s;">x</div>"#, css);
+        let div = find_node(&tree, "div").unwrap();
+        assert!(matches!(transform_of(div), Some(Value::Transform(_))), "got {:?}", transform_of(div));
+    }
+
+    #[test]
+    fn test_animation_without_fill_or_infinite_keeps_base_style() {
+        let css = "@keyframes fade{from{opacity:0}to{opacity:0.5}}\
+                   .a{animation:fade 1s} .b{animation:fade 1s infinite forwards} .c{animation:fade 1s forwards}";
+        let tree = make_tree(r#"<p class="a">a</p><span class="b">b</span><i class="c">c</i>"#, css);
+        let op = |tag: &str| find_node(&tree, tag).unwrap().specified_values.get(&intern("opacity")).cloned();
+        assert_eq!(op("p"), None);
+        assert_eq!(op("span"), None);
+        assert_eq!(op("i"), Some(Value::Number(0.5)));
+    }
+
+    #[test]
+    fn test_animation_direction_and_important() {
+        let css = "@keyframes m{from{opacity:0.25}to{opacity:0.75}}\
+                   .rev{animation:m 1s reverse forwards} .alt{animation:m 1s 2 alternate both}\
+                   .imp{animation:m 1s forwards; opacity:1 !important}";
+        let tree = make_tree(r#"<p class="rev">a</p><span class="alt">b</span><i class="imp">c</i>"#, css);
+        let op = |tag: &str| find_node(&tree, tag).unwrap().specified_values.get(&intern("opacity")).cloned();
+        assert_eq!(op("p"), Some(Value::Number(0.25)));
+        assert_eq!(op("span"), Some(Value::Number(0.25)));
+        assert_eq!(op("i"), Some(Value::Number(1.0)));
+    }
+}
