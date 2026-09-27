@@ -4,6 +4,7 @@
 //!   browser-daemon              # GUI window + HTTP server on :7070
 //!   browser-daemon --no-gui     # headless HTTP server only
 //!   browser-daemon --port 7071  # custom port
+//!   browser-daemon --viewport-height 1200  # viewport height in CSS px (default 768)
 
 use std::collections::HashMap;
 
@@ -18,11 +19,13 @@ use poll_promise::Promise;
 struct DaemonArgs {
     no_gui: bool,
     port: u16,
+    viewport_height: Option<f32>,
 }
 
 fn parse_args_from(args: &[&str]) -> DaemonArgs {
     let mut no_gui = false;
     let mut port = 7070u16;
+    let mut viewport_height = None;
     let mut i = 0;
     while i < args.len() {
         match args[i] {
@@ -33,11 +36,15 @@ fn parse_args_from(args: &[&str]) -> DaemonArgs {
                     port = p.parse().unwrap_or(7070);
                 }
             }
+            "--viewport-height" => {
+                i += 1;
+                viewport_height = args.get(i).and_then(|h| h.parse().ok());
+            }
             _ => {}
         }
         i += 1;
     }
-    DaemonArgs { no_gui, port }
+    DaemonArgs { no_gui, port, viewport_height }
 }
 
 fn parse_args() -> DaemonArgs {
@@ -86,6 +93,15 @@ struct ConsoleEvalRequest {
 struct TickRequest {
     count: Option<u32>,
     width: Option<f32>,
+}
+
+/// `GET /screenshot?mode=viewport|full`. `full` (the default) is the whole
+/// page from the document origin; `viewport` is the `width` x
+/// `--viewport-height` rectangle at the current document scroll offset, as a
+/// Chromium page screenshot.
+#[derive(serde::Deserialize, Default)]
+struct ScreenshotQuery {
+    mode: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -175,6 +191,41 @@ async fn navigate_handler(
     }
 }
 
+/// `POST /back` and `POST /forward`: load the neighbouring session history
+/// entry. 404 with an error message when there is none.
+async fn traverse(handle: EngineHandle, delta: isize) -> axum::response::Response {
+    let result = blocking!(move || {
+        let page = handle.send_traverse(delta, 800.0)?;
+        Ok::<_, String>(page.map(|page| {
+            let base_url = page.base_url.clone();
+            engine::page_to_api_response(&page, &base_url)
+        }))
+    });
+    match result {
+        Ok(Some(resp)) => (StatusCode::OK, Json(resp)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: if delta < 0 {
+                    "Already at the beginning of history.".to_string()
+                } else {
+                    "Already at the end of history.".to_string()
+                },
+            }),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+async fn back_handler(State(handle): State<EngineHandle>) -> impl IntoResponse {
+    traverse(handle, -1).await
+}
+
+async fn forward_handler(State(handle): State<EngineHandle>) -> impl IntoResponse {
+    traverse(handle, 1).await
+}
+
 async fn page_handler(State(handle): State<EngineHandle>) -> impl IntoResponse {
     let resp = blocking!(move || handle.send_get_page_control());
     match resp {
@@ -247,8 +298,26 @@ async fn console_eval_handler(
         .into_response()
 }
 
-async fn screenshot_handler(State(handle): State<EngineHandle>) -> impl IntoResponse {
-    let png_opt = blocking!(move || handle.send_screenshot_control());
+async fn screenshot_handler(
+    State(handle): State<EngineHandle>,
+    Query(query): Query<ScreenshotQuery>,
+) -> impl IntoResponse {
+    let viewport = match query.mode.as_deref() {
+        None | Some("") | Some("full") | Some("full-page") | Some("full_page") => false,
+        Some("viewport") => true,
+        Some(other) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("unknown screenshot mode '{}' (expected viewport or full)", other),
+            )
+                .into_response()
+        }
+    };
+    let png_opt = blocking!(move || if viewport {
+        handle.send_screenshot_viewport_control()
+    } else {
+        handle.send_screenshot_control()
+    });
     match png_opt {
         Ok(Some(bytes)) => (
             StatusCode::OK,
@@ -352,6 +421,8 @@ async fn submit_handler(State(handle): State<EngineHandle>) -> impl IntoResponse
 pub fn build_router(handle: EngineHandle) -> Router {
     Router::new()
         .route("/navigate", post(navigate_handler))
+        .route("/back", post(back_handler))
+        .route("/forward", post(forward_handler))
         .route("/page", get(page_handler))
         .route("/status", get(status_handler))
         .route("/health", get(health_handler))
@@ -379,11 +450,16 @@ async fn run_http_server(handle: EngineHandle, port: u16) {
 
 // ── DaemonBrowserApp — GUI front-end ──────────────────────────────────────────
 
+/// Width kept free for the page scroll area's vertical scrollbar.
+const PANEL_SCROLLBAR_ALLOWANCE: f32 = 12.0;
+/// Narrowest layout width the GUI asks the engine for.
+const MIN_RENDER_WIDTH: f32 = 320.0;
+/// How long the panel width must stay unchanged before the page reflows.
+const RESIZE_SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
+
 struct DaemonBrowserApp {
     handle: EngineHandle,
     url: String,
-    history: Vec<String>,
-    history_index: usize,
     texture: Option<egui::TextureHandle>,
     error: Option<String>,
     current_links: Vec<(layout::Rect, String)>,
@@ -413,13 +489,18 @@ struct DaemonBrowserApp {
     console_history_index: Option<usize>,
     console_eval_promise: Option<Promise<browser::js::EvalOutcome>>,
     has_page: bool,
+    /// Page layout width in CSS px: the central panel's width, so the page
+    /// reflows when the window is resized (the HTTP API keeps 800).
+    render_width: f32,
+    /// A new panel width waiting to settle before re-rendering at it.
+    pending_width: Option<(f32, std::time::Instant)>,
 }
 
 impl DaemonBrowserApp {
     fn new(cc: &eframe::CreationContext<'_>, handle: EngineHandle) -> Self {
         // Load Korean font (same as BrowserApp)
         let mut fonts = egui::FontDefinitions::default();
-        let nanum_data = include_bytes!("../../assets/fonts/NanumGothic.ttf");
+        let nanum_data = browser::fonts::EMBEDDED_FALLBACK;
         fonts
             .font_data
             .insert("nanum".to_owned(), egui::FontData::from_static(nanum_data));
@@ -438,8 +519,6 @@ impl DaemonBrowserApp {
         Self {
             handle,
             url: "https://yunseong.dev".to_string(),
-            history: vec![],
-            history_index: 0,
             texture: None,
             error: None,
             current_links: vec![],
@@ -467,47 +546,39 @@ impl DaemonBrowserApp {
             console_history_index: None,
             console_eval_promise: None,
             has_page: false,
+            render_width: 800.0,
+            pending_width: None,
         }
     }
 
+    /// Load `url`; the engine adds it to session history.
     fn load_url(&mut self, url: String, width: f32) {
         let resolved = engine::resolve_url(&url);
-        if self.history.is_empty() || self.history[self.history_index] != resolved {
-            self.history.truncate(self.history_index + 1);
-            self.history.push(resolved.clone());
-            self.history_index = self.history.len() - 1;
-        }
-        self.load_url_direct(resolved, width);
+        self.url = resolved.clone();
+        let handle = self.handle.clone();
+        self.start_load(move || handle.send_navigate(resolved, width));
     }
 
-    fn navigate_back(&mut self, width: f32) {
-        if self.history_index > 0 {
-            self.history_index -= 1;
-            let url = self.history[self.history_index].clone();
-            self.load_url_direct(url, width);
-        }
+    /// Load the session history entry `delta` steps away.
+    fn traverse_history(&mut self, delta: isize, width: f32) {
+        let handle = self.handle.clone();
+        self.start_load(move || {
+            handle
+                .send_traverse(delta, width)?
+                .ok_or_else(|| "no session history entry there".to_string())
+        });
     }
 
-    fn navigate_forward(&mut self, width: f32) {
-        if self.history_index + 1 < self.history.len() {
-            self.history_index += 1;
-            let url = self.history[self.history_index].clone();
-            self.load_url_direct(url, width);
-        }
-    }
-
-    fn load_url_direct(&mut self, url: String, width: f32) {
-        self.url = url.clone();
+    fn start_load(
+        &mut self,
+        load: impl FnOnce() -> Result<engine::PageResult, String> + Send + 'static,
+    ) {
         self.error = None;
         self.image_promises.clear();
         self.hovered_id = None;
         self.is_loading = true;
         self.has_page = false;
-
-        let handle = self.handle.clone();
-        self.content_promise = Some(Promise::spawn_thread("daemon-navigate", move || {
-            handle.send_navigate(url, width)
-        }));
+        self.content_promise = Some(Promise::spawn_thread("daemon-navigate", load));
     }
 
     fn trigger_re_render(&mut self, ctx: &egui::Context, width: f32) {
@@ -519,6 +590,14 @@ impl DaemonBrowserApp {
             handle.send_re_render(hovered_id, focused_id, width)
         }));
         ctx.request_repaint();
+    }
+
+    /// Show the engine's current URL, which script navigations, redirects
+    /// and history traversal change engine-side.
+    fn sync_url_from_history(&mut self) {
+        if let Some(url) = self.handle.history().current() {
+            self.url = url.to_string();
+        }
     }
 
     fn apply_page_data(&mut self, page: engine::PageResult, ctx: &egui::Context) {
@@ -542,22 +621,29 @@ impl eframe::App for DaemonBrowserApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // JS tick — at most one in-flight at a time to prevent unbounded thread spawns.
         let timestamp = self.start_time.elapsed().as_secs_f64() * 1000.0;
+        if let Some(tick_p) = &self.tick_promise {
+            if tick_p.ready().is_some() {
+                self.tick_promise = None;
+            }
+        }
+        // The tick thread wakes the UI again only when the page has work: at
+        // once after script ran, when the next timer is due, or to poll an
+        // in-flight fetch. With nothing pending the UI sleeps until input.
         if self.tick_promise.is_none()
             && self.content_promise.is_none()
             && self.re_render_promise.is_none()
         {
             let handle = self.handle.clone();
+            let ctx = ctx.clone();
             self.tick_promise = Some(Promise::spawn_thread("daemon-tick", move || {
-                handle.send_tick(timestamp, None)
-            }));
-        }
-        if let Some(tick_p) = &self.tick_promise {
-            if let Some(needs) = tick_p.ready() {
-                if *needs {
+                let outcome = handle.send_tick(timestamp, None);
+                if outcome.worked {
                     ctx.request_repaint();
+                } else if let Some(wake) = outcome.wake_after {
+                    ctx.request_repaint_after(wake);
                 }
-                self.tick_promise = None;
-            }
+                outcome.worked
+            }));
         }
 
         self.console_entries = self.handle.send_get_console();
@@ -568,7 +654,7 @@ impl eframe::App for DaemonBrowserApp {
                     && self.re_render_promise.is_none()
                     && self.content_promise.is_none()
                 {
-                    self.trigger_re_render(ctx, 800.0);
+                    self.trigger_re_render(ctx, self.render_width);
                 } else {
                     ctx.request_repaint();
                 }
@@ -595,7 +681,7 @@ impl eframe::App for DaemonBrowserApp {
                     }
                 };
                 self.focused_id = Some(focusables[next_index].1.clone());
-                self.trigger_re_render(ctx, 800.0);
+                self.trigger_re_render(ctx, self.render_width);
             }
         }
 
@@ -632,15 +718,16 @@ impl eframe::App for DaemonBrowserApp {
                             )
                         };
 
-                    if btn_style(ui, "←", self.history_index > 0).clicked() {
-                        self.navigate_back(800.0);
+                    let history = self.handle.history();
+                    if btn_style(ui, "←", history.can_go_back()).clicked() {
+                        self.traverse_history(-1, self.render_width);
                     }
-                    if btn_style(ui, "→", self.history_index + 1 < self.history.len()).clicked() {
-                        self.navigate_forward(800.0);
+                    if btn_style(ui, "→", history.can_go_forward()).clicked() {
+                        self.traverse_history(1, self.render_width);
                     }
                     if btn_style(ui, "⟳", true).clicked() {
                         let url = self.url.clone();
-                        self.load_url_direct(url, 800.0);
+                        self.load_url(url, self.render_width);
                     }
 
                     ui.spacing_mut().item_spacing.x = 8.0;
@@ -659,7 +746,7 @@ impl eframe::App for DaemonBrowserApp {
                         let resp = ui.add(edit);
                         if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             let url = self.url.clone();
-                            self.load_url(url, 800.0);
+                            self.load_url(url, self.render_width);
                         }
                     });
 
@@ -677,7 +764,7 @@ impl eframe::App for DaemonBrowserApp {
                         .clicked()
                     {
                         let url = self.url.clone();
-                        self.load_url(url, 800.0);
+                        self.load_url(url, self.render_width);
                     }
 
                     // Daemon badge
@@ -725,10 +812,19 @@ impl eframe::App for DaemonBrowserApp {
                 // Poll click promise — trigger re-render if onclick fired JS style changes
                 if let Some(click_p) = &self.click_promise {
                     if let Some(results) = click_p.ready() {
-                        let had_script = results.iter().any(|r| matches!(r, engine::ClickResult::ScriptExecuted));
+                        let navigated = results
+                            .iter()
+                            .any(|r| matches!(r, engine::ClickResult::Navigated { .. }));
+                        let had_script = navigated
+                            || results
+                                .iter()
+                                .any(|r| matches!(r, engine::ClickResult::ScriptExecuted));
                         self.click_promise = None;
+                        if navigated {
+                            self.sync_url_from_history();
+                        }
                         if had_script {
-                            self.trigger_re_render(ctx, 800.0);
+                            self.trigger_re_render(ctx, self.render_width);
                         }
                     }
                 }
@@ -738,7 +834,7 @@ impl eframe::App for DaemonBrowserApp {
                         let url = maybe_url.clone();
                         self.submit_promise = None;
                         if let Some(url) = url {
-                            self.load_url(url, 800.0);
+                            self.load_url(url, self.render_width);
                         }
                     }
                 }
@@ -776,6 +872,7 @@ impl eframe::App for DaemonBrowserApp {
                             let image_urls = page.image_urls.clone();
 
                             self.is_loading = false;
+                            self.sync_url_from_history();
                             self.form_values.clear();
                             for (i, (_, val)) in page.form_controls.iter().enumerate() {
                                 self.form_values.insert(i.to_string(), val.clone());
@@ -821,7 +918,7 @@ impl eframe::App for DaemonBrowserApp {
                     None => true,
                 });
                 if newly_loaded {
-                    self.trigger_re_render(ctx, 800.0);
+                    self.trigger_re_render(ctx, self.render_width);
                 }
 
                 // Error
@@ -833,6 +930,31 @@ impl eframe::App for DaemonBrowserApp {
                             format!("페이지를 불러올 수 없습니다: {}", err),
                         );
                     });
+                }
+
+                // Reflow the page to the panel width once a resize settles.
+                let panel_width = (ui.available_width() - PANEL_SCROLLBAR_ALLOWANCE)
+                    .floor()
+                    .max(MIN_RENDER_WIDTH);
+                if (panel_width - self.render_width).abs() >= 1.0 {
+                    let settled = match self.pending_width {
+                        Some((w, since)) if (w - panel_width).abs() < 1.0 => {
+                            since.elapsed() >= RESIZE_SETTLE
+                        }
+                        _ => {
+                            self.pending_width = Some((panel_width, std::time::Instant::now()));
+                            false
+                        }
+                    };
+                    if settled && self.has_page && self.re_render_promise.is_none() && self.content_promise.is_none() {
+                        self.render_width = panel_width;
+                        self.pending_width = None;
+                        self.trigger_re_render(ctx, self.render_width);
+                    } else {
+                        ctx.request_repaint_after(RESIZE_SETTLE);
+                    }
+                } else {
+                    self.pending_width = None;
                 }
 
                 // Render page texture + interactive overlay
@@ -943,7 +1065,7 @@ impl eframe::App for DaemonBrowserApp {
                                     }
                                     if new_focus != self.focused_id {
                                         self.focused_id = new_focus;
-                                        self.trigger_re_render(ctx, 800.0);
+                                        self.trigger_re_render(ctx, self.render_width);
                                     }
 
                                     // GUI-side link navigation
@@ -974,16 +1096,16 @@ impl eframe::App for DaemonBrowserApp {
                                 }
                                 if new_hovered_id != self.hovered_id {
                                     self.hovered_id = new_hovered_id;
-                                    self.trigger_re_render(ctx, 800.0);
+                                    self.trigger_re_render(ctx, self.render_width);
                                 }
                             } else if self.hovered_id.is_some() {
                                 self.hovered_id = None;
-                                self.trigger_re_render(ctx, 800.0);
+                                self.trigger_re_render(ctx, self.render_width);
                             }
                         });
 
                     if let Some(url) = url_to_load {
-                        self.load_url(url, 800.0);
+                        self.load_url(url, self.render_width);
                     }
                 }
             });
@@ -1167,7 +1289,10 @@ fn main() {
     let args = parse_args();
 
     // Spawn the engine actor thread and get a cloneable handle to it.
-    let handle = EngineHandle::spawn();
+    let handle = EngineHandle::spawn_with_viewport_height(
+        args.viewport_height
+            .unwrap_or(engine::DEFAULT_VIEWPORT_HEIGHT),
+    );
 
     // HTTP server thread — runs its own tokio runtime
     let handle_for_http = handle.clone();
@@ -1222,6 +1347,14 @@ mod tests {
         let args = parse_args_from(&[]);
         assert!(!args.no_gui);
         assert_eq!(args.port, 7070);
+    }
+
+    #[test]
+    fn test_parse_args_viewport_height() {
+        assert_eq!(parse_args_from(&[]).viewport_height, None);
+        let args = parse_args_from(&["--no-gui", "--viewport-height", "1200"]);
+        assert_eq!(args.viewport_height, Some(1200.0));
+        assert!(args.no_gui);
     }
 
     #[test]
@@ -1307,8 +1440,9 @@ mod tests {
     #[test]
     fn test_engine_actor_tick_empty() {
         let handle = make_test_handle();
-        let needs = handle.send_tick(0.0, None);
-        assert!(!needs);
+        let outcome = handle.send_tick(0.0, None);
+        assert!(!outcome.worked);
+        assert_eq!(outcome.wake_after, None);
     }
 
     #[test]
@@ -1387,6 +1521,24 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_http_screenshot_modes() {
+        for (uri, expected) in [
+            ("/screenshot?mode=viewport", StatusCode::NOT_FOUND),
+            ("/screenshot?mode=full", StatusCode::NOT_FOUND),
+            ("/screenshot?mode=sideways", StatusCode::BAD_REQUEST),
+        ] {
+            let app = build_router(make_test_handle());
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), expected, "{uri}");
+        }
     }
 
     #[tokio::test]
@@ -1512,5 +1664,179 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.as_object().unwrap().is_empty());
+    }
+
+    // ── Session history ──────────────────────────────────────────────────────
+
+    /// Serve `pages` (path → HTML) over HTTP on a local port until the test
+    /// process exits; unknown paths get an empty page. Returns the origin.
+    fn serve_pages(pages: Vec<(&'static str, &'static str)>) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                loop {
+                    let mut header = String::new();
+                    match reader.read_line(&mut header) {
+                        Ok(n) if n > 2 => continue,
+                        _ => break,
+                    }
+                }
+                let target = request_line.split_whitespace().nth(1).unwrap_or("/");
+                let path = target.split('?').next().unwrap_or("/");
+                let body = pages
+                    .iter()
+                    .find(|(p, _)| *p == path)
+                    .map(|(_, html)| *html)
+                    .unwrap_or("<html><body></body></html>");
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+        });
+        origin
+    }
+
+    async fn request_json(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let builder = axum::http::Request::builder().method(method).uri(uri);
+        let req = match body {
+            Some(json) => builder
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(json.to_string()))
+                .unwrap(),
+            None => builder.body(axum::body::Body::empty()).unwrap(),
+        };
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    async fn current_url(app: &Router) -> String {
+        let (_, json) = request_json(app, "GET", "/status", None).await;
+        json["url"].as_str().unwrap_or_default().to_string()
+    }
+
+    const PAGE_A: &str = r#"<html><body><a href="/b" style="display:block;height:40px">to b</a>
+        <button id="go" onclick="location.href='/c'">go</button>
+        <form action="/search"><input name="q" value="rust lang"></form></body></html>"#;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_http_back_forward_follow_navigate_and_click() {
+        let origin = serve_pages(vec![
+            ("/a", PAGE_A),
+            ("/b", "<html><body><p>b</p></body></html>"),
+        ]);
+        let app = build_router(make_test_handle());
+
+        let (status, json) = request_json(&app, "POST", "/back", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["error"], "Already at the beginning of history.");
+
+        let (status, _) = request_json(
+            &app,
+            "POST",
+            "/navigate",
+            Some(serde_json::json!({ "url": format!("{origin}/a") })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // A link click answers Navigate; the client then loads it, as
+        // browser-cli does.
+        let (_, clicks) = request_json(
+            &app,
+            "POST",
+            "/click",
+            Some(serde_json::json!({ "x": 10.0, "y": 20.0 })),
+        )
+        .await;
+        let link = clicks
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["type"] == "Navigate")
+            .expect("link click navigates")["url"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(link, format!("{origin}/b"));
+        request_json(&app, "POST", "/navigate", Some(serde_json::json!({ "url": link }))).await;
+        assert_eq!(current_url(&app).await, format!("{origin}/b"));
+
+        let (status, json) = request_json(&app, "POST", "/back", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["url"], format!("{origin}/a"));
+        assert_eq!(current_url(&app).await, format!("{origin}/a"));
+
+        let (status, json) = request_json(&app, "POST", "/forward", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["url"], format!("{origin}/b"));
+
+        let (status, json) = request_json(&app, "POST", "/forward", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["error"], "Already at the end of history.");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_http_script_navigations_add_history_entries() {
+        let origin = serve_pages(vec![
+            ("/a", PAGE_A),
+            ("/c", "<html><body><p>c</p></body></html>"),
+            (
+                "/redirect",
+                "<html><body><script>location.replace('/c')</script></body></html>",
+            ),
+        ]);
+        let app = build_router(make_test_handle());
+        let navigate = |path: &str| serde_json::json!({ "url": format!("{origin}{path}") });
+
+        // location.href from script run through /js.
+        request_json(&app, "POST", "/navigate", Some(navigate("/a"))).await;
+        request_json(
+            &app,
+            "POST",
+            "/js",
+            Some(serde_json::json!({ "script": "location.href = '/c'" })),
+        )
+        .await;
+        assert_eq!(current_url(&app).await, format!("{origin}/c"));
+        let (_, json) = request_json(&app, "POST", "/back", None).await;
+        assert_eq!(json["url"], format!("{origin}/a"));
+
+        // form.submit() loads the action with the fields as a query.
+        request_json(
+            &app,
+            "POST",
+            "/js",
+            Some(serde_json::json!({ "script": "document.querySelector('form').submit()" })),
+        )
+        .await;
+        assert_eq!(current_url(&app).await, format!("{origin}/search?q=rust+lang"));
+        let (_, json) = request_json(&app, "POST", "/back", None).await;
+        assert_eq!(json["url"], format!("{origin}/a"));
+
+        // A redirect while the page loads replaces its entry: back skips it.
+        request_json(&app, "POST", "/navigate", Some(navigate("/redirect"))).await;
+        assert_eq!(current_url(&app).await, format!("{origin}/c"));
+        let (_, json) = request_json(&app, "POST", "/back", None).await;
+        assert_eq!(json["url"], format!("{origin}/a"));
     }
 }

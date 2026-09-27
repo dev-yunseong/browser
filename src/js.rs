@@ -68,6 +68,8 @@ thread_local! {
     static CURRENT_ORIGIN: RefCell<Option<Url>> = RefCell::new(None);
     static CSP_POLICY: RefCell<Option<CspPolicy>> = RefCell::new(None);
     static LAYOUT_METRICS: RefCell<HashMap<String, LayoutMetrics>> = RefCell::new(HashMap::new());
+    /// Document scroll position and the ranges it is clamped to.
+    static SCROLL_STATE: RefCell<ScrollState> = RefCell::new(ScrollState::default());
     static CONSOLE_BUFFER: RefCell<Option<ConsoleBuffer>> = const { RefCell::new(None) };
     static RUN_PENDING: RefCell<Vec<(v8::Global<v8::Function>, Option<f64>)>> = RefCell::new(Vec::new());
     static FETCH_PENDING: RefCell<VecDeque<(v8::Global<v8::Function>, String, bool)>> = RefCell::new(VecDeque::new());
@@ -80,8 +82,19 @@ thread_local! {
     /// Prevents re-compilation of the same module in cyclic import graphs.
     static RESOLVED_MODULES: RefCell<HashMap<String, v8::Global<v8::Module>>> =
         RefCell::new(HashMap::new());
-    /// Pending form submission requests from JS — checked by engine.
-    static FORM_SUBMIT_REQUESTS: RefCell<Vec<u32>> = RefCell::new(Vec::new());
+    /// Document navigation requested by page script (`location.href = …`,
+    /// `location.assign/replace/reload`, `form.submit()`). The last request
+    /// wins; the engine takes it after running script.
+    static NAVIGATION_REQUEST: RefCell<Option<NavigationRequest>> = const { RefCell::new(None) };
+}
+
+/// A document navigation requested by page script.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NavigationRequest {
+    /// Absolute URL to load.
+    pub url: String,
+    /// Replace the current session history entry instead of adding one.
+    pub replace: bool,
 }
 
 unsafe extern "C" fn import_meta_callback(
@@ -104,7 +117,7 @@ unsafe extern "C" fn import_meta_callback(
 fn host_import_module_dynamically<'s, 'i>(
     scope: &mut v8::PinScope<'s, 'i>,
     _host_defined_options: v8::Local<'s, v8::Data>,
-    _resource_name: v8::Local<'s, v8::Value>,
+    resource_name: v8::Local<'s, v8::Value>,
     specifier: v8::Local<'s, v8::String>,
     _import_attributes: v8::Local<'s, v8::FixedArray>,
 ) -> Option<v8::Local<'s, v8::Promise>> {
@@ -121,13 +134,15 @@ fn host_import_module_dynamically<'s, 'i>(
         }};
     }
 
-    let resolved_url = CURRENT_ORIGIN.with(|origin| {
-        origin
-            .borrow()
-            .as_ref()
-            .and_then(|base| base.join(&spec_str).ok())
-            .map(|u| u.to_string())
-    });
+    // Relative specifiers resolve against the importing script's URL; inline
+    // scripts have no URL resource name and fall back to the document base.
+    let referrer = Url::parse(&resource_name.to_rust_string_lossy(scope))
+        .ok()
+        .filter(|u| matches!(u.scheme(), "http" | "https" | "file"))
+        .or_else(|| CURRENT_ORIGIN.with(|origin| origin.borrow().clone()));
+    let resolved_url = referrer
+        .and_then(|base| base.join(&spec_str).ok())
+        .map(|u| u.to_string());
 
     let resolved_str = match resolved_url {
         Some(url) => url,
@@ -475,6 +490,53 @@ pub struct LayoutMetrics {
     pub height: f32,
 }
 
+/// Document (viewport) scroll state shared by the JS scroll APIs and the engine.
+///
+/// `x`/`y` are always kept inside `0..=max_x()` / `0..=max_y()`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollState {
+    pub x: f64,
+    pub y: f64,
+    /// Scrollable document size (layout overflow extent).
+    pub document_width: f64,
+    pub document_height: f64,
+    /// Viewport size in CSS px.
+    pub viewport_width: f64,
+    pub viewport_height: f64,
+}
+
+impl Default for ScrollState {
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            document_width: 0.0,
+            document_height: 0.0,
+            viewport_width: 800.0,
+            viewport_height: crate::engine::DEFAULT_VIEWPORT_HEIGHT as f64,
+        }
+    }
+}
+
+impl ScrollState {
+    pub fn max_x(&self) -> f64 {
+        (self.document_width - self.viewport_width).max(0.0)
+    }
+
+    pub fn max_y(&self) -> f64 {
+        (self.document_height - self.viewport_height).max(0.0)
+    }
+
+    /// Clamp `(x, y)` into the scrollable range. Non-finite values become 0.
+    pub fn clamp(&self, x: f64, y: f64) -> (f64, f64) {
+        let finite = |v: f64| if v.is_finite() { v } else { 0.0 };
+        (
+            finite(x).clamp(0.0, self.max_x()),
+            finite(y).clamp(0.0, self.max_y()),
+        )
+    }
+}
+
 impl LayoutMetrics {
     pub fn right(&self) -> f32 {
         self.x + self.width
@@ -612,6 +674,34 @@ pub struct JsRuntime {
     isolate: v8::OwnedIsolate,
 }
 
+impl Drop for JsRuntime {
+    /// Release every thread-local `v8::Global` (queued callbacks, fetch
+    /// handlers, cached modules) while this runtime's isolate is still alive.
+    /// Left behind, they would be dropped after the isolate is disposed —
+    /// e.g. when the next page's runtime replaces this one — and V8 panics
+    /// with "attempt to access disposed Isolate".
+    fn drop(&mut self) {
+        let macro_tasks = MACRO_TASKS.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+        let micro_tasks = MICRO_TASKS.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+        let raf_tasks = RAF_TASKS.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+        let idle_tasks = IDLE_TASKS.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+        let fetch_handlers = FETCH_REGISTRY.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+        let run_pending = RUN_PENDING.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+        let fetch_pending = FETCH_PENDING.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+        let resolved_modules = RESOLVED_MODULES.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+        drop((
+            macro_tasks,
+            micro_tasks,
+            raf_tasks,
+            idle_tasks,
+            fetch_handlers,
+            run_pending,
+            fetch_pending,
+            resolved_modules,
+        ));
+    }
+}
+
 #[derive(Default)]
 pub struct ModuleLoader {
     modules: HashMap<Url, ModuleRecord>,
@@ -674,10 +764,17 @@ impl JsRuntime {
         CURRENT_ORIGIN.with(|origin| *origin.borrow_mut() = base_url);
         CSP_POLICY.with(|p| *p.borrow_mut() = policy);
         LAYOUT_METRICS.with(|metrics| *metrics.borrow_mut() = layout_metrics.unwrap_or_default());
+        SCROLL_STATE.with(|state| *state.borrow_mut() = ScrollState::default());
         CONSOLE_BUFFER.with(|cell| *cell.borrow_mut() = Some(console_buffer));
+        NAVIGATION_REQUEST.with(|request| *request.borrow_mut() = None);
 
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| {
+            // Must precede V8 initialization: ICU data backs Intl and every
+            // toLocale*String call (pages such as naver.com format dates).
+            if let Err(code) = v8::icu::set_common_data_77(deno_core_icudata::ICU_DATA) {
+                eprintln!("[JS] failed to load ICU data (error {code})");
+            }
             let platform = v8::new_default_platform(0, false).make_shared();
             v8::V8::initialize_platform(platform);
             v8::V8::initialize();
@@ -773,6 +870,7 @@ impl JsRuntime {
 
     pub fn tick(&mut self, timestamp: Option<f64>, deadline_ms: Option<f64>) -> bool {
         const MAX_TASKS_PER_TICK: usize = 32;
+        const MAX_MACRO_TASKS_PER_TICK: usize = 256;
         let mut did_work = false;
         if self.sync_focus() {
             did_work = true;
@@ -785,14 +883,25 @@ impl JsRuntime {
             }
         }
 
-        let macro_task = MACRO_TASKS.with(|tasks| tasks.borrow_mut().pop_front());
-        if let Some(task) = macro_task {
+        // Run every task that was queued when this turn started (new tasks
+        // queued by these callbacks wait for the next tick), so fetch/XHR
+        // completions are not starved behind a backlog of zero-delay work.
+        let queued = MACRO_TASKS.with(|tasks| tasks.borrow().len()).min(MAX_MACRO_TASKS_PER_TICK);
+        for _ in 0..queued {
+            let Some(task) = MACRO_TASKS.with(|tasks| tasks.borrow_mut().pop_front()) else {
+                break;
+            };
             task();
             did_work = true;
+            self.run_pending_callbacks();
+            self.run_microtasks();
         }
-
         self.run_pending_callbacks();
         self.run_microtasks();
+
+        if self.run_due_timers() {
+            did_work = true;
+        }
 
         if let Some(ts) = timestamp {
             let mut tasks = VecDeque::new();
@@ -843,6 +952,88 @@ impl JsRuntime {
         }
 
         did_work
+    }
+
+    /// Run the timers (setTimeout/setInterval) that are due now, one callback
+    /// at a time with a microtask checkpoint after each. Timers armed while
+    /// this runs wait for the next tick.
+    fn run_due_timers(&mut self) -> bool {
+        const MAX_TIMERS_PER_TICK: usize = 256;
+        self.call_global_bool("__aura_timers_begin_turn");
+        let mut ran = false;
+        for _ in 0..MAX_TIMERS_PER_TICK {
+            if !self.call_global_bool("__aura_run_next_due_timer") {
+                break;
+            }
+            ran = true;
+            self.run_pending_callbacks();
+            self.run_microtasks();
+        }
+        ran
+    }
+
+    /// Call a global zero-argument JS function and report whether it
+    /// returned `true`. Missing functions and exceptions count as `false`.
+    /// How long the event loop can sleep before it has work that is not
+    /// queued yet: until the earliest timer is due, or a short poll interval
+    /// while a fetch is in flight. `None` when nothing is pending, so a
+    /// caller can wait for input.
+    pub fn next_wake(&mut self) -> Option<std::time::Duration> {
+        const FETCH_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+        let queued = MACRO_TASKS.with(|tasks| !tasks.borrow().is_empty())
+            || RAF_TASKS.with(|tasks| !tasks.borrow().is_empty());
+        if queued {
+            return Some(std::time::Duration::ZERO);
+        }
+        let timer = self
+            .call_global_number("__aura_next_timer_delay")
+            .filter(|ms| *ms >= 0.0)
+            .map(|ms| std::time::Duration::from_secs_f64(ms / 1000.0));
+        let fetching = FETCH_REGISTRY.with(|registry| !registry.borrow().is_empty());
+        match (timer, fetching) {
+            (Some(timer), true) => Some(timer.min(FETCH_POLL)),
+            (Some(timer), false) => Some(timer),
+            (None, true) => Some(FETCH_POLL),
+            (None, false) => None,
+        }
+    }
+
+    fn call_global_number(&mut self, name: &str) -> Option<f64> {
+        let hs = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
+        let hs = &mut hs.init();
+        let local_context = v8::Local::new(hs, &self.global_context);
+        let scope = &mut v8::ContextScope::new(hs, local_context);
+        let tc = std::pin::pin!(v8::TryCatch::new(scope));
+        let tc = &mut tc.init();
+        let global = local_context.global(tc);
+        let key = v8::String::new(tc, name)?;
+        let value = global.get(tc, key.into())?;
+        let func = v8::Local::<v8::Function>::try_from(value).ok()?;
+        let undef = v8::undefined(tc);
+        func.call(tc, undef.into(), &[])?.number_value(tc)
+    }
+
+    fn call_global_bool(&mut self, name: &str) -> bool {
+        let hs = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
+        let hs = &mut hs.init();
+        let local_context = v8::Local::new(hs, &self.global_context);
+        let scope = &mut v8::ContextScope::new(hs, local_context);
+        let tc = std::pin::pin!(v8::TryCatch::new(scope));
+        let tc = &mut tc.init();
+        let global = local_context.global(tc);
+        let Some(key) = v8::String::new(tc, name) else {
+            return false;
+        };
+        let Some(value) = global.get(tc, key.into()) else {
+            return false;
+        };
+        let Ok(func) = v8::Local::<v8::Function>::try_from(value) else {
+            return false;
+        };
+        let undef = v8::undefined(tc);
+        func.call(tc, undef.into(), &[])
+            .map(|result| result.is_true())
+            .unwrap_or(false)
     }
 
     fn run_pending_callbacks(&mut self) {
@@ -963,9 +1154,12 @@ impl JsRuntime {
     }
 
     pub fn trigger_event_on_node_id(&mut self, node_id: u32, event_type: &str) {
+        // Resource `load` / `error` events do not bubble (HTML spec); user
+        // input style events do.
+        let bubbles = !matches!(event_type, "load" | "error");
         let code = format!(
-            "document.__trigger_event({}, '{}', {{ bubbles: true }})",
-            node_id, event_type
+            "document.__trigger_event({}, '{}', {{ bubbles: {} }})",
+            node_id, event_type, bubbles
         );
         self.execute(&code);
     }
@@ -1463,42 +1657,55 @@ impl JsRuntime {
         Ok(specifiers)
     }
 
-    pub fn get_style_overrides(&mut self) -> HashMap<String, HashMap<String, String>> {
-        let mut result = HashMap::new();
-        let hs = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
-        let hs = &mut hs.init();
-        let local_context = v8::Local::new(hs, &self.global_context);
-        let scope = &mut v8::ContextScope::new(hs, local_context);
-        {
-            let tc = std::pin::pin!(v8::TryCatch::new(scope));
-            let tc = &mut tc.init();
-            let src = v8::String::new(tc, "__aura_style_log.join('####')").unwrap();
-            if let Some(script) = v8::Script::compile(tc, src, None) {
-                if let Some(val) = script.run(tc) {
-                    if let Some(s) = val.to_string(tc) {
-                        let s_std = s.to_rust_string_lossy(tc);
-                        for entry in s_std.split("####") {
-                            let parts: Vec<&str> = entry.splitn(3, "||||").collect();
-                            if parts.len() == 3 && !parts[0].is_empty() {
-                                result
-                                    .entry(parts[0].to_string())
-                                    .or_insert_with(HashMap::new)
-                                    .insert(parts[1].to_string(), parts[2].to_string());
-                            }
-                        }
-                    }
-                }
-            }
+    /// Current document scroll state (position and clamping ranges).
+    pub fn scroll_state(&self) -> ScrollState {
+        SCROLL_STATE.with(|state| *state.borrow())
+    }
+
+    /// Current document scroll offset `(scrollX, scrollY)`.
+    pub fn scroll_position(&self) -> (f32, f32) {
+        let state = self.scroll_state();
+        (state.x as f32, state.y as f32)
+    }
+
+    /// Update the scrollable document size and viewport size after a layout.
+    /// The scroll position is re-clamped; when that moves it, a `scroll` event
+    /// is queued for page scripts.
+    pub fn set_scroll_extent(
+        &mut self,
+        document_width: f32,
+        document_height: f32,
+        viewport_width: f32,
+        viewport_height: f32,
+    ) {
+        let resized = SCROLL_STATE.with(|state| {
+            let state = state.borrow();
+            // The first layout only sets the size; later changes are resizes.
+            state.document_width > 0.0
+                && (state.viewport_width != viewport_width as f64 || state.viewport_height != viewport_height as f64)
+        });
+        let moved = SCROLL_STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.document_width = document_width as f64;
+            state.document_height = document_height as f64;
+            state.viewport_width = viewport_width as f64;
+            state.viewport_height = viewport_height as f64;
+            let (x, y) = state.clamp(state.x, state.y);
+            let moved = (x, y) != (state.x, state.y);
+            state.x = x;
+            state.y = y;
+            moved
+        });
+        if moved {
+            self.execute("if (typeof __aura_queue_scroll_event === 'function') __aura_queue_scroll_event();");
         }
-        {
-            let tc2 = std::pin::pin!(v8::TryCatch::new(scope));
-            let tc2 = &mut tc2.init();
-            let clear = v8::String::new(tc2, "__aura_style_log = [];").unwrap();
-            if let Some(script) = v8::Script::compile(tc2, clear, None) {
-                let _ = script.run(tc2);
-            }
+        if resized {
+            self.execute(&format!(
+                "window.innerWidth = window.outerWidth = {viewport_width}; \
+                 window.innerHeight = window.outerHeight = {viewport_height}; \
+                 window.dispatchEvent(new Event('resize'));"
+            ));
         }
-        result
     }
 
     pub fn get_focused_node_id(&self) -> Option<String> {
@@ -1509,8 +1716,9 @@ impl JsRuntime {
         FOCUSED_NODE.with(|f| *f.borrow_mut() = id);
     }
 
-    pub fn take_form_submit_requests(&mut self) -> Vec<u32> {
-        FORM_SUBMIT_REQUESTS.with(|r| r.borrow_mut().drain(..).collect())
+    /// Take the navigation page script requested since the last call.
+    pub fn take_navigation_request(&mut self) -> Option<NavigationRequest> {
+        NAVIGATION_REQUEST.with(|request| request.borrow_mut().take())
     }
 }
 
@@ -1669,6 +1877,8 @@ fn register_native_functions(
         get_doctype_info_cb,
     );
     register_fn(scope, global, "__aura_set_focus", set_focus_cb);
+    register_fn(scope, global, "__aura_scroll_metrics", scroll_metrics_cb);
+    register_fn(scope, global, "__aura_scroll_store", scroll_store_cb);
     register_fn(scope, global, "__aura_queue_task", queue_task_cb);
     register_fn(scope, global, "__aura_resolve_url", resolve_url_cb);
     register_fn(
@@ -1687,7 +1897,7 @@ fn register_native_functions(
     register_fn(scope, global, "requestAnimationFrame", raf_cb);
     register_fn(scope, global, "requestIdleCallback", ric_cb);
     register_fn(scope, global, "cancelIdleCallback", cic_cb);
-    register_fn(scope, global, "__aura_submit_form", submit_form_cb);
+    register_fn(scope, global, "__aura_navigate", navigate_cb);
     register_fn(
         scope,
         global,
@@ -2773,6 +2983,51 @@ fn get_doctype_info_cb(
         rv.set_null();
     }
 }
+/// `__aura_scroll_metrics()` -> `[scrollX, scrollY, maxX, maxY,
+/// viewportWidth, viewportHeight, documentWidth, documentHeight]`.
+fn scroll_metrics_cb(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let state = SCROLL_STATE.with(|state| *state.borrow());
+    let values = [
+        state.x,
+        state.y,
+        state.max_x(),
+        state.max_y(),
+        state.viewport_width,
+        state.viewport_height,
+        state.document_width.max(state.viewport_width),
+        state.document_height.max(state.viewport_height),
+    ];
+    let elements: Vec<v8::Local<v8::Value>> = values
+        .iter()
+        .map(|v| v8::Number::new(scope, *v).into())
+        .collect();
+    rv.set(v8::Array::new_with_elements(scope, &elements).into());
+}
+
+/// `__aura_scroll_store(x, y)` clamps and stores the document scroll offset;
+/// returns whether the offset changed.
+fn scroll_store_cb(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let x = args.get(0).number_value(scope).unwrap_or(0.0);
+    let y = args.get(1).number_value(scope).unwrap_or(0.0);
+    let changed = SCROLL_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let (x, y) = state.clamp(x, y);
+        let changed = (x, y) != (state.x, state.y);
+        state.x = x;
+        state.y = y;
+        changed
+    });
+    rv.set_bool(changed);
+}
+
 fn set_focus_cb(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -2785,15 +3040,27 @@ fn set_focus_cb(
         FOCUSED_NODE.with(|f| *f.borrow_mut() = Some(id));
     }
 }
-fn submit_form_cb(
+/// `__aura_navigate(url, replace)`: record a document navigation for the
+/// engine. Only http(s) and file URLs load a new document.
+fn navigate_cb(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
-    let nid = args.get(0).uint32_value(scope).unwrap_or(0);
-    if nid > 0 {
-        FORM_SUBMIT_REQUESTS.with(|r| r.borrow_mut().push(nid));
+    let url = args.get(0).to_rust_string_lossy(scope);
+    let replace = args.get(1).boolean_value(scope);
+    let Ok(parsed) = Url::parse(&url) else {
+        return;
+    };
+    if !matches!(parsed.scheme(), "http" | "https" | "file") {
+        return;
     }
+    NAVIGATION_REQUEST.with(|request| {
+        *request.borrow_mut() = Some(NavigationRequest {
+            url: parsed.to_string(),
+            replace,
+        })
+    });
 }
 fn queue_task_cb(
     scope: &mut v8::PinScope,
@@ -3013,6 +3280,18 @@ fn storage_clear_cb(
         store.save();
     }
 }
+/// `BROWSER_DEBUG_FETCH=1` logs every script-initiated fetch/XHR with its
+/// status to stderr, which is how failed page API calls are diagnosed.
+/// The variable is read once per process.
+fn debug_fetch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BROWSER_DEBUG_FETCH")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
+
 fn fetch_cb(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -3113,8 +3392,11 @@ fn fetch_cb(
                         let response_url = response.url().to_string();
                         let status = response.status().as_u16();
                         let status_text = response.status().canonical_reason().unwrap_or("").to_string();
+                        let acao = response.headers().get("access-control-allow-origin").and_then(|h| h.to_str().ok());
+                        if debug_fetch_enabled() {
+                            eprintln!("[FETCH] {} {} -> {} (cross_origin={}, acao={:?})", method, target_url, status, is_cross_origin, acao);
+                        }
                         if is_cross_origin && !bypass_cors {
-                            let acao = response.headers().get("access-control-allow-origin").and_then(|h| h.to_str().ok());
                             let allowed = match acao { Some("*") => true, Some(val) if val == origin_str => true, _ => false };
                             if !allowed {
                                 let _ = sender_clone.send(Box::new(move || {
@@ -3150,6 +3432,9 @@ fn fetch_cb(
                     }
                     Err(e) => {
                         let err_msg = e.to_string();
+                        if debug_fetch_enabled() {
+                            eprintln!("[FETCH] {} {} -> error: {}", method, target_url, err_msg);
+                        }
                         let _ = sender_clone.send(Box::new(move || {
                             FETCH_REGISTRY.with(|reg| {
                                 if let Some(handlers) = reg.borrow_mut().remove(&fetch_id) {
@@ -3478,6 +3763,40 @@ mod tests {
             None,
             new_console_buffer(),
         )
+    }
+
+    #[test]
+    fn test_scroll_state_clamps_to_document_minus_viewport() {
+        let state = ScrollState {
+            document_width: 1340.0,
+            document_height: 900.0,
+            viewport_width: 800.0,
+            viewport_height: 1200.0,
+            ..ScrollState::default()
+        };
+        assert_eq!(state.max_x(), 540.0);
+        assert_eq!(state.max_y(), 0.0);
+        assert_eq!(state.clamp(64.0, 50.0), (64.0, 0.0));
+        assert_eq!(state.clamp(-5.0, f64::NAN), (0.0, 0.0));
+        assert_eq!(state.clamp(9999.0, 0.0), (540.0, 0.0));
+    }
+
+    #[test]
+    fn test_set_scroll_extent_reclamps_and_queues_scroll_event() {
+        let mut rt = make_dom_runtime("<html><body></body></html>", "https://example.com/");
+        rt.set_scroll_extent(2000.0, 3000.0, 800.0, 600.0);
+        rt.execute("window.scrollTo(1000, 2000); window.seen = 0; window.addEventListener('scroll', function() { seen++; });");
+        rt.tick(Some(0.0), None);
+        assert_eq!(rt.scroll_position(), (1000.0, 2000.0));
+        assert_eq!(rt.execute_with_result("seen").result.as_deref(), Some("1"));
+        // The document shrank: the offset is clamped and page scripts hear it.
+        rt.set_scroll_extent(1000.0, 1000.0, 800.0, 600.0);
+        assert_eq!(rt.scroll_position(), (200.0, 400.0));
+        rt.tick(Some(0.0), None);
+        assert_eq!(
+            rt.execute_with_result("JSON.stringify([scrollX, scrollY, seen])").result.as_deref(),
+            Some("[200,400,2]")
+        );
     }
 
     #[test]
@@ -4218,7 +4537,7 @@ mod tests {
         );
         let outcome = rt.execute_with_result(
             "document.search.onsubmit = function(e) { e.preventDefault(); window.__documentSearchSubmit = true; }; \
-             document.search.submit(); \
+             document.search.requestSubmit(); \
              window.__documentSearchSubmit",
         );
         assert_eq!(outcome.error, None);
@@ -4233,7 +4552,7 @@ mod tests {
         );
         let outcome = rt.execute_with_result(
             "window.search.onsubmit = function(e) { e.preventDefault(); window.__windowSearchSubmit = true; }; \
-             window.search.submit(); \
+             window.search.requestSubmit(); \
              window.__windowSearchSubmit",
         );
         assert_eq!(outcome.error, None);
@@ -4286,11 +4605,71 @@ mod tests {
         rt.execute(
             "var form = document.getElementById('f'); \
              form.onsubmit = function(e) { e.preventDefault(); window.__formSubmitted = true; }; \
-             form.submit();",
+             form.requestSubmit();",
         );
         let outcome = rt.execute_with_result("window.__formSubmitted");
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.result.as_deref(), Some("true"));
+        // The handler cancelled the submission.
+        assert_eq!(rt.take_navigation_request(), None);
+    }
+
+    #[test]
+    fn test_global_function_can_shadow_event_handler_attribute() {
+        // news.ycombinator.com's hn.js declares `function onclick (ev)`.
+        let mut rt = make_dom_runtime("<html><body></body></html>", "https://example.com/");
+        let outcome = rt.execute_with_result(
+            "function onclick (ev) { return 'page'; } \
+             document.addEventListener('click', onclick); onclick()",
+        );
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("page"));
+    }
+
+    #[test]
+    fn test_form_submit_skips_submit_event_and_navigates() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><form id='f' action='/find'><input name='q' value='a b'>
+               <input type='checkbox' name='c'><input type='checkbox' name='d' checked>
+               <input name='off' disabled value='x'><button name='go' value='1'>Go</button></form></body></html>"#,
+            "https://example.com/start",
+        );
+        let outcome = rt.execute_with_result(
+            "var form = document.getElementById('f'); window.__fired = false; \
+             form.onsubmit = function() { window.__fired = true; }; \
+             form.submit(); window.__fired",
+        );
+        assert_eq!(outcome.result.as_deref(), Some("false"));
+        assert_eq!(
+            rt.take_navigation_request(),
+            Some(NavigationRequest {
+                url: "https://example.com/find?q=a+b&d=on".to_string(),
+                replace: false,
+            })
+        );
+    }
+
+    #[test]
+    fn test_location_assign_and_replace_request_navigation() {
+        let mut rt = make_dom_runtime("<html><body></body></html>", "https://example.com/a/b");
+        rt.execute("location.assign('c?x=1')");
+        assert_eq!(
+            rt.take_navigation_request(),
+            Some(NavigationRequest {
+                url: "https://example.com/a/c?x=1".to_string(),
+                replace: false,
+            })
+        );
+        rt.execute("location.replace('https://other.test/')");
+        assert_eq!(
+            rt.take_navigation_request().map(|r| (r.url, r.replace)),
+            Some(("https://other.test/".to_string(), true))
+        );
+        // The document's own URL does not change until the engine loads it.
+        let outcome = rt.execute_with_result("location.href");
+        assert_eq!(outcome.result.as_deref(), Some("https://example.com/a/b"));
+        rt.execute("location.href = 'javascript:void(0)'");
+        assert_eq!(rt.take_navigation_request(), None);
     }
 
     #[test]
@@ -4894,6 +5273,178 @@ mod tests {
         assert_eq!(val["shadow_itself"], true);
         assert_eq!(val["shadow_composed"], true);
     }
+
+    fn eval_str(rt: &mut JsRuntime, code: &str) -> String {
+        let outcome = rt.execute_with_result(code);
+        assert_eq!(outcome.error, None, "JS error for: {code}");
+        outcome.result.unwrap_or_default()
+    }
+
+    #[test]
+    fn test_element_load_event_does_not_reach_window() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><img id='pic'></body></html>"#,
+            "https://example.com/",
+        );
+        rt.execute(
+            "globalThis.__windowLoads = 0; \
+             window.addEventListener('load', function() { globalThis.__windowLoads++; });",
+        );
+        let before = eval_str(&mut rt, "String(globalThis.__windowLoads)");
+        let nid = eval_str(&mut rt, "String(document.getElementById('pic')._id)");
+        rt.trigger_event_on_node_id(nid.parse().unwrap(), "load");
+        rt.execute(
+            "document.getElementById('pic').dispatchEvent(new Event('load', { bubbles: true }));",
+        );
+        assert_eq!(eval_str(&mut rt, "String(globalThis.__windowLoads)"), before);
+    }
+
+    #[test]
+    fn test_created_img_has_no_spurious_size_attributes() {
+        let mut rt = make_dom_runtime(r#"<html><body></body></html>"#, "https://example.com/");
+        let html = eval_str(
+            &mut rt,
+            "var img = document.createElement('img'); img.setAttribute('height', '20'); \
+             document.body.appendChild(img); \
+             [document.body.innerHTML, img instanceof HTMLImageElement, \
+              document.body.firstChild === img].join('|')",
+        );
+        assert_eq!(html, r#"<img height="20">|true|true"#);
+        let sized = eval_str(
+            &mut rt,
+            "var i2 = new Image(4, 5); document.body.appendChild(i2); \
+             [i2.getAttribute('width'), i2.getAttribute('height'), document.body.lastChild === i2].join('|')",
+        );
+        assert_eq!(sized, "4|5|true");
+    }
+
+    #[test]
+    fn test_timers_honour_delay_and_clear() {
+        let mut rt = make_dom_runtime(r#"<html><body></body></html>"#, "https://example.com/");
+        rt.execute(
+            "globalThis.__log = []; \
+             setTimeout(function() { __log.push('zero'); }, 0); \
+             setTimeout(function(a) { __log.push('late:' + a); }, 60000, 'x'); \
+             var cancelled = setTimeout(function() { __log.push('cancelled'); }, 0); \
+             clearTimeout(cancelled); \
+             var count = 0; var iv = setInterval(function() { if (++count >= 2) clearInterval(iv); __log.push('iv'); }, 0);",
+        );
+        for _ in 0..3 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            rt.tick(Some(0.0), None);
+        }
+        assert_eq!(eval_str(&mut rt, "__log.join(',')"), "zero,iv,iv");
+    }
+
+    #[test]
+    fn test_tick_runs_all_queued_tasks() {
+        let mut rt = make_dom_runtime(r#"<html><body></body></html>"#, "https://example.com/");
+        rt.execute(
+            "globalThis.__n = 0; for (var i = 0; i < 5; i++) setTimeout(function() { __n++; }, 0);",
+        );
+        rt.tick(Some(0.0), None);
+        assert_eq!(eval_str(&mut rt, "String(__n)"), "5");
+    }
+
+    #[test]
+    fn test_reflected_id_title_and_inner_text() {
+        let mut rt = make_dom_runtime(
+            r#"<html><head><title> Hello
+               World </title></head><body><p id='p'>x</p></body></html>"#,
+            "https://example.com/",
+        );
+        let out = eval_str(
+            &mut rt,
+            "var f = document.createElement('iframe'); f.id = 'frame1'; document.body.appendChild(f); \
+             var p = document.getElementById('p'); p.innerText = 'changed'; p.hidden = true; \
+             [document.title, f.getAttribute('id'), document.getElementById('frame1') === f, \
+              p.outerHTML, p instanceof HTMLElement].join('|')",
+        );
+        assert_eq!(
+            out,
+            r#"Hello World|frame1|true|<p id="p" hidden="">changed</p>|true"#
+        );
+    }
+
+    #[test]
+    fn test_element_style_is_backed_by_style_attribute() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><div id='d' style="width:10px; background:url(data:image/png;base64,AA==)"></div></body></html>"#,
+            "https://example.com/",
+        );
+        let out = eval_str(
+            &mut rt,
+            "var d = document.getElementById('d'); \
+             var before = d.style.width + '|' + d.style.backgroundImage + d.style.background; \
+             d.style.display = 'block'; d.style.width = ''; \
+             var mid = d.getAttribute('style'); \
+             d.setAttribute('style', 'color: red'); \
+             [before, mid, d.style.color, d.style.length].join('|')",
+        );
+        assert_eq!(
+            out,
+            "10px|url(data:image/png;base64,AA==)|background: url(data:image/png;base64,AA==); display: block;|red|1"
+        );
+        let html = eval_str(
+            &mut rt,
+            "var e = document.createElement('span'); e.style = 'margin-top: 2px'; e.style.zIndex = 3; e.outerHTML",
+        );
+        assert_eq!(html, r#"<span style="margin-top: 2px; z-index: 3;"></span>"#);
+    }
+
+    #[test]
+    fn test_element_interfaces_and_svg_serialization() {
+        let mut rt = make_dom_runtime(
+            r#"<html><head><link rel='x'></head><body><ul><li id='li'>a</li></ul><svg id='s' xmlns="http://www.w3.org/2000/svg"><path d="M0"></path></svg></body></html>"#,
+            "https://example.com/",
+        );
+        let out = eval_str(
+            &mut rt,
+            "[document.getElementById('li') instanceof HTMLLIElement, \
+              document.querySelector('link') instanceof HTMLLinkElement, \
+              document.querySelector('path') instanceof SVGElement, \
+              document.defaultView === window, \
+              document.getElementById('s').outerHTML].join('|')",
+        );
+        assert_eq!(
+            out,
+            r#"true|true|true|true|<svg id="s" xmlns="http://www.w3.org/2000/svg"><path d="M0"></path></svg>"#
+        );
+    }
+
+    #[test]
+    fn test_canvas_context_references_canvas() {
+        let mut rt = make_dom_runtime(r#"<html><body></body></html>"#, "https://example.com/");
+        let out = eval_str(
+            &mut rt,
+            "var c = document.createElement('canvas'); var ctx = c.getContext('2d'); \
+             [ctx.canvas === c, ctx.canvas.width, c.getContext('2d') === ctx, c.getContext('webgl')].join('|')",
+        );
+        assert_eq!(out, "true|300|true|");
+    }
+
+    #[test]
+    fn test_intl_locale_formatting_works() {
+        let mut rt = make_dom_runtime(r#"<html><body></body></html>"#, "https://example.com/");
+        let out = eval_str(
+            &mut rt,
+            "(1234.5).toLocaleString('en-US') + '|' + new Date(0).toLocaleDateString('ko-KR', { timeZone: 'UTC' })",
+        );
+        assert_eq!(out, "1,234.5|1970. 1. 1.");
+    }
+
+    #[test]
+    fn test_runtime_can_be_replaced_with_pending_callbacks() {
+        let mut rt = make_dom_runtime(r#"<html><body></body></html>"#, "https://example.com/");
+        rt.execute(
+            "setTimeout(function() {}, 0); requestAnimationFrame(function() {}); \
+             Promise.resolve().then(function() {});",
+        );
+        drop(rt);
+        let mut rt = make_dom_runtime(r#"<html><body></body></html>"#, "https://example.com/");
+        rt.tick(Some(0.0), None);
+        assert_eq!(eval_str(&mut rt, "String(1 + 1)"), "2");
+    }
 }
 
 // ── DOM Helper Functions ──────────────────────────────────────────────────────
@@ -5133,6 +5684,7 @@ fn serialize_inner_html(node: &Handle) -> String {
 }
 
 fn serialize_node(node: &Handle, out: &mut String, parent_tag: Option<&str>) {
+    use html5ever::ns;
     match &node.data {
         NodeData::Element {
             ref name,
@@ -5144,6 +5696,12 @@ fn serialize_node(node: &Handle, out: &mut String, parent_tag: Option<&str>) {
             out.push_str(&tag);
             for attr in attrs.borrow().iter() {
                 out.push(' ');
+                // Keep namespace prefixes such as `xlink:href` (HTML spec
+                // fragment serialization).
+                if let Some(prefix) = attr.name.prefix.as_ref().filter(|p| !p.is_empty()) {
+                    out.push_str(prefix);
+                    out.push(':');
+                }
                 out.push_str(&attr.name.local.to_string());
                 out.push_str("=\"");
                 out.push_str(&html_escape(&attr.value.to_string()));
@@ -5151,6 +5709,22 @@ fn serialize_node(node: &Handle, out: &mut String, parent_tag: Option<&str>) {
             }
             out.push('>');
             let tag_lower = tag.to_ascii_lowercase();
+            let is_html = name.ns == ns!(html);
+            // Void elements have no end tag and no serialized children.
+            if is_html && is_void_html_element(&tag_lower) {
+                return;
+            }
+            // The parser drops a newline right after <pre>/<textarea>/<listing>,
+            // so content that starts with a newline needs an extra one.
+            if is_html && matches!(tag_lower.as_str(), "pre" | "textarea" | "listing") {
+                if let Some(first) = node.children.borrow().first() {
+                    if let NodeData::Text { ref contents } = first.data {
+                        if contents.borrow().starts_with('\n') {
+                            out.push('\n');
+                        }
+                    }
+                }
+            }
             for child in node.children.borrow().iter() {
                 serialize_node(child, out, Some(&tag_lower));
             }
@@ -5205,6 +5779,14 @@ fn serialize_node(node: &Handle, out: &mut String, parent_tag: Option<&str>) {
         }
         _ => {}
     }
+}
+
+fn is_void_html_element(tag_lower: &str) -> bool {
+    matches!(
+        tag_lower,
+        "area" | "base" | "basefont" | "bgsound" | "br" | "col" | "embed" | "frame" | "hr"
+            | "img" | "input" | "keygen" | "link" | "meta" | "param" | "source" | "track" | "wbr"
+    )
 }
 
 fn html_escape(s: &str) -> String {
