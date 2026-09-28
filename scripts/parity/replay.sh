@@ -30,12 +30,14 @@ for _ in $(seq 1 40); do ss -ltn | grep -q ":$PORT " && break; sleep 0.25; done
 
 source ~/.nvm/nvm.sh >/dev/null 2>&1 || true
 NB=$(ls -d ~/.nvm/versions/node/*/bin 2>/dev/null | tail -1)
-PATH="$NB:$PATH" timeout 180s npx --yes playwright screenshot --browser chromium \
-  --proxy-server "http://127.0.0.1:$PORT" --ignore-https-errors \
-  --viewport-size 800,1200 --wait-for-timeout 8000 "$URL" "$OUT/chromium-$MODE.png" > /dev/null 2>&1
+CAPTURE_AT=${CAPTURE_AT:-10}
+# Playwright is resolved from the directory holding chromium_at.js.
+[ -d "$OUT/node_modules/playwright" ] || (cd "$OUT" && PATH="$NB:$PATH" npm i playwright > /dev/null 2>&1)
+cp "$HERE/chromium_at.js" "$OUT/chromium_at.js"
+PATH="$NB:$PATH" timeout 180s node "$OUT/chromium_at.js" "$URL" "$OUT/chromium-$MODE.png" "$CAPTURE_AT" "http://127.0.0.1:$PORT" > /dev/null 2>&1
 
 NO_PROXY=127.0.0.1,localhost HTTPS_PROXY="http://127.0.0.1:$PORT" HTTP_PROXY="http://127.0.0.1:$PORT" SSL_CERT_FILE="$CA_BUNDLE" \
-  VIEWPORT=1 "$HERE/cap.sh" "$OUT/ours-$MODE.png" "${SETTLE:-6}" "$URL"
+  CAPTURE_AT=$CAPTURE_AT VIEWPORT=1 "$HERE/cap.sh" "$OUT/ours-$MODE.png" 0 "$URL"
 
 kill "$PROXY_PID" 2>/dev/null
 if [ "$MODE" = compare ]; then

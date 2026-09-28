@@ -8,6 +8,7 @@
 #                  (matches `npx playwright screenshot --viewport-size 800,1200`);
 #                  otherwise capture the full page
 #        DUMP      path to also save the DOM the last render used
+#        CAPTURE_AT seconds after navigation starts to capture (overrides SETTLE)
 set -u
 REPO=${REPO:-$(cd "$(dirname "$0")/../.." && pwd)}
 PORT=${PORT:-7071}
@@ -21,12 +22,22 @@ for _ in $(seq 1 40); do ss -ltn | grep -q ":$PORT " || break; sleep 0.5; done
 timeout 900s "$REPO/target/release/browser-daemon" --no-gui --port "$PORT" --viewport-height 1200 \
   > "/tmp/browser-daemon-$PORT.log" 2>&1 &
 for _ in $(seq 1 40); do ss -ltn | grep -q ":$PORT " && break; sleep 0.25; done
+NAV_START=$(date +%s.%N)
 timeout 150s "$CLI" --port "$PORT" navigate "$URL" > "/tmp/browser-nav-$PORT.txt" 2>&1
-# Keep the page's timers and frame messages moving while it settles.
-for _ in $(seq 1 "$SETTLE"); do
-  timeout 60s "$CLI" --port "$PORT" tick 5 > /dev/null 2>&1
-  sleep 1
-done
+# Keep the page's timers and frame messages moving while it settles. With
+# CAPTURE_AT=<seconds>, settle until that long after navigation started
+# instead (to line rolling banners up with a capture taken at that time).
+if [ -n "${CAPTURE_AT:-}" ]; then
+  while awk -v s="$NAV_START" -v now="$(date +%s.%N)" -v at="$CAPTURE_AT" 'BEGIN { exit !(now - s < at) }'; do
+    timeout 60s "$CLI" --port "$PORT" tick 5 > /dev/null 2>&1
+    sleep 0.2
+  done
+else
+  for _ in $(seq 1 "$SETTLE"); do
+    timeout 60s "$CLI" --port "$PORT" tick 5 > /dev/null 2>&1
+    sleep 1
+  done
+fi
 MODE=--full-page
 [ "${VIEWPORT:-}" = 1 ] && MODE=--viewport
 for _ in $(seq 1 20); do
