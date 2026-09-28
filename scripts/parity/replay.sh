@@ -15,6 +15,12 @@ mkdir -p "$OUT/recording"
 CA_BUNDLE="$OUT/ca-bundle.pem"
 cat /etc/ssl/certs/ca-certificates.crt ~/.mitmproxy/mitmproxy-ca-cert.pem > "$CA_BUNDLE"
 
+# A proxy left over from an earlier run would keep the port.
+for pid in $(pgrep -x mitmdump); do
+  tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q -- "-p $PORT " && kill "$pid"
+done
+for _ in $(seq 1 20); do ss -ltn | grep -q ":$PORT " || break; sleep 0.25; done
+
 proxy_mode=replay
 [ "$MODE" = record ] && proxy_mode=record
 PARITY_MODE=$proxy_mode PARITY_DIR="$OUT/recording" \

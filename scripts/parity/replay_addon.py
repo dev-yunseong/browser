@@ -20,11 +20,21 @@ MODE = os.environ.get("PARITY_MODE", "record")
 DIR = pathlib.Path(os.environ.get("PARITY_DIR", "parity-recording"))
 DIR.mkdir(parents=True, exist_ok=True)
 
-SEED = (
-    b"<script>(function(){var s=0x2F6B3C1D;Math.random=function(){"
-    b"s|=0;s=s+0x6D2B79F5|0;var t=Math.imul(s^s>>>15,1|s);"
-    b"t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};})();</script>"
-)
+# Math.random seeded per call site (script URL, line and column of the
+# caller) with a per-site counter, so a shuffle gets the same numbers in both
+# engines even when they call Math.random a different number of times
+# elsewhere. Both run V8, so stack frames read the same.
+SEED = rb"""<script>(function(){
+var counts={};
+function h(s){var x=2166136261;for(var i=0;i<s.length;i++){x^=s.charCodeAt(i);x=Math.imul(x,16777619);}return x>>>0;}
+function mix(a){a=a+0x6D2B79F5|0;var t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;}
+Math.random=function(){
+  var line=(new Error().stack||'').split('\n')[2]||'';
+  var m=line.match(/(https?:[^\s()]+|<anonymous>[^\s()]*)\)?\s*$/);
+  var site=m?m[1]:line;
+  var n=counts[site]=(counts[site]||0)+1;
+  return mix((h(site)^Math.imul(n,0x9E3779B1))|0);
+};})();</script>"""
 LOCAL_HOSTS = {"127.0.0.1", "localhost"}
 DROP_HEADERS = {"content-encoding", "content-length", "transfer-encoding", "strict-transport-security"}
 
