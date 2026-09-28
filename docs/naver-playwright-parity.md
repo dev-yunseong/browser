@@ -73,3 +73,15 @@ The live page changes between loads (ads, banners, news), so compare horizontal 
 - Browser output shows populated Naver shell content beyond raw placeholders such as `#shortcutArea`, `#root`, and `#footer`.
 - `browser-cli logs` has no critical startup blocker such as `Cannot read properties of undefined (reading 'onsubmit')`.
 - Any visible layout/CSS drift is recorded in the PR or a linked follow-up issue. After #288 the same-DOM render is within about 1 mean pixel difference of Chromium; the remaining live drift (iframe documents: shopping box, ad frames) is tracked in #295.
+
+## Compare on identical content (record and replay)
+
+Live captures differ between any two loads (ads, newsstand order, shopping items), so pixel numbers from live runs mix engine differences with content differences. To compare the engines on the same content, record the page once through a local proxy and replay it to both clients (requires `pip install --user mitmproxy`):
+
+```bash
+scripts/parity/replay.sh record /tmp/naver-replay
+scripts/parity/replay.sh record /tmp/naver-replay
+SETTLE=6 scripts/parity/replay.sh compare /tmp/naver-replay
+```
+
+Recording twice lets each client add the resources it requests. Replay serves recorded responses (exact URL, else the same path), and seeds `Math.random` in every HTML document. Content that depends on timing or on the order of `Math.random` calls, such as the newsstand page or the rolling ticker, can still differ between the two engines.
