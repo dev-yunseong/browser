@@ -454,6 +454,8 @@ async fn run_http_server(handle: EngineHandle, port: u16) {
 const PANEL_SCROLLBAR_ALLOWANCE: f32 = 12.0;
 /// Narrowest layout width the GUI asks the engine for.
 const MIN_RENDER_WIDTH: f32 = 320.0;
+/// Minimum time between re-renders for changes made by page script.
+const TICK_RENDER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 /// How long the panel width must stay unchanged before the page reflows.
 const RESIZE_SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
 
@@ -494,6 +496,12 @@ struct DaemonBrowserApp {
     render_width: f32,
     /// A new panel width waiting to settle before re-rendering at it.
     pending_width: Option<(f32, std::time::Instant)>,
+    /// The page must be re-rendered at `render_width` once the render or load
+    /// in flight finishes.
+    reflow_pending: bool,
+    /// Page script changed the document since the last render.
+    script_dirty: bool,
+    last_tick_render: std::time::Instant,
 }
 
 impl DaemonBrowserApp {
@@ -548,6 +556,9 @@ impl DaemonBrowserApp {
             has_page: false,
             render_width: 800.0,
             pending_width: None,
+            reflow_pending: false,
+            script_dirty: false,
+            last_tick_render: std::time::Instant::now(),
         }
     }
 
@@ -614,6 +625,11 @@ impl DaemonBrowserApp {
         self.current_element_ids = page.element_ids;
         self.current_focusable_elements = page.focusable_elements;
         self.has_page = true;
+        // A page laid out at another width (loaded through the HTTP API or by
+        // page script) is re-laid out at the window width.
+        if (page.width as f32 - self.render_width).abs() >= 1.0 {
+            self.reflow_pending = true;
+        }
     }
 }
 
@@ -622,9 +638,27 @@ impl eframe::App for DaemonBrowserApp {
         // JS tick — at most one in-flight at a time to prevent unbounded thread spawns.
         let timestamp = self.start_time.elapsed().as_secs_f64() * 1000.0;
         if let Some(tick_p) = &self.tick_promise {
-            if tick_p.ready().is_some() {
+            if let Some(worked) = tick_p.ready() {
+                // Script changed the document: show it (at most every
+                // TICK_RENDER_INTERVAL, at the window width).
+                self.script_dirty |= *worked;
+                // Script ran, so the engine holds a page even when it was
+                // loaded outside the GUI (through the HTTP API).
+                self.has_page |= *worked;
                 self.tick_promise = None;
             }
+        }
+        if self.script_dirty
+            && self.has_page
+            && self.re_render_promise.is_none()
+            && self.content_promise.is_none()
+            && self.last_tick_render.elapsed() >= TICK_RENDER_INTERVAL
+        {
+            self.script_dirty = false;
+            self.last_tick_render = std::time::Instant::now();
+            self.trigger_re_render(ctx, self.render_width);
+        } else if self.script_dirty {
+            ctx.request_repaint_after(TICK_RENDER_INTERVAL);
         }
         // The tick thread wakes the UI again only when the page has work: at
         // once after script ran, when the next timer is due, or to poll an
@@ -853,6 +887,10 @@ impl eframe::App for DaemonBrowserApp {
                         }
                     }
                 }
+                if self.reflow_pending && self.has_page && self.re_render_promise.is_none() && self.content_promise.is_none() {
+                    self.reflow_pending = false;
+                    self.trigger_re_render(ctx, self.render_width);
+                }
 
                 // Poll content (navigate) promise
                 if let Some(promise) = &self.content_promise {
@@ -946,10 +984,18 @@ impl eframe::App for DaemonBrowserApp {
                             false
                         }
                     };
-                    if settled && self.has_page && self.re_render_promise.is_none() && self.content_promise.is_none() {
+                    if settled {
+                        // Adopt the width now; if a render or load is in
+                        // flight (pages with timers re-render constantly),
+                        // reflow as soon as it finishes instead of waiting
+                        // for an idle moment that may never come.
                         self.render_width = panel_width;
                         self.pending_width = None;
-                        self.trigger_re_render(ctx, self.render_width);
+                        if self.has_page && self.re_render_promise.is_none() && self.content_promise.is_none() {
+                            self.trigger_re_render(ctx, self.render_width);
+                        } else {
+                            self.reflow_pending = true;
+                        }
                     } else {
                         ctx.request_repaint_after(RESIZE_SETTLE);
                     }
