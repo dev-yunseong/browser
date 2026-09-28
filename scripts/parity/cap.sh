@@ -22,8 +22,11 @@ timeout 900s "$REPO/target/release/browser-daemon" --no-gui --port "$PORT" --vie
   > "/tmp/browser-daemon-$PORT.log" 2>&1 &
 for _ in $(seq 1 40); do ss -ltn | grep -q ":$PORT " && break; sleep 0.25; done
 timeout 150s "$CLI" --port "$PORT" navigate "$URL" > "/tmp/browser-nav-$PORT.txt" 2>&1
-sleep "$SETTLE"
-timeout 60s "$CLI" --port "$PORT" tick 20 > /dev/null 2>&1
+# Keep the page's timers and frame messages moving while it settles.
+for _ in $(seq 1 "$SETTLE"); do
+  timeout 60s "$CLI" --port "$PORT" tick 5 > /dev/null 2>&1
+  sleep 1
+done
 MODE=--full-page
 [ "${VIEWPORT:-}" = 1 ] && MODE=--viewport
 for _ in $(seq 1 20); do
