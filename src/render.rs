@@ -1826,18 +1826,26 @@ mod tests {
         assert!(cache_size > 0, "glyph cache should be non-empty after rendering text; got {} entries", cache_size);
     }
 
-    /// `clear_glyph_cache()` must empty the cache.
+    /// `clear_glyph_cache()` must drop cached glyphs. The cache is shared by
+    /// tests running in parallel, so this checks a key no other test creates
+    /// rather than the cache size.
     #[test]
     fn test_clear_glyph_cache_empties_cache() {
-        // Populate.
-        let rect = full_rect(200.0, 40.0);
-        let mut pixmap = white_pixmap(200, 40);
-        render_text_raw("Test".to_string(), rect, 16.0, &black(), rect, &mut pixmap, false, false, 0);
+        let key = GlyphKey {
+            face: usize::MAX,
+            glyph_id: u16::MAX,
+            font_size_half_px: u32::MAX,
+            size_64: u32::MAX,
+            subpixel: 0,
+            bold: false,
+            italic: false,
+        };
+        let pixels = GlyphPixels { left: 0, top: 0, width: 0, height: 0, coverage: Vec::new() };
+        GLYPH_CACHE.lock().unwrap().insert(key.clone(), std::sync::Arc::new(pixels));
 
         clear_glyph_cache();
 
-        let cache_size = GLYPH_CACHE.lock().unwrap().len();
-        assert_eq!(cache_size, 0, "cache should be empty after clear_glyph_cache()");
+        assert!(!GLYPH_CACHE.lock().unwrap().contains_key(&key), "cache should be empty after clear_glyph_cache()");
     }
 
     /// Bold text rendered twice must match.
