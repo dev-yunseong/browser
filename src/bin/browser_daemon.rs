@@ -642,6 +642,9 @@ impl eframe::App for DaemonBrowserApp {
                 // Script changed the document: show it (at most every
                 // TICK_RENDER_INTERVAL, at the window width).
                 self.script_dirty |= *worked;
+                // Script ran, so the engine holds a page even when it was
+                // loaded outside the GUI (through the HTTP API).
+                self.has_page |= *worked;
                 self.tick_promise = None;
             }
         }
