@@ -1219,9 +1219,13 @@ impl JsRuntime {
 
     /// Run a parser-inserted classic script with `document.currentScript`
     /// set to its `<script>` element (`node_id` from `ScriptSource`).
-    pub fn execute_classic_script(&mut self, source: &str, node_id: u32) {
+    /// `url` names external scripts in stack traces and error locations.
+    pub fn execute_classic_script(&mut self, source: &str, node_id: u32, url: Option<&str>) {
         self.execute(&format!("__aura_set_current_script_node({node_id});"));
-        self.execute(source);
+        let outcome = self.execute_with_result_named(source, url);
+        if let Some(error) = outcome.error {
+            eprintln!("[JS Error] execute: {}", error);
+        }
         self.execute("__aura_set_current_script_node(0);");
     }
 
@@ -1233,6 +1237,12 @@ impl JsRuntime {
     }
 
     pub fn execute_with_result(&mut self, source: &str) -> EvalOutcome {
+        self.execute_with_result_named(source, None)
+    }
+
+    /// Run a classic script; `resource_name` (the script URL) is reported in
+    /// stack traces instead of `<anonymous>`.
+    pub fn execute_with_result_named(&mut self, source: &str, resource_name: Option<&str>) -> EvalOutcome {
         // Watchdog: terminate execution if it takes more than 10 seconds.
         // Also sends periodic interrupts for debugging purposes.
         let isolate_handle = self.isolate.thread_safe_handle();
@@ -1275,7 +1285,10 @@ impl JsRuntime {
             let tc = std::pin::pin!(v8::TryCatch::new(scope));
             let tc = &mut tc.init();
 
-            match v8::Script::compile(tc, code, None) {
+            let origin = resource_name.and_then(|name| v8::String::new(tc, name)).map(|name| {
+                v8::ScriptOrigin::new(tc, name.into(), 0, 0, false, 0, None, false, false, false, None)
+            });
+            match v8::Script::compile(tc, code, origin.as_ref()) {
                 None => {
                     let error_msg = tc
                         .exception()
@@ -5092,6 +5105,22 @@ mod tests {
         let outcome = rt.execute_with_result("document.getElementById('empty').href");
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.result.as_deref(), Some("https://example.com/initialized"));
+    }
+
+    #[test]
+    fn test_document_get_elements_by_name() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><input name="q"><meta name="q"><input name='a"b'><input name="other"></body></html>"#,
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result(
+            r#"[document.getElementsByName('q').length,
+                document.getElementsByName('q')[0].tagName,
+                document.getElementsByName('a"b').length,
+                document.getElementsByName('missing').length].join(',')"#,
+        );
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("2,INPUT,1,0"));
     }
 
     #[test]

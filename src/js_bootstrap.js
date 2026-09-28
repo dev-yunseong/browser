@@ -2463,6 +2463,12 @@ var document = {
             return JSON.parse(__aura_get_elements_by_tag(0, tagName));
         });
     },
+    // Elements whose name attribute equals `name` (a NodeList, in tree order).
+    getElementsByName: function(name) {
+        let value = String(name);
+        let matches = Array.from(this.querySelectorAll('[name]')).filter(el => el.getAttribute('name') === value);
+        return new NodeList(matches.map(el => el._id));
+    },
     // Document surface getters follow the parsed tree shape, not arbitrary descendants.
     get body() {
         let nativeId = __aura_get_body();
