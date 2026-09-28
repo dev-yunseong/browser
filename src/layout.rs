@@ -1592,6 +1592,19 @@ fn layout_block_level_inner<'a>(
 
 
 /// Border-box size of a replaced element.
+/// Containing-block widths at or above this are the indefinite width used for
+/// intrinsic (min/max-content) sizing.
+const INDEFINITE_WIDTH: f32 = 1.0e5;
+
+/// Whether `prop` is specified as a percentage (or a `calc()` with one).
+fn is_percentage(sn: &StyledNode, prop: &str) -> bool {
+    match sval(sn, prop) {
+        Some(Value::Length(_, Unit::Percent)) => true,
+        Some(Value::Keyword(k)) => k.contains('%'),
+        _ => false,
+    }
+}
+
 fn replaced_size(sn: &StyledNode, bm: &BoxModel, cb: Cb, ctx: &Ctx) -> (f32, f32) {
     replaced_size_for(sn, bm, cb, ctx, None)
 }
@@ -1601,7 +1614,17 @@ fn replaced_size(sn: &StyledNode, bm: &BoxModel, cb: Cb, ctx: &Ctx) -> (f32, f32
 /// formatting context already decided it (e.g. a stretched flex item), so the
 /// height follows the aspect ratio of that width.
 fn replaced_size_for(sn: &StyledNode, bm: &BoxModel, cb: Cb, ctx: &Ctx, used_border_w: Option<f32>) -> (f32, f32) {
-    let w = used_border_w.or_else(|| specified_border_width(sn, Some(cb.width), bm, ctx));
+    // Intrinsic sizing passes an indefinite (huge) containing block: a
+    // percentage width then behaves as `auto` (CSS Sizing 3 §5.2.1, cyclic
+    // percentages) instead of resolving against it.
+    let indefinite = cb.width >= INDEFINITE_WIDTH;
+    let w = used_border_w.or_else(|| {
+        if indefinite && is_percentage(sn, "width") {
+            None
+        } else {
+            specified_border_width(sn, Some(cb.width), bm, ctx)
+        }
+    });
     let h = specified_border_height(sn, cb.height, bm, ctx);
     let tag = tag_name(sn).unwrap_or_default();
     let (default_w, default_h) = match tag.as_str() {
@@ -1620,7 +1643,7 @@ fn replaced_size_for(sn: &StyledNode, bm: &BoxModel, cb: Cb, ctx: &Ctx, used_bor
             ratio = vbh / vbw;
         }
         if w.is_none() && h.is_none() {
-            let cw = if cb.width < 1.0e5 { (cb.width - bm.margin.horizontal()).max(0.0) } else { vb.map_or(300.0, |v| v.0) };
+            let cw = if cb.width < INDEFINITE_WIDTH { (cb.width - bm.margin.horizontal()).max(0.0) } else { vb.map_or(300.0, |v| v.0) };
             let content_w = (cw - bm.pb_h()).max(0.0);
             let ch = if vb.is_some() { content_w * ratio } else { 150.0 };
             let bw = clamp_border_width(sn, content_w + bm.pb_h(), Some(cb.width), bm, ctx);
@@ -1645,7 +1668,11 @@ fn replaced_size_for(sn: &StyledNode, bm: &BoxModel, cb: Cb, ctx: &Ctx, used_bor
     let limit = |prop: &str, base: Option<f32>, pb: f32| {
         prop_len(sn, prop, base, ctx).map(|v| if is_border_box(sn) { (v - pb).max(0.0) } else { v.max(0.0) })
     };
-    let min_w = limit("min-width", Some(cb.width), pb_h).unwrap_or(0.0);
+    let min_w = if indefinite && is_percentage(sn, "min-width") {
+        0.0
+    } else {
+        limit("min-width", Some(cb.width), pb_h).unwrap_or(0.0)
+    };
     let max_w = limit("max-width", Some(cb.width), pb_h).unwrap_or(f32::INFINITY).max(min_w);
     let min_h = limit("min-height", cb.height, pb_v).unwrap_or(0.0);
     let max_h = limit("max-height", cb.height, pb_v).unwrap_or(f32::INFINITY).max(min_h);
@@ -8048,6 +8075,21 @@ mod tests {
         assert!(d.dimensions.height >= 40.0);
         assert!(m.dimensions.y >= d.dimensions.y - 0.01);
         assert!(m.dimensions.y + 40.0 <= d.dimensions.y + d.dimensions.height + 0.01);
+    }
+
+    /// A percentage-width replaced child of a shrink-to-fit box is sized as
+    /// `auto` while the box measures its content (cyclic percentage), so the
+    /// box does not grow to the indefinite measuring width.
+    #[test]
+    fn test_percentage_width_iframe_in_inline_block_uses_default_size() {
+        let (root, _, _) = layout_from_html_css(
+            r#"<div><span id="s" style="display:inline-block"><iframe style="width:100%;height:10px;border:0"></iframe></span></div>"#,
+            "body{margin:0}",
+            800.0,
+            600.0,
+        );
+        let s = by_id(&root, "s");
+        assert!((s.dimensions.width - 300.0).abs() < 0.5, "got {}", s.dimensions.width);
     }
 
     #[test]
