@@ -599,6 +599,11 @@ impl LayerTreeBuilder {
         Some(src)
     }
 
+    /// Whether `layout` is a `<video>` element box.
+    fn is_video_element(layout: &LayoutBox) -> bool {
+        matches!(layout.style_node.node.data, NodeData::Element { ref name, .. } if name.local.as_ref() == "video")
+    }
+
     /// Whether `layout` is an `<svg>` element box.
     fn is_svg_element(layout: &LayoutBox) -> bool {
         matches!(layout.style_node.node.data, NodeData::Element { ref name, .. } if name.local.as_ref() == "svg")
@@ -861,6 +866,16 @@ impl LayerTreeBuilder {
             commands.push(PaintCommand::Shadow(d, shadow.clone(), radius));
         }
 
+        // A <video> is black where it has no frame to show (no poster; we do
+        // not decode video), as Chromium paints one without a frame.
+        if Self::is_video_element(layout) {
+            let content = crate::background::box_rect(layout, crate::background::BoxArea::Content);
+            if content.width > 0.0 && content.height > 0.0 {
+                let black = Color { r: 0, g: 0, b: 0, a: 255 };
+                commands.push(PaintCommand::Rect(content, black, inner_radius(crate::background::BoxArea::Content)));
+            }
+        }
+
         // Image
         if layout.display == DisplayType::Image {
             if let Some(ref url) = layout.image_url {
@@ -871,6 +886,8 @@ impl LayerTreeBuilder {
                         "none"    => ObjectFit::None,
                         _         => ObjectFit::Fill,
                     },
+                    // A video poster keeps its aspect ratio inside the box.
+                    _ if Self::is_video_element(layout) => ObjectFit::Contain,
                     _ => ObjectFit::Fill,
                 };
                 let alt = layout.alt_text.clone().unwrap_or_default();
@@ -2129,5 +2146,21 @@ mod tests {
             .expect("iframe image command");
         assert_eq!(url, iframe_frame_key(&srcdoc_paint_src("<p>hi</p>"), 100, 50));
         assert_ne!(srcdoc_paint_src("<p>hi</p>"), srcdoc_paint_src("<p>bye</p>"));
+    }
+
+    /// A `<video>` without a poster paints black; with one, the poster is
+    /// drawn over it keeping its aspect ratio.
+    #[test]
+    fn test_video_paints_black_and_its_poster() {
+        let tree = build_tree_from_html(
+            r#"<video style="width:160px;height:90px"></video><video poster="p.png" style="width:160px;height:90px"></video>"#,
+            "",
+        );
+        let cmds: Vec<&PaintCommand> = tree.layers.iter()
+            .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
+            .collect();
+        let black = cmds.iter().filter(|c| matches!(c, PaintCommand::Rect(r, col, _) if col.r == 0 && col.g == 0 && col.b == 0 && col.a == 255 && (r.width - 160.0).abs() < 0.5)).count();
+        assert_eq!(black, 2, "both videos paint black");
+        assert!(cmds.iter().any(|c| matches!(c, PaintCommand::Image { url, object_fit: ObjectFit::Contain, .. } if url == "p.png")));
     }
 }

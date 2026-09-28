@@ -1544,7 +1544,7 @@ impl BrowserEngine {
         let post_js_page = if js_modified || self.cache_missing_images(&page.image_urls) {
             self.re_render(None, None, width)?
         } else {
-            self.frames.sync(&page.frames, &self.document_origin());
+            self.frames.sync(&page.frames, &self.document_origin(), &self.console_buffer);
             page
         };
         self.settle_frames(post_js_page, width)
@@ -1699,7 +1699,10 @@ impl BrowserEngine {
             page.width as f32,
             self.viewport_height,
         );
-        self.frames.sync(&page.frames, &base_url.origin().ascii_serialization());
+        self.frames.sync(&page.frames, &base_url.origin().ascii_serialization(), &self.console_buffer);
+        // Sizes are known now: let ResizeObserver report the ones that changed.
+        self.js_runtime
+            .execute("if (typeof __aura_resize_observer_check === 'function') __aura_resize_observer_check();");
         self.drain_js_outbox();
         self.refresh_after_image_loads(page, width)
     }
