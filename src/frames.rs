@@ -40,6 +40,10 @@ pub const FRAME_BUDGET: Duration = Duration::from_secs(8);
 /// first capture, so documents that render from `setTimeout` show content.
 const FRAME_SETTLE: Duration = Duration::from_millis(1500);
 const FRAME_TICK_INTERVAL: Duration = Duration::from_millis(100);
+/// How long after its last command a frame keeps running its timers.
+const FRAME_IDLE_TICKS: Duration = Duration::from_secs(30);
+/// Minimum time between captures sent for timer-driven changes.
+const FRAME_IDLE_CAPTURE_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Image-cache key of the rendered document of an `<iframe>` with absolute
 /// `src` and a `width` x `height` px content box (the paint side's key).
@@ -185,10 +189,19 @@ pub fn collect_frame_boxes(root: &layout::LayoutBox, base_url: &Url) -> Vec<Fram
 // ── Messages ──────────────────────────────────────────────────────────────────
 
 /// What a frame document knows about the document embedding it.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct FrameParent {
     pub origin: String,
     pub name: String,
+    /// The embedder's console: frame console entries are forwarded to it,
+    /// as browser devtools show frame logs with the page's.
+    pub console: Option<crate::js::ConsoleBuffer>,
+}
+
+impl std::fmt::Debug for FrameParent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrameParent").field("origin", &self.origin).field("name", &self.name).finish()
+    }
 }
 
 /// A `postMessage` queued by page script, as drained from the JS runtime.
@@ -310,7 +323,7 @@ impl FrameHost {
 
     /// Start loading frames that are new in this render and resize frames
     /// whose content box changed. Never blocks.
-    pub fn sync(&mut self, frames: &[FrameBox], parent_origin: &str) {
+    pub fn sync(&mut self, frames: &[FrameBox], parent_origin: &str, console: &crate::js::ConsoleBuffer) {
         if self.depth >= MAX_DEPTH {
             return;
         }
@@ -344,7 +357,11 @@ impl FrameHost {
                 continue;
             }
             let index = self.children.len();
-            let parent = FrameParent { origin: parent_origin.to_string(), name: frame.name.clone() };
+            let parent = FrameParent {
+                origin: parent_origin.to_string(),
+                name: frame.name.clone(),
+                console: Some(console.clone()),
+            };
             let Some(tx) = spawn_child(index, self.depth + 1, self.budget.clone(), parent, self.events_tx.clone()) else {
                 continue;
             };
@@ -466,6 +483,20 @@ fn spawn_child(
     Some(tx)
 }
 
+/// Move the frame document's console entries to the embedder's console,
+/// labelled with the frame URL.
+fn forward_console(engine: &crate::engine::BrowserEngine, parent: &Option<crate::js::ConsoleBuffer>, label: &str) {
+    let Some(parent) = parent else { return };
+    let entries = engine.console_entries();
+    if entries.is_empty() {
+        return;
+    }
+    engine.clear_console();
+    for entry in entries {
+        crate::js::append_console_entry(parent, entry.level, format!("[frame {label}] {}", entry.message));
+    }
+}
+
 /// Frame thread body: owns the child engine for its whole life.
 fn run_child(
     index: usize,
@@ -477,6 +508,8 @@ fn run_child(
 ) {
     FRAME_THREAD.with(|flag| flag.set(true));
     let parent_origin = parent.origin.clone();
+    let parent_console = parent.console.clone();
+    let mut frame_label = String::new();
     let mut engine = crate::engine::BrowserEngine::new_frame(FrameHost::new(depth, budget), parent);
     let forward = |engine: &mut crate::engine::BrowserEngine| {
         let origin = engine.document_origin();
@@ -488,10 +521,39 @@ fn run_child(
     };
     let mut width = 0u32;
     let mut current_key = String::new();
-    for cmd in rx {
+    let mut last_command = Instant::now();
+    let mut last_capture = Instant::now();
+    let mut dirty = false;
+    loop {
+        let cmd = match rx.recv_timeout(FRAME_TICK_INTERVAL) {
+            Ok(cmd) => cmd,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // No command: keep the document's timers running for a while,
+                // as a browser does, and report what they change.
+                if engine.last_page.is_none() || last_command.elapsed() > FRAME_IDLE_TICKS {
+                    continue;
+                }
+                dirty |= engine.tick_js(None, None);
+                forward(&mut engine);
+                forward_console(&engine, &parent_console, &frame_label);
+                if dirty && last_capture.elapsed() >= FRAME_IDLE_CAPTURE_INTERVAL {
+                    dirty = false;
+                    last_capture = Instant::now();
+                    let _ = engine.re_render(None, None, width as f32);
+                    let png = engine.screenshot_viewport().and_then(|pixmap| pixmap.encode_png().ok());
+                    if events.send(FrameEvent::Rendered { index, key: current_key.clone(), png }).is_err() {
+                        break;
+                    }
+                }
+                continue;
+            }
+        };
+        last_command = Instant::now();
         match cmd {
             FrameCmd::Load { url, html, width: w, height: h, key } => {
                 (width, current_key) = (w, key);
+                frame_label = url.clone();
                 engine.viewport_height = (h as f32).max(1.0);
                 engine.frame_deadline = Some(Instant::now() + FRAME_BUDGET);
                 let loaded = match &html {
@@ -531,6 +593,9 @@ fn run_child(
                 let _ = engine.re_render(None, None, width as f32);
             }
         }
+        forward_console(&engine, &parent_console, &frame_label);
+        dirty = false;
+        last_capture = Instant::now();
         let png = engine.screenshot_viewport().and_then(|pixmap| pixmap.encode_png().ok());
         let rendered = FrameEvent::Rendered { index, key: current_key.clone(), png };
         if events.send(rendered).is_err() {
@@ -579,5 +644,19 @@ mod tests {
         assert!(target_origin_allows("https://a.com/path", "https://a.com"));
         assert!(!target_origin_allows("https://b.com", "https://a.com"));
         assert!(!target_origin_allows("", "https://a.com"));
+    }
+
+    /// Frame console entries move to the embedder's console with the frame
+    /// URL, and leave the frame's own console empty.
+    #[test]
+    fn test_forward_console_labels_entries_and_clears_the_frame_console() {
+        let engine = crate::engine::BrowserEngine::new();
+        crate::js::append_console_entry(&engine.console_buffer, crate::js::ConsoleLevel::Error, "boom".to_string());
+        let parent = crate::js::new_console_buffer();
+        forward_console(&engine, &Some(parent.clone()), "https://ad.example/frame");
+        let entries = crate::js::console_entries(&parent);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].message, "[frame https://ad.example/frame] boom");
+        assert!(engine.console_entries().is_empty());
     }
 }
