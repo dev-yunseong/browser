@@ -177,7 +177,8 @@ impl FontDb {
         }
     }
 
-    /// The fontconfig default directories.  `BROWSER_NO_SYSTEM_FONTS=1` disables
+    /// The fontconfig default directories (plus the Windows font folders on
+    /// Windows).  `BROWSER_NO_SYSTEM_FONTS=1` disables
     /// system fonts so only the embedded face is used.
     pub fn system_dirs() -> Vec<PathBuf> {
         if std::env::var_os("BROWSER_NO_SYSTEM_FONTS").is_some() {
@@ -194,6 +195,14 @@ impl FontDb {
         }
         if let Some(home) = std::env::var_os("HOME") {
             dirs.push(PathBuf::from(home).join(".fonts"));
+        }
+        // Windows: system fonts and per-user installed fonts.
+        if cfg!(windows) {
+            let windir = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
+            dirs.push(PathBuf::from(windir).join("Fonts"));
+            if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+                dirs.push(PathBuf::from(local).join("Microsoft").join("Windows").join("Fonts"));
+            }
         }
         dirs
     }

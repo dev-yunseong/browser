@@ -72,4 +72,4 @@ The live page changes between loads (ads, banners, news), so compare horizontal 
 - The search box, header icons and newsstand line up horizontally between the two captures.
 - Browser output shows populated Naver shell content beyond raw placeholders such as `#shortcutArea`, `#root`, and `#footer`.
 - `browser-cli logs` has no critical startup blocker such as `Cannot read properties of undefined (reading 'onsubmit')`.
-- Any visible layout/CSS drift is recorded in the PR or a linked follow-up issue. Remaining Naver layout/CSS drift is tracked in #288.
+- Any visible layout/CSS drift is recorded in the PR or a linked follow-up issue. After #288 the same-DOM render is within about 1 mean pixel difference of Chromium; the remaining live drift (iframe documents: shopping box, ad frames) is tracked in #295.

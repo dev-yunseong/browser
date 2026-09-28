@@ -460,7 +460,7 @@ fn run_child(
         match cmd {
             FrameCmd::Load { url, width: w, height: h, key } => {
                 (width, current_key) = (w, key);
-                crate::engine::set_thread_viewport_height(Some(h as f32));
+                engine.viewport_height = (h as f32).max(1.0);
                 engine.frame_deadline = Some(Instant::now() + FRAME_BUDGET);
                 if let Err(error) = engine.navigate(&url, w as f32) {
                     eprintln!("[frames] {url} failed to load: {error}");
@@ -470,7 +470,7 @@ fn run_child(
             }
             FrameCmd::Resize { width: w, height: h, key } => {
                 (width, current_key) = (w, key);
-                crate::engine::set_thread_viewport_height(Some(h as f32));
+                engine.viewport_height = (h as f32).max(1.0);
                 if let Err(error) = engine.re_render(None, None, w as f32) {
                     eprintln!("[frames] re-render failed: {error}");
                 }

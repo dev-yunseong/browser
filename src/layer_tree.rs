@@ -321,6 +321,9 @@ impl LayerTree {
 ///
 /// Each box that carries a compositing trigger establishes a new `Layer`;
 /// all other boxes paint into the current ancestor layer.
+/// Clip rect that never cuts anything, for text outside any overflow clip.
+const UNBOUNDED_CLIP: LayoutRect = LayoutRect { x: -1.0e7, y: -1.0e7, width: 2.0e7, height: 2.0e7 };
+
 pub struct LayerTreeBuilder;
 
 impl LayerTreeBuilder {
@@ -331,7 +334,10 @@ impl LayerTreeBuilder {
         let mut tree = LayerTree::new();
         let root = Layer::new(0, 0, 1.0, viewport, vec![], Matrix4x4::identity());
         tree.add_layer(root);
-        Self::traverse(layout, &mut tree, 0, viewport);
+        // Text runs are not clipped to the viewport: layer transforms move
+        // content after this clip would apply (a box translated from x=900 to
+        // x=400 must still paint). Overflow clipping is done by clip masks.
+        Self::traverse(layout, &mut tree, 0, UNBOUNDED_CLIP);
         tree
     }
 
@@ -350,6 +356,9 @@ impl LayerTreeBuilder {
             Process {
                 layout: &'f LayoutBox<'f>,
                 layer_id: usize,
+                /// Layer of the nearest ancestor stacking context: new layers
+                /// are ordered by z-index among that layer's children.
+                stacking_id: usize,
                 clip: LayoutRect,
                 clips: Rc<Vec<ClipRegion>>,
             },
@@ -363,6 +372,7 @@ impl LayerTreeBuilder {
         let mut stack: Vec<Frame> = vec![Frame::Process {
             layout,
             layer_id: current_layer_id,
+            stacking_id: current_layer_id,
             clip,
             clips: Rc::new(Vec::new()),
         }];
@@ -387,7 +397,7 @@ impl LayerTreeBuilder {
                     }
                 }
 
-                Frame::Process { layout: frame_layout, layer_id: frame_layer_id, clip: frame_clip, clips: frame_clips } => {
+                Frame::Process { layout: frame_layout, layer_id: frame_layer_id, stacking_id: frame_stacking_id, clip: frame_clip, clips: frame_clips } => {
                     let d = frame_layout.dimensions;
                     let (clips, child_clips) = Self::clip_regions_for(frame_layout, frame_clips);
 
@@ -430,7 +440,7 @@ impl LayerTreeBuilder {
                         }
                         // Push children in reverse order so the first child is processed first.
                         for child in frame_layout.children.iter().rev() {
-                            stack.push(Frame::Process { layout: child, layer_id: frame_layer_id, clip: next_clip, clips: child_clips.clone() });
+                            stack.push(Frame::Process { layout: child, layer_id: frame_layer_id, stacking_id: frame_stacking_id, clip: next_clip, clips: child_clips.clone() });
                         }
                         continue;
                     }
@@ -451,7 +461,14 @@ impl LayerTreeBuilder {
 
                         // Record parent → child relationship: access parent index first,
                         // then new_id — both are distinct indices so no aliasing.
-                        tree.layers[frame_layer_id].child_layer_ids.push(new_id);
+                        // Layers are ordered within the nearest stacking context, not
+                        // within a positioned `z-index: auto` ancestor (CSS 2.1 §9.9.1).
+                        tree.layers[frame_stacking_id].child_layer_ids.push(new_id);
+                        let child_stacking_id = if Self::establishes_stacking_context(frame_layout, &tree.layers[new_id].triggers) {
+                            new_id
+                        } else {
+                            frame_stacking_id
+                        };
 
                         // Collect this box's paint commands into the new layer as BACKGROUND.
                         Self::collect_paint_commands(frame_layout, &mut tree.layers[new_id], frame_clip, true);
@@ -472,7 +489,7 @@ impl LayerTreeBuilder {
 
                         // All children belong to the new layer's stacking context.
                         for child in frame_layout.children.iter().rev() {
-                            stack.push(Frame::Process { layout: child, layer_id: new_id, clip: next_clip, clips: child_clips.clone() });
+                            stack.push(Frame::Process { layout: child, layer_id: new_id, stacking_id: child_stacking_id, clip: next_clip, clips: child_clips.clone() });
                         }
                     } else {
                         // No trigger — paint into the current ancestor layer as CONTENT.
@@ -492,7 +509,7 @@ impl LayerTreeBuilder {
                         }
 
                         for child in frame_layout.children.iter().rev() {
-                            stack.push(Frame::Process { layout: child, layer_id: frame_layer_id, clip: next_clip, clips: child_clips.clone() });
+                            stack.push(Frame::Process { layout: child, layer_id: frame_layer_id, stacking_id: frame_stacking_id, clip: next_clip, clips: child_clips.clone() });
                         }
                     }
                 }
@@ -585,6 +602,19 @@ impl LayerTreeBuilder {
     /// Whether `layout` is an `<svg>` element box.
     fn is_svg_element(layout: &LayoutBox) -> bool {
         matches!(layout.style_node.node.data, NodeData::Element { ref name, .. } if name.local.as_ref() == "svg")
+    }
+
+    /// Whether a layer-creating box also establishes a stacking context. A
+    /// positioned box with `z-index: auto` gets its own layer but does not:
+    /// its positioned descendants take part in the enclosing context.
+    fn establishes_stacking_context(layout: &LayoutBox, triggers: &[CompositingTrigger]) -> bool {
+        let z_index_auto = match layout.style_node.specified_values.get(&crate::css::intern("z-index")) {
+            None => true,
+            Some(Value::Keyword(k)) => k.as_ref() == "auto",
+            Some(_) => false,
+        };
+        let only_positioning = triggers.iter().all(|t| matches!(t, CompositingTrigger::ZIndex(_)));
+        !(only_positioning && z_index_auto)
     }
 
     /// Returns `true` if this box has `overflow: hidden` set.
@@ -2030,5 +2060,47 @@ mod tests {
             _ => None,
         }).expect("background rect");
         assert!((radius - 60.0).abs() < 0.01, "got {radius}");
+    }
+
+    /// A `z-index: 10` box inside a positioned `z-index: auto` parent is
+    /// ordered in the root stacking context, above a later positioned sibling
+    /// of that parent.
+    #[test]
+    fn test_z_index_escapes_positioned_z_auto_parent() {
+        let tree = build_tree_from_html(
+            r#"<div style="position:relative;width:100px;height:20px"><div style="position:relative;z-index:10;width:100px;height:20px">high</div></div>
+               <div style="position:absolute;left:0;top:0;width:50px;height:50px">later</div>"#,
+            "",
+        );
+        let layer_with = |marker: &str| {
+            tree.layers
+                .iter()
+                .position(|l| l.background_commands.iter().chain(l.content_commands.iter()).any(|c| {
+                    matches!(c, PaintCommand::Text { text, .. } if text.contains(marker))
+                }))
+                .expect("layer painting the marker")
+        };
+        let (high, later) = (layer_with("high"), layer_with("later"));
+        let (_, zero, positive) = tree.categorize_children(0);
+        assert!(positive.contains(&high), "z-index 10 box is a positive child of the root context");
+        assert!(zero.contains(&later), "z-index auto box stays in the root's zero list");
+    }
+
+    /// Text runs carry no viewport clip: a transform may move text laid out
+    /// past the canvas edge back into view.
+    #[test]
+    fn test_text_clip_is_not_bounded_by_the_viewport() {
+        let tree = build_tree_from_html(
+            r#"<div style="position:absolute;left:900px;top:0;width:300px;transform:translateX(-80%)">far text</div>"#,
+            "",
+        );
+        let clip = tree.layers.iter()
+            .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
+            .find_map(|c| match c {
+                PaintCommand::Text { text, clip, .. } if text.contains("far") => Some(*clip),
+                _ => None,
+            })
+            .expect("text command");
+        assert!(clip.x + clip.width > 1200.0, "text clip must extend past the canvas: {clip:?}");
     }
 }

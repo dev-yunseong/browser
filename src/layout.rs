@@ -240,6 +240,9 @@ pub enum DisplayType {
 
 // ── Public entry points ───────────────────────────────────────────────────────
 
+/// `current_x` is accepted for call-site compatibility (historically the
+/// starting inline-layout cursor) but is not used: layout always starts a
+/// fresh block-formatting context at `container_start_x`.
 pub fn build_layout_tree<'a>(
     style_node: &'a StyledNode,
     container_start_x: f32,
@@ -249,7 +252,8 @@ pub fn build_layout_tree<'a>(
     vw: f32,
     vh: f32,
 ) -> (Option<LayoutBox<'a>>, f32, f32) {
-    build_layout_tree_with_cb(style_node, container_start_x, current_x, current_y, container_width, vw, vh, None)
+    let _ = current_x;
+    build_layout_tree_with_cb(style_node, container_start_x, current_y, container_width, vw, vh, None)
 }
 
 /// Variant that takes the initial containing block for absolutely positioned
@@ -257,7 +261,6 @@ pub fn build_layout_tree<'a>(
 pub fn build_layout_tree_with_cb<'a>(
     style_node: &'a StyledNode,
     container_start_x: f32,
-    _current_x: f32,
     current_y: f32,
     container_width: f32,
     vw: f32,
@@ -978,19 +981,20 @@ impl<'a> LayoutBox<'a> {
 }
 
 /// Iterative subtree translation (avoids stack overflows on deep trees).
+///
+/// Uses a stack of `&mut LayoutBox` rather than recursion: each entry is a
+/// disjoint mutable borrow taken from its parent's `children` vector via
+/// `iter_mut`, so the whole traversal is safe — no raw pointers needed.
 pub fn offset_layout_box(layout: &mut LayoutBox, dx: f32, dy: f32) {
     if dx == 0.0 && dy == 0.0 {
         return;
     }
-    let mut stack: Vec<*mut LayoutBox> = vec![layout as *mut LayoutBox];
-    while let Some(ptr) = stack.pop() {
-        // SAFETY: Each pointer comes from a uniquely-owned LayoutBox node; no two
-        // entries on the stack alias the same allocation.
-        let node = unsafe { &mut *ptr };
+    let mut stack: Vec<&mut LayoutBox> = vec![layout];
+    while let Some(node) = stack.pop() {
         node.dimensions.x += dx;
         node.dimensions.y += dy;
         for child in &mut node.children {
-            stack.push(child as *mut LayoutBox);
+            stack.push(child);
         }
     }
 }
@@ -4143,6 +4147,165 @@ fn layout_table<'a>(lb: &mut LayoutBox<'a>, content_x: f32, content_y: f32, cont
 
 // ── Grid (explicit column tracks, auto placement) ─────────────────────────────
 
+/// Normalized sizing behavior for one grid track, after resolving
+/// `Value::MinMax`/`Value::FitContent`/keywords down to something the sizing
+/// pass below can distribute space against. This does not implement the full
+/// CSS Grid track-sizing algorithm (no per-item min/max-content track
+/// contributions), but covers the common cases: fixed length/percentage
+/// tracks, `fr` tracks (optionally with a fixed floor via `minmax(px, fr)`),
+/// and `auto`/`min-content`/`max-content`/`fit-content()` tracks that share
+/// left-over space.
+enum TrackSizing {
+    /// A track whose size is fully determined up front (px, percent, or a
+    /// `minmax()`/`fit-content()` whose upper bound is itself fixed).
+    Fixed(f32),
+    /// A flexible (`fr`) track. `min_floor` comes from `minmax(<fixed>, Nfr)`.
+    Fr { amount: f32, min_floor: f32 },
+    /// An `auto`-like track that shares left-over space with its peers.
+    /// `cap` bounds it for `fit-content(L)`.
+    Auto { min_floor: f32, cap: Option<f32> },
+}
+
+/// Resolve a single operand of `minmax(min, max)` to a fixed px value, when
+/// it names one (plain length/percentage). Keywords (`auto`, `min-content`,
+/// `max-content`) have no context-free px size here, so they resolve to
+/// `None` (treated as a floor/cap of 0 / unbounded by the caller).
+fn resolve_fixed_track_operand(v: &Value, content_w: f32) -> Option<f32> {
+    match v {
+        Value::Length(n, Unit::Px) => Some(*n),
+        Value::Length(n, Unit::Percent) => Some(content_w * n / 100.0),
+        _ => None,
+    }
+}
+
+fn resolve_track_sizing(t: &Value, content_w: f32) -> TrackSizing {
+    match t {
+        Value::Length(v, Unit::Px) => TrackSizing::Fixed(*v),
+        Value::Length(v, Unit::Percent) => TrackSizing::Fixed(content_w * v / 100.0),
+        Value::Length(v, Unit::Fr) => TrackSizing::Fr { amount: *v, min_floor: 0.0 },
+        Value::FitContent(cap) => TrackSizing::Auto { min_floor: 0.0, cap: Some(*cap) },
+        Value::Keyword(k) if matches!(k.as_ref(), "auto" | "min-content" | "max-content") => {
+            TrackSizing::Auto { min_floor: 0.0, cap: None }
+        }
+        Value::MinMax(min, max) => {
+            let min_floor = resolve_fixed_track_operand(min, content_w).unwrap_or(0.0);
+            match max.as_ref() {
+                Value::Length(v, Unit::Fr) => TrackSizing::Fr { amount: *v, min_floor },
+                Value::Length(v, Unit::Px) => TrackSizing::Fixed(v.max(min_floor)),
+                Value::Length(v, Unit::Percent) => TrackSizing::Fixed((content_w * v / 100.0).max(min_floor)),
+                _ => TrackSizing::Auto { min_floor, cap: None },
+            }
+        }
+        // Anything else (e.g. a leftover, un-expanded AutoRepeat) falls back
+        // to a plain auto track rather than collapsing to zero.
+        _ => TrackSizing::Auto { min_floor: 0.0, cap: None },
+    }
+}
+
+/// Expand at most one `Value::AutoRepeat` entry within `tracks` in place,
+/// using `avail_w` (content width minus fixed gaps between *other* tracks) to
+/// pick a repeat count. Per spec, only one auto-repeat is meaningful in a
+/// track list; if it isn't the sole track (rare in practice), later entries
+/// are left alone.
+fn expand_auto_repeat_tracks(tracks: &mut Vec<Value>, content_w: f32, gap: f32, item_count: usize) {
+    let Some(pos) = tracks.iter().position(|t| matches!(t, Value::AutoRepeat { .. })) else {
+        return;
+    };
+    let Value::AutoRepeat { auto_fit, tracks: group } = tracks.remove(pos) else { unreachable!() };
+    if group.is_empty() {
+        return;
+    }
+    // Sum of the fixed sizes of every *other* track plus their gaps, so the
+    // repeat count is based on what's actually left over for the group.
+    let other_fixed: f32 = tracks
+        .iter()
+        .map(|t| match resolve_track_sizing(t, content_w) {
+            TrackSizing::Fixed(v) => v,
+            TrackSizing::Fr { min_floor, .. } | TrackSizing::Auto { min_floor, .. } => min_floor,
+        })
+        .sum();
+    let other_gaps = if tracks.is_empty() { 0.0 } else { gap * tracks.len() as f32 };
+    let avail_for_group = (content_w - other_fixed - other_gaps).max(0.0);
+
+    // A definite base size for the repeated group is required to compute a
+    // count; fall back to a single repetition when the group has no
+    // context-free fixed size (e.g. `repeat(auto-fill, 1fr)` — indefinite,
+    // so the spec also collapses this to one repetition).
+    let group_base: f32 = group
+        .iter()
+        .map(|t| match resolve_track_sizing(t, content_w) {
+            TrackSizing::Fixed(v) => v,
+            TrackSizing::Fr { min_floor, .. } | TrackSizing::Auto { min_floor, .. } => min_floor,
+        })
+        .sum();
+    let group_gap_total = gap * group.len().saturating_sub(1) as f32;
+    let per_rep = group_base + group_gap_total;
+    let count = if per_rep > 0.0 {
+        (((avail_for_group + gap) / (per_rep + gap)).floor() as usize).max(1)
+    } else {
+        1
+    };
+    // `auto-fit` collapses trailing empty repetitions down to the number of
+    // items actually present (still at least one repetition/track so an
+    // empty grid doesn't disappear).
+    let count = if auto_fit && item_count > 0 {
+        let cells_per_rep = group.len().max(1);
+        let needed_reps = item_count.div_ceil(cells_per_rep);
+        count.min(needed_reps.max(1))
+    } else {
+        count
+    };
+    let mut expanded = Vec::with_capacity(group.len() * count);
+    for _ in 0..count {
+        expanded.extend(group.iter().cloned());
+    }
+    for (i, v) in expanded.into_iter().enumerate() {
+        tracks.insert(pos + i, v);
+    }
+}
+
+/// `grid-column: span N` → `Some(N)`; anything else (including no
+/// declaration) → `None`, meaning "auto-placed, span 1".
+fn grid_column_span(sn: &StyledNode) -> Option<usize> {
+    if let Some(Value::Keyword(k)) = sval(sn, "grid-column") {
+        let s = k.as_ref().trim().to_ascii_lowercase();
+        if let Some(rest) = s.strip_prefix("span") {
+            return rest.trim().parse::<usize>().ok().filter(|n| *n > 0);
+        }
+    }
+    None
+}
+
+/// `grid-column: N` (a bare, positive, 1-based line number) → `Some(N - 1)`
+/// as a 0-based column start. Ranges (`N / M`) and negative/`span` lines
+/// aren't handled — this covers the cheap, common single-line case only.
+fn grid_column_start(sn: &StyledNode) -> Option<usize> {
+    if let Some(Value::Keyword(k)) = sval(sn, "grid-column") {
+        let s = k.as_ref().trim();
+        if let Ok(n) = s.parse::<i32>() {
+            if n >= 1 {
+                return Some((n - 1) as usize);
+            }
+        }
+    }
+    None
+}
+
+/// Maps `align-items`/`align-self`/`justify-items`/`justify-self` keywords to
+/// one of the four values this layout distinguishes; anything else (or no
+/// declaration) is `"stretch"`, the CSS Grid initial value.
+fn grid_alignment_keyword(sn: &StyledNode, prop: &str) -> &'static str {
+    match sval(sn, prop) {
+        Some(Value::Keyword(k)) => match k.as_ref() {
+            "center" => "center",
+            "start" | "flex-start" | "self-start" => "start",
+            "end" | "flex-end" | "self-end" => "end",
+            _ => "stretch",
+        },
+        _ => "stretch",
+    }
+}
+
 fn layout_grid<'a>(lb: &mut LayoutBox<'a>, content_x: f32, content_y: f32, content_w: f32, cb: Cb, ctx: &mut Ctx) -> f32 {
     let sn = lb.style_node;
     let read_tracks = |prop: &str| -> Vec<Value> {
@@ -4151,37 +4314,71 @@ fn layout_grid<'a>(lb: &mut LayoutBox<'a>, content_x: f32, content_y: f32, conte
             _ => Vec::new(),
         }
     };
-    let col_tracks = read_tracks("grid-template-columns");
+    let mut col_tracks = read_tracks("grid-template-columns");
     let row_tracks = read_tracks("grid-template-rows");
     let col_gap = gap_px(sn, "column-gap", Some(content_w), ctx);
     let row_gap = gap_px(sn, "row-gap", cb.height, ctx);
+
+    let grid_children: Vec<&'a StyledNode> = sn
+        .children
+        .iter()
+        .filter(|c| !should_skip(c) && !(is_text(c) && is_collapsible_whitespace_text(c)))
+        .collect();
+    let mut in_flow: Vec<&'a StyledNode> = Vec::with_capacity(grid_children.len());
+    for c in grid_children {
+        if is_out_of_flow_positioned(c) {
+            lb.children.push(make_abs_placeholder(c, content_x, content_y, ctx));
+        } else {
+            in_flow.push(c);
+        }
+    }
+
+    expand_auto_repeat_tracks(&mut col_tracks, content_w, col_gap, in_flow.len());
+
     let num_cols = col_tracks.len().max(1);
     let total_gaps = col_gap * (num_cols - 1) as f32;
     let avail = (content_w - total_gaps).max(0.0);
-    let fixed: f32 = col_tracks
-        .iter()
-        .map(|t| match t {
-            Value::Length(v, Unit::Px) => *v,
-            Value::Length(v, Unit::Percent) => content_w * v / 100.0,
-            _ => 0.0,
-        })
-        .sum();
-    let fr_total: f32 = col_tracks.iter().map(|t| if let Value::Length(v, Unit::Fr) = t { *v } else { 0.0 }).sum();
-    let auto_count = col_tracks.iter().filter(|t| matches!(t, Value::Keyword(k) if k.as_ref() == "auto")).count() as f32;
-    let flex_space = (avail - fixed).max(0.0);
-    let col_widths: Vec<f32> = if col_tracks.is_empty() {
+
+    let sizings: Vec<TrackSizing> = if col_tracks.is_empty() {
+        Vec::new()
+    } else {
+        col_tracks.iter().map(|t| resolve_track_sizing(t, content_w)).collect()
+    };
+    let fixed_sum: f32 = sizings.iter().map(|s| match s {
+        TrackSizing::Fixed(v) => *v,
+        _ => 0.0,
+    }).sum();
+    let fr_total: f32 = sizings.iter().map(|s| match s {
+        TrackSizing::Fr { amount, .. } => *amount,
+        _ => 0.0,
+    }).sum();
+    let auto_count = sizings.iter().filter(|s| matches!(s, TrackSizing::Auto { .. })).count() as f32;
+    let flex_space = (avail - fixed_sum).max(0.0);
+    let col_widths: Vec<f32> = if sizings.is_empty() {
         vec![content_w]
     } else {
-        col_tracks
+        sizings
             .iter()
-            .map(|t| match t {
-                Value::Length(v, Unit::Px) => *v,
-                Value::Length(v, Unit::Percent) => content_w * v / 100.0,
-                Value::Length(v, Unit::Fr) => if fr_total > 0.0 { flex_space * v / fr_total } else { 0.0 },
-                Value::Keyword(k) if k.as_ref() == "auto" => {
-                    if fr_total > 0.0 { 0.0 } else if auto_count > 0.0 { flex_space / auto_count } else { 0.0 }
+            .map(|s| match s {
+                TrackSizing::Fixed(v) => *v,
+                TrackSizing::Fr { amount, min_floor } => {
+                    let share = if fr_total > 0.0 { flex_space * amount / fr_total } else { 0.0 };
+                    share.max(*min_floor)
                 }
-                _ => 0.0,
+                TrackSizing::Auto { min_floor, cap } => {
+                    let share = if fr_total > 0.0 {
+                        0.0
+                    } else if auto_count > 0.0 {
+                        flex_space / auto_count
+                    } else {
+                        0.0
+                    };
+                    let share = share.max(*min_floor);
+                    match cap {
+                        Some(c) => share.min(*c).max(min_floor.min(*c)),
+                        None => share,
+                    }
+                }
             })
             .collect()
     };
@@ -4191,39 +4388,74 @@ fn layout_grid<'a>(lb: &mut LayoutBox<'a>, content_x: f32, content_y: f32, conte
         col_x.push(xx);
         xx += w + col_gap;
     }
-    let grid_children: Vec<&'a StyledNode> = sn
-        .children
-        .iter()
-        .filter(|c| !should_skip(c) && !(is_text(c) && is_collapsible_whitespace_text(c)))
-        .collect();
-    let mut placed: Vec<(usize, usize, LayoutBox<'a>)> = Vec::new();
-    let mut idx = 0usize;
-    for c in grid_children {
-        if is_out_of_flow_positioned(c) {
-            lb.children.push(make_abs_placeholder(c, content_x, content_y, ctx));
-            continue;
+    // Width spanned by columns `[start, start+span)`, including the gaps
+    // between them.
+    let span_width = |start: usize, span: usize| -> f32 {
+        let end = (start + span).min(col_widths.len());
+        if end <= start {
+            return col_widths.get(start).copied().unwrap_or(content_w);
         }
-        let col = idx % num_cols;
-        let row = idx / num_cols;
-        idx += 1;
-        let w = col_widths.get(col).copied().unwrap_or(content_w);
+        let sum: f32 = col_widths[start..end].iter().sum();
+        sum + col_gap * (end - start).saturating_sub(1) as f32
+    };
+
+    let container_align = grid_alignment_keyword(sn, "align-items");
+    let container_justify = grid_alignment_keyword(sn, "justify-items");
+
+    let mut placed: Vec<(usize, usize, usize, LayoutBox<'a>)> = Vec::new(); // (row, col, span, box)
+    let mut cursor_col = 0usize;
+    let mut cursor_row = 0usize;
+    for c in in_flow {
+        let span = grid_column_span(c).unwrap_or(1).clamp(1, num_cols);
+        let mut col = grid_column_start(c).unwrap_or(cursor_col).min(num_cols.saturating_sub(1));
+        if col + span > num_cols {
+            // Doesn't fit on the current row — wrap.
+            cursor_row += if col > cursor_col || cursor_col > 0 { 1 } else { 0 };
+            col = 0;
+        }
+        let row = cursor_row;
+        cursor_col = col + span;
+        if cursor_col >= num_cols {
+            cursor_row += 1;
+            cursor_col = 0;
+        }
+
+        let w = span_width(col, span);
         if is_text(c) {
             let (b, _) = layout_anon_text(c, sn, w, cb, ctx);
-            placed.push((row, col, b));
+            placed.push((row, col, span, b));
             continue;
         }
         let bm = box_model(c, w, ctx);
+        let justify = grid_alignment_keyword(c, "justify-self");
+        let justify = if justify == "stretch" { container_justify } else { justify };
         let fw = match specified_border_width(c, Some(w), &bm, ctx) {
             Some(sw) => sw,
-            None => (w - bm.margin.horizontal()).max(0.0),
+            None if justify == "stretch" => (w - bm.margin.horizontal()).max(0.0),
+            None => {
+                let (min_c, max_c) = intrinsic_widths(c, ctx);
+                max_c.min((w - bm.margin.horizontal()).max(0.0)).max(min_c)
+            }
         };
         if let Some(out) = layout_block_level(c, 0.0, 0.0, Cb { width: w, height: None }, None, BlockOpts { forced_width: Some(fw), ..Default::default() }, ctx) {
-            placed.push((row, col, out.lb));
+            let mut b = out.lb;
+            if justify != "stretch" {
+                let extra = (w - b.margin_box_width()).max(0.0);
+                let shift = match justify {
+                    "center" => extra / 2.0,
+                    "end" => extra,
+                    _ => 0.0,
+                };
+                if shift != 0.0 {
+                    offset_layout_box(&mut b, shift, 0.0);
+                }
+            }
+            placed.push((row, col, span, b));
         }
     }
-    let num_rows = placed.iter().map(|(r, _, _)| r + 1).max().unwrap_or(0);
+    let num_rows = placed.iter().map(|(r, _, _, _)| r + 1).max().unwrap_or(0);
     let mut row_h = vec![0.0f32; num_rows];
-    for (r, _, b) in &placed {
+    for (r, _, _, b) in &placed {
         row_h[*r] = row_h[*r].max(b.margin_box_height());
     }
     for (r, h) in row_h.iter_mut().enumerate() {
@@ -4237,15 +4469,26 @@ fn layout_grid<'a>(lb: &mut LayoutBox<'a>, content_x: f32, content_y: f32, conte
         row_y.push(yy);
         yy += h + row_gap;
     }
-    for (r, c, mut b) in placed {
+    for (r, c, _span, mut b) in placed {
+        let align = grid_alignment_keyword(b.style_node, "align-self");
+        let align = if align == "stretch" { container_align } else { align };
         let x = col_x[c] + b.margin.left;
-        let y = row_y[r] + b.margin.top;
+        let extra_v = (row_h[r] - b.margin_box_height()).max(0.0);
+        let y = row_y[r]
+            + b.margin.top
+            + match align {
+                "center" => extra_v / 2.0,
+                "end" => extra_v,
+                _ => 0.0,
+            };
         let dx = x - b.dimensions.x;
         let dy = y - b.dimensions.y;
         offset_layout_box(&mut b, dx, dy);
-        let stretch_h = (row_h[r] - b.margin.vertical()).max(0.0);
-        if is_auto_height(b.style_node, ctx) && stretch_h > b.dimensions.height {
-            b.dimensions.height = stretch_h;
+        if align == "stretch" {
+            let stretch_h = (row_h[r] - b.margin.vertical()).max(0.0);
+            if is_auto_height(b.style_node, ctx) && stretch_h > b.dimensions.height {
+                b.dimensions.height = stretch_h;
+            }
         }
         lb.children.push(b);
     }
@@ -4270,35 +4513,41 @@ fn make_abs_placeholder<'a>(sn: &'a StyledNode, x: f32, y: f32, ctx: &mut Ctx) -
 /// Replace pending placeholders in `root`'s subtree whose containing block is
 /// `cb_rect` (absolute boxes; fixed boxes only when `is_viewport`).
 fn resolve_pending_abs(root: &mut LayoutBox, cb_rect: Rect, is_viewport: bool, ctx: &mut Ctx) {
-    let mut stack: Vec<*mut LayoutBox> = vec![root as *mut LayoutBox];
-    while let Some(ptr) = stack.pop() {
+    if ctx.pending_abs == 0 {
+        return;
+    }
+    resolve_pending_abs_node(root, cb_rect, is_viewport, ctx);
+}
+
+/// Recursive helper for `resolve_pending_abs`. Recursion (rather than a raw-
+/// pointer stack) is safe here because each call only ever holds one `&mut
+/// LayoutBox` at a time, borrowed from the parent's `children` vector by
+/// index; layout trees are bounded by DOM nesting depth, so this does not
+/// risk a stack overflow in practice.
+fn resolve_pending_abs_node(node: &mut LayoutBox, cb_rect: Rect, is_viewport: bool, ctx: &mut Ctx) {
+    for k in 0..node.children.len() {
         if ctx.pending_abs == 0 {
-            break;
+            return;
         }
-        // SAFETY: each pointer refers to a distinct node of the tree owned by `root`;
-        // children vectors are only modified for the node currently being visited.
-        let node = unsafe { &mut *ptr };
-        for k in 0..node.children.len() {
+        if node.children[k].abs_placeholder {
             let child = &node.children[k];
-            if child.abs_placeholder {
-                let is_fixed = child.position == PositionType::Fixed;
-                if is_fixed && !is_viewport {
-                    continue;
-                }
-                let sn = child.style_node;
-                let (sx, sy) = (child.dimensions.x, child.dimensions.y);
-                let cbr = if is_fixed { Rect { x: 0.0, y: 0.0, width: ctx.vw, height: ctx.vh } } else { cb_rect };
-                ctx.pending_abs = ctx.pending_abs.saturating_sub(1);
-                if let Some(b) = layout_abs(sn, sx, sy, cbr, ctx) {
-                    node.children[k] = b;
-                } else {
-                    let mut empty = LayoutBox::new(sn);
-                    empty.dimensions = Rect { x: sx, y: sy, width: 0.0, height: 0.0 };
-                    node.children[k] = empty;
-                }
-            } else {
-                stack.push(&mut node.children[k] as *mut LayoutBox);
+            let is_fixed = child.position == PositionType::Fixed;
+            if is_fixed && !is_viewport {
+                continue;
             }
+            let sn = child.style_node;
+            let (sx, sy) = (child.dimensions.x, child.dimensions.y);
+            let cbr = if is_fixed { Rect { x: 0.0, y: 0.0, width: ctx.vw, height: ctx.vh } } else { cb_rect };
+            ctx.pending_abs = ctx.pending_abs.saturating_sub(1);
+            if let Some(b) = layout_abs(sn, sx, sy, cbr, ctx) {
+                node.children[k] = b;
+            } else {
+                let mut empty = LayoutBox::new(sn);
+                empty.dimensions = Rect { x: sx, y: sy, width: 0.0, height: 0.0 };
+                node.children[k] = empty;
+            }
+        } else {
+            resolve_pending_abs_node(&mut node.children[k], cb_rect, is_viewport, ctx);
         }
     }
 }
@@ -7515,6 +7764,153 @@ mod tests {
             "Row 2 should be below row 1: c.y={}, a.y={}",
             c.dimensions.y, a.dimensions.y
         );
+    }
+
+    /// The yunseong.dev hero regression: `132px minmax(0, 1fr)` must give the
+    /// second column essentially all the remaining space, not collapse to
+    /// zero (which forced its text to wrap one character per line).
+    #[test]
+    fn test_grid_minmax_zero_to_1fr_fills_remaining_space() {
+        let html = r#"<div id="grid">
+            <div id="a">A</div>
+            <div id="b">Some longer text that must wrap normally across the column, not one character per line.</div>
+        </div>"#;
+        let css_src = "#grid { display: grid; grid-template-columns: 132px minmax(0, 1fr); }";
+        let (layout, _, _) = layout_from_html_css(html, css_src, 800.0, 600.0);
+
+        let a = find_element_by_id(&layout, "a").expect("cell A");
+        let b = find_element_by_id(&layout, "b").expect("cell B");
+
+        assert!(
+            (a.dimensions.width - 132.0).abs() < 2.0,
+            "fixed column A should be 132px, got {}",
+            a.dimensions.width
+        );
+        assert!(
+            b.dimensions.width > 600.0,
+            "minmax(0, 1fr) column B should fill remaining space (>600px), got {}",
+            b.dimensions.width
+        );
+    }
+
+    /// `minmax(100px, 300px)` (both operands fixed) clamps the track's size;
+    /// since we don't measure per-item content contributions, this
+    /// approximates to the max operand — but it must not collapse to 0 and
+    /// must stay within [min, max].
+    #[test]
+    fn test_grid_minmax_fixed_both_operands() {
+        let html = r#"<div id="grid">
+            <div id="a">A</div>
+            <div id="b">B</div>
+        </div>"#;
+        let css_src = "#grid { display: grid; grid-template-columns: minmax(100px, 300px) 1fr; }";
+        let (layout, _, _) = layout_from_html_css(html, css_src, 800.0, 600.0);
+        let a = find_element_by_id(&layout, "a").expect("cell A");
+        assert!(
+            a.dimensions.width >= 100.0 - 1.0 && a.dimensions.width <= 300.0 + 1.0,
+            "minmax(100px, 300px) column should be within [100, 300], got {}",
+            a.dimensions.width
+        );
+    }
+
+    #[test]
+    fn test_grid_fit_content_caps_track_width() {
+        let html = r#"<div id="grid">
+            <div id="a">A</div>
+            <div id="b">B</div>
+        </div>"#;
+        let css_src = "#grid { display: grid; grid-template-columns: fit-content(150px) 1fr; }";
+        let (layout, _, _) = layout_from_html_css(html, css_src, 800.0, 600.0);
+        let a = find_element_by_id(&layout, "a").expect("cell A");
+        assert!(
+            a.dimensions.width <= 150.0 + 1.0,
+            "fit-content(150px) column must not exceed 150px, got {}",
+            a.dimensions.width
+        );
+    }
+
+    /// `align-items: center` must vertically center a shorter grid item
+    /// within its (taller) row, instead of stretching or top-aligning it.
+    #[test]
+    fn test_grid_align_items_center() {
+        let html = r#"<div id="grid">
+            <div id="short">S</div>
+            <div id="tall" style="height:200px">Tall</div>
+        </div>"#;
+        let css_src = "#grid { display: grid; grid-template-columns: 1fr 1fr; align-items: center; }";
+        let (layout, _, _) = layout_from_html_css(html, css_src, 800.0, 600.0);
+        let short = find_element_by_id(&layout, "short").expect("short cell");
+        let tall = find_element_by_id(&layout, "tall").expect("tall cell");
+
+        // The short item should be vertically centered within the 200px row,
+        // i.e. its top should be well below the row's top edge and its
+        // bottom well above the row's bottom edge.
+        let row_top = tall.dimensions.y;
+        let row_bottom = tall.dimensions.y + tall.dimensions.height;
+        assert!(
+            short.dimensions.y > row_top + 10.0,
+            "centered short item should not be flush with row top: short.y={}, row_top={}",
+            short.dimensions.y, row_top
+        );
+        assert!(
+            short.dimensions.y + short.dimensions.height < row_bottom - 10.0,
+            "centered short item should not be flush with row bottom: short bottom={}, row_bottom={}",
+            short.dimensions.y + short.dimensions.height, row_bottom
+        );
+    }
+
+    /// `grid-column: span 2` makes an item occupy both columns of a 2-column
+    /// grid, so the next auto-placed item has no room left and wraps to the
+    /// next row.
+    #[test]
+    fn test_grid_column_span_two() {
+        let html = r#"<div id="grid">
+            <div id="wide" style="grid-column: span 2">Wide</div>
+            <div id="next">Next</div>
+        </div>"#;
+        let css_src = "#grid { display: grid; grid-template-columns: 1fr 1fr; }";
+        let (layout, _, _) = layout_from_html_css(html, css_src, 900.0, 600.0);
+        let wide = find_element_by_id(&layout, "wide").expect("wide cell");
+        let next = find_element_by_id(&layout, "next").expect("next cell");
+
+        assert!(
+            wide.dimensions.width > 850.0,
+            "span-2 item should cover the full 900px grid width, got {}",
+            wide.dimensions.width
+        );
+        assert!(
+            next.dimensions.y > wide.dimensions.y + 1.0,
+            "item after a span-2 that doesn't fit the row should wrap to the next row"
+        );
+    }
+
+    /// `repeat(auto-fit, minmax(200px, 1fr))` should produce more columns in
+    /// a wider container than in a narrower one.
+    #[test]
+    fn test_grid_repeat_auto_fit_column_count_scales_with_width() {
+        let html = r#"<div id="grid">
+            <div class="c">1</div><div class="c">2</div><div class="c">3</div>
+            <div class="c">4</div><div class="c">5</div><div class="c">6</div>
+        </div>"#;
+        let css_src = "#grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }";
+
+        let (narrow, _, _) = layout_from_html_css(html, css_src, 420.0, 600.0);
+        let (wide, _, _) = layout_from_html_css(html, css_src, 900.0, 600.0);
+
+        // In the 420px container, at most 2 columns of >=200px fit; in the
+        // 900px container, at least 4 do. Compare the y position of the 3rd
+        // item: in the narrow layout it should have wrapped to a new row
+        // (higher y) while in the wide layout it should stay on row 1 (same
+        // y as the 1st item).
+        let wide_grid = find_element_by_id(&wide, "grid").expect("grid (wide)");
+        let wide_third_y = wide_grid.children.get(2).map(|c| c.dimensions.y);
+        let wide_first_y = wide_grid.children.first().map(|c| c.dimensions.y);
+        assert_eq!(wide_third_y, wide_first_y, "wide container should fit 3+ columns on one row");
+
+        let narrow_grid = find_element_by_id(&narrow, "grid").expect("grid (narrow)");
+        let narrow_third_y = narrow_grid.children.get(2).map(|c| c.dimensions.y);
+        let narrow_first_y = narrow_grid.children.first().map(|c| c.dimensions.y);
+        assert_ne!(narrow_third_y, narrow_first_y, "narrow container should wrap before a 3rd column");
     }
 
     // ── Layout rewrite: feature tests ─────────────────────────────────────────

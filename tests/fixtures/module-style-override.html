@@ -4,9 +4,10 @@
 
 <script type="module">
   window.__results = [];
-  __aura_set_style('test', 'color', 'red');
-  __aura_set_style('test', 'font-size', '24px');
-  __aura_set_style('test', 'display', 'none');
+  var target = document.getElementById('test');
+  target.style.color = 'red';
+  target.style.fontSize = '24px';
+  target.style.display = 'none';
   window.__results.push({phase: 'style-override', value: 'set'});
 </script>
 </body></html>

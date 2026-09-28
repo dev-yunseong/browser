@@ -759,14 +759,74 @@ fn find_ci(hay: &str, needle: &str) -> Option<usize> {
 
 // ── Decoded image cache ───────────────────────────────────────────────────────
 
+type DecodedKey = (String, usize, u32, u32);
+type DecodedValue = Option<Arc<tiny_skia::Pixmap>>;
+
+/// Byte size of one cached (possibly absent) decoded pixmap.
+fn decoded_value_bytes(value: &DecodedValue) -> usize {
+    value.as_ref().map(|p| p.width() as usize * p.height() as usize * 4).unwrap_or(0)
+}
+
+/// A decoded-image cache bounded by total decoded bytes rather than entry
+/// count: a handful of large sprite sheets could otherwise blow well past a
+/// naive entry-count budget. Oldest-inserted entries are evicted first once
+/// the budget is exceeded.
+struct DecodedCache {
+    map: std::collections::HashMap<DecodedKey, DecodedValue>,
+    order: std::collections::VecDeque<DecodedKey>,
+    bytes: usize,
+}
+
+impl DecodedCache {
+    fn new() -> Self {
+        Self { map: std::collections::HashMap::new(), order: std::collections::VecDeque::new(), bytes: 0 }
+    }
+
+    fn get(&self, key: &DecodedKey) -> Option<DecodedValue> {
+        self.map.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: DecodedKey, value: DecodedValue) {
+        // A repeated key (e.g. a concurrent decode of the same image) would
+        // otherwise double-count its bytes and leave a stale `order` entry.
+        if let Some(old) = self.map.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(decoded_value_bytes(&old));
+            self.order.retain(|k| k != &key);
+        }
+        self.bytes += decoded_value_bytes(&value);
+        self.map.insert(key.clone(), value);
+        self.order.push_back(key);
+        while self.bytes > DECODED_CACHE_MAX_BYTES {
+            let Some(oldest) = self.order.pop_front() else { break };
+            if let Some(evicted) = self.map.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(decoded_value_bytes(&evicted));
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+        self.bytes = 0;
+    }
+}
+
 lazy_static::lazy_static! {
     /// Decoded, premultiplied images keyed by `(url, byte length, target w, target h)`.
     /// Target `(0, 0)` means intrinsic size.
-    static ref DECODED: std::sync::Mutex<std::collections::HashMap<(String, usize, u32, u32), Option<Arc<tiny_skia::Pixmap>>>> =
-        std::sync::Mutex::new(std::collections::HashMap::new());
+    static ref DECODED: std::sync::Mutex<DecodedCache> = std::sync::Mutex::new(DecodedCache::new());
 }
 
-const DECODED_CACHE_MAX_ENTRIES: usize = 512;
+/// Total decoded-image bytes kept before older entries are evicted.
+const DECODED_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// Evict every decoded image from the cache. Called on navigation so a
+/// previous page's decoded images do not linger in memory.
+pub fn clear_decoded_image_cache() {
+    if let Ok(mut cache) = DECODED.lock() {
+        cache.clear();
+    }
+}
 
 /// Convert straight-alpha RGBA bytes to the premultiplied form tiny-skia expects.
 pub fn premultiply_rgba_in_place(data: &mut [u8]) {
@@ -845,7 +905,7 @@ fn area_downscale(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
 pub fn decoded_image(url: &str, bytes: &[u8], target: Option<(u32, u32)>) -> Option<Arc<tiny_skia::Pixmap>> {
     let (tw, th) = target.unwrap_or((0, 0));
     let key = (url.to_string(), bytes.len(), tw, th);
-    if let Some(hit) = DECODED.lock().ok().and_then(|c| c.get(&key).cloned()) {
+    if let Some(hit) = DECODED.lock().ok().and_then(|c| c.get(&key)) {
         return hit;
     }
     let result = (|| {
@@ -860,9 +920,6 @@ pub fn decoded_image(url: &str, bytes: &[u8], target: Option<(u32, u32)>) -> Opt
         tiny_skia::Pixmap::from_vec(resized, tiny_skia::IntSize::from_wh(tw, th)?).map(Arc::new)
     })();
     if let Ok(mut c) = DECODED.lock() {
-        if c.len() >= DECODED_CACHE_MAX_ENTRIES {
-            c.clear();
-        }
         c.insert(key, result.clone());
     }
     result
@@ -1055,5 +1112,26 @@ mod tests {
         assert_eq!((layers[0].repeat_x, layers[0].repeat_y), (true, false));
         assert_eq!(layers[1].image, LayerImage::Url("top.png".into()));
         assert_eq!((layers[1].repeat_x, layers[1].repeat_y), (false, false));
+    }
+
+    /// The decoded-image cache is bounded by total decoded bytes, not entry
+    /// count: once the budget is exceeded, the oldest-inserted entries are
+    /// evicted first so a handful of large sprite sheets cannot grow the
+    /// cache without bound.
+    #[test]
+    fn test_decoded_cache_evicts_oldest_once_over_budget() {
+        let mut cache = DecodedCache::new();
+        // Each 4096x4096 pixmap is 64 MiB; five of them (320 MiB) exceed the
+        // 256 MiB budget, so the oldest must be evicted.
+        for i in 0..5u32 {
+            let pixmap = Arc::new(tiny_skia::Pixmap::new(4096, 4096).unwrap());
+            cache.insert((format!("img{i}"), 0, 0, 0), Some(pixmap));
+        }
+        assert!(cache.bytes <= DECODED_CACHE_MAX_BYTES, "cache stayed within its byte budget");
+        assert!(cache.get(&("img0".to_string(), 0, 0, 0)).is_none(), "oldest entry was evicted");
+        assert!(cache.get(&("img4".to_string(), 0, 0, 0)).is_some(), "newest entry was kept");
+        cache.clear();
+        assert_eq!(cache.bytes, 0);
+        assert!(cache.get(&("img4".to_string(), 0, 0, 0)).is_none());
     }
 }

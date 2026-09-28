@@ -2,12 +2,7 @@
 // (Loaded at compile-time via include_bytes! in js.rs)
 
 // -- Tracking state ----------------------------------------------------------
-var __aura_style_log = [];
 var __aura_inner_html_log = [];
-
-function __aura_set_style(id, prop, value) {
-    __aura_style_log.push(id + '||||' + prop + '||||' + value);
-}
 
 function __aura_url_parts(href) {
     var value = String(href || '');
@@ -1440,7 +1435,6 @@ class CSSStyleDeclaration {
         }
         entry.value = value;
         entry.priority = priority;
-        if (this._ownerId !== null) __aura_set_style(this._ownerId, name, value);
         if (!this._batching) this._writeBack();
     }
     removeProperty(name) {
@@ -1449,7 +1443,6 @@ class CSSStyleDeclaration {
         let old = this.getPropertyValue(name);
         let had = this._props.length;
         this._props = this._props.filter(entry => entry.name !== name);
-        if (this._ownerId !== null) __aura_set_style(this._ownerId, name, '');
         if (!this._batching && this._props.length !== had) this._writeBack();
         return old;
     }
@@ -2144,9 +2137,15 @@ class Element extends Node {
     for (var i = 0; i < handlers.length; i++) {
         (function(name) {
             var key = '_' + name;
+            // Configurable like WebIDL attributes: a page script's global
+            // `function onclick() {}` must be able to replace the accessor
+            // (a non-configurable one makes V8 throw "Identifier 'onclick'
+            // has already been declared").
             defs[name] = {
                 get: function() { return this[key] || null; },
-                set: function(fn) { this[key] = fn; }
+                set: function(fn) { this[key] = fn; },
+                configurable: true,
+                enumerable: true
             };
         })(handlers[i]);
     }
@@ -3479,6 +3478,16 @@ function __aura_timers_begin_turn() {
     __aura_timer_turn_limit = __aura_timer_seq;
 }
 
+// Milliseconds until the earliest pending timer is due (0 when one is
+// overdue), or -1 when no timer is pending.
+function __aura_next_timer_delay() {
+    let due = Infinity;
+    for (const timer of __aura_timers.values()) {
+        if (timer.due < due) due = timer.due;
+    }
+    return due === Infinity ? -1 : Math.max(0, due - performance.now());
+}
+
 function __aura_run_next_due_timer() {
     let now = performance.now();
     let next = null;
@@ -4322,26 +4331,52 @@ class Location {
         document.documentURI = this.href;
         document.baseURI = this.href;
     }
+    // Ask the engine to load `value` (resolved against the current URL). A
+    // change to only the fragment stays in this document: it updates the
+    // URL, adds a history entry unless `replace`, and fires `hashchange`.
+    _navigate(value, replace) {
+        var target;
+        try { target = new URL(String(value), this.href); } catch (e) { return; }
+        var oldURL = this.href;
+        if (target.hash && target.href.split('#')[0] === oldURL.split('#')[0]) {
+            if (target.href === oldURL) return;
+            if (replace) {
+                window.history.replaceState(window.history.state, '', target.href);
+            } else {
+                window.history.pushState(null, '', target.href);
+            }
+            window.dispatchEvent(new HashChangeEvent('hashchange', { oldURL: oldURL, newURL: target.href }));
+            return;
+        }
+        if (typeof __aura_navigate === 'function') __aura_navigate(target.href, !!replace);
+    }
+    // A copy of the current URL with one component changed, then navigated to.
+    _navigateWith(component, value) {
+        var next = new URL(this.href);
+        next[component] = value;
+        next._reparse();
+        this._navigate(next.href, false);
+    }
     get href() { return this._url.href; }
-    set href(value) { this._setHref(String(value), this.href); }
+    set href(value) { this._navigate(value, false); }
     get protocol() { return this._url.protocol; }
-    set protocol(value) { this._url.protocol = value; this._url._reparse(); this._setHref(this._url.href); }
+    set protocol(value) { this._navigateWith('protocol', value); }
     get host() { return this._url.host; }
-    set host(value) { this._url.host = value; this._url._reparse(); this._setHref(this._url.href); }
+    set host(value) { this._navigateWith('host', value); }
     get hostname() { return this._url.hostname; }
-    set hostname(value) { this._url.hostname = value; this._url._reparse(); this._setHref(this._url.href); }
+    set hostname(value) { this._navigateWith('hostname', value); }
     get port() { return this._url.port; }
-    set port(value) { this._url.port = value; this._url._reparse(); this._setHref(this._url.href); }
+    set port(value) { this._navigateWith('port', value); }
     get pathname() { return this._url.pathname; }
-    set pathname(value) { this._url.pathname = value; this._url._reparse(); this._setHref(this._url.href); }
+    set pathname(value) { this._navigateWith('pathname', value); }
     get search() { return this._url.search; }
-    set search(value) { this._url.search = value; this._url._reparse(); this._setHref(this._url.href); }
+    set search(value) { this._navigateWith('search', value); }
     get hash() { return this._url.hash; }
-    set hash(value) { this._url.hash = value; this._url._reparse(); this._setHref(this._url.href); }
+    set hash(value) { this._navigateWith('hash', value); }
     get origin() { return this._url.origin; }
-    assign(url) { this.href = new URL(String(url), this.href).href; }
-    replace(url) { this.assign(url); }
-    reload() {}
+    assign(url) { this._navigate(url, false); }
+    replace(url) { this._navigate(url, true); }
+    reload() { if (typeof __aura_navigate === 'function') __aura_navigate(this.href, true); }
     toString() { return this.href; }
 }
 
@@ -4755,18 +4790,53 @@ class HTMLFormElement extends HTMLElement {
         });
     }
 
+    // Navigate to the form's action with its successful controls as an
+    // `application/x-www-form-urlencoded` query. Like form.submit(), this
+    // fires no `submit` event. A POST body cannot be sent yet, so a POST
+    // form loads its action URL with a GET.
     submit() {
-        var event = new Event('submit', { bubbles: true, cancelable: true });
-        var dispatched = this.dispatchEvent(event);
-        if (dispatched && typeof __aura_submit_form === 'function') {
-            __aura_submit_form(this._id);
+        this._navigateToAction(null);
+    }
+
+    _navigateToAction(submitter) {
+        if (typeof __aura_navigate !== 'function') return;
+        var action = this.getAttribute('action') || '';
+        var method = (this.getAttribute('method') || 'get').toLowerCase();
+        var target;
+        try { target = new URL(action || location.href, location.href); } catch (e) { return; }
+        var encode = function(text) {
+            return encodeURIComponent(String(text)).replace(/%20/g, '+');
+        };
+        var pairs = [];
+        var controls = this.elements;
+        for (var i = 0; i < controls.length; i++) {
+            var node = controls[i];
+            if (!node) continue;
+            var name = node.getAttribute('name');
+            if (!name || node.hasAttribute('disabled')) continue;
+            var tag = node.tagName;
+            var type = (node.getAttribute('type') || '').toLowerCase();
+            if (tag === 'BUTTON' || (tag === 'INPUT' && (type === 'submit' || type === 'button' || type === 'reset' || type === 'image'))) {
+                if (node !== submitter) continue;
+            }
+            if (tag === 'INPUT' && (type === 'checkbox' || type === 'radio') && !node.checked) continue;
+            if (tag === 'INPUT' && type === 'file') continue;
+            var value = node.value;
+            if ((type === 'checkbox' || type === 'radio') && !node.hasAttribute('value')) value = 'on';
+            pairs.push(encode(name) + '=' + encode(value === undefined || value === null ? '' : value));
         }
+        if (method === 'get') {
+            target.search = pairs.length ? '?' + pairs.join('&') : '';
+            target.hash = '';
+            target._reparse();
+        }
+        __aura_navigate(target.href, false);
     }
 
     reset() {
-        var controls = this._controls();
+        var controls = this.elements;
         for (var i = 0; i < controls.length; i++) {
-            var node = __get_or_create_node(controls[i].nid, controls[i].tag, controls[i].id, controls[i].kind);
+            var node = controls[i];
             if (!node) continue;
             if (node.tagName === 'INPUT' || node.tagName === 'TEXTAREA') {
                 node.value = node.defaultValue;
@@ -4787,7 +4857,7 @@ class HTMLFormElement extends HTMLElement {
         }
         var dispatched = this.dispatchEvent(event);
         if (dispatched) {
-            this.submit();
+            this._navigateToAction(submitter || null);
         }
     }
 }

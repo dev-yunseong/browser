@@ -82,8 +82,19 @@ thread_local! {
     /// Prevents re-compilation of the same module in cyclic import graphs.
     static RESOLVED_MODULES: RefCell<HashMap<String, v8::Global<v8::Module>>> =
         RefCell::new(HashMap::new());
-    /// Pending form submission requests from JS — checked by engine.
-    static FORM_SUBMIT_REQUESTS: RefCell<Vec<u32>> = RefCell::new(Vec::new());
+    /// Document navigation requested by page script (`location.href = …`,
+    /// `location.assign/replace/reload`, `form.submit()`). The last request
+    /// wins; the engine takes it after running script.
+    static NAVIGATION_REQUEST: RefCell<Option<NavigationRequest>> = const { RefCell::new(None) };
+}
+
+/// A document navigation requested by page script.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NavigationRequest {
+    /// Absolute URL to load.
+    pub url: String,
+    /// Replace the current session history entry instead of adding one.
+    pub replace: bool,
 }
 
 thread_local! {
@@ -543,7 +554,7 @@ impl Default for ScrollState {
             document_width: 0.0,
             document_height: 0.0,
             viewport_width: 800.0,
-            viewport_height: 600.0,
+            viewport_height: crate::engine::DEFAULT_VIEWPORT_HEIGHT as f64,
         }
     }
 }
@@ -796,6 +807,7 @@ impl JsRuntime {
         LAYOUT_METRICS.with(|metrics| *metrics.borrow_mut() = layout_metrics.unwrap_or_default());
         SCROLL_STATE.with(|state| *state.borrow_mut() = ScrollState::default());
         CONSOLE_BUFFER.with(|cell| *cell.borrow_mut() = Some(console_buffer));
+        NAVIGATION_REQUEST.with(|request| *request.borrow_mut() = None);
 
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| {
@@ -1006,6 +1018,45 @@ impl JsRuntime {
 
     /// Call a global zero-argument JS function and report whether it
     /// returned `true`. Missing functions and exceptions count as `false`.
+    /// How long the event loop can sleep before it has work that is not
+    /// queued yet: until the earliest timer is due, or a short poll interval
+    /// while a fetch is in flight. `None` when nothing is pending, so a
+    /// caller can wait for input.
+    pub fn next_wake(&mut self) -> Option<std::time::Duration> {
+        const FETCH_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+        let queued = MACRO_TASKS.with(|tasks| !tasks.borrow().is_empty())
+            || RAF_TASKS.with(|tasks| !tasks.borrow().is_empty());
+        if queued {
+            return Some(std::time::Duration::ZERO);
+        }
+        let timer = self
+            .call_global_number("__aura_next_timer_delay")
+            .filter(|ms| *ms >= 0.0)
+            .map(|ms| std::time::Duration::from_secs_f64(ms / 1000.0));
+        let fetching = FETCH_REGISTRY.with(|registry| !registry.borrow().is_empty());
+        match (timer, fetching) {
+            (Some(timer), true) => Some(timer.min(FETCH_POLL)),
+            (Some(timer), false) => Some(timer),
+            (None, true) => Some(FETCH_POLL),
+            (None, false) => None,
+        }
+    }
+
+    fn call_global_number(&mut self, name: &str) -> Option<f64> {
+        let hs = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
+        let hs = &mut hs.init();
+        let local_context = v8::Local::new(hs, &self.global_context);
+        let scope = &mut v8::ContextScope::new(hs, local_context);
+        let tc = std::pin::pin!(v8::TryCatch::new(scope));
+        let tc = &mut tc.init();
+        let global = local_context.global(tc);
+        let key = v8::String::new(tc, name)?;
+        let value = global.get(tc, key.into())?;
+        let func = v8::Local::<v8::Function>::try_from(value).ok()?;
+        let undef = v8::undefined(tc);
+        func.call(tc, undef.into(), &[])?.number_value(tc)
+    }
+
     fn call_global_bool(&mut self, name: &str) -> bool {
         let hs = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
         let hs = &mut hs.init();
@@ -1658,44 +1709,6 @@ impl JsRuntime {
         Ok(specifiers)
     }
 
-    pub fn get_style_overrides(&mut self) -> HashMap<String, HashMap<String, String>> {
-        let mut result = HashMap::new();
-        let hs = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
-        let hs = &mut hs.init();
-        let local_context = v8::Local::new(hs, &self.global_context);
-        let scope = &mut v8::ContextScope::new(hs, local_context);
-        {
-            let tc = std::pin::pin!(v8::TryCatch::new(scope));
-            let tc = &mut tc.init();
-            let src = v8::String::new(tc, "__aura_style_log.join('####')").unwrap();
-            if let Some(script) = v8::Script::compile(tc, src, None) {
-                if let Some(val) = script.run(tc) {
-                    if let Some(s) = val.to_string(tc) {
-                        let s_std = s.to_rust_string_lossy(tc);
-                        for entry in s_std.split("####") {
-                            let parts: Vec<&str> = entry.splitn(3, "||||").collect();
-                            if parts.len() == 3 && !parts[0].is_empty() {
-                                result
-                                    .entry(parts[0].to_string())
-                                    .or_insert_with(HashMap::new)
-                                    .insert(parts[1].to_string(), parts[2].to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        {
-            let tc2 = std::pin::pin!(v8::TryCatch::new(scope));
-            let tc2 = &mut tc2.init();
-            let clear = v8::String::new(tc2, "__aura_style_log = [];").unwrap();
-            if let Some(script) = v8::Script::compile(tc2, clear, None) {
-                let _ = script.run(tc2);
-            }
-        }
-        result
-    }
-
     /// Current document scroll state (position and clamping ranges).
     pub fn scroll_state(&self) -> ScrollState {
         SCROLL_STATE.with(|state| *state.borrow())
@@ -1717,6 +1730,12 @@ impl JsRuntime {
         viewport_width: f32,
         viewport_height: f32,
     ) {
+        let resized = SCROLL_STATE.with(|state| {
+            let state = state.borrow();
+            // The first layout only sets the size; later changes are resizes.
+            state.document_width > 0.0
+                && (state.viewport_width != viewport_width as f64 || state.viewport_height != viewport_height as f64)
+        });
         let moved = SCROLL_STATE.with(|state| {
             let mut state = state.borrow_mut();
             state.document_width = document_width as f64;
@@ -1732,12 +1751,13 @@ impl JsRuntime {
         if moved {
             self.execute("if (typeof __aura_queue_scroll_event === 'function') __aura_queue_scroll_event();");
         }
-    }
-
-    /// Scroll the document as `window.scrollTo(x, y)` would (clamped, and
-    /// queues a `scroll` event when the position changes).
-    pub fn scroll_to(&mut self, x: f32, y: f32) {
-        self.execute(&format!("window.scrollTo({}, {});", x, y));
+        if resized {
+            self.execute(&format!(
+                "window.innerWidth = window.outerWidth = {viewport_width}; \
+                 window.innerHeight = window.outerHeight = {viewport_height}; \
+                 window.dispatchEvent(new Event('resize'));"
+            ));
+        }
     }
 
     pub fn get_focused_node_id(&self) -> Option<String> {
@@ -1748,8 +1768,9 @@ impl JsRuntime {
         FOCUSED_NODE.with(|f| *f.borrow_mut() = id);
     }
 
-    pub fn take_form_submit_requests(&mut self) -> Vec<u32> {
-        FORM_SUBMIT_REQUESTS.with(|r| r.borrow_mut().drain(..).collect())
+    /// Take the navigation page script requested since the last call.
+    pub fn take_navigation_request(&mut self) -> Option<NavigationRequest> {
+        NAVIGATION_REQUEST.with(|request| request.borrow_mut().take())
     }
 }
 
@@ -1928,7 +1949,7 @@ fn register_native_functions(
     register_fn(scope, global, "requestAnimationFrame", raf_cb);
     register_fn(scope, global, "requestIdleCallback", ric_cb);
     register_fn(scope, global, "cancelIdleCallback", cic_cb);
-    register_fn(scope, global, "__aura_submit_form", submit_form_cb);
+    register_fn(scope, global, "__aura_navigate", navigate_cb);
     register_fn(
         scope,
         global,
@@ -3071,15 +3092,27 @@ fn set_focus_cb(
         FOCUSED_NODE.with(|f| *f.borrow_mut() = Some(id));
     }
 }
-fn submit_form_cb(
+/// `__aura_navigate(url, replace)`: record a document navigation for the
+/// engine. Only http(s) and file URLs load a new document.
+fn navigate_cb(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
-    let nid = args.get(0).uint32_value(scope).unwrap_or(0);
-    if nid > 0 {
-        FORM_SUBMIT_REQUESTS.with(|r| r.borrow_mut().push(nid));
+    let url = args.get(0).to_rust_string_lossy(scope);
+    let replace = args.get(1).boolean_value(scope);
+    let Ok(parsed) = Url::parse(&url) else {
+        return;
+    };
+    if !matches!(parsed.scheme(), "http" | "https" | "file") {
+        return;
     }
+    NAVIGATION_REQUEST.with(|request| {
+        *request.borrow_mut() = Some(NavigationRequest {
+            url: parsed.to_string(),
+            replace,
+        })
+    });
 }
 fn queue_task_cb(
     scope: &mut v8::PinScope,
@@ -3301,8 +3334,14 @@ fn storage_clear_cb(
 }
 /// `BROWSER_DEBUG_FETCH=1` logs every script-initiated fetch/XHR with its
 /// status to stderr, which is how failed page API calls are diagnosed.
+/// The variable is read once per process.
 fn debug_fetch_enabled() -> bool {
-    std::env::var("BROWSER_DEBUG_FETCH").map(|v| !v.is_empty() && v != "0").unwrap_or(false)
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BROWSER_DEBUG_FETCH")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
 }
 
 fn fetch_cb(
@@ -3405,12 +3444,11 @@ fn fetch_cb(
                         let response_url = response.url().to_string();
                         let status = response.status().as_u16();
                         let status_text = response.status().canonical_reason().unwrap_or("").to_string();
+                        let acao = response.headers().get("access-control-allow-origin").and_then(|h| h.to_str().ok());
                         if debug_fetch_enabled() {
-                            let acao = response.headers().get("access-control-allow-origin").and_then(|h| h.to_str().ok());
                             eprintln!("[FETCH] {} {} -> {} (cross_origin={}, acao={:?})", method, target_url, status, is_cross_origin, acao);
                         }
                         if is_cross_origin && !bypass_cors {
-                            let acao = response.headers().get("access-control-allow-origin").and_then(|h| h.to_str().ok());
                             let allowed = match acao { Some("*") => true, Some(val) if val == origin_str => true, _ => false };
                             if !allowed {
                                 let _ = sender_clone.send(Box::new(move || {
@@ -4554,7 +4592,7 @@ mod tests {
         );
         let outcome = rt.execute_with_result(
             "document.search.onsubmit = function(e) { e.preventDefault(); window.__documentSearchSubmit = true; }; \
-             document.search.submit(); \
+             document.search.requestSubmit(); \
              window.__documentSearchSubmit",
         );
         assert_eq!(outcome.error, None);
@@ -4569,7 +4607,7 @@ mod tests {
         );
         let outcome = rt.execute_with_result(
             "window.search.onsubmit = function(e) { e.preventDefault(); window.__windowSearchSubmit = true; }; \
-             window.search.submit(); \
+             window.search.requestSubmit(); \
              window.__windowSearchSubmit",
         );
         assert_eq!(outcome.error, None);
@@ -4622,11 +4660,71 @@ mod tests {
         rt.execute(
             "var form = document.getElementById('f'); \
              form.onsubmit = function(e) { e.preventDefault(); window.__formSubmitted = true; }; \
-             form.submit();",
+             form.requestSubmit();",
         );
         let outcome = rt.execute_with_result("window.__formSubmitted");
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.result.as_deref(), Some("true"));
+        // The handler cancelled the submission.
+        assert_eq!(rt.take_navigation_request(), None);
+    }
+
+    #[test]
+    fn test_global_function_can_shadow_event_handler_attribute() {
+        // news.ycombinator.com's hn.js declares `function onclick (ev)`.
+        let mut rt = make_dom_runtime("<html><body></body></html>", "https://example.com/");
+        let outcome = rt.execute_with_result(
+            "function onclick (ev) { return 'page'; } \
+             document.addEventListener('click', onclick); onclick()",
+        );
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("page"));
+    }
+
+    #[test]
+    fn test_form_submit_skips_submit_event_and_navigates() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><form id='f' action='/find'><input name='q' value='a b'>
+               <input type='checkbox' name='c'><input type='checkbox' name='d' checked>
+               <input name='off' disabled value='x'><button name='go' value='1'>Go</button></form></body></html>"#,
+            "https://example.com/start",
+        );
+        let outcome = rt.execute_with_result(
+            "var form = document.getElementById('f'); window.__fired = false; \
+             form.onsubmit = function() { window.__fired = true; }; \
+             form.submit(); window.__fired",
+        );
+        assert_eq!(outcome.result.as_deref(), Some("false"));
+        assert_eq!(
+            rt.take_navigation_request(),
+            Some(NavigationRequest {
+                url: "https://example.com/find?q=a+b&d=on".to_string(),
+                replace: false,
+            })
+        );
+    }
+
+    #[test]
+    fn test_location_assign_and_replace_request_navigation() {
+        let mut rt = make_dom_runtime("<html><body></body></html>", "https://example.com/a/b");
+        rt.execute("location.assign('c?x=1')");
+        assert_eq!(
+            rt.take_navigation_request(),
+            Some(NavigationRequest {
+                url: "https://example.com/a/c?x=1".to_string(),
+                replace: false,
+            })
+        );
+        rt.execute("location.replace('https://other.test/')");
+        assert_eq!(
+            rt.take_navigation_request().map(|r| (r.url, r.replace)),
+            Some(("https://other.test/".to_string(), true))
+        );
+        // The document's own URL does not change until the engine loads it.
+        let outcome = rt.execute_with_result("location.href");
+        assert_eq!(outcome.result.as_deref(), Some("https://example.com/a/b"));
+        rt.execute("location.href = 'javascript:void(0)'");
+        assert_eq!(rt.take_navigation_request(), None);
     }
 
     #[test]
@@ -5052,7 +5150,8 @@ mod tests {
         assert_eq!(outcome.error, None);
         let val: serde_json::Value = serde_json::from_str(outcome.result.as_deref().unwrap()).unwrap();
         assert_eq!(val["data"], "hello");
-        assert_eq!(val["origin"], "*");
+        // event.origin is the sender's origin, not the targetOrigin argument.
+        assert_eq!(val["origin"], "https://example.com");
 
         // 4. Verify global window postMessage works similarly
         rt.execute(
