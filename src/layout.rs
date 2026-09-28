@@ -927,6 +927,8 @@ impl<'a> LayoutBox<'a> {
                 match name.as_str() {
                     "href" if tag == "a" => layout.link_url = Some(value),
                     "src" if tag == "img" => layout.image_url = Some(value),
+                    // A video shows its poster until it plays (we do not decode video).
+                    "poster" if tag == "video" && !value.trim().is_empty() => layout.image_url = Some(value),
                     "alt" if tag == "img" => layout.alt_text = Some(value),
                     "onclick" => {
                         layout.event_handlers.insert("click".to_string(), value);
