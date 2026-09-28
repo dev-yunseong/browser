@@ -2877,6 +2877,13 @@ mod tests {
     }
 
     #[test]
+    fn test_transform_functions_without_whitespace() {
+        let ops = parse_transform_list("translate(-50%,-50%)rotate(45deg)");
+        assert_eq!(ops.len(), 2, "{ops:?}");
+        assert!(matches!(ops[1], TransformOp::Rotate(_)), "{ops:?}");
+    }
+
+    #[test]
     fn test_media_queries_use_the_configured_viewport() {
         set_media_viewport(1200.0, 768.0);
         let wide = parse_css("@media (max-width: 900px) { p { color: red; } }");
@@ -3129,9 +3136,43 @@ mod tests {
 }
 
 
+/// Split a transform function list into its functions. Functions may be
+/// written without whitespace between them (`translate(-50%,-50%)rotate(45deg)`).
+fn split_transform_functions(val: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    for ch in val.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+                if depth == 0 {
+                    parts.push(std::mem::take(&mut current));
+                }
+            }
+            c if c.is_whitespace() && depth == 0 => {
+                if !current.trim().is_empty() {
+                    parts.push(std::mem::take(&mut current));
+                }
+                current.clear();
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.trim().is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
 fn parse_transform_list(val: &str) -> Vec<TransformOp> {
     let mut ops = Vec::new();
-    let parts = split_respecting_parens(val);
+    let parts = split_transform_functions(val);
     for part in parts {
         let part = part.trim();
         if part.is_empty() { continue; }

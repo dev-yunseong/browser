@@ -256,7 +256,9 @@ function __aura_normalize_listener_options(options) {
 }
 
 function __aura_add_listener(target, type, callback, options) {
-    if (typeof callback !== 'function') return;
+    // A listener is a function or an object with a handleEvent method
+    // (DOM EventListener); the object's handleEvent is looked up per event.
+    if (typeof callback !== 'function' && !(callback && typeof callback === 'object')) return;
     if (!target._listeners) target._listeners = new Map();
     if (!target._listeners.has(type)) target._listeners.set(type, []);
     let normalized = __aura_normalize_listener_options(options);
@@ -312,7 +314,11 @@ function __aura_invoke_listeners(target, event, capture) {
     for (let listener of list.slice()) {
         if (event._immediateStopped) break;
         if (!!listener.capture !== !!capture) continue;
-        try { listener.callback.call(target, event); } catch(e) { console.log("Event Error: " + e); }
+        try {
+            let cb = listener.callback;
+            if (typeof cb === 'function') cb.call(target, event);
+            else if (cb && typeof cb.handleEvent === 'function') cb.handleEvent(event);
+        } catch(e) { console.log("Event Error: " + e); }
         if (listener.once) {
             __aura_remove_listener(target, event.type, listener.callback, { capture: listener.capture });
         }
@@ -1174,7 +1180,7 @@ class Node extends EventTarget {
             __aura_append_child(this._id, child._id);
             if (oldParent && oldParent !== this) __aura_child_list_mutation(oldParent, [], [child], oldPrevious, oldNext);
             if (added.length > 0) __aura_child_list_mutation(this, added, [], previous, null);
-            added.forEach(__aura_maybe_run_script);
+            added.forEach(__aura_on_node_inserted);
         }
         return child;
     }
@@ -1198,7 +1204,7 @@ class Node extends EventTarget {
             __aura_insert_before(this._id, newChild._id, refChild ? refChild._id : null);
             if (oldParent && oldParent !== this) __aura_child_list_mutation(oldParent, [], [newChild], oldPrevious, oldNext);
             if (added.length > 0) __aura_child_list_mutation(this, added, [], previous, next);
-            added.forEach(__aura_maybe_run_script);
+            added.forEach(__aura_on_node_inserted);
         }
         return newChild;
     }
@@ -1602,6 +1608,13 @@ class Attr {
         this.value = value;
         this.ownerElement = element;
     }
+    get localName() { return this.name; }
+    get nodeName() { return this.name; }
+    get nodeValue() { return this.value; }
+    get nodeType() { return 2; }
+    get namespaceURI() { return null; }
+    get prefix() { return null; }
+    get specified() { return true; }
 }
 
 class NamedNodeMap {
@@ -1641,6 +1654,11 @@ class NamedNodeMap {
     removeNamedItem(name) {
         this._element.removeAttribute(name);
     }
+    [Symbol.iterator]() {
+        let items = [];
+        for (let i = 0; i < this.length; i++) items.push(this.item(i));
+        return items[Symbol.iterator]();
+    }
 }
 
 class Element extends Node {
@@ -1660,6 +1678,30 @@ class Element extends Node {
     get classList() {
         if (!this._classList) this._classList = new DOMTokenList(this._id);
         return this._classList;
+    }
+    getAttributeNames() {
+        let attrs = typeof __aura_get_attributes === 'function'
+            ? JSON.parse(__aura_get_attributes(this._id))
+            : [];
+        return attrs.map(function(a) { return a.name; });
+    }
+    getAttributeNode(name) {
+        let value = this.getAttribute(name);
+        return value === null ? null : new Attr(this, String(name).toLowerCase(), value);
+    }
+    setAttributeNode(attr) {
+        let previous = this.getAttributeNode(attr.name);
+        this.setAttribute(attr.name, attr.value);
+        attr.ownerElement = this;
+        return previous;
+    }
+    removeAttributeNode(attr) {
+        if (!attr || !this.hasAttribute(attr.name)) {
+            throw new DOMException('The attribute is not owned by this element.', 'NotFoundError');
+        }
+        this.removeAttribute(attr.name);
+        attr.ownerElement = null;
+        return attr;
     }
     get attributes() {
         let map = new NamedNodeMap(this);
@@ -2354,6 +2396,7 @@ var document = {
     },
 
     get currentScript() {
+        if (__aura_current_script) return __aura_current_script;
         let scripts = document.scripts;
         if (!scripts || scripts.length === 0) return null;
         return scripts[scripts.length - 1] || null;
@@ -2425,6 +2468,49 @@ var document = {
         return new HTMLCollection(function() {
             return JSON.parse(__aura_get_elements_by_tag(0, tagName));
         });
+    },
+    // document.write/writeln. Scripts run after parsing here, so written
+    // markup goes right after the running <script> (where the parser would
+    // have put it), or at the end of <body> when no script is running.
+    // Written <script> elements run, as they do in browsers.
+    write: function() {
+        let html = '';
+        for (let i = 0; i < arguments.length; i++) html += String(arguments[i]);
+        if (!html) return;
+        let holder = this.createElement('div');
+        holder.innerHTML = html;
+        let nodes = Array.from(holder.childNodes);
+        let anchor = __aura_current_script;
+        let parent = anchor && anchor.parentNode ? anchor.parentNode : (this.body || this.documentElement);
+        if (!parent) return;
+        let next = anchor && anchor.parentNode ? anchor.nextSibling : null;
+        for (let node of nodes) {
+            // Written classic scripts block the parser: run each one, in
+            // order, before the markup after it is inserted.
+            let blocking = node.nodeType === Node.ELEMENT_NODE
+                && String(node.tagName).toLowerCase() === 'script'
+                && !__aura_script_type(node).includes('module')
+                && !node.hasAttribute('async') && !node.hasAttribute('defer');
+            if (blocking) node._alreadyStarted = true;
+            if (next) parent.insertBefore(node, next);
+            else parent.appendChild(node);
+            if (blocking) {
+                let code = node.src ? __aura_fetch_text_sync(node.src) : (node.text || node.textContent || '');
+                if (code === null) __aura_script_fire(node, 'error');
+                else __aura_execute_classic_script(node, code);
+            }
+        }
+    },
+    writeln: function() {
+        let parts = Array.prototype.slice.call(arguments);
+        parts.push('\n');
+        return this.write.apply(this, parts);
+    },
+    // Elements whose name attribute equals `name` (a NodeList, in tree order).
+    getElementsByName: function(name) {
+        let value = String(name);
+        let matches = Array.from(this.querySelectorAll('[name]')).filter(el => el.getAttribute('name') === value);
+        return new NodeList(matches.map(el => el._id));
     },
     // Document surface getters follow the parsed tree shape, not arbitrary descendants.
     get body() {
@@ -3278,10 +3364,11 @@ function __aura_post_message_impl(target, message, targetOrigin) {
     if (typeof target.dispatchEvent !== 'function') return;
     setTimeout(function() {
         try {
-            var ev = new Event('message');
-            ev.data = message;
-            ev.origin = typeof targetOrigin === 'string' ? targetOrigin : '*';
-            ev.source = target;
+            var ev = new MessageEvent('message', {
+                data: message,
+                origin: (location && location.origin) || '',
+                source: window
+            });
             target.dispatchEvent(ev);
         } catch (e) {
             console.error('Error dispatching message event: ' + e);
@@ -3291,6 +3378,136 @@ function __aura_post_message_impl(target, message, targetOrigin) {
 window.postMessage = function(message, targetOrigin, transfer) {
     __aura_post_message_impl(globalThis, message, targetOrigin);
 };
+
+// -- Frames ------------------------------------------------------------------
+// postMessage between documents in different engines. Calls queue here; the
+// engine drains the queue (__aura_frame_take_outbox) and routes each message
+// to the parent or child frame engine, which dispatches it with
+// __aura_frame_receive_message. Data crosses as JSON.
+var __aura_frame_outbox = [];
+
+function __aura_frame_serialize(message) {
+    try {
+        var json = JSON.stringify(message === undefined ? null : message);
+        return json === undefined ? 'null' : json;
+    } catch (e) {
+        return 'null';
+    }
+}
+
+function __aura_frame_target_origin(targetOrigin) {
+    var target = targetOrigin === undefined ? '/' : String(targetOrigin);
+    return target === '/' ? ((location && location.origin) || '') : target;
+}
+
+function __aura_frame_take_outbox() {
+    var out = JSON.stringify(__aura_frame_outbox);
+    __aura_frame_outbox = [];
+    return out;
+}
+
+// Absolute http(s) src of a network <iframe>, as the engine names frames.
+function __aura_frame_src(frame) {
+    if (!frame || typeof frame.getAttribute !== 'function') return null;
+    // srcdoc frames are named by document order among srcdoc frames.
+    if (frame.hasAttribute && frame.hasAttribute('srcdoc')) return 'about:srcdoc';
+    var raw = String(frame.getAttribute('src') || '').trim();
+    if (!raw) return null;
+    var abs = __aura_resolve_url_attribute(raw);
+    return /^https?:/i.test(abs) ? abs : null;
+}
+
+// [src, ordinal] naming `frame` for the engine: the ordinal counts earlier
+// <iframe> elements with the same src in document order.
+function __aura_frame_identity(frame) {
+    var src = __aura_frame_src(frame);
+    if (!src) return null;
+    var frames = document.getElementsByTagName('iframe');
+    var ordinal = 0;
+    for (var i = 0; i < frames.length; i++) {
+        if (frames[i] === frame) return [src, ordinal];
+        if (__aura_frame_src(frames[i]) === src) ordinal++;
+    }
+    return null;
+}
+
+function __aura_find_frame_element(src, ordinal) {
+    var frames = document.getElementsByTagName('iframe');
+    var seen = 0;
+    for (var i = 0; i < frames.length; i++) {
+        if (__aura_frame_src(frames[i]) !== src) continue;
+        if (seen === ordinal) return frames[i];
+        seen++;
+    }
+    return null;
+}
+
+// Make this document a frame of a document with origin `parentOrigin`:
+// window.parent / window.top become a cross-origin window proxy whose
+// postMessage reaches the parent engine.
+function __aura_install_frame_parent(parentOrigin, frameName) {
+    var parentWindow = new EventTarget();
+    parentWindow.postMessage = function(message, targetOrigin, transfer) {
+        __aura_frame_outbox.push({
+            to: 'parent',
+            data: __aura_frame_serialize(message),
+            targetOrigin: String(targetOrigin === undefined ? '' : targetOrigin)
+        });
+    };
+    parentWindow.self = parentWindow;
+    parentWindow.window = parentWindow;
+    parentWindow.top = parentWindow;
+    parentWindow.parent = parentWindow;
+    parentWindow.frames = parentWindow;
+    parentWindow.length = 1;
+    parentWindow.closed = false;
+    parentWindow.opener = null;
+    parentWindow.focus = function() {};
+    parentWindow.blur = function() {};
+    // The parent document lives in another engine, so a same-origin frame
+    // cannot reach its DOM: it reads as a document with no elements.
+    parentWindow.document = {
+        nodeType: 9,
+        readyState: 'complete',
+        body: null,
+        head: null,
+        documentElement: null,
+        getElementById: function() { return null; },
+        querySelector: function() { return null; },
+        querySelectorAll: function() { return new NodeList([]); },
+        getElementsByTagName: function() { return new NodeList([]); },
+        getElementsByClassName: function() { return new NodeList([]); },
+        addEventListener: function() {},
+        removeEventListener: function() {},
+    };
+    window.parent = parentWindow;
+    window.top = parentWindow;
+    window.frameElement = null;
+    window.name = String(frameName || '');
+    window.__aura_parent_origin = String(parentOrigin || '');
+    if (location && location.ancestorOrigins === undefined) {
+        try { location.ancestorOrigins = [String(parentOrigin || '')]; } catch (e) {}
+    }
+}
+
+// Dispatch a message from another frame engine. `src` null means the parent
+// document; otherwise the child frame (src, ordinal) of this document.
+function __aura_frame_receive_message(src, ordinal, data, origin) {
+    var source = null;
+    if (src === null || src === undefined) {
+        source = window.parent;
+    } else {
+        var frame = __aura_find_frame_element(src, ordinal);
+        source = frame ? frame.contentWindow : null;
+    }
+    var value;
+    try { value = JSON.parse(data); } catch (e) { value = data; }
+    try {
+        window.dispatchEvent(new MessageEvent('message', { data: value, origin: origin, source: source }));
+    } catch (e) {
+        console.error('Error dispatching message event: ' + e);
+    }
+}
 
 // -- Timers ------------------------------------------------------------------
 // Timers honour their delay against performance.now() and can be cancelled.
@@ -3587,12 +3804,27 @@ function __aura_script_fire(script, type) {
     __aura_queue_task(() => script.dispatchEvent(new Event(type)));
 }
 
+// The <script> element whose code is running, for document.currentScript.
+var __aura_current_script = null;
+
+// Set by the engine around parser-inserted classic scripts (0 clears).
+function __aura_set_current_script_node(nid) {
+    __aura_current_script = nid ? __get_or_create_node(nid) : null;
+}
+
 function __aura_execute_classic_script(script, code) {
+    let previous = __aura_current_script;
+    __aura_current_script = script;
     try {
-        (0, eval)(String(code || ''));
+        let source = String(code || '');
+        // Name external scripts in stack traces, as the parser-run path does.
+        if (script.src) source += '\n//# sourceURL=' + script.src;
+        (0, eval)(source);
+        __aura_current_script = previous;
         __aura_script_fire(script, 'load');
     } catch (e) {
-        console.error('Script execution error: ' + e);
+        __aura_current_script = previous;
+        console.error('Script execution error: ' + (e && e.stack ? e.stack : e));
         __aura_script_fire(script, 'error');
     }
 }
@@ -3609,6 +3841,40 @@ function __aura_execute_module_script(script, url, code) {
         console.error('Module script execution error: ' + e);
         __aura_script_fire(script, 'error');
     }
+}
+
+// A node was inserted into the document by script: run inserted <script>
+// elements and load inserted <link> resources, including those inside an
+// inserted subtree, in tree order.
+function __aura_on_node_inserted(node) {
+    if (!node || node.nodeType !== Node.ELEMENT_NODE) return;
+    let tag = String(node.tagName || '').toLowerCase();
+    if (tag === 'script') {
+        __aura_maybe_run_script(node);
+    } else if (tag === 'link') {
+        __aura_maybe_load_link(node);
+    } else if (typeof node.querySelectorAll === 'function') {
+        node.querySelectorAll('script, link').forEach(__aura_on_node_inserted);
+    }
+}
+
+// rel values whose <link> fetches a resource and fires load/error. Bundlers
+// (Turbopack, webpack) wait for a stylesheet link's load event before
+// running the chunks that need it.
+const __aura_fetching_link_rels = ['stylesheet', 'preload', 'modulepreload'];
+
+function __aura_maybe_load_link(link) {
+    if (link._alreadyStarted) return;
+    let rels = String(link.getAttribute('rel') || '').toLowerCase().split(/\s+/);
+    if (!rels.some(rel => __aura_fetching_link_rels.includes(rel))) return;
+    let href = link.href;
+    if (!href) return;
+    link._alreadyStarted = true;
+    new Promise((resolve, reject) => {
+        __aura_fetch(href, 'GET', '', '', resolve, reject, true);
+    })
+        .then(response => __aura_script_fire(link, response.ok ? 'load' : 'error'))
+        .catch(() => __aura_script_fire(link, 'error'));
 }
 
 function __aura_maybe_run_script(node) {
@@ -4506,6 +4772,24 @@ class HTMLIFrameElement extends HTMLElement {
                     return new NodeIterator(root, whatToShow, filter);
                 },
                 createRange: function() { return new Range(); },
+                // document.open/write/close on an about:blank frame: the
+                // written markup becomes the frame's srcdoc document, which
+                // the engine renders like any frame document.
+                open: function() { self._written = ''; return this; },
+                write: function() {
+                    if (self._written === undefined || self._written === null) self._written = '';
+                    for (var i = 0; i < arguments.length; i++) self._written += String(arguments[i]);
+                },
+                writeln: function() {
+                    this.write.apply(this, arguments);
+                    this.write('\n');
+                },
+                close: function() {
+                    if (typeof self._written === 'string') {
+                        self.setAttribute('srcdoc', self._written);
+                        self._written = null;
+                    }
+                },
                 importNode: function(node, deep) { return node; },
                 adoptNode: function(node) { return node; },
                 execCommand: function() { return false; },
@@ -4524,16 +4808,35 @@ class HTMLIFrameElement extends HTMLElement {
                 configurable: true
             });
             self._contentWindow.self = self._contentWindow;
-            self._contentWindow.top = self._contentWindow;
+            self._contentWindow.window = self._contentWindow;
+            self._contentWindow.top = window.top;
             self._contentWindow.parent = window;
             self._contentWindow.frames = self._contentWindow;
             self._contentWindow.length = 0;
             self._contentWindow.name = '';
-            self._contentWindow.location = document.location;
+            // The frame's own location: navigating it must never move the parent.
+            self._contentWindow.location = {
+                href: 'about:blank', protocol: 'about:', host: '', hostname: '', port: '',
+                pathname: 'blank', search: '', hash: '', origin: document.location.origin,
+                assign: function() {}, replace: function() {}, reload: function() {},
+                toString: function() { return 'about:blank'; }
+            };
             self._contentWindow.closed = false;
             self._contentWindow.opener = null;
             self._contentWindow.frameElement = self;
             self._contentWindow.postMessage = function(message, targetOrigin, transfer) {
+                // A frame with a network document runs in its own engine.
+                var identity = __aura_frame_identity(self);
+                if (identity) {
+                    __aura_frame_outbox.push({
+                        to: 'child',
+                        src: identity[0],
+                        ordinal: identity[1],
+                        data: __aura_frame_serialize(message),
+                        targetOrigin: __aura_frame_target_origin(targetOrigin)
+                    });
+                    return;
+                }
                 __aura_post_message_impl(self._contentWindow, message, targetOrigin);
             };
         }
@@ -4982,6 +5285,532 @@ if (typeof Intl === 'undefined') {
         NumberFormat: function() { return { format: function(n) { return String(n); } }; },
         Collator: function() { return { compare: function(a, b) { return a < b ? -1 : a > b ? 1 : 0; } }; },
     };
+}
+
+
+// -- DOMException -------------------------------------------------------------
+if (typeof globalThis.DOMException !== 'function') {
+    class DOMException extends Error {
+        constructor(message, name) {
+            super(message === undefined ? '' : String(message));
+            this.name = name === undefined ? 'Error' : String(name);
+        }
+        get code() {
+            let codes = { IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4, InvalidCharacterError: 5,
+                NotFoundError: 8, NotSupportedError: 9, InvalidStateError: 11, SyntaxError: 12, SecurityError: 18,
+                NetworkError: 19, AbortError: 20, TimeoutError: 23, DataCloneError: 25 };
+            return codes[this.name] || 0;
+        }
+    }
+    window.DOMException = DOMException;
+}
+
+// -- Encoding: TextEncoder / TextDecoder (UTF-8) ------------------------------
+function __aura_utf8_encode(input) {
+    let s = String(input);
+    let out = new Uint8Array(s.length * 3);
+    let n = 0;
+    for (let i = 0; i < s.length; i++) {
+        let c = s.charCodeAt(i);
+        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s.length) {
+            let d = s.charCodeAt(i + 1);
+            if (d >= 0xDC00 && d <= 0xDFFF) {
+                c = 0x10000 + ((c - 0xD800) << 10) + (d - 0xDC00);
+                i++;
+            } else {
+                c = 0xFFFD;
+            }
+        } else if (c >= 0xD800 && c <= 0xDFFF) {
+            c = 0xFFFD;
+        }
+        if (c < 0x80) {
+            out[n++] = c;
+        } else if (c < 0x800) {
+            out[n++] = 0xC0 | (c >> 6);
+            out[n++] = 0x80 | (c & 63);
+        } else if (c < 0x10000) {
+            out[n++] = 0xE0 | (c >> 12);
+            out[n++] = 0x80 | ((c >> 6) & 63);
+            out[n++] = 0x80 | (c & 63);
+        } else {
+            out[n++] = 0xF0 | (c >> 18);
+            out[n++] = 0x80 | ((c >> 12) & 63);
+            out[n++] = 0x80 | ((c >> 6) & 63);
+            out[n++] = 0x80 | (c & 63);
+        }
+    }
+    return out.slice(0, n);
+}
+
+class TextEncoder {
+    get encoding() { return 'utf-8'; }
+    encode(input) { return __aura_utf8_encode(input === undefined ? '' : input); }
+    encodeInto(input, dest) {
+        let bytes = __aura_utf8_encode(input);
+        let written = Math.min(bytes.length, dest.length);
+        // Do not split a multi-byte sequence at the end of `dest`.
+        while (written > 0 && written < bytes.length && (bytes[written] & 0xC0) === 0x80) written--;
+        dest.set(bytes.subarray(0, written));
+        let read = new TextDecoder().decode(bytes.subarray(0, written)).length;
+        return { read: read, written: written };
+    }
+}
+
+function __aura_bytes_of(input) {
+    if (input === undefined || input === null) return new Uint8Array(0);
+    if (input instanceof Uint8Array) return input;
+    if (input instanceof ArrayBuffer) return new Uint8Array(input);
+    if (ArrayBuffer.isView(input)) return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+    throw new TypeError("The provided value is not of type '(ArrayBuffer or ArrayBufferView)'");
+}
+
+class TextDecoder {
+    constructor(label, options) {
+        let name = String(label === undefined ? 'utf-8' : label).trim().toLowerCase();
+        this._latin1 = name === 'latin1' || name === 'iso-8859-1' || name === 'windows-1252' || name === 'ascii' || name === 'us-ascii';
+        this._encoding = this._latin1 ? 'windows-1252' : 'utf-8';
+        this._fatal = !!(options && options.fatal);
+        this._ignoreBOM = !!(options && options.ignoreBOM);
+        this._pending = [];
+        this._bomSeen = false;
+    }
+    get encoding() { return this._encoding; }
+    get fatal() { return this._fatal; }
+    get ignoreBOM() { return this._ignoreBOM; }
+    decode(input, options) {
+        let stream = !!(options && options.stream);
+        let bytes = __aura_bytes_of(input);
+        if (this._pending.length) {
+            let merged = new Uint8Array(this._pending.length + bytes.length);
+            merged.set(this._pending, 0);
+            merged.set(bytes, this._pending.length);
+            bytes = merged;
+            this._pending = [];
+        }
+        if (this._latin1) {
+            let text = '';
+            for (let i = 0; i < bytes.length; i += 8192) {
+                text += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+            }
+            return text;
+        }
+        let codes = [];
+        let parts = [];
+        let i = 0;
+        if (!this._bomSeen && !this._ignoreBOM && bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) i = 3;
+        if (bytes.length >= 3 || !stream) this._bomSeen = true;
+        let fail = () => {
+            if (this._fatal) throw new TypeError('The encoded data was not valid.');
+            codes.push(0xFFFD);
+        };
+        while (i < bytes.length) {
+            let b = bytes[i];
+            let need = b < 0x80 ? 0 : (b >= 0xC2 && b <= 0xDF) ? 1 : (b >= 0xE0 && b <= 0xEF) ? 2 : (b >= 0xF0 && b <= 0xF4) ? 3 : -1;
+            if (need < 0) { fail(); i++; continue; }
+            if (need === 0) { codes.push(b); i++; }
+            else if (i + need >= bytes.length) {
+                // Truncated sequence at the end of the input.
+                let valid = true;
+                for (let k = 1; i + k < bytes.length; k++) if ((bytes[i + k] & 0xC0) !== 0x80) valid = false;
+                if (stream && valid) { this._pending = Array.from(bytes.subarray(i)); break; }
+                fail();
+                i++;
+                continue;
+            } else {
+                let c = b & (need === 1 ? 0x1F : need === 2 ? 0x0F : 0x07);
+                let ok = true;
+                for (let k = 1; k <= need; k++) {
+                    let cb = bytes[i + k];
+                    if ((cb & 0xC0) !== 0x80) { ok = false; break; }
+                    c = (c << 6) | (cb & 63);
+                }
+                if (!ok || (need === 2 && (c < 0x800 || (c >= 0xD800 && c <= 0xDFFF))) || (need === 3 && (c < 0x10000 || c > 0x10FFFF))) {
+                    fail();
+                    i++;
+                    continue;
+                }
+                if (c >= 0x10000) {
+                    c -= 0x10000;
+                    codes.push(0xD800 + (c >> 10), 0xDC00 + (c & 0x3FF));
+                } else {
+                    codes.push(c);
+                }
+                i += need + 1;
+            }
+            if (codes.length >= 8192) {
+                parts.push(String.fromCharCode.apply(null, codes));
+                codes = [];
+            }
+        }
+        parts.push(String.fromCharCode.apply(null, codes));
+        if (!stream) this._bomSeen = false;
+        return parts.join('');
+    }
+}
+window.TextEncoder = TextEncoder;
+window.TextDecoder = TextDecoder;
+
+// -- Streams: ReadableStream / WritableStream / TransformStream ---------------
+// A small implementation of the default (non-byte) streams: enough for code
+// that builds a stream with start/pull, reads it with a reader or `for await`,
+// and pipes it through transforms.
+class ReadableStreamDefaultController {
+    constructor(stream) { this._stream = stream; }
+    get desiredSize() {
+        let s = this._stream;
+        return s._state === 'errored' ? null : s._state === 'closed' ? 0 : s._highWaterMark - s._queue.length;
+    }
+    enqueue(chunk) {
+        if (this._stream._closeRequested || this._stream._state !== 'readable') throw new TypeError('Cannot enqueue a chunk into a closed stream');
+        this._stream._enqueue(chunk);
+    }
+    close() {
+        if (this._stream._closeRequested || this._stream._state !== 'readable') throw new TypeError('Cannot close a closed stream');
+        this._stream._requestClose();
+    }
+    error(e) { this._stream._error(e); }
+}
+
+class ReadableStreamDefaultReader {
+    constructor(stream) {
+        if (!(stream instanceof ReadableStream)) throw new TypeError('ReadableStreamDefaultReader needs a ReadableStream');
+        if (stream._reader) throw new TypeError('ReadableStream is locked');
+        stream._reader = this;
+        this._stream = stream;
+        this._closed = new Promise((resolve, reject) => { this._resolveClosed = resolve; this._rejectClosed = reject; });
+        this._closed.catch(function() {});
+        if (stream._state === 'closed') this._resolveClosed();
+        if (stream._state === 'errored') this._rejectClosed(stream._storedError);
+    }
+    get closed() { return this._closed; }
+    read() {
+        if (!this._stream) return Promise.reject(new TypeError('Reader is released'));
+        return this._stream._read();
+    }
+    releaseLock() {
+        if (!this._stream) return;
+        let stream = this._stream;
+        for (let pending of stream._readRequests.splice(0)) pending.reject(new TypeError('Reader was released'));
+        stream._reader = null;
+        this._stream = null;
+    }
+    cancel(reason) {
+        return this._stream ? this._stream._cancel(reason) : Promise.reject(new TypeError('Reader is released'));
+    }
+}
+
+class ReadableStream {
+    constructor(source, strategy) {
+        source = source || {};
+        this._source = source;
+        this._queue = [];
+        this._state = 'readable';
+        this._closeRequested = false;
+        this._storedError = undefined;
+        this._reader = null;
+        this._readRequests = [];
+        this._started = false;
+        this._pulling = false;
+        this._pullAgain = false;
+        let hwm = strategy && strategy.highWaterMark;
+        this._highWaterMark = hwm === undefined ? 1 : Number(hwm);
+        this._controller = new ReadableStreamDefaultController(this);
+        let started;
+        try {
+            started = typeof source.start === 'function' ? source.start(this._controller) : undefined;
+        } catch (e) {
+            this._error(e);
+            return;
+        }
+        Promise.resolve(started).then(() => {
+            this._started = true;
+            this._pullIfNeeded();
+        }, (e) => this._error(e));
+    }
+    get locked() { return !!this._reader; }
+    _enqueue(chunk) {
+        if (this._readRequests.length) this._readRequests.shift().resolve({ value: chunk, done: false });
+        else this._queue.push(chunk);
+        this._pullIfNeeded();
+    }
+    _requestClose() {
+        this._closeRequested = true;
+        if (!this._queue.length) this._finishClose();
+    }
+    _finishClose() {
+        if (this._state !== 'readable') return;
+        this._state = 'closed';
+        for (let pending of this._readRequests.splice(0)) pending.resolve({ value: undefined, done: true });
+        if (this._reader) this._reader._resolveClosed();
+    }
+    _error(e) {
+        if (this._state !== 'readable') return;
+        this._state = 'errored';
+        this._storedError = e;
+        this._queue = [];
+        for (let pending of this._readRequests.splice(0)) pending.reject(e);
+        if (this._reader) this._reader._rejectClosed(e);
+    }
+    _read() {
+        if (this._queue.length) {
+            let chunk = this._queue.shift();
+            if (this._closeRequested && !this._queue.length) this._finishClose();
+            else this._pullIfNeeded();
+            return Promise.resolve({ value: chunk, done: false });
+        }
+        if (this._state === 'closed') return Promise.resolve({ value: undefined, done: true });
+        if (this._state === 'errored') return Promise.reject(this._storedError);
+        return new Promise((resolve, reject) => {
+            this._readRequests.push({ resolve: resolve, reject: reject });
+            this._pullIfNeeded();
+        });
+    }
+    _pullIfNeeded() {
+        if (!this._started || this._state !== 'readable' || this._closeRequested) return;
+        if (typeof this._source.pull !== 'function') return;
+        if (!this._readRequests.length && this._queue.length >= this._highWaterMark) return;
+        if (this._pulling) { this._pullAgain = true; return; }
+        this._pulling = true;
+        Promise.resolve().then(() => this._source.pull(this._controller)).then(() => {
+            this._pulling = false;
+            if (this._pullAgain) { this._pullAgain = false; this._pullIfNeeded(); }
+        }, (e) => this._error(e));
+    }
+    _cancel(reason) {
+        if (this._state === 'closed') return Promise.resolve();
+        if (this._state === 'errored') return Promise.reject(this._storedError);
+        this._queue = [];
+        this._finishClose();
+        let cancel = typeof this._source.cancel === 'function' ? this._source.cancel(reason) : undefined;
+        return Promise.resolve(cancel).then(function() {});
+    }
+    cancel(reason) {
+        if (this._reader) return Promise.reject(new TypeError('Cannot cancel a locked stream'));
+        return this._cancel(reason);
+    }
+    getReader(options) {
+        if (options && options.mode === 'byob') throw new TypeError('BYOB readers are not supported');
+        return new ReadableStreamDefaultReader(this);
+    }
+    pipeTo(dest, options) {
+        let reader = this.getReader();
+        let writer = dest.getWriter();
+        let preventClose = !!(options && options.preventClose);
+        let pump = () => reader.read().then((result) => {
+            if (result.done) {
+                reader.releaseLock();
+                writer.releaseLock();
+                return preventClose ? undefined : dest.close();
+            }
+            return writer.write(result.value).then(pump);
+        });
+        return pump().catch((e) => {
+            try { reader.releaseLock(); writer.releaseLock(); } catch (ignored) {}
+            if (!(options && options.preventAbort)) dest.abort(e);
+            throw e;
+        });
+    }
+    pipeThrough(transform, options) {
+        this.pipeTo(transform.writable, options).catch(function() {});
+        return transform.readable;
+    }
+    tee() {
+        let reader = this.getReader();
+        let controllers = [];
+        let branch = () => new ReadableStream({
+            start(controller) { controllers.push(controller); },
+            pull() {
+                return reader.read().then((result) => {
+                    for (let c of controllers) {
+                        try { result.done ? c.close() : c.enqueue(result.value); } catch (ignored) {}
+                    }
+                });
+            }
+        });
+        return [branch(), branch()];
+    }
+    values(options) {
+        let reader = this.getReader();
+        let preventCancel = !!(options && options.preventCancel);
+        return {
+            next() { return reader.read(); },
+            return(value) {
+                let done = preventCancel ? Promise.resolve() : reader.cancel(value);
+                reader.releaseLock();
+                return done.then(() => ({ value: value, done: true }));
+            },
+            [Symbol.asyncIterator]() { return this; }
+        };
+    }
+    [Symbol.asyncIterator](options) { return this.values(options); }
+    static from(iterable) {
+        let iterator = iterable[Symbol.asyncIterator] ? iterable[Symbol.asyncIterator]() : iterable[Symbol.iterator]();
+        return new ReadableStream({
+            pull(controller) {
+                return Promise.resolve(iterator.next()).then((result) => {
+                    if (result.done) controller.close();
+                    else controller.enqueue(result.value);
+                });
+            }
+        });
+    }
+}
+
+class WritableStreamDefaultWriter {
+    constructor(stream) {
+        if (stream._writer) throw new TypeError('WritableStream is locked');
+        stream._writer = this;
+        this._stream = stream;
+    }
+    get desiredSize() { return 1; }
+    get ready() { return Promise.resolve(); }
+    get closed() { return this._stream._closedPromise; }
+    write(chunk) { return this._stream._write(chunk); }
+    close() { return this._stream._close(); }
+    abort(reason) { return this._stream.abort(reason); }
+    releaseLock() { if (this._stream) this._stream._writer = null; this._stream = null; }
+}
+
+class WritableStream {
+    constructor(sink) {
+        this._sink = sink || {};
+        this._writer = null;
+        this._state = 'writable';
+        this._chain = Promise.resolve();
+        this._closedPromise = new Promise((resolve, reject) => { this._resolveClosed = resolve; this._rejectClosed = reject; });
+        this._closedPromise.catch(function() {});
+        let controller = { error: (e) => this._fail(e), signal: undefined };
+        this._controller = controller;
+        this._chain = Promise.resolve(typeof this._sink.start === 'function' ? this._sink.start(controller) : undefined);
+    }
+    get locked() { return !!this._writer; }
+    getWriter() { return new WritableStreamDefaultWriter(this); }
+    _fail(e) {
+        if (this._state !== 'writable') return;
+        this._state = 'errored';
+        this._rejectClosed(e);
+    }
+    _write(chunk) {
+        if (this._state !== 'writable') return Promise.reject(new TypeError('The stream is not writable'));
+        this._chain = this._chain.then(() => typeof this._sink.write === 'function' ? this._sink.write(chunk, this._controller) : undefined);
+        this._chain.catch((e) => this._fail(e));
+        return this._chain;
+    }
+    _close() {
+        this._chain = this._chain.then(() => typeof this._sink.close === 'function' ? this._sink.close() : undefined).then(() => {
+            this._state = 'closed';
+            this._resolveClosed();
+        });
+        return this._chain;
+    }
+    close() { return this._close(); }
+    abort(reason) {
+        this._fail(reason);
+        return Promise.resolve(typeof this._sink.abort === 'function' ? this._sink.abort(reason) : undefined);
+    }
+}
+
+class TransformStream {
+    constructor(transformer) {
+        transformer = transformer || {};
+        let readableController;
+        this.readable = new ReadableStream({ start(controller) { readableController = controller; } });
+        let controller = {
+            enqueue(chunk) { readableController.enqueue(chunk); },
+            error(e) { readableController.error(e); },
+            terminate() { try { readableController.close(); } catch (ignored) {} },
+            get desiredSize() { return readableController.desiredSize; }
+        };
+        let started = Promise.resolve(typeof transformer.start === 'function' ? transformer.start(controller) : undefined);
+        this.writable = new WritableStream({
+            write(chunk) {
+                return started.then(() => typeof transformer.transform === 'function'
+                    ? transformer.transform(chunk, controller)
+                    : controller.enqueue(chunk));
+            },
+            close() {
+                return started.then(() => typeof transformer.flush === 'function' ? transformer.flush(controller) : undefined)
+                    .then(() => controller.terminate());
+            },
+            abort(reason) { controller.error(reason); }
+        });
+    }
+}
+
+class TextDecoderStream extends TransformStream {
+    constructor(label, options) {
+        let decoder = new TextDecoder(label, options);
+        super({
+            transform(chunk, controller) {
+                let text = decoder.decode(chunk, { stream: true });
+                if (text) controller.enqueue(text);
+            },
+            flush(controller) {
+                let text = decoder.decode();
+                if (text) controller.enqueue(text);
+            }
+        });
+    }
+}
+
+class TextEncoderStream extends TransformStream {
+    constructor() {
+        let encoder = new TextEncoder();
+        super({ transform(chunk, controller) { controller.enqueue(encoder.encode(chunk)); } });
+    }
+}
+
+window.ReadableStream = ReadableStream;
+window.ReadableStreamDefaultReader = ReadableStreamDefaultReader;
+window.ReadableStreamDefaultController = ReadableStreamDefaultController;
+window.WritableStream = WritableStream;
+window.WritableStreamDefaultWriter = WritableStreamDefaultWriter;
+window.TransformStream = TransformStream;
+window.TextDecoderStream = TextDecoderStream;
+window.TextEncoderStream = TextEncoderStream;
+
+// -- structuredClone ---------------------------------------------------------
+function __aura_structured_clone(value, seen) {
+    if (value === null || typeof value !== 'object') {
+        if (typeof value === 'function' || typeof value === 'symbol') {
+            throw new DOMException('The object could not be cloned.', 'DataCloneError');
+        }
+        return value;
+    }
+    if (seen.has(value)) return seen.get(value);
+    let out;
+    if (value instanceof Date) out = new Date(value.getTime());
+    else if (value instanceof RegExp) out = new RegExp(value.source, value.flags);
+    else if (value instanceof ArrayBuffer) out = value.slice(0);
+    else if (ArrayBuffer.isView(value)) out = new value.constructor(value);
+    else if (value instanceof Map) {
+        out = new Map();
+        seen.set(value, out);
+        value.forEach((v, k) => out.set(__aura_structured_clone(k, seen), __aura_structured_clone(v, seen)));
+        return out;
+    } else if (value instanceof Set) {
+        out = new Set();
+        seen.set(value, out);
+        value.forEach((v) => out.add(__aura_structured_clone(v, seen)));
+        return out;
+    } else if (Array.isArray(value)) {
+        out = [];
+        seen.set(value, out);
+        for (let i = 0; i < value.length; i++) out[i] = __aura_structured_clone(value[i], seen);
+        return out;
+    } else if (value instanceof Error) {
+        out = new value.constructor(value.message);
+    } else {
+        out = {};
+        seen.set(value, out);
+        for (let key of Object.keys(value)) out[key] = __aura_structured_clone(value[key], seen);
+        return out;
+    }
+    seen.set(value, out);
+    return out;
+}
+if (typeof globalThis.structuredClone !== 'function') {
+    window.structuredClone = function(value) { return __aura_structured_clone(value, new Map()); };
 }
 
 __aura_install_window_named_properties();

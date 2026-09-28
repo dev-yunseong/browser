@@ -582,8 +582,8 @@ impl LayerTreeBuilder {
             return None;
         }
         let attrs = attrs.borrow();
-        if attrs.iter().any(|a| a.name.local.as_ref() == "srcdoc") {
-            return None;
+        if let Some(srcdoc) = attrs.iter().find(|a| a.name.local.as_ref() == "srcdoc") {
+            return Some(srcdoc_paint_src(&srcdoc.value));
         }
         let src = attrs.iter().find(|a| a.name.local.as_ref() == "src")?.value.trim().to_string();
         if src.is_empty() {
@@ -1083,6 +1083,20 @@ fn border_radius_px(layout: &LayoutBox) -> f32 {
         Some(Value::Length(v, _)) => v.max(0.0),
         _ => 0.0,
     }
+}
+
+
+/// Identity `src` of an `<iframe srcdoc>` frame (with its ordinal among such
+/// frames); shared with page script's frame routing.
+pub const SRCDOC_FRAME_SRC: &str = "about:srcdoc";
+
+/// Paint-side `src` of an `<iframe srcdoc>` document: `about:srcdoc` plus a
+/// hash of the markup, so a rewritten document gets a new cache key.
+pub fn srcdoc_paint_src(html: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    html.hash(&mut hasher);
+    format!("{SRCDOC_FRAME_SRC}#{:016x}", hasher.finish())
 }
 
 /// Image-cache key under which the rendered document of an `<iframe>` with
@@ -2102,5 +2116,18 @@ mod tests {
             })
             .expect("text command");
         assert!(clip.x + clip.width > 1200.0, "text clip must extend past the canvas: {clip:?}");
+    }
+
+    /// An `<iframe srcdoc>` paints its document from the cache key built on a
+    /// hash of the markup, so rewriting the markup changes the key.
+    #[test]
+    fn test_srcdoc_iframe_paints_from_markup_key() {
+        let tree = build_tree_from_html(r#"<iframe srcdoc="<p>hi</p>" style="width:100px;height:50px;border:0"></iframe>"#, "");
+        let url = tree.layers.iter()
+            .flat_map(|l| l.background_commands.iter().chain(l.content_commands.iter()))
+            .find_map(|c| match c { PaintCommand::Image { url, .. } => Some(url.clone()), _ => None })
+            .expect("iframe image command");
+        assert_eq!(url, iframe_frame_key(&srcdoc_paint_src("<p>hi</p>"), 100, 50));
+        assert_ne!(srcdoc_paint_src("<p>hi</p>"), srcdoc_paint_src("<p>bye</p>"));
     }
 }

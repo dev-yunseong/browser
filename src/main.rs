@@ -14,6 +14,7 @@ pub mod js;
 pub mod matrix;
 pub mod svg;
 pub mod engine;
+pub mod frames;
 
 struct BrowserApp {
     url: String,

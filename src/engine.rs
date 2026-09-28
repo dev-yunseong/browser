@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use url::Url;
 
-use crate::{css, dom, js, layout, render, style};
+use crate::{css, dom, frames, js, layout, render, style};
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -55,6 +55,9 @@ pub struct PageResult {
     /// boxes are painted relative to the viewport at this offset.
     pub scroll_x: f32,
     pub scroll_y: f32,
+    /// `<iframe>` boxes that load a network document, with their content-box
+    /// size; their rendered documents are painted from `image_cache`.
+    pub frames: Vec<frames::FrameBox>,
 }
 
 /// Most documents one script-driven navigation may chain through (a page
@@ -841,7 +844,10 @@ pub fn process_html_with_scroll(
     let mut pixmap = tiny_skia::Pixmap::new(w_u32, height)
         .ok_or_else(|| format!("Failed to create pixmap with size {}x{}", w_u32, height))?;
 
-    pixmap.fill(tiny_skia::Color::WHITE);
+    // A frame document without a background shows its parent through it.
+    if !frames::is_frame_thread() {
+        pixmap.fill(tiny_skia::Color::WHITE);
+    }
 
     let mut links: Vec<(layout::Rect, String)> = Vec::new();
     let mut form_controls = Vec::new();
@@ -871,6 +877,7 @@ pub fn process_html_with_scroll(
         .map(|(_, url)| base_url.join(&url).map(|u| u.to_string()).unwrap_or(url))
         .collect();
     crate::background::collect_background_image_urls(&layout_tree, base_url, &mut image_urls);
+    let frame_boxes = frames::collect_frame_boxes(&layout_tree, base_url);
 
     let (form_action, form_method) = layout_tree
         .collect_form_element()
@@ -973,6 +980,7 @@ pub fn process_html_with_scroll(
             scroll_height,
             scroll_x,
             scroll_y,
+            frames: frame_boxes,
         },
         stylesheet,
     ))
@@ -1339,6 +1347,17 @@ pub struct BrowserEngine {
     pub current_csp_policy: Option<js::CspPolicy>,
     /// The most recently rendered page result.
     pub last_page: Option<PageResult>,
+    /// Child engines rendering this document's `<iframe>` documents.
+    pub frames: frames::FrameHost,
+    /// Set when this engine renders a frame document: its embedder.
+    frame_parent: Option<frames::FrameParent>,
+    /// Latest time a navigation of this (frame) engine waits for its own
+    /// frames; `None` means `frames::FRAME_BUDGET` from the navigation start.
+    pub frame_deadline: Option<Instant>,
+    /// `iframe.contentWindow.postMessage` calls whose frame has no child yet.
+    undelivered_child_messages: Vec<frames::OutgoingMessage>,
+    /// `window.parent.postMessage` calls not yet taken by the frame thread.
+    parent_outbox: Vec<frames::OutgoingMessage>,
     /// Session history of top-level documents.
     pub history: SharedHistory,
     /// Viewport height in CSS px; the width is passed per render.
@@ -1357,9 +1376,23 @@ impl BrowserEngine {
             console_buffer,
             current_csp_policy: None,
             last_page: None,
+            frames: frames::FrameHost::new_top_level(),
+            frame_parent: None,
+            frame_deadline: None,
+            undelivered_child_messages: Vec::new(),
+            parent_outbox: Vec::new(),
             history: SharedHistory::default(),
             viewport_height: DEFAULT_VIEWPORT_HEIGHT,
         }
+    }
+
+    /// An engine for a frame document embedded by `parent`, whose own frames
+    /// run under `frames`. Must be created on the frame's thread.
+    pub fn new_frame(frames: frames::FrameHost, parent: frames::FrameParent) -> Self {
+        let mut engine = Self::new();
+        engine.frames = frames;
+        engine.frame_parent = Some(parent);
+        engine
     }
 
     pub fn new() -> Self {
@@ -1451,7 +1484,33 @@ impl BrowserEngine {
             self.viewport_height,
         )
         .map_err(|e| e.to_string())?;
+        self.finish_load(result, width)
+    }
 
+    /// Load a document from markup instead of the network (an `<iframe
+    /// srcdoc>` document); `base_url` is its URL and origin. Session history
+    /// is left to the caller.
+    pub fn load_html_document(&mut self, html: &str, base_url: &Url, width: f32) -> Result<PageResult, String> {
+        self.clear_for_new_url();
+        let result = process_html_with_scroll(
+            html,
+            base_url,
+            &HashMap::new(),
+            &mut self.css_cache,
+            None,
+            None,
+            None,
+            None,
+            width,
+            self.viewport_height,
+            (0.0, 0.0),
+        )
+        .map_err(|e| e.to_string())?;
+        self.finish_load(result, width)
+    }
+
+    /// Run the scripts of a freshly parsed document and render it.
+    fn finish_load(&mut self, result: (PageResult, css::Stylesheet), width: f32) -> Result<PageResult, String> {
         let (page, stylesheet) = result;
         self.last_stylesheet = Some(stylesheet);
         self.stylesheet_viewport = (width.max(1.0), self.viewport_height);
@@ -1485,9 +1544,106 @@ impl BrowserEngine {
         let post_js_page = if js_modified || self.cache_missing_images(&page.image_urls) {
             self.re_render(None, None, width)?
         } else {
+            self.frames.sync(&page.frames, &self.document_origin());
             page
         };
-        Ok(post_js_page)
+        self.settle_frames(post_js_page, width)
+    }
+
+    /// Wait (within the frame budget) for the page's frames to load, relaying
+    /// their messages and re-rendering as they report, so the page returned
+    /// by `navigate` shows its frames.
+    fn settle_frames(&mut self, mut page: PageResult, width: f32) -> Result<PageResult, String> {
+        let budget_end = Instant::now() + frames::FRAME_BUDGET;
+        let deadline = self.frame_deadline.map_or(budget_end, |d| d.min(budget_end));
+        while self.frames.has_pending() && Instant::now() < deadline {
+            self.frames.wait_until(deadline);
+            let mut dirty = self.frames.has_ready_images();
+            for _ in 0..5 {
+                if !self.tick_js(None, None) {
+                    break;
+                }
+                dirty = true;
+            }
+            if dirty {
+                page = self.re_render(None, None, width)?;
+            }
+        }
+        Ok(page)
+    }
+
+    /// Origin of the current document (`"null"` for opaque origins).
+    pub fn document_origin(&self) -> String {
+        self.last_page
+            .as_ref()
+            .map(|p| p.base_url.origin().ascii_serialization())
+            .unwrap_or_else(|| "null".to_string())
+    }
+
+    /// Move `postMessage` calls queued by page script out of the JS runtime:
+    /// messages to child frames go to their engines, messages to the parent
+    /// wait in `parent_outbox` for the frame thread.
+    fn drain_js_outbox(&mut self) {
+        let outcome = self.js_runtime.execute_with_result(
+            "typeof __aura_frame_take_outbox === 'function' ? __aura_frame_take_outbox() : '[]'",
+        );
+        let queued: Vec<frames::OutgoingMessage> = outcome
+            .result
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
+        let origin = self.document_origin();
+        let mut to_children = std::mem::take(&mut self.undelivered_child_messages);
+        for message in queued {
+            match message.to.as_str() {
+                "parent" if self.frame_parent.is_some() => self.parent_outbox.push(message),
+                "child" => to_children.push(message),
+                _ => {}
+            }
+        }
+        for message in to_children {
+            let Some(src) = message.src.clone() else { continue };
+            let child_origin = Url::parse(&src)
+                .map(|u| u.origin().ascii_serialization())
+                .unwrap_or_default();
+            if !frames::target_origin_allows(&message.target_origin, &child_origin) {
+                continue;
+            }
+            if !self.frames.post_to_child(&src, message.ordinal, message.data.clone(), &origin)
+                && self.undelivered_child_messages.len() < 64
+            {
+                self.undelivered_child_messages.push(message);
+            }
+        }
+    }
+
+    /// `window.parent.postMessage` calls made by this frame document since
+    /// the last call.
+    pub fn take_parent_messages(&mut self) -> Vec<frames::OutgoingMessage> {
+        self.drain_js_outbox();
+        std::mem::take(&mut self.parent_outbox)
+    }
+
+    /// Dispatch a `message` event from the parent document on this frame
+    /// document's window (`event.source === window.parent`).
+    pub fn deliver_parent_message(&mut self, data: &str, origin: &str) {
+        self.dispatch_message_event(None, 0, data, origin);
+    }
+
+    fn dispatch_message_event(&mut self, src: Option<&str>, ordinal: usize, data: &str, origin: &str) {
+        let args = serde_json::json!([src, ordinal, data, origin]);
+        self.js_runtime.execute(&format!(
+            "if (typeof __aura_frame_receive_message === 'function') __aura_frame_receive_message.apply(null, {args});"
+        ));
+    }
+
+    /// Dispatch the messages child frames posted to this document.
+    fn deliver_child_messages(&mut self) -> bool {
+        let messages = self.frames.take_messages();
+        let delivered = !messages.is_empty();
+        for message in messages {
+            self.dispatch_message_event(Some(&message.src), message.ordinal, &message.data, &message.origin);
+        }
+        delivered
     }
 
     /// Re-render the current page (e.g. after JS style changes or hover state).
@@ -1543,6 +1699,8 @@ impl BrowserEngine {
             page.width as f32,
             self.viewport_height,
         );
+        self.frames.sync(&page.frames, &base_url.origin().ascii_serialization());
+        self.drain_js_outbox();
         self.refresh_after_image_loads(page, width)
     }
 
@@ -1682,7 +1840,10 @@ impl BrowserEngine {
         page: PageResult,
         width: f32,
     ) -> Result<PageResult, String> {
-        if !self.cache_missing_images(&page.image_urls) {
+        let loaded_images = self.cache_missing_images(&page.image_urls);
+        self.frames.poll();
+        let loaded_frames = self.frames.store_images(&mut self.image_cache);
+        if !loaded_images && !loaded_frames {
             return Ok(page);
         }
 
@@ -1751,7 +1912,8 @@ impl BrowserEngine {
             let page = self.last_page.as_ref()?;
             ((page.scroll_x, page.scroll_y), page.width)
         };
-        if rendered_at != (sx, sy) {
+        self.frames.poll();
+        if rendered_at != (sx, sy) || self.frames.has_ready_images() {
             if let Err(error) = self.re_render(None, None, width as f32) {
                 eprintln!("[screenshot] re-render at scroll offset failed: {}", error);
             }
@@ -1777,7 +1939,7 @@ impl BrowserEngine {
                 );
             }
         }
-        let bytes = crop_viewport(
+        let mut bytes = crop_viewport(
             &page.pixmap_bytes,
             page.width,
             page.height,
@@ -1786,6 +1948,9 @@ impl BrowserEngine {
             page.width,
             vh,
         );
+        if frames::is_frame_thread() {
+            clear_past_source(&mut bytes, page.width, sy as u32, page.height);
+        }
         tiny_skia::Pixmap::from_vec(bytes, tiny_skia::IntSize::from_wh(page.width, vh)?)
     }
 
@@ -1908,6 +2073,10 @@ impl BrowserEngine {
             "window.innerHeight = window.outerHeight = screen.height = screen.availHeight = {viewport_h}; \
              window.innerWidth = window.outerWidth = {viewport_w};"
         ));
+        if let Some(parent) = &self.frame_parent {
+            let args = serde_json::json!([parent.origin, parent.name]);
+            self.js_runtime.execute(&format!("__aura_install_frame_parent.apply(null, {args});"));
+        }
         self.js_runtime.set_scroll_extent(
             page.scroll_width,
             page.scroll_height,
@@ -1940,8 +2109,8 @@ impl BrowserEngine {
         let fetch_script = |url: &Url| prefetched_or_fetch(&prefetched, url);
 
         // ── Phase-bucketed collections ──────────────────────────────────────
-        let mut deferred_classics: Vec<String> = Vec::new();
-        let mut async_classics: Vec<String> = Vec::new();
+        let mut deferred_classics: Vec<(String, u32, Option<String>)> = Vec::new();
+        let mut async_classics: Vec<(String, u32, Option<String>)> = Vec::new();
         let mut deferred_module_urls: Vec<Url> = Vec::new();
         let mut deferred_module_targets: Vec<(Url, u32)> = Vec::new();
         let mut async_module_urls: Vec<Url> = Vec::new();
@@ -1970,7 +2139,7 @@ impl BrowserEngine {
         // ── Phase 1: execute synchronous classics, bucket the rest ─────────
         for script in scripts {
             match script {
-                js::ScriptSource::InlineClassic { source, is_defer } => {
+                js::ScriptSource::InlineClassic { source, is_defer, node_id } => {
                     let allowed = self
                         .current_csp_policy
                         .as_ref()
@@ -1981,10 +2150,10 @@ impl BrowserEngine {
                         continue;
                     }
                     if is_defer {
-                        deferred_classics.push(source);
+                        deferred_classics.push((source, node_id, None));
                     } else {
                         eprintln!("[JS DEBUG] Executing inline classic script (len={})", source.len());
-                        self.js_runtime.execute(&source);
+                        self.js_runtime.execute_classic_script(&source, node_id, None);
                         eprintln!("[JS DEBUG] Inline classic script finished");
                     }
                 }
@@ -1992,6 +2161,7 @@ impl BrowserEngine {
                     url,
                     is_async,
                     is_defer,
+                    node_id,
                 } => {
                     eprintln!("[JS DEBUG] Fetching external classic script: {}", url);
                     let source = fetch_classic_source(self, &url);
@@ -1999,12 +2169,12 @@ impl BrowserEngine {
                     if let Some(source) = source {
                         if is_async {
                             // async wins over defer per HTML spec
-                            async_classics.push(source);
+                            async_classics.push((source, node_id, Some(url.to_string())));
                         } else if is_defer {
-                            deferred_classics.push(source);
+                            deferred_classics.push((source, node_id, Some(url.to_string())));
                         } else {
                             eprintln!("[JS DEBUG] Executing external classic script: {}", url);
-                            self.js_runtime.execute(&source);
+                            self.js_runtime.execute_classic_script(&source, node_id, Some(url.as_str()));
                             eprintln!("[JS DEBUG] External classic script finished: {}", url);
                         }
                     }
@@ -2076,10 +2246,9 @@ impl BrowserEngine {
         }
 
         // ── Phase 2: execute deferred classics, then evaluate deferred modules ──
-        for (idx, script) in deferred_classics.iter().enumerate() {
-            let preview = if script.len() > 200 { &script[..200] } else { script };
-            eprintln!("[JS DEBUG] Executing deferred classic script #{} (len={}, preview={})", idx, script.len(), preview);
-            self.js_runtime.execute(script);
+        for (idx, (script, node_id, url)) in deferred_classics.iter().enumerate() {
+            eprintln!("[JS DEBUG] Executing deferred classic script #{} (len={})", idx, script.len());
+            self.js_runtime.execute_classic_script(script, *node_id, url.as_deref());
             eprintln!("[JS DEBUG] Deferred classic script #{} finished", idx);
         }
 
@@ -2109,9 +2278,9 @@ impl BrowserEngine {
         }
 
         // ── Phase 3: execute async classics, then evaluate async modules ──
-        for (idx, script) in async_classics.iter().enumerate() {
+        for (idx, (script, node_id, url)) in async_classics.iter().enumerate() {
             eprintln!("[JS DEBUG] Executing async classic script #{}", idx);
-            self.js_runtime.execute(script);
+            self.js_runtime.execute_classic_script(script, *node_id, url.as_deref());
             eprintln!("[JS DEBUG] Async classic script #{} finished", idx);
         }
 
@@ -2242,6 +2411,9 @@ impl BrowserEngine {
         self.last_stylesheet = None;
         self.last_page = None;
         self.css_cache.clear();
+        self.frames = self.frames.for_new_document();
+        self.undelivered_child_messages.clear();
+        self.parent_outbox.clear();
         // Decoded raster and SVG images of the previous page.
         crate::background::clear_decoded_image_cache();
         crate::svg::clear_svg_caches();
@@ -2249,9 +2421,16 @@ impl BrowserEngine {
 
     /// Advance the JS event loop by one tick.
     /// Returns `true` if a re-render is needed.
+    /// Also dispatches messages from child frames and reports finished frame
+    /// renders as work, so the caller re-renders to show them.
     pub fn tick_js(&mut self, timestamp: Option<f64>, deadline: Option<f64>) -> bool {
-        self.js_runtime
-            .tick(Some(timestamp.unwrap_or(0.0)), deadline)
+        self.frames.poll();
+        let delivered = self.deliver_child_messages();
+        let worked = self
+            .js_runtime
+            .tick(Some(timestamp.unwrap_or(0.0)), deadline);
+        self.drain_js_outbox();
+        worked || delivered || self.frames.has_ready_images()
     }
 }
 
@@ -2292,6 +2471,14 @@ fn crop_viewport(src: &[u8], src_w: u32, src_h: u32, x: u32, y: u32, out_w: u32,
         out[to..to + copy_w * 4].copy_from_slice(&src[from..from + copy_w * 4]);
     }
     out
+}
+
+/// Make the rows of a viewport capture that lie past the end of the rendered
+/// canvas transparent (`crop_viewport` pads them white), for frame documents.
+fn clear_past_source(bytes: &mut [u8], width: u32, y: u32, src_h: u32) {
+    let first_row = src_h.saturating_sub(y) as usize;
+    let start = (first_row * width as usize * 4).min(bytes.len());
+    bytes[start..].fill(0);
 }
 
 #[inline]
