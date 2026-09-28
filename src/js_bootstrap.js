@@ -1085,6 +1085,15 @@ class Node extends EventTarget {
         let parent = this.parentNode;
         return parent && parent.nodeType === Node.ELEMENT_NODE ? parent : null;
     }
+    // In the document tree (through shadow hosts), as opposed to detached.
+    get isConnected() {
+        let node = this;
+        for (let depth = 0; node && depth < 10000; depth++) {
+            if (node === document || node.nodeType === Node.DOCUMENT_NODE) return true;
+            node = node._isShadowRoot ? node.host : node.parentNode;
+        }
+        return false;
+    }
     get childNodes() {
         if (!this._id) return new NodeList([]);
         let arr = JSON.parse(__aura_get_children(this._id));
@@ -3987,11 +3996,57 @@ class IntersectionObserver {
 }
 
 // -- ResizeObserver stub -----------------------------------------------------
+// ResizeObserver: after each render the engine calls
+// __aura_resize_observer_check(), which compares every observed element's
+// size with the last one reported and queues the callbacks whose targets
+// changed (including the first observation, per spec).
+var __aura_resize_observers = [];
 class ResizeObserver {
-    constructor(callback) { this._callback = callback; }
-    observe(target) {}
-    unobserve(target) {}
-    disconnect() {}
+    constructor(callback) {
+        if (typeof callback !== 'function') throw new TypeError('ResizeObserver callback must be a function');
+        this._callback = callback;
+        this._targets = [];
+    }
+    observe(target, options) {
+        if (!target || this._targets.some(t => t.target === target)) return;
+        this._targets.push({ target: target, box: (options && options.box) || 'content-box', width: -1, height: -1 });
+        if (!__aura_resize_observers.includes(this)) __aura_resize_observers.push(this);
+        __aura_queue_task(() => __aura_resize_observer_check());
+    }
+    unobserve(target) {
+        this._targets = this._targets.filter(t => t.target !== target);
+    }
+    disconnect() {
+        this._targets = [];
+        __aura_resize_observers = __aura_resize_observers.filter(o => o !== this);
+    }
+}
+
+function __aura_resize_observer_check() {
+    for (let observer of __aura_resize_observers.slice()) {
+        let entries = [];
+        for (let t of observer._targets) {
+            if (!t.target || !t.target.isConnected) continue;
+            let rect = typeof t.target.getBoundingClientRect === 'function' ? t.target.getBoundingClientRect() : null;
+            if (!rect) continue;
+            let w = rect.width, h = rect.height;
+            if (w === t.width && h === t.height) continue;
+            t.width = w;
+            t.height = h;
+            let size = [{ inlineSize: w, blockSize: h }];
+            entries.push({
+                target: t.target,
+                contentRect: { x: 0, y: 0, top: 0, left: 0, width: w, height: h, right: w, bottom: h },
+                borderBoxSize: size,
+                contentBoxSize: size,
+                devicePixelContentBoxSize: size,
+            });
+        }
+        if (entries.length) {
+            let callback = observer._callback;
+            __aura_queue_task(() => callback.call(observer, entries, observer));
+        }
+    }
 }
 
 // -- CustomEvent -------------------------------------------------------------

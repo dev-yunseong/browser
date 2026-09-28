@@ -1700,6 +1700,9 @@ impl BrowserEngine {
             self.viewport_height,
         );
         self.frames.sync(&page.frames, &base_url.origin().ascii_serialization(), &self.console_buffer);
+        // Sizes are known now: let ResizeObserver report the ones that changed.
+        self.js_runtime
+            .execute("if (typeof __aura_resize_observer_check === 'function') __aura_resize_observer_check();");
         self.drain_js_outbox();
         self.refresh_after_image_loads(page, width)
     }
