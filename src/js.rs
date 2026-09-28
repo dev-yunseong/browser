@@ -1958,6 +1958,7 @@ fn register_native_functions(
     register_fn(scope, global, "__aura_storage_remove", storage_remove_cb);
     register_fn(scope, global, "__aura_storage_clear", storage_clear_cb);
     register_fn(scope, global, "__aura_fetch", fetch_cb);
+    register_fn(scope, global, "__aura_fetch_text_sync", fetch_text_sync_cb);
     register_fn(scope, global, "setTimeout", setTimeout_cb);
     register_fn(scope, global, "requestAnimationFrame", raf_cb);
     register_fn(scope, global, "requestIdleCallback", ric_cb);
@@ -3180,6 +3181,35 @@ fn resolve_url_cb(
             .into(),
     );
 }
+/// `__aura_fetch_text_sync(url)`: blocking GET of an http(s) URL resolved
+/// against the document, returning the body text or `null`. Only for
+/// parser-blocking loads (scripts written by `document.write`).
+fn fetch_text_sync_cb(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let url_str = args.get(0).to_rust_string_lossy(scope);
+    let base_url = CURRENT_ORIGIN.with(|o| (*o.borrow()).clone());
+    let target = match base_url.as_ref().map_or_else(|| Url::parse(&url_str), |b| b.join(&url_str)) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") => url,
+        _ => {
+            rv.set_null();
+            return;
+        }
+    };
+    let text = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .and_then(|client| client.get(target).send())
+        .and_then(|response| response.error_for_status())
+        .and_then(|response| response.text());
+    match text.ok().and_then(|t| v8::String::new(scope, &t)) {
+        Some(value) => rv.set(value.into()),
+        None => rv.set_null(),
+    }
+}
+
 fn can_execute_script_url_cb(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -5105,6 +5135,55 @@ mod tests {
         let outcome = rt.execute_with_result("document.getElementById('empty').href");
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.result.as_deref(), Some("https://example.com/initialized"));
+    }
+
+    #[test]
+    fn test_document_write_inserts_after_running_script_and_runs_scripts() {
+        let mut rt = make_dom_runtime(
+            r#"<html><body><div id="before"></div><script id="s"></script><div id="after"></div></body></html>"#,
+            "https://example.com/",
+        );
+        let outcome = rt.execute_with_result(
+            r#"__aura_current_script = document.getElementById('s');
+               document.write('<p id="w">hi</p><script>window.__ran = 1<\/script>');
+               __aura_current_script = null;
+               var w = document.getElementById('w');
+               [w ? w.textContent : 'missing',
+                w && w.previousSibling ? w.previousSibling.id : 'none',
+                document.getElementById('after').previousSibling.tagName,
+                window.__ran].join(',')"#,
+        );
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("hi,s,SCRIPT,1"));
+    }
+
+    #[test]
+    fn test_event_listener_objects_receive_handle_event() {
+        let mut rt = make_dom_runtime(r#"<html><body></body></html>"#, "https://example.com/");
+        let outcome = rt.execute_with_result(
+            r#"var seen = [];
+               var listener = { tag: 'obj', handleEvent: function(e) { seen.push(this.tag + ':' + e.type); } };
+               window.addEventListener('ping', listener);
+               window.dispatchEvent(new Event('ping'));
+               window.removeEventListener('ping', listener);
+               window.dispatchEvent(new Event('ping'));
+               seen.join(',')"#,
+        );
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("obj:ping"));
+    }
+
+    #[test]
+    fn test_iframe_content_document_write_becomes_srcdoc() {
+        let mut rt = make_dom_runtime(r#"<html><body><iframe id="f"></iframe></body></html>"#, "https://example.com/");
+        let outcome = rt.execute_with_result(
+            r#"var f = document.getElementById('f');
+               var d = f.contentDocument;
+               d.open(); d.write('<p>ad</p>'); d.writeln('<b>x</b>'); d.close();
+               f.getAttribute('srcdoc')"#,
+        );
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.result.as_deref(), Some("<p>ad</p><b>x</b>\n"));
     }
 
     #[test]

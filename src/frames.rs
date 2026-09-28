@@ -25,6 +25,8 @@ use url::Url;
 
 use crate::layout;
 
+/// Largest frame viewport side in px; bigger boxes are rendered clipped to it.
+pub const MAX_FRAME_SIDE: u32 = 4096;
 /// Child documents per top-level page, counted across all nesting levels.
 pub const MAX_FRAMES: usize = 8;
 /// Nesting levels that load documents: the top-level page is depth 0, its
@@ -72,11 +74,16 @@ pub struct FrameBox {
     pub height: u32,
     /// The `name` attribute, which becomes the frame's `window.name`.
     pub name: String,
+    /// Markup of an `<iframe srcdoc>` frame (`src` is then `about:srcdoc`).
+    pub html: Option<String>,
 }
 
 impl FrameBox {
     pub fn key(&self) -> String {
-        iframe_frame_key(&self.src, self.width, self.height)
+        match &self.html {
+            Some(html) => iframe_frame_key(&crate::layer_tree::srcdoc_paint_src(html), self.width, self.height),
+            None => iframe_frame_key(&self.src, self.width, self.height),
+        }
     }
 }
 
@@ -84,7 +91,7 @@ impl FrameBox {
 /// `http(s)` after resolution against `base_url`, no `srcdoc`.
 fn frame_src(attrs: &[(String, String)], base_url: &Url) -> Option<String> {
     if attrs.iter().any(|(name, _)| name == "srcdoc") {
-        return None;
+        return Some(crate::layer_tree::SRCDOC_FRAME_SRC.to_string());
     }
     let src = attrs.iter().find(|(name, _)| name == "src")?.1.trim();
     if src.is_empty() {
@@ -142,8 +149,8 @@ fn document_root(node: &markup5ever_rcdom::Handle) -> markup5ever_rcdom::Handle 
     }
 }
 
-/// The `<iframe>` boxes of a laid-out page that load a network document and
-/// have a non-empty content box, in document order.
+/// The `<iframe>` boxes of a laid-out page that load a document (network
+/// `src` or `srcdoc`), in document order.
 pub fn collect_frame_boxes(root: &layout::LayoutBox, base_url: &Url) -> Vec<FrameBox> {
     let ordinals = frame_ordinals(&document_root(&root.style_node.node), base_url);
     if ordinals.is_empty() {
@@ -157,11 +164,15 @@ pub fn collect_frame_boxes(root: &layout::LayoutBox, base_url: &Url) -> Vec<Fram
             // Rounded like the paint side rounds the key it looks up.
             let content = crate::background::box_rect(layout_box, crate::background::BoxArea::Content);
             let (width, height) = (content.width.round() as u32, content.height.round() as u32);
-            let name = iframe_attrs(node)
-                .and_then(|attrs| attrs.into_iter().find(|(n, _)| n == "name").map(|(_, v)| v))
-                .unwrap_or_default();
-            if width > 0 && height > 0 && !out.iter().any(|f: &FrameBox| f.src == *src && f.ordinal == *ordinal) {
-                out.push(FrameBox { src: src.clone(), ordinal: *ordinal, width, height, name });
+            let attrs = iframe_attrs(node).unwrap_or_default();
+            let attr = |wanted: &str| attrs.iter().find(|(n, _)| n == wanted).map(|(_, v)| v.clone());
+            let name = attr("name").unwrap_or_default();
+            let html = attr("srcdoc");
+            // Zero-size frames still load: their scripts often ask the
+            // embedder for a size (ad SafeFrames). A 1px viewport stands in.
+            let (width, height) = (width.clamp(1, MAX_FRAME_SIDE), height.clamp(1, MAX_FRAME_SIDE));
+            if !out.iter().any(|f: &FrameBox| f.src == *src && f.ordinal == *ordinal) {
+                out.push(FrameBox { src: src.clone(), ordinal: *ordinal, width, height, name, html });
             }
         }
         for child in layout_box.children.iter().rev() {
@@ -221,7 +232,8 @@ pub struct IncomingMessage {
 // ── Frame host ────────────────────────────────────────────────────────────────
 
 enum FrameCmd {
-    Load { url: String, width: u32, height: u32, key: String },
+    /// `html` is set for `<iframe srcdoc>` documents.
+    Load { url: String, html: Option<String>, width: u32, height: u32, key: String },
     Resize { width: u32, height: u32, key: String },
     Message { data: String, origin: String },
 }
@@ -236,6 +248,8 @@ enum FrameEvent {
 struct ChildFrame {
     src: String,
     ordinal: usize,
+    /// Markup of a srcdoc frame; a change reloads the child document.
+    html: Option<String>,
     tx: mpsc::Sender<FrameCmd>,
     requested: (u32, u32),
     /// Key of the render the child is working on, if any.
@@ -308,7 +322,18 @@ impl FrameHost {
                 .iter_mut()
                 .find(|c| c.src == frame.src && c.ordinal == frame.ordinal)
             {
-                if child.requested != size {
+                if child.html != frame.html {
+                    child.html = frame.html.clone();
+                    child.requested = size;
+                    child.awaiting = Some(key.clone());
+                    let _ = child.tx.send(FrameCmd::Load {
+                        url: frame.src.clone(),
+                        html: frame.html.clone(),
+                        width: frame.width,
+                        height: frame.height,
+                        key,
+                    });
+                } else if child.requested != size {
                     child.requested = size;
                     child.awaiting = Some(key.clone());
                     let _ = child.tx.send(FrameCmd::Resize { width: frame.width, height: frame.height, key });
@@ -323,10 +348,17 @@ impl FrameHost {
             let Some(tx) = spawn_child(index, self.depth + 1, self.budget.clone(), parent, self.events_tx.clone()) else {
                 continue;
             };
-            let _ = tx.send(FrameCmd::Load { url: frame.src.clone(), width: frame.width, height: frame.height, key: key.clone() });
+            let _ = tx.send(FrameCmd::Load {
+                url: frame.src.clone(),
+                html: frame.html.clone(),
+                width: frame.width,
+                height: frame.height,
+                key: key.clone(),
+            });
             self.children.push(ChildFrame {
                 src: frame.src.clone(),
                 ordinal: frame.ordinal,
+                html: frame.html.clone(),
                 tx,
                 requested: size,
                 awaiting: Some(key),
@@ -458,11 +490,19 @@ fn run_child(
     let mut current_key = String::new();
     for cmd in rx {
         match cmd {
-            FrameCmd::Load { url, width: w, height: h, key } => {
+            FrameCmd::Load { url, html, width: w, height: h, key } => {
                 (width, current_key) = (w, key);
                 engine.viewport_height = (h as f32).max(1.0);
                 engine.frame_deadline = Some(Instant::now() + FRAME_BUDGET);
-                if let Err(error) = engine.navigate(&url, w as f32) {
+                let loaded = match &html {
+                    // A srcdoc document has its embedder's URL as base and origin.
+                    Some(html) => match Url::parse(&parent_origin).and_then(|u| u.join("/")) {
+                        Ok(base) => engine.load_html_document(html, &base, w as f32).map(|_| ()),
+                        Err(error) => Err(error.to_string()),
+                    },
+                    None => engine.navigate(&url, w as f32).map(|_| ()),
+                };
+                if let Err(error) = loaded {
                     eprintln!("[frames] {url} failed to load: {error}");
                 }
                 forward(&mut engine);

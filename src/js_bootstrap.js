@@ -256,7 +256,9 @@ function __aura_normalize_listener_options(options) {
 }
 
 function __aura_add_listener(target, type, callback, options) {
-    if (typeof callback !== 'function') return;
+    // A listener is a function or an object with a handleEvent method
+    // (DOM EventListener); the object's handleEvent is looked up per event.
+    if (typeof callback !== 'function' && !(callback && typeof callback === 'object')) return;
     if (!target._listeners) target._listeners = new Map();
     if (!target._listeners.has(type)) target._listeners.set(type, []);
     let normalized = __aura_normalize_listener_options(options);
@@ -312,7 +314,11 @@ function __aura_invoke_listeners(target, event, capture) {
     for (let listener of list.slice()) {
         if (event._immediateStopped) break;
         if (!!listener.capture !== !!capture) continue;
-        try { listener.callback.call(target, event); } catch(e) { console.log("Event Error: " + e); }
+        try {
+            let cb = listener.callback;
+            if (typeof cb === 'function') cb.call(target, event);
+            else if (cb && typeof cb.handleEvent === 'function') cb.handleEvent(event);
+        } catch(e) { console.log("Event Error: " + e); }
         if (listener.once) {
             __aura_remove_listener(target, event.type, listener.callback, { capture: listener.capture });
         }
@@ -2463,6 +2469,43 @@ var document = {
             return JSON.parse(__aura_get_elements_by_tag(0, tagName));
         });
     },
+    // document.write/writeln. Scripts run after parsing here, so written
+    // markup goes right after the running <script> (where the parser would
+    // have put it), or at the end of <body> when no script is running.
+    // Written <script> elements run, as they do in browsers.
+    write: function() {
+        let html = '';
+        for (let i = 0; i < arguments.length; i++) html += String(arguments[i]);
+        if (!html) return;
+        let holder = this.createElement('div');
+        holder.innerHTML = html;
+        let nodes = Array.from(holder.childNodes);
+        let anchor = __aura_current_script;
+        let parent = anchor && anchor.parentNode ? anchor.parentNode : (this.body || this.documentElement);
+        if (!parent) return;
+        let next = anchor && anchor.parentNode ? anchor.nextSibling : null;
+        for (let node of nodes) {
+            // Written classic scripts block the parser: run each one, in
+            // order, before the markup after it is inserted.
+            let blocking = node.nodeType === Node.ELEMENT_NODE
+                && String(node.tagName).toLowerCase() === 'script'
+                && !__aura_script_type(node).includes('module')
+                && !node.hasAttribute('async') && !node.hasAttribute('defer');
+            if (blocking) node._alreadyStarted = true;
+            if (next) parent.insertBefore(node, next);
+            else parent.appendChild(node);
+            if (blocking) {
+                let code = node.src ? __aura_fetch_text_sync(node.src) : (node.text || node.textContent || '');
+                if (code === null) __aura_script_fire(node, 'error');
+                else __aura_execute_classic_script(node, code);
+            }
+        }
+    },
+    writeln: function() {
+        let parts = Array.prototype.slice.call(arguments);
+        parts.push('\n');
+        return this.write.apply(this, parts);
+    },
     // Elements whose name attribute equals `name` (a NodeList, in tree order).
     getElementsByName: function(name) {
         let value = String(name);
@@ -3366,7 +3409,8 @@ function __aura_frame_take_outbox() {
 // Absolute http(s) src of a network <iframe>, as the engine names frames.
 function __aura_frame_src(frame) {
     if (!frame || typeof frame.getAttribute !== 'function') return null;
-    if (frame.hasAttribute && frame.hasAttribute('srcdoc')) return null;
+    // srcdoc frames are named by document order among srcdoc frames.
+    if (frame.hasAttribute && frame.hasAttribute('srcdoc')) return 'about:srcdoc';
     var raw = String(frame.getAttribute('src') || '').trim();
     if (!raw) return null;
     var abs = __aura_resolve_url_attribute(raw);
@@ -3420,6 +3464,22 @@ function __aura_install_frame_parent(parentOrigin, frameName) {
     parentWindow.opener = null;
     parentWindow.focus = function() {};
     parentWindow.blur = function() {};
+    // The parent document lives in another engine, so a same-origin frame
+    // cannot reach its DOM: it reads as a document with no elements.
+    parentWindow.document = {
+        nodeType: 9,
+        readyState: 'complete',
+        body: null,
+        head: null,
+        documentElement: null,
+        getElementById: function() { return null; },
+        querySelector: function() { return null; },
+        querySelectorAll: function() { return new NodeList([]); },
+        getElementsByTagName: function() { return new NodeList([]); },
+        getElementsByClassName: function() { return new NodeList([]); },
+        addEventListener: function() {},
+        removeEventListener: function() {},
+    };
     window.parent = parentWindow;
     window.top = parentWindow;
     window.frameElement = null;
@@ -3756,12 +3816,15 @@ function __aura_execute_classic_script(script, code) {
     let previous = __aura_current_script;
     __aura_current_script = script;
     try {
-        (0, eval)(String(code || ''));
+        let source = String(code || '');
+        // Name external scripts in stack traces, as the parser-run path does.
+        if (script.src) source += '\n//# sourceURL=' + script.src;
+        (0, eval)(source);
         __aura_current_script = previous;
         __aura_script_fire(script, 'load');
     } catch (e) {
         __aura_current_script = previous;
-        console.error('Script execution error: ' + e);
+        console.error('Script execution error: ' + (e && e.stack ? e.stack : e));
         __aura_script_fire(script, 'error');
     }
 }
@@ -4709,6 +4772,24 @@ class HTMLIFrameElement extends HTMLElement {
                     return new NodeIterator(root, whatToShow, filter);
                 },
                 createRange: function() { return new Range(); },
+                // document.open/write/close on an about:blank frame: the
+                // written markup becomes the frame's srcdoc document, which
+                // the engine renders like any frame document.
+                open: function() { self._written = ''; return this; },
+                write: function() {
+                    if (self._written === undefined || self._written === null) self._written = '';
+                    for (var i = 0; i < arguments.length; i++) self._written += String(arguments[i]);
+                },
+                writeln: function() {
+                    this.write.apply(this, arguments);
+                    this.write('\n');
+                },
+                close: function() {
+                    if (typeof self._written === 'string') {
+                        self.setAttribute('srcdoc', self._written);
+                        self._written = null;
+                    }
+                },
                 importNode: function(node, deep) { return node; },
                 adoptNode: function(node) { return node; },
                 execCommand: function() { return false; },
@@ -4733,7 +4814,13 @@ class HTMLIFrameElement extends HTMLElement {
             self._contentWindow.frames = self._contentWindow;
             self._contentWindow.length = 0;
             self._contentWindow.name = '';
-            self._contentWindow.location = document.location;
+            // The frame's own location: navigating it must never move the parent.
+            self._contentWindow.location = {
+                href: 'about:blank', protocol: 'about:', host: '', hostname: '', port: '',
+                pathname: 'blank', search: '', hash: '', origin: document.location.origin,
+                assign: function() {}, replace: function() {}, reload: function() {},
+                toString: function() { return 'about:blank'; }
+            };
             self._contentWindow.closed = false;
             self._contentWindow.opener = null;
             self._contentWindow.frameElement = self;

@@ -1410,7 +1410,33 @@ impl BrowserEngine {
             self.viewport_height,
         )
         .map_err(|e| e.to_string())?;
+        self.finish_load(result, width)
+    }
 
+    /// Load a document from markup instead of the network (an `<iframe
+    /// srcdoc>` document); `base_url` is its URL and origin. Session history
+    /// is left to the caller.
+    pub fn load_html_document(&mut self, html: &str, base_url: &Url, width: f32) -> Result<PageResult, String> {
+        self.clear_for_new_url();
+        let result = process_html_with_scroll(
+            html,
+            base_url,
+            &HashMap::new(),
+            &mut self.css_cache,
+            None,
+            None,
+            None,
+            None,
+            width,
+            self.viewport_height,
+            (0.0, 0.0),
+        )
+        .map_err(|e| e.to_string())?;
+        self.finish_load(result, width)
+    }
+
+    /// Run the scripts of a freshly parsed document and render it.
+    fn finish_load(&mut self, result: (PageResult, css::Stylesheet), width: f32) -> Result<PageResult, String> {
         let (page, stylesheet) = result;
         self.last_stylesheet = Some(stylesheet);
         self.stylesheet_viewport = (width.max(1.0), self.viewport_height);
@@ -1967,13 +1993,6 @@ impl BrowserEngine {
             page.width as f32,
             viewport_h,
         );
-
-        // Debug hook: a script run before the page's own scripts.
-        if let Ok(path) = std::env::var("BROWSER_DEBUG_PRELUDE") {
-            if let Ok(prelude) = std::fs::read_to_string(&path) {
-                self.js_runtime.execute(&prelude);
-            }
-        }
 
         let scripts = js::extract_script_sources_from_dom(&dom.document, Some(&page.base_url));
 
