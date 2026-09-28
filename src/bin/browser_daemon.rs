@@ -494,6 +494,9 @@ struct DaemonBrowserApp {
     render_width: f32,
     /// A new panel width waiting to settle before re-rendering at it.
     pending_width: Option<(f32, std::time::Instant)>,
+    /// The page must be re-rendered at `render_width` once the render or load
+    /// in flight finishes.
+    reflow_pending: bool,
 }
 
 impl DaemonBrowserApp {
@@ -548,6 +551,7 @@ impl DaemonBrowserApp {
             has_page: false,
             render_width: 800.0,
             pending_width: None,
+            reflow_pending: false,
         }
     }
 
@@ -853,6 +857,10 @@ impl eframe::App for DaemonBrowserApp {
                         }
                     }
                 }
+                if self.reflow_pending && self.has_page && self.re_render_promise.is_none() && self.content_promise.is_none() {
+                    self.reflow_pending = false;
+                    self.trigger_re_render(ctx, self.render_width);
+                }
 
                 // Poll content (navigate) promise
                 if let Some(promise) = &self.content_promise {
@@ -946,10 +954,18 @@ impl eframe::App for DaemonBrowserApp {
                             false
                         }
                     };
-                    if settled && self.has_page && self.re_render_promise.is_none() && self.content_promise.is_none() {
+                    if settled {
+                        // Adopt the width now; if a render or load is in
+                        // flight (pages with timers re-render constantly),
+                        // reflow as soon as it finishes instead of waiting
+                        // for an idle moment that may never come.
                         self.render_width = panel_width;
                         self.pending_width = None;
-                        self.trigger_re_render(ctx, self.render_width);
+                        if self.has_page && self.re_render_promise.is_none() && self.content_promise.is_none() {
+                            self.trigger_re_render(ctx, self.render_width);
+                        } else {
+                            self.reflow_pending = true;
+                        }
                     } else {
                         ctx.request_repaint_after(RESIZE_SETTLE);
                     }
